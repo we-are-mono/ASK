@@ -7869,35 +7869,42 @@ static void test_selective_routes(void)
     event.prefixlen = 33;
     ft_neigh_event(NULL, NETEVENT_IPV4_ROUTE_UPDATE, &event);
     assert(ft_invalid); ft_invalid = 0;
-    for (unsigned e = FIB_EVENT_RULE_ADD; e <= FIB_EVENT_RULE_DEL; e++) {
-        ft_fib_event(NULL, e, &info); assert(ft_invalid); ft_invalid = 0;
-    }
-    /* Policy changes need explicit recovery in either family, not just IPv4. */
-    info.family = AF_INET6;
-    ft_fib_event(NULL, FIB_EVENT_RULE_ADD, &info); assert(ft_invalid); ft_invalid = 0;
-    /* A family this adapter forwards for neither of is still ignored outright. */
-    info.family = AF_BRIDGE;
-    ft_fib_event(NULL, FIB_EVENT_RULE_ADD, &info); assert(!ft_invalid);
 
-    for (unsigned e = FIB_EVENT_NH_ADD; e <= FIB_EVENT_NH_DEL; e++) {
+    /* A routing rule, in either family, and IPv4's built-in nexthop sync can
+     * each move any flow and any SA's outer path, with no prefix to scope
+     * them: every flow is retired and every SA asked again, and admission and
+     * the bindings stay up. A family this adapter forwards for neither of is
+     * ignored outright. */
+    static const struct { unsigned long event; int family; u64 *counter; } policy[] = {
+        { FIB_EVENT_RULE_ADD, AF_INET, &ft_route_invalidations },
+        { FIB_EVENT_RULE_DEL, AF_INET, &ft_route_invalidations },
+        { FIB_EVENT_RULE_ADD, AF_INET6, &ft_route_invalidations },
+        { FIB_EVENT_RULE_DEL, AF_INET6, &ft_route_invalidations },
+        { FIB_EVENT_NH_ADD, AF_INET, &ft_link_invalidations },
+        { FIB_EVENT_NH_DEL, AF_INET, &ft_link_invalidations },
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(policy); i++) {
         fixture();
         struct nf_flow_offload_handle other = { .refs = 1 };
-        u64 links = ft_link_invalidations;
+        u64 counted = *policy[i].counter, rearms = ft_rearms;
+        unsigned marked = ipsec_marked_all, bound = ft_bound;
         assert(ft_replace(&binding, &cls) == 0);
         cls.cookie++; pk.src++; cls.nf_handle = &other;
         assert(ft_replace(&binding, &cls) == 0);
-        ft_fib_event(NULL, e, &info); /* Another family is ignored. */
-        assert(!handle.invalid && !other.invalid);
-        info.family = AF_INET;
-        ft_fib_event(NULL, e, &info);
-        ft_fib_event(NULL, e, &info);
+        info.family = AF_BRIDGE;
+        ft_fib_event(NULL, policy[i].event, &info);
+        assert(!handle.invalid && !other.invalid && !ft_invalid && ipsec_marked_all == marked);
+        info.family = policy[i].family;
+        ft_fib_event(NULL, policy[i].event, &info);
+        ft_fib_event(NULL, policy[i].event, &info);
         assert(handle.invalid && other.invalid && !ft_invalid);
-        assert(ft_link_invalidations == links + 2);
+        assert(*policy[i].counter == counted + 2 && ipsec_marked_all == marked + 2);
         ft_retire_workfn(NULL);
         assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated);
         assert(handle.refs == 1 && other.refs == 1);
-        info.family = AF_BRIDGE;
+        assert(ft_bound == bound && ft_rearms == rearms);
     }
+    info.family = AF_BRIDGE;
 
     /* Queued admission may carry one current and one stale route. Refuse and
      * invalidate the entire generation before any hardware allocation. */
@@ -8615,7 +8622,6 @@ static void test_device_recovery(void)
     struct net other_net;
     struct net_device unrelated = { .ifindex = in.ifindex };
     struct netdev_notifier_info info = { .dev = &unrelated };
-    struct fib_notifier_info policy = { .family = AF_INET };
     u64 rearms = ft_rearms;
 
     unsigned long events[] = {NETDEV_CHANGEMTU, NETDEV_GOING_DOWN, NETDEV_CHANGEADDR};
@@ -8685,7 +8691,7 @@ static void test_device_recovery(void)
                 assert(ft_rearms == rearms); /* No table recreation or global rearm. */
 
                 /* MTU recovery must not reopen admission after a policy event. */
-                ft_fib_event(NULL, FIB_EVENT_RULE_ADD, &policy);
+                ft_nexthop_event(NULL, NEXTHOP_EVENT_REPLACE, NULL);
                 ft_netdev_event(NULL, event, &info);
                 ft_retire_workfn(NULL);
                 /* The latch holds the worker off, not a port that is stopping. */

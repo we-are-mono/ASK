@@ -450,21 +450,22 @@ async def test_add_failures(rig):
 
 
 async def test_rearm(rig):
-    """Recover after upper-device and routing-policy changes and a retried delete barrier."""
+    """Recover after upper-device and nexthop-object changes and a retried delete barrier."""
     r = rig
     initial = await r.state()
     if initial["observe"]:
         pytest.skip("rearm proof requires installed hardware")
     original_mtu = (await read(r.target, r.session, f"/sys/class/net/{TARGET_LAN_IF}/mtu")).strip()
-    rule_priority = "32001"
-    rules = json.loads((await command(r.target, r.session, "ip", "-j", "rule", "show"))["stdout"])
-    assert not any(rule.get("priority") == int(rule_priority) for rule in rules), rules
-    rule_added = False
+    nexthop_id = "32001"
+    listed = await command(r.target, r.session, "ip", "-j", "nexthop", "show", check=False)
+    nexthops = json.loads(listed["stdout"] or "[]")
+    assert not any(nexthop.get("id") == int(nexthop_id) for nexthop in nexthops), nexthops
+    nexthop_added = False
     boot_id = await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")
     await r.table()
     await r.admit(128, promiscuous=False)
     try:
-        for cycle, trigger in enumerate(("device", "rule", "barrier"), 1):
+        for cycle, trigger in enumerate(("device", "nexthop", "barrier"), 1):
             before = await r.state()
             traffic = None
             knob = "/proc/fm_ehash_hcsync_fail"
@@ -477,10 +478,10 @@ async def test_rearm(rig):
                         assert not traffic.done() and time.monotonic() < deadline
                         await asyncio.sleep(0.02)
                     await upper_roundtrip(r, TARGET_LAN_IF)
-                elif trigger == "rule":
-                    await command(r.target, r.session, "ip", "rule", "add", "pref", rule_priority,
-                                  "from", "198.18.254.0/24", "table", "main")
-                    rule_added = True
+                elif trigger == "nexthop":
+                    await command(r.target, r.session, "ip", "nexthop", "add", "id", nexthop_id,
+                                  "dev", TARGET_LAN_IF)
+                    nexthop_added = True
                 else:
                     result = await r.target.fs_write(r.session, knob, "2")
                     assert result["errno"] == 0, result
@@ -565,9 +566,42 @@ async def test_rearm(rig):
         try:
             await r.delete_table()
         finally:
-            if rule_added:
-                await command(r.target, r.session, "ip", "rule", "del", "pref", rule_priority,
-                              "from", "198.18.254.0/24", "table", "main")
+            if nexthop_added:
+                await command(r.target, r.session, "ip", "nexthop", "del", "id", nexthop_id)
+
+
+async def test_rule_change(rig):
+    """A routing rule coming and going retires the offloaded connection, which
+    comes back on its next packets: the table, its bindings and admission stay
+    up throughout, and nothing is rearmed (A414)."""
+    r = rig
+    if (await r.state())["observe"]:
+        pytest.skip("rule retirement requires installed hardware")
+    rule = ["pref", "32001", "from", "198.18.254.0/24", "table", "main"]
+    rules = json.loads((await command(r.target, r.session, "ip", "-j", "rule", "show"))["stdout"])
+    assert not any(row.get("priority") == 32001 for row in rules), rules
+    added = False
+    await r.table()
+    before = await r.admit()
+    try:
+        for verb in ("add", "del"):
+            await command(r.target, r.session, "ip", "rule", verb, *rule)
+            added = verb == "add"
+            retired = await r.wait(lambda s: s["entries"] == 0 and
+                                   s["route_invalidations"] > before["route_invalidations"])
+            assert retired["invalidated"] == retired["fatal"] == retired["quarantine"] == 0, retired
+            assert retired["errors"] == before["errors"], retired
+            assert retired["bindings"] == before["bindings"] == 2, retired
+            assert retired["rearms"] == before["rearms"], retired
+            back = await r.admit()
+            assert back["installs"] == before["installs"] + 2, (before, back)
+            assert back["invalidated"] == 0 and back["rearms"] == before["rearms"], back
+            r.record(f"rule-{verb}", {"before": before, "retired": retired, "back": back})
+            before = back
+    finally:
+        if added:
+            await command(r.target, r.session, "ip", "rule", "del", *rule, check=False)
+        await r.delete_table()
 
 
 @pytest.mark.parametrize("trigger", [os.environ.get("ASK_FLOWTABLE_INVALIDATION", "neighbour")])

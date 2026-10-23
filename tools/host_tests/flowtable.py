@@ -48,7 +48,7 @@ def test_decoder_and_lifecycle(tmp_path):
              "ft_find", "ft_retire_kick", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches",
              "ft_neigh_table", "ft_neigh_check", "ft_neigh_moved", "ft_nexthop_usable",
              "ft_next_hop", "ft_routes_valid", "ft_offer_routes_current", "ft_offer_current", "ft_policy_covers", "ft_fdb_key", "ft_watch_publish", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used",
-             "ft_route_event", "ft_route6_event", "ft_neigh_event", "ft_fib_event", "ft_nexthop_event",
+             "ft_route_event", "ft_route6_event", "ft_neigh_event", "ft_retire_all", "ft_fib_event", "ft_nexthop_event",
              "ft_ppp_rx_overhead", "ft_tunnel_under",
              "ft_dev_stats_release",
              "ft_dev_stats_get", "ft_dev_stats_put", "ft_dev_stats_gone",

@@ -372,6 +372,45 @@ sendp(Ether(src={mac!r}, dst='33:33:00:00:00:01') / IPv6(src={LAN_IPV6!r}, dst='
         await _drop_tables(r)
 
 
+async def test_rule_change(ipv6_rig):
+    """An IPv6 routing rule coming and going -- netifd adds one like it per
+    delegated prefix whenever the WAN comes up -- retires the offloaded flow,
+    which comes back on its next packets: the table, its bindings and admission
+    stay up throughout, and nothing is rearmed (A414)."""
+    r = ipv6_rig
+    sport, dport = PORTS["rule"]
+    loop = asyncio.get_running_loop()
+    transport, _ = await loop.create_datagram_endpoint(
+        Echo, local_addr=(WAN_IPV6, dport), family=socket.AF_INET6)
+    rule = ["pref", "4199999999", "from", "2001:db8:ff::/64", "iif", TARGET_LAN_IF, "unreachable"]
+    added = False
+
+    async def send(count=8):
+        return await _udp_exchange(r, sport, WAN_IPV6, dport, count, (WAN_IPV6, dport),
+                                   "flowtable_v6_rule")
+    try:
+        await _offload_table(r, f'ip6 saddr {LAN_IPV6} udp sport {sport} udp dport {dport}')
+        before = await _drive(r, send, lambda s: s["entries"] == 2, "IPv6 flow did not install")
+        for verb in ("add", "del"):
+            await command(r.target, r.session, "ip", "-6", "rule", verb, *rule)
+            added = verb == "add"
+            retired = await r.wait(lambda s: s["entries"] == 0 and
+                                   s["route_invalidations"] > before["route_invalidations"])
+            assert retired["invalidated"] == 0 and retired["errors"] == r.errors, retired
+            assert retired["bindings"] == before["bindings"], retired
+            assert retired["rearms"] == before["rearms"], retired
+            back = await _drive(r, send, lambda s: s["entries"] == 2, "IPv6 flow did not come back")
+            assert back["installs"] == before["installs"] + 2, (before, back)
+            assert await send(64) == {"echoed": 64, "lost": 0}
+            r.record(f"ipv6-rule-{verb}", {"before": before, "retired": retired, "back": back})
+            before = back
+    finally:
+        if added:
+            await command(r.target, r.session, "ip", "-6", "rule", "del", *rule, check=False)
+        transport.close()
+        await _drop_tables(r)
+
+
 @pytest.mark.rfc("8200", section="4.5")
 @pytest.mark.rfc("5722")
 async def test_fragments(ipv6_rig):

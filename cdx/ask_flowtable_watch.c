@@ -852,10 +852,26 @@ int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *ptr)
 	return NOTIFY_DONE;
 }
 
+/* Every flow retired and every SA asked to follow its path again, the bindings
+ * and admission left up: for a routing change with no prefix to scope it. The
+ * caller's RTNL section also invalidates every cached route, so an admission
+ * still queued revalidates against the new routing, as after a prefix's
+ * change. */
+static void ft_retire_all(atomic64_t *counter)
+{
+	struct cdx_ft_entry *entry;
+
+	spin_lock_bh(&ft_watch_lock);
+	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
+		ft_handle_invalidate(entry->handle, counter);
+	spin_unlock_bh(&ft_watch_lock);
+	/* Nothing re-offers an SA the way a packet re-offers a flow. */
+	ft_ipsec_all_moved();
+}
+
 int ft_fib_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
 	struct fib_notifier_info *info = ptr;
-	struct cdx_ft_entry *entry;
 
 	/* ipmr and ip6mr announce their VIFs, their MFC entries and their
 	 * policy rules on this same chain under two families of their own.
@@ -882,17 +898,22 @@ int ft_fib_event(struct notifier_block *nb, unsigned long event, void *ptr)
 	case FIB_EVENT_NH_DEL:
 		/* IPv4 emits these while synchronizing built-in nexthops on
 		 * device/address transitions. A revived alternative can change
-		 * routing even for flows not using that device. Retire all flow
-		 * generations without closing bindings; RTNL/dst revalidation
-		 * excludes queued routes from before the completed transition.
-		 * These are not notifications from the nexthop-object API. */
-		spin_lock_bh(&ft_watch_lock);
-		list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
-			ft_handle_invalidate(entry->handle, &ft_link_invalidations);
-		spin_unlock_bh(&ft_watch_lock);
+		 * routing even for flows not using that device. These are not
+		 * notifications from the nexthop-object API. */
+		ft_retire_all(&ft_link_invalidations);
+		break;
+	case FIB_EVENT_RULE_ADD:
+	case FIB_EVENT_RULE_DEL:
+		/* A rule decides which table a lookup reads, so any flow or SA may
+		 * now leave another way. netifd adds one per delegated IPv6 prefix
+		 * whenever the WAN comes up. fib_nl_newrule() and fib_nl_delrule()
+		 * notify, change the rule list and flush the route cache under one
+		 * RTNL hold. A kernel that drops RTNL before the flush (6.18 does)
+		 * lets an admission revalidate a route from before the change. */
+		ft_retire_all(&ft_route_invalidations);
 		break;
 	default:
-		/* Policy changes and unknown events require explicit recovery. */
+		/* Unknown events require explicit recovery. */
 		ft_invalidate();
 	}
 	return NOTIFY_DONE;
