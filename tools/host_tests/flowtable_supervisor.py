@@ -73,6 +73,18 @@ def test_worker_exit_including_zero_is_restarted(running, sig):
     assert len(c.calls("-f")) == 1
 
 
+def test_worker_is_named_ask_flowtable(running):
+    """The worker is executed through /proc/self/exe, so it runs the
+    supervisor's own binary even mid-upgrade, and the kernel names a process
+    after the file it was started from: "exe". It names itself, so ps, top and
+    the kernel's own OOM and hung-task reports say ask-flowtable."""
+    c = running
+    pid = worker(c)
+    assert Path(f"/proc/{pid}/comm").read_text() == "ask-flowtable\n"
+    argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    assert argv[:2] == [b"ask-flowtable", b"daemon"], argv
+
+
 def test_manual_pause_survives_worker_crash(running):
     c = running
     c.run("stop")

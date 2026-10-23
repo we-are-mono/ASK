@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A419 — the ask-flowtable worker showed as `exe` in ps, top and the kernel's reports.** The supervisor executes
+  it through /proc/self/exe; it now names itself (_:/^flowtable: name the worker ask-flowtable_).
+
 - [x] **A418 — bridge VLAN configuration stopped hardware admission globally, and every bridge join raised it.** A
   membership, filtering or protocol change now retires the flows using the device and sweeps its software flows, a
   bridge's on every port (_:/^cdx: retire a device's flows on an upper or bridge VLAN change_).

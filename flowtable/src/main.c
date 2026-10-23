@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <poll.h>
 #include <time.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <syslog.h>
 
@@ -606,6 +607,11 @@ static int cmd_daemon(const char *conf)
 	int64_t due = 0;
 	bool failed = false, restarting = false;
 
+	/* The supervisor executes this through /proc/self/exe, so it runs the
+	 * supervisor's own binary even mid-upgrade, and the kernel names a
+	 * process after the file it was started from. Named here, ps, top and
+	 * the kernel's OOM and hung-task reports say ask-flowtable, not exe. */
+	prctl(PR_SET_NAME, "ask-flowtable");
 	if (!ft_cdx_present()) {
 		fprintf(stderr, "ask-flowtable: cdx not loaded; idle\n");
 		ft_log(LOG_NOTICE, "cdx not loaded; idle");
