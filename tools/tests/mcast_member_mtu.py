@@ -64,8 +64,8 @@ async def _state(target, session, group, state, timeout=15, *, family=None):
             config = new_config(family, wan_source_address(family), group, PORT, [])
             await asyncio.to_thread(send, frames(config, {SMALL: 256}, 4))
         await asyncio.sleep(0.2)
-    changes = re.search(r"^mroute_ruleset_changes (\d+)$",
-                        await read(target, session, "/proc/cdx_flowtable"), re.M)
+    changes = re.search(r"^mroute_ruleset_changes:\s+(\d+)$",
+                        await read(target, session, "/proc/ask_flowtable/stats"), re.M)
     raise AssertionError(f"{group}: expected state={state}, got {last!r}; "
                          f"ruleset changes so far: {changes and changes[1]}")
 

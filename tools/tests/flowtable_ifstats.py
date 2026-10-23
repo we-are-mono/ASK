@@ -169,7 +169,7 @@ async def test_vlan_and_ports(offload_service_stopped, vlan_rig):
     assert forward == {"packets": COUNT, "bytes": COUNT * tagged}, forward
     assert reverse == {"packets": COUNT, "bytes": COUNT * untagged}, reverse
     # The device's record: what the strip left and what the insert made. Both
-    # read back through /proc/cdx_flowtable as the firmware keeps them.
+    # read back through /proc/ask_flowtable/devices as the firmware keeps them.
     record = delta["vlans"][r.dut_vlan_if]
     assert record == {"rx_packets": COUNT, "rx_bytes": COUNT * untagged,
                       "tx_packets": COUNT, "tx_bytes": COUNT * tagged}, record

@@ -8,37 +8,66 @@ import sqlite3
 import threading
 import time
 
-TABLE = Path("/proc/cdx_flowtable")
+PROC = Path("/proc/ask_flowtable")
+# A summary reads the levels and the counters, one short hold of the adapter's
+# transaction, as the controller's health probe does; a state adds every row
+# file, the flows' last. A snapshot streams the flows into SQLite rather than
+# into memory.
+SUMMARY = ("status", "stats")
+STATE = (*SUMMARY, "devices", "mcast", "mroute", "l2", "flows")
 ROW_NAMES = {"flow": "flows", "session": "sessions", "vlan": "vlans",
              "tunnel": "tunnels", "mcast": "mcast", "mroute": "mroute",
              "l2flow": "l2flows"}
+# The module parameters the adapter runs with. procfs does not repeat them
+# (docs/flowtable/procfs.md, rule 4); a state carries them beside what the
+# files say, under these names, read here so a poll costs no extra round trip.
+PARAMETERS = {
+    "observe": Path("/sys/module/cdx/parameters/flowtable_observe"),
+    "transit": Path("/sys/module/cdx/parameters/transit"),
+    "mcast_enabled": Path("/sys/module/ask_flowtable/parameters/multicast"),
+    "qos_mark_mask": Path("/sys/module/ask_flowtable/parameters/qos_mark_mask"),
+    "qos_default_class": Path("/sys/module/ask_flowtable/parameters/qos_default_class"),
+    "route_mark_mask": Path("/sys/module/ask_flowtable/parameters/route_mark_mask"),
+}
 
 
 def empty():
     return {name: [] for name in ROW_NAMES.values()}
 
 
+def parameters_into(state, parameters=PARAMETERS):
+    """Y and N as 1 and 0, numbers as numbers; one whose module is not loaded
+    is left out."""
+    for name, path in parameters.items():
+        try:
+            text = path.read_text().strip()
+        except FileNotFoundError:
+            continue
+        state[name] = {"Y": 1, "N": 0}[text] if text in ("Y", "N") else int(text, 0)
+
+
 def line_into(state, line):
+    """A row, by its leading tag, or a status or stats line, `key: value`."""
     kind, _, rest = line.strip().partition(" ")
     if kind in ROW_NAMES:
         state[ROW_NAMES[kind]].append(dict(item.split("=", 1) for item in rest.split()))
-    else:
-        key, value = line.split()
-        state[key] = int(value) if value.isdecimal() else value
+        return
+    key, colon, value = line.partition(":")
+    key, value = key.strip(), value.strip()
+    if not colon or not key or " " in key or not value or " " in value:
+        raise ValueError(f"unexpected /proc/ask_flowtable line: {line!r}")
+    state[key] = int(value) if value.isdecimal() else value
 
 
-def read_state(*, summary=False, path=TABLE):
+def read_state(*, summary=False, proc=PROC, parameters=PARAMETERS):
     result = empty()
-    with path.open() as stream:
-        for line in stream:
-            # A summary stops at the flow rows, and so leaves out the bridged
-            # pairs' rows (l2flow), which follow them; their totals are in
-            # the header.
-            if summary and line.startswith("flow "):
-                break
-            line_into(result, line)
-            if len(result["flows"]) > 2048:
-                raise ValueError("large flowtable requires a local snapshot")
+    for name in SUMMARY if summary else STATE:
+        with (proc / name).open() as stream:
+            for line in stream:
+                line_into(result, line)
+                if len(result["flows"]) > 2048:
+                    raise ValueError("large flowtable requires a local snapshot")
+    parameters_into(result, parameters)
     return result
 
 
@@ -49,8 +78,8 @@ class Snapshots:
     page cache. Gzip files retain the complete raw rows for failure diagnosis.
     """
 
-    def __init__(self, root, path=TABLE):
-        self.path = path
+    def __init__(self, root, proc=PROC, parameters=PARAMETERS):
+        self.proc, self.parameters = proc, parameters
         self.root = root
         self.db = sqlite3.connect(root / "flows.sqlite", check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=MEMORY")
@@ -74,19 +103,21 @@ class Snapshots:
 
         def rows(raw):
             nonlocal count, total
-            with self.path.open() as stream:
-                for line in stream:
-                    total += len(line)
-                    if total > 32 << 20:
-                        raise ValueError("flowtable exceeds snapshot budget")
-                    raw.write(line)
-                    if not line.startswith("flow "):
-                        line_into(header, line)
-                        continue
-                    row = dict(item.split("=", 1) for item in line.split()[1:])
-                    count += 1
-                    yield (ident, *(row[k] for k in ("in", "proto", "src", "dst", "cookie")),
-                           int(row["packets"]), int(row["bytes"]), int(row["mtu"]), row["new_src"])
+            for name in STATE:
+                with (self.proc / name).open() as stream:
+                    for line in stream:
+                        total += len(line)
+                        if total > 32 << 20:
+                            raise ValueError("flowtable exceeds snapshot budget")
+                        raw.write(line)
+                        if name != "flows":
+                            line_into(header, line)
+                            continue
+                        row = dict(item.split("=", 1) for item in line.split()[1:])
+                        count += 1
+                        yield (ident, *(row[k] for k in ("in", "proto", "src", "dst", "cookie")),
+                               int(row["packets"]), int(row["bytes"]), int(row["mtu"]),
+                               row["new_src"])
 
         started = time.monotonic()
         evidence = self.root / f"snapshot-{ident}.txt.gz"
@@ -97,6 +128,7 @@ class Snapshots:
             evidence.unlink(missing_ok=True)
             raise
         header.pop("flows")
+        parameters_into(header, self.parameters)
         header.update(snapshot=ident, flow_count=count, read_seconds=time.monotonic() - started)
         self.headers[ident] = header
         return dict(header)
@@ -271,7 +303,7 @@ async def observe(operation, body, state):
                 "longest_read_seconds": max(longest, result["longest_read_seconds"])}
     if operation == "wait_entries":
         start = time.monotonic()
-        # The longest a header read waited: the header takes the adapter's
+        # The longest a summary read waited: status takes the adapter's
         # transaction, so this is how long a reader stood behind whatever
         # retirement or admission held it meanwhile.
         longest = 0.0

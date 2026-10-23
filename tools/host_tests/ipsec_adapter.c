@@ -178,7 +178,7 @@ static void pr_warn_ratelimited(const char *fmt, ...)
 	va_end(ap);
 	sec_fault_lines++;
 }
-/* /proc/cdx_flowtable, as far as the rows a case reads. */
+/* /proc/ask_flowtable/stats, as far as the lines a case reads. */
 struct seq_file { char buf[4096]; size_t len; };
 static void seq_printf(struct seq_file *seq, const char *fmt, ...)
 {
@@ -188,6 +188,34 @@ static void seq_printf(struct seq_file *seq, const char *fmt, ...)
 	seq->len += vsnprintf(seq->buf + seq->len, sizeof(seq->buf) - seq->len, fmt, ap);
 	va_end(ap);
 	assert(seq->len < sizeof(seq->buf));
+}
+/* A key's value, from a line laid out as /proc/meminfo's are: the key, its
+ * colon, at least one space, and a value right-aligned to the forty-eighth
+ * column; every line of the rendering is checked for that layout on the way.
+ * A key that is missing fails. */
+static unsigned long long proc_value(const char *buf, const char *key)
+{
+	size_t n = strlen(key);
+	unsigned long long value = 0;
+	bool found = false;
+
+	for (const char *line = buf; *line; ) {
+		const char *end = strchr(line, '\n'), *colon = strchr(line, ':');
+		char *stop;
+
+		assert(end && colon && colon < end && colon[1] == ' ');
+		assert(end - line == 48);
+		unsigned long long v = strtoull(colon + 1, &stop, 10);
+		assert(stop == end);
+		if ((size_t)(colon - line) == n && !strncmp(line, key, n)) {
+			assert(!found);
+			found = true;
+			value = v;
+		}
+		line = end + 1;
+	}
+	assert(found);
+	return value;
 }
 #define WARN_ON_ONCE(cond) ({ bool hit = !!(cond); assert(!hit); hit; })
 #define xchg(p, value) ({ __typeof__(*(p)) old = *(p); *(p) = (value); old; })
@@ -4970,13 +4998,13 @@ static void test_sec_refusals(void)
 	assert(muram_reads - reads == CDX_SEC_REFUSAL_CLASSES);
 	assert(xfrm_mib[LINUX_MIB_XFRMINSTATESEQERROR] == 9);
 
-	/* /proc/cdx_flowtable: the total since load, then every class. */
-	ft_sec_refusal_rows(&seq);
-	snprintf(row, sizeof(row), "ipsec_sec_refused %llu\n", (unsigned long long)sec_total());
-	assert(!strncmp(seq.buf, row, strlen(row)));
-	assert(strstr(seq.buf, "\nipsec_sec_refused_buffer_depletion 7\n"));
-	assert(strstr(seq.buf, "\nipsec_sec_refused_ttl_zero 4\n"));
-	assert(strstr(seq.buf, "\nipsec_sec_refused_replay 7\n"));
+	/* /proc/ask_flowtable/stats: the total since load, then every class. */
+	ft_sec_refusal_stats(&seq);
+	assert(!strncmp(seq.buf, "ipsec_sec_refused:", strlen("ipsec_sec_refused:")));
+	assert(proc_value(seq.buf, "ipsec_sec_refused") == sec_total());
+	assert(proc_value(seq.buf, "ipsec_sec_refused_buffer_depletion") == 7);
+	assert(proc_value(seq.buf, "ipsec_sec_refused_ttl_zero") == 4);
+	assert(proc_value(seq.buf, "ipsec_sec_refused_replay") == 7);
 	/* The fault line has room for every fault class moving at once, each
 	 * at the widest count a u32 prints. */
 	size_t widest = 1;
@@ -4985,10 +5013,10 @@ static void test_sec_refusals(void)
 			widest += strlen(ft_sec_refusal[i].name) + strlen(" =4294967295");
 	assert(widest <= FT_SEC_FAULT_TEXT);
 	for (unsigned i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++) {
-		/* Every class has a row, under a name no other has. */
+		/* Every class has a line, under a name no other has. */
 		assert(ft_sec_refusal[i].name);
-		snprintf(row, sizeof(row), "\nipsec_sec_refused_%s ", ft_sec_refusal[i].name);
-		assert(strstr(seq.buf, row));
+		snprintf(row, sizeof(row), "ipsec_sec_refused_%s", ft_sec_refusal[i].name);
+		assert(proc_value(seq.buf, row) == ft_sec_counted[i]);
 		for (unsigned j = 0; j < i; j++)
 			assert(strcmp(ft_sec_refusal[i].name, ft_sec_refusal[j].name));
 		/* A class is folded into a counter of xfrm's, or is a fault
@@ -5073,7 +5101,7 @@ static void test_sec_refusals(void)
 	struct seq_file rows = { .len = 0 };
 	unsigned long long mibs = mib_total();
 
-	assert(strstr(seq.buf, "\nipsec_offline_port_rejected 0\n") && !ft_sec_rejected_known);
+	assert(proc_value(seq.buf, "ipsec_offline_port_rejected") == 0 && !ft_sec_rejected_known);
 	lines = sec_fault_lines;
 	offline_port_present = true;
 	offline_port_rejections = 0xfffffff0;
@@ -5091,11 +5119,11 @@ static void test_sec_refusals(void)
 	ft_ipsec_stats_work(NULL);
 	assert(ft_sec_rejected == 0x40);
 	assert(mib_total() == mibs && sec_fault_lines == lines);
-	ft_sec_refusal_rows(&rows);
-	assert(strstr(rows.buf, "\nipsec_offline_port_rejected 64\n"));
+	ft_sec_refusal_stats(&rows);
+	assert(proc_value(rows.buf, "ipsec_offline_port_rejected") == 64);
 	/* Linux's own enqueues SEC's input group refused are counted the same
 	 * way, beside it, through a wrap, and reach no xfrm counter either. */
-	assert(strstr(rows.buf, "\nipsec_sec_input_refused 0\n") && ft_sec_input_refused_known);
+	assert(proc_value(rows.buf, "ipsec_sec_input_refused") == 0 && ft_sec_input_refused_known);
 	sec_input_refusals = 0xfffffffc;
 	ft_ipsec_stats_work(NULL);
 	sec_input_refusals = 3;
@@ -5103,9 +5131,8 @@ static void test_sec_refusals(void)
 	assert(ft_sec_input_refused == 0xfffffffcull + 7);
 	assert(mib_total() == mibs && sec_fault_lines == lines);
 	struct seq_file refused = { .len = 0 };
-	ft_sec_refusal_rows(&refused);
-	snprintf(row, sizeof(row), "\nipsec_sec_input_refused %llu\n", 0xfffffffcull + 7);
-	assert(strstr(refused.buf, row));
+	ft_sec_refusal_stats(&refused);
+	assert(proc_value(refused.buf, "ipsec_sec_input_refused") == 0xfffffffcull + 7);
 
 	bench_clear_sas();
 	en_global_muram_mem = NULL;

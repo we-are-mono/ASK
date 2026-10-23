@@ -53,9 +53,11 @@ neighbour can affect every connection. Hardware deletion and whole-table
 retirement remain serialized. Capacity verification therefore includes route
 invalidation, resource reuse and complete table detachment.
 
-`/proc/cdx_flowtable` retains its header and per-flow diagnostic format, streamed
-through `seq_file`. Policy status reads only the header. A complete dump at
-capacity requires several megabytes; consumers must not silently truncate it.
+`/proc/ask_flowtable/flows` retains the per-flow diagnostic format, streamed
+through `seq_file`. The controller and its health probe read
+`/proc/ask_flowtable/status` and `stats`, which hold no rows ([procfs](procfs.md)).
+A complete dump of `flows` at capacity requires several megabytes; consumers
+must not silently truncate it.
 Paged reads resume within the cookie hash bucket rather than rescanning the
 preceding entries. Separate reads can observe intervening mutations, so
 snapshots should be taken outside admission/retirement transitions.

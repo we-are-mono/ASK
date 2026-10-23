@@ -382,7 +382,7 @@ vwd = Path('/sys/class/vwd/vwd0')
 netdevs = {p.name for p in Path('/sys/class/net').iterdir()}
 print(json.dumps({
     'adapter': Path('/sys/module/ask_flowtable').exists(),
-    'proc': Path('/proc/cdx_flowtable').exists(),
+    'proc': Path('/proc/ask_flowtable').exists(),
     'holder': Path('/sys/module/cdx/holders/ask_flowtable').exists(),
     'provider_refcount': int(Path('/sys/module/cdx/refcnt').read_text()),
     'vaps': sorted(p.name for p in vwd.iterdir() if p.name in netdevs) if vwd.exists() else [],

@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import socket
 import subprocess
@@ -154,7 +155,7 @@ def test_stale_pid_files_never_signal_unrelated_process(running):
 
 def test_absent_cdx_suppresses_respawn_but_allows_stop(running):
     c = running
-    (c.root / "cdx").rmdir()
+    shutil.rmtree(c.root / "cdx")  # the module, and its parameters with it
     os.kill(worker(c), signal.SIGKILL)
     c.wait(lambda: worker(c) == 0)
     time.sleep(0.5)

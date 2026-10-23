@@ -674,7 +674,7 @@ succeeded both times, which is the A144 case. Shaping followed `tc`:
 
 Each is the ceiling less TCP's header share, and the last two came from
 `TC_HTB_NODE_MODIFY` on a live tree. With two classes on one 200 Mbit channel
-and two marks, `/proc/cdx_flowtable` showed six flows at `qos=06` and six at
+and two marks, `/proc/ask_flowtable/flows` showed six flows at `qos=06` and six at
 `qos=07` — the two classes the two marks name — and the strict priority between
 them is unambiguous: the `prio 0` flow took 188 Mbit/s and the `prio 1` flow
 0.00 bit/s. **That is the first point at which QoS genuinely shapes.** No
@@ -852,10 +852,11 @@ headers, read from `skb->data` through any VLAN tags and a PPPoE session header:
   committed tokens, so a budget stands in front of it: a sixteenth of the top
   channel's committed rate, never under 64 kbit/s unless the channel is slower
   than twice that, with a burst of sixteen full-size frames. What exceeds it is
-  sent as unclassified traffic, not dropped, and counted in `/proc/cdx_flowtable`
-  as `qos_control_overruns`. The gateway's own link traffic may run a second
-  burst beyond what its sessions and the hosts it bridges for have spent, so
-  neither a bulk transfer from the gateway nor a host flooding broadcasts can
+  sent as unclassified traffic, not dropped, and counted in
+  `/proc/ask_flowtable/stats` as `qos_control_overruns`. The gateway's own link
+  traffic may run a second burst beyond what its sessions and the hosts it
+  bridges for have spent, so neither a bulk transfer from the gateway nor a
+  host flooding broadcasts can
   push an ARP reply or an LCP echo off the top of the tree; nothing a host sends
   through the gateway touches the budget at all. A leaf can lose at most the
   budget to control traffic.
@@ -1694,7 +1695,7 @@ is a property of policing, not of this hardware.
 
 **The rule is the single truth, which is why the filter is resolved in the
 adapter rather than in the backend.** The first cut looked it up in
-`cdx_ft_hw_add()`, which worked but left `/proc/cdx_flowtable` reporting
+`cdx_ft_hw_add()`, which worked but left `/proc/ask_flowtable/flows` reporting
 `qos=000` for a flow that was being metered: the row printed the rule's nibble,
 the one derived from the mark, while the hardware had been told something else.
 `ft_parse()` now resolves it last, once the tuple is finished, so what the
@@ -2361,7 +2362,7 @@ the table's size to that mask keeps saying so.
 init validation tracking the widened encoding — and
 `qos_default_class=0x5d000`: remark flag set, codepoint 46, which is EF.
 
-Every installed rule reported `qos=5d000` in `/proc/cdx_flowtable`, whose field
+Every installed rule reported `qos=5d000` in `/proc/ask_flowtable/flows`, whose field
 widened from three hex digits to five along with the class. Then the wire, with
 loki sending plain iperf3 and setting no DSCP of its own:
 
@@ -2427,7 +2428,7 @@ selection that already decodes the same class from the same mark:
   the adapter about a frame only when some class it can decode carries a remark
   — the image's 0xf0 mask cannot, and its default class does not.
 - **A frame that cannot be rewritten is sent as it is**, never dropped for a
-  marking, and counted in `/proc/cdx_flowtable` as `qos_remark_failures`. A
+  marking, and counted in `/proc/ask_flowtable/stats` as `qos_remark_failures`. A
   frame already at the codepoint costs no copy of a shared head.
 - **Before the DSCP map is consulted**, so the map reads the codepoint the
   frame leaves with. In hardware the rewrite is an opcode of the entry's
@@ -2512,7 +2513,7 @@ bounds and shares out their egress queue (A313):
   counter of the port that enqueued it — the receiving port's `fmbm_rfdc`,
   which its `rx_dropped` now includes, or the IPsec offline port's
   `fmbm_ofwdc` for what SEC returned, `ipsec_offline_port_rejected` in
-  `/proc/cdx_flowtable`. The flow's own counters were incremented before the
+  `/proc/ask_flowtable/stats`. The flow's own counters were incremented before the
   enqueue and count it as sent; the egress port's transmit counters come from
   its MAC and do not (statistics.md, "What a port sent and what it dropped").
 
@@ -2538,8 +2539,9 @@ no ecosystem tooling and has to be packaged three times.
 
 The flowtable controller already sets the precedent and should be matched
 rather than improved on. `ask-flowtable` (`flowtable/src`) is a C service that
-depends only on libc, over `/etc/ask/offload.conf`, `/proc/cdx_flowtable`,
-`/sys/class/net`, a raw `NETLINK_ROUTE` socket and the `nft` binary. No UCI, no
+depends only on libc, over `/etc/ask/offload.conf`, `/proc/ask_flowtable/status`
+and `stats`, `/sys/module`, `/sys/class/net`, a raw `NETLINK_ROUTE` socket and
+the `nft` binary. No UCI, no
 procd, no systemd, no distribution assumption anywhere; a consumer packages it
 with its own init script. QoS should look the same.
 

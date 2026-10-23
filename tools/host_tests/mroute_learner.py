@@ -534,21 +534,27 @@ def test_proc_reports_a_row_and_a_summary():
     `ip mroute show` says offloaded, and this says why not.
     """
     source = flowtable_source()
-    show = function(source, "ft_show")
-    assert "ft_mr_rows(seq);" in show
-    for key in ("mroute_groups", "mroute_installed", "mroute_refused",
-                "mroute_install_errors", "mroute_policy_rules",
-                # Entries the per-family group cap turned away (A309).
-                "mroute_capped",
-                "mroute_xfrm_changes", "mroute_ruleset_changes",
-                "mroute_ruleset_settled", "mroute_confirm_errors",
-                "mroute_port_probe_errors", "mroute_xtables_changes",
+    assert "ft_mr_rows(seq);" in function(source, "ft_mroute_show")
+    # Levels in status, read under the transaction cdx_mc_group_ids()
+    # asserts; counts in stats.
+    status = function(source, "ft_status_show")
+    stats = function(source, "ft_stats_show")
+    for key in ("mroute_groups", "mroute_installed", "mroute_policy_rules",
+                "mroute_ruleset_settled",
                 # The group ids both learners draw on, per family, and how
                 # many there are: what a refused-failed group ran out of.
                 "mcast_group_ids4", "mcast_group_ids6", "mcast_group_id_slots"):
-        assert key in show, f"{key} missing from the summary"
-    assert "cdx_mc_group_ids(AF_INET, &id_slots)" in show
-    assert "cdx_mc_group_ids(AF_INET6, NULL)" in show
+        assert f'"{key}"' in status, f"{key} missing from the status"
+    for key in ("mroute_refused", "mroute_install_errors",
+                # Entries the per-family group cap turned away (A309).
+                "mroute_capped",
+                "mroute_xfrm_changes", "mroute_ruleset_changes",
+                "mroute_confirm_errors",
+                "mroute_port_probe_errors", "mroute_xtables_changes"):
+        assert f'"{key}"' in stats, f"{key} missing from the stats"
+    assert "cdx_ft_begin();" in status and "cdx_ft_begin" not in stats
+    assert "cdx_mc_group_ids(AF_INET, &id_slots)" in status
+    assert "cdx_mc_group_ids(AF_INET6, NULL)" in status
     # Read under the transaction every add and delete runs under, from the
     # arrays GetNewMcastGrpId() hands ids out of, and none once exit freed
     # them.

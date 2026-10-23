@@ -2605,7 +2605,7 @@ static bool cdx_htb_control(const struct sk_buff *skb, const struct cdx_htb_fram
 }
 
 /* Control frames sent as unclassified traffic because their port's budget was
- * spent. Reported in /proc/cdx_flowtable. */
+ * spent. Reported in /proc/ask_flowtable/stats. */
 static atomic64_t cdx_htb_control_overruns = ATOMIC64_INIT(0);
 
 /* Take `len' bytes from the port's control budget, or refuse. Lock-free, and
@@ -2828,7 +2828,7 @@ static bool cdx_htb_routed(const struct sk_buff *skb)
 
 /* Frames the software path found a remark class for but could not rewrite --
  * the header could not be made writable -- and so sent as they arrived rather
- * than dropped for a marking. Reported in /proc/cdx_flowtable. */
+ * than dropped for a marking. Reported in /proc/ask_flowtable/stats. */
 static atomic64_t cdx_htb_remark_failures = ATOMIC64_INIT(0);
 
 u64 cdx_ft_qos_remark_failures(void)

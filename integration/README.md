@@ -21,14 +21,14 @@ enable automatic recovery because fault tests deliberately stop the datapath.
 `ask-flowtable health` returns 0 while networking is responsive and 1 on
 invalid diagnostics, RTNL not answering within five seconds, or CDX's
 transaction held by one holder for five seconds. It checks RTNL even when no
-flow exists. Its read of `/proc/cdx_flowtable` waits for the transaction behind
+flow exists. Its read of `/proc/ask_flowtable/status` waits for the transaction behind
 every caller queued for it; still waiting at the deadline while the
 transaction changes hands (`/sys/module/cdx/parameters/flowtable_hold_ms`, how
 long the current holder has held it, below five seconds), the datapath is busy,
 not dead, and the probe passes (A411). A CDX datapath restart after an
 unproven deletion is healthy however long it waits: the classifier is bypassed
-and the ports forward in software meanwhile (`bypassed 1` in
-`/proc/cdx_flowtable`, the wait in
+and the ports forward in software meanwhile (`bypassed: 1` in
+`/proc/ask_flowtable/status`, the wait in
 `/sys/module/cdx/parameters/flowtable_degraded_reason`). A blocked kernel
 reader cannot prevent the command's parent from reporting.
 

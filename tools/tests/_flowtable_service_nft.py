@@ -34,7 +34,8 @@ def crash(point):
     assert controller == parent, (controller, parent)
     hit = dict(point=point, controller=controller, guardian=guardian,
                wrapper=os.getpid(), real_nft=child, time=time.monotonic(),
-               backend=Path("/proc/cdx_flowtable").read_text().split("\nflow ", 1)[0])
+               backend="".join(Path(f"/proc/ask_flowtable/{name}").read_text()
+                               for name in ("status", "stats")))
     (root / "crash-hit.tmp").write_text(json.dumps(hit))
     (root / "crash-hit.tmp").replace(root / "crash-hit")
     os.kill(controller, signal.SIGKILL)

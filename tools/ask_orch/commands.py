@@ -12,7 +12,8 @@ import pytest
 
 
 async def read(agent, session, path):
-    limit = 16 << 20 if path == "/proc/cdx_flowtable" else 1 << 20
+    # The adapter's row files run to megabytes at capacity.
+    limit = 16 << 20 if path.startswith("/proc/ask_flowtable/") else 1 << 20
     result = await agent.fs_read(session, path, max_bytes=limit)
     assert result.get("size", 0) < limit, (path, "truncated diagnostics")
     assert result["errno"] == 0, (path, result)

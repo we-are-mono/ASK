@@ -11,8 +11,9 @@ merge-gating rows.
 Every counter is read through Linux's own tooling. `ip -s link`, `/proc/net/dev`
 and anything else that calls `dev_get_stats()` see the offloaded traffic on the
 device it belongs to, in the units that device's own counters use. There is no
-FCI query, no socket and no ASK binary on the reading side; `/proc/cdx_flowtable`
-keeps its raw rows as a diagnostic, and that is all it is.
+FCI query, no socket and no ASK binary on the reading side;
+`/proc/ask_flowtable/devices` keeps its raw rows as a diagnostic, and that is
+all it is.
 
 CMM answered `cmm stat show vlan` and `cmm stat show interface` over FCI from
 the same firmware records. Those records are what this increment reads; the
@@ -39,7 +40,7 @@ count into them.
 - `STRIP_PPPoE_HDR` and `INSERT_PPPoE_HDR` take one pointer each, into a
   timestamped record. This is where a **ppp device's** counters come from; the
   [PPPoE increment](pppoe.md) already claimed the record, keyed on the
-  session, and read it back through `/proc/cdx_flowtable` alone.
+  session, and read it back through `/proc/ask_flowtable/devices` alone.
 
 The adapter holds one record per logical device a flow's encapsulation crosses
 (`struct cdx_ft_dev_stats` in `cdx/ask_flowtable_internal.h`): a plain one for each VLAN
@@ -115,7 +116,7 @@ entry holds every record its opcodes name from the moment its key is linked,
 and gives them back only once a barrier completes or the datapath is stopped;
 until then the record stays off the free list, where its first word would be
 the list's link and the next device would be handed a record the old entry
-still counts into. `/proc/cdx_flowtable` shows `stats_retained`, the records
+still counts into. `/proc/ask_flowtable/status` shows `stats_retained`, the records
 freed by the adapter and held that way now, which returns to zero with every
 completed recovery, and `stats_deferred`, how many frees have had to wait since
 CDX loaded.
@@ -143,7 +144,7 @@ zero, because padding on a minimum-size frame is counted by the firmware and
 cannot be told apart from payload afterwards. What to subtract was measured
 rather than inferred, with bursts of 64 UDP datagrams of 256 bytes (284-byte IP
 packets) through a tagged LAN on the DK, reading the raw records off
-`/proc/cdx_flowtable` and the devices' counters at the same time.
+`/proc/ask_flowtable/devices` and the devices' counters at the same time.
 
 | Frame | On the wire | Port rx record | Device rx record | Device tx record |
 | --- | ---: | ---: | ---: | ---: |
@@ -348,9 +349,9 @@ sampler in either order; `vlan_hm.py` the two opcodes' record lists, their order
 and the all-or-nothing rule against the shipped SDK header; `flowtable.py`
 the record's lifetime across flows, unregistration and reuse of an index.
 
-`/proc/cdx_flowtable` gained `vlan_records` and `vlan_slots` in its header and
-one `vlan` row per device with a record, and its `session` rows now name the
-device too:
+`/proc/ask_flowtable/status` carries `vlan_records` and `vlan_slots`, and
+`/proc/ask_flowtable/devices` one `vlan` row per device with a record beside
+the `session` rows, which name the device too:
 
 ```
 session dev=ppp0 ifindex=18 pppoe=1@00:11:22:33:44:55 lower=7 refs=2 slot=yes rx_packets=64 rx_bytes=19328 tx_packets=64 tx_bytes=19584

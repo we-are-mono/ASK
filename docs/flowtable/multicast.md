@@ -804,9 +804,10 @@ enabled policy switches it on again, so `resume` and a reload carry the groups
 back. Off, both learners keep learning -- memberships, routes and
 confirmations are the kernel's and are left alone -- but every flow comes out
 of hardware and none goes in, each reading `refused-paused`, which is tested
-ahead of every other refusal. `/proc` reports the switch as `mcast_enabled`. A
-consumer without the service, such as OpenWrt's fw4, leaves it on and carries
-multicast as before. The rig cases
+ahead of every other refusal. The switch is read from its module parameter,
+`/sys/module/ask_flowtable/parameters/multicast`, and the controller's `status`
+reports it as `mcast_enabled`. A consumer without the service, such as
+OpenWrt's fw4, leaves it on and carries multicast as before. The rig cases
 `flowtable_service_multicast.py::test_stops_with_acceleration` and
 `..._bridge_stops_with_acceleration` stop by each route with live unicast and
 both learners' groups installed, require nothing of either in hardware when
@@ -844,8 +845,8 @@ arrived on a bridge port the hardware cannot key. A flow that has aged out, or
 been taken back, reads `retiring` until the next worker pass removes it; its
 entry is still in
 hardware and still counted until then. `mcast_groups` counts memberships and
-`mcast_flows` flows; `mcast_installed` counts flows in hardware, and
-`mcast_enabled` is the global switch both learners answer to.
+`mcast_flows` flows; `mcast_installed` counts flows in hardware, and the
+`multicast` module parameter is the global switch both learners answer to.
 
 **Capacity.** 512 group ids per family (`MAX_MC4_ENTRIES`), and one id per
 flow — per `(S,G,ingress)` triple — rather than per membership; the routed
@@ -1034,9 +1035,9 @@ notifier.
 blocking chain. Accumulate per-`(bridge, group, vid)` port sets, resolve each
 port's tag stack, and hold the result as a pending group.
 
-Nothing is installed at this step. `/proc/cdx_flowtable` grows a multicast
-section showing pending groups, which is both the proof and the operator
-surface the contract promised.
+Nothing is installed at this step. `/proc/ask_flowtable/mcast` shows the
+pending groups, which is both the proof and the operator surface the contract
+promised.
 
 #### The handler cannot install, and that decides what `offload` means
 
@@ -1080,7 +1081,7 @@ has already called `obj->complete()` and returned by then, and MDB has no late
 notification of the kind `SWITCHDEV_FDB_OFFLOADED` gives the FDB.
 
 What makes the stretch tolerable is that it is not the surface anything
-important reads. `/proc/cdx_flowtable` says what is actually installed, and it
+important reads. `/proc/ask_flowtable/mcast` says what is actually installed, and it
 is where a disagreement shows up. The two are worth reading together, and the
 end-to-end tests assert both for that reason.
 
@@ -1164,7 +1165,7 @@ a forwarding decision in software.
 Flowtable boot, KASAN image, a plain bridge over the DUT's WAN and LAN ports
 with snooping on. Memberships added with `bridge mdb add`; streams injected
 from the orchestrator. Every case reads three independent things: the group's
-row in `/proc/cdx_flowtable`, the classifier entry's own match counter, and
+row in `/proc/ask_flowtable/mcast`, the classifier entry's own match counter, and
 whether the frames reached the CPU at all.
 
 | What | Result |

@@ -5,19 +5,50 @@ import gzip
 
 import pytest
 
-from askd_agent.observe import Snapshots, read_state
+from askd_agent.observe import STATE, Snapshots, read_state
+
+
+def proc_dir(tmp_path, **levels):
+    """A /proc/ask_flowtable with these levels in its status, and every other
+    file but the flows empty; the caller writes the flows."""
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    for name in STATE:
+        (proc / name).write_text("")
+    (proc / "status").write_text("".join(f"{k + ':':<36}{v:>12}\n" for k, v in levels.items()))
+    return proc
+
+
+def test_state_carries_the_module_parameters(tmp_path):
+    """procfs repeats no module parameter; a state reads them beside the files,
+    a bool's Y and N as 1 and 0, and leaves out one whose module is not
+    loaded."""
+    proc = proc_dir(tmp_path, entries=0, bindings=2)
+    params = tmp_path / "params"
+    params.mkdir()
+    (params / "multicast").write_text("Y\n")
+    (params / "flowtable_observe").write_text("N\n")
+    (params / "qos_mark_mask").write_text("240\n")
+    parameters = {"mcast_enabled": params / "multicast", "observe": params / "flowtable_observe",
+                  "qos_mark_mask": params / "qos_mark_mask", "transit": params / "absent"}
+    state = read_state(summary=True, proc=proc, parameters=parameters)
+    assert state["bindings"] == 2 and state["mcast_enabled"] == 1 and state["observe"] == 0
+    assert state["qos_mark_mask"] == 0xf0 and "transit" not in state
+    with pytest.raises(ValueError, match="unexpected"):
+        (proc / "stats").write_text("installs 3\n")  # the old layout
+        read_state(summary=True, proc=proc, parameters={})
 
 
 def test_full_table_comparison_detects_hidden_identity_changes(tmp_path):
-    path = tmp_path / "flowtable"
     count = 16384
+    proc = proc_dir(tmp_path, entries=count * 2, handle_refs=count * 2, neighbour_refs=count * 2)
+    path = proc / "flows"
     config = dict(lan="192.0.2.2", wan="198.51.100.2", public="198.51.100.1",
                   lan_if="lan", wan_if="wan", base=20000, dport=48271,
                   count=count, survivors=1)
 
     def write(*, changed=False, missing=False, packets=10):
         with path.open("w") as stream:
-            stream.write(f"entries {count * 2}\nhandle_refs {count * 2}\nneighbour_refs {count * 2}\n")
             for ident in range(count):
                 proto, port = (6 if ident & 1 else 17), 20000 + ident // 2
                 for ingress, src, dst in (
@@ -33,17 +64,21 @@ def test_full_table_comparison_detects_hidden_identity_changes(tmp_path):
                     stream.write(f"flow cookie={cookie} in={ingress} proto={proto} src={src} dst={dst} "
                                  f"packets={packets} bytes=2560 mtu=1500 new_src=198.51.100.1:{port}\n")
 
-    store = Snapshots(tmp_path, path)
+    store = Snapshots(tmp_path, proc)
     try:
         store.configure(config)
         write()
         first = store.capture({})
-        assert gzip.decompress((tmp_path / f"snapshot-{first['snapshot']}.txt.gz").read_bytes()).decode() == path.read_text()
+        # The evidence is every file as read, in the order it was read.
+        assert gzip.decompress((tmp_path / f"snapshot-{first['snapshot']}.txt.gz").read_bytes()).decode() == \
+            "".join((proc / name).read_text() for name in STATE)
         assert first["flow_count"] == 32768 and len(json.dumps(first)) < 1024
+        assert first["entries"] == first["handle_refs"] == 32768
         assert store.check({"snapshot": first["snapshot"]})["missing_count"] == 0
-        assert read_state(summary=True, path=path)["flows"] == []
+        summary = read_state(summary=True, proc=proc)
+        assert summary["flows"] == [] and summary["entries"] == 32768
         with pytest.raises(ValueError, match="local snapshot"):
-            read_state(path=path)
+            read_state(proc=proc)
 
         write(changed=True, packets=11)
         second = store.capture({})
@@ -72,11 +107,11 @@ def test_check_follows_a_remapped_masquerade_port(tmp_path, reply_port, clean):
     holds that reply tuple, and then picks another one. A flow whose two
     directions agree on the port it was given is the workload's flow; one
     whose reply direction names some other port is not."""
-    path = tmp_path / "flowtable"
+    proc = proc_dir(tmp_path, entries=8)
+    path = proc / "flows"
     config = dict(lan="192.0.2.2", wan="198.51.100.2", public="198.51.100.1",
                   lan_if="lan", wan_if="wan", base=20000, dport=48271, count=4)
     with path.open("w") as stream:
-        stream.write("entries 8\n")
         for ident in range(4):
             proto, port = (6 if ident & 1 else 17), 20000 + ident // 2
             given, reply = (14247, reply_port) if ident == 2 else (port, port)
@@ -86,7 +121,7 @@ def test_check_follows_a_remapped_masquerade_port(tmp_path, reply_port, clean):
             stream.write(f"flow cookie={ident}-wan in=wan proto={proto} src=198.51.100.2:48271 "
                          f"dst=198.51.100.1:{reply} packets=1 bytes=1 mtu=1500 "
                          f"new_src=198.51.100.2:48271\n")
-    store = Snapshots(tmp_path, path)
+    store = Snapshots(tmp_path, proc)
     try:
         store.configure(config)
         before = store.capture({})["snapshot"]

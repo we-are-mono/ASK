@@ -16,7 +16,7 @@ import pytest
 
 from _ipsec_helpers import endpoints_down, endpoints_up
 from _topology import TARGET_WAN_IF
-from _flowtable_rig import (command, read, status_text)
+from _flowtable_rig import (command, proc_paths, read, status_text)
 from _flowtable_service_ipsec import (Transform)
 
 KNOB = "/proc/cdx_split_key_fail"
@@ -32,7 +32,7 @@ UNMOVED = ("ipsec_sas", "ipsec_sa_cache", "fatal")
 
 
 async def backend(agent, session):
-    state = status_text(await read(agent, session, "/proc/cdx_flowtable"))
+    state = status_text(await read(agent, session, *proc_paths("status")))
     return {key: state[key] for key in UNMOVED}
 
 

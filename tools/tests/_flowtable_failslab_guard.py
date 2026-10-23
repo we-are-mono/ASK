@@ -95,7 +95,7 @@ def drain_kmsg(fd):
 
 
 def run(root, target, *, lease=20, continuous=False, debugfs=Path("/sys/kernel/debug/failslab"),
-        kallsyms=Path("/proc/kallsyms"), backend=Path("/proc/cdx_flowtable"),
+        kallsyms=Path("/proc/kallsyms"), backend=Path("/proc/ask_flowtable"),
         lock_path=Path("/run/ask-flowtable-failslab.lock"), kmsg=Path("/dev/kmsg")):
     assert 0 < lease <= 60
     root.mkdir(exist_ok=True)
@@ -169,7 +169,7 @@ def run(root, target, *, lease=20, continuous=False, debugfs=Path("/sys/kernel/d
             result["restore_errors"] = failures
             result["finished_at"] = time.monotonic()
             result["kernel_records"] = records
-            result["backend"] = backend.read_text()
+            result["backend"] = "".join((backend / name).read_text() for name in ("status", "stats"))
             save(root, "result.json", result)
 
 

@@ -14,7 +14,7 @@ from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from _flowtable_connections import (FLOWS, healthy, peer)
-from _flowtable_rig import (artifact_dir, DPORT, TABLE, WAN_IP, command, console_command, status_text)
+from _flowtable_rig import (artifact_dir, DPORT, TABLE, WAN_IP, command, console_command, proc_paths, status_text)
 from _flowtable_policy import (CONFIG, apply, candidate, stop)
 from _flowtable_snat import (udp_snat as _udp)
 from _flowtable_tcp import (cpu, cpu_delta, software_tx, tcp_retransmit_withdraw_rst as _tcp)
@@ -148,7 +148,7 @@ async def test_wan_lifecycle(connections, masquerade_network):
         async def retired(ids, before):
             deadline = asyncio.get_running_loop().time() + 8
             while asyncio.get_running_loop().time() < deadline:
-                state = status_text((await console_command(con, "cat", "/proc/cdx_flowtable"))["stdout"])
+                state = status_text((await console_command(con, "cat", *proc_paths("status", "stats")))["stdout"])
                 conntracks = await ct(ids)
                 if not state["entries"] and not any(v.strip() for v in conntracks.values()):
                     break

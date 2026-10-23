@@ -30,7 +30,7 @@ import re
 import shlex
 import time
 import pytest
-from _flowtable_rig import (CONSOLE_NOISE, RX_PORTS_CODE, RX_PORTS_SCRIPT, console_command, console_json, console_python, status_text)
+from _flowtable_rig import (CONSOLE_NOISE, RX_PORTS_CODE, RX_PORTS_SCRIPT, console_command, console_json, console_python, proc_paths, status_text)
 
 HOLD = "/sys/module/cdx/parameters/flowtable_restart_hold"
 LIMIT = "/sys/module/cdx/parameters/flowtable_restart_limit"
@@ -79,9 +79,9 @@ async def require_knobs(agent, session, *paths):
 
 
 async def proc(console) -> dict:
-    """The adapter's header over the UART, less any line another writer --
-    the managed service, the kernel -- dropped into it."""
-    text = (await console_command(console, "cat", "/proc/cdx_flowtable"))["stdout"]
+    """The adapter's status and stats over the UART, less any line another
+    writer -- the managed service, the kernel -- dropped into them."""
+    text = (await console_command(console, "cat", *proc_paths("status", "stats")))["stdout"]
     return status_text(CONSOLE_NOISE.sub("", text).strip())
 
 
@@ -147,12 +147,12 @@ async def wait_bypassed(console, before: dict, classifying: dict, timeout: float
 
 async def latch_cleared(console, timeout: float = 10) -> bool:
     """Whether CDX has no restart pending, waiting up to `timeout` for one to
-    finish: the latch clear in the adapter's /proc. A case that failed with
+    finish: the latch clear in the adapter's status. A case that failed with
     the adapter unloaded gets it loaded again, which the latch refuses until
     it clears."""
     deadline = time.monotonic() + timeout
     while True:
-        present = await console_command(console, "test", "-e", "/proc/cdx_flowtable", check=False)
+        present = await console_command(console, "test", "-e", *proc_paths("status"), check=False)
         if present["rc"]:
             await console_command(console, "modprobe", "ask_flowtable", check=False, timeout=30)
         else:
@@ -307,10 +307,10 @@ TIMED_RESTART = '''
 import json, subprocess, time
 def proc():
     fields = {{}}
-    for line in open('/proc/cdx_flowtable'):
-        parts = line.split()
-        if len(parts) == 2 and parts[1].isdigit():
-            fields[parts[0]] = int(parts[1])
+    for line in open('/proc/ask_flowtable/status'):
+        key, _, value = line.partition(':')
+        if value.strip().isdigit():
+            fields[key.strip()] = int(value)
     return fields
 dumps = rx_port_dumps()
 first = proc()

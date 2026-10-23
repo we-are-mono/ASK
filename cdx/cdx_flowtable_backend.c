@@ -268,7 +268,7 @@ static void cdx_ft_taken(void)
 
 /* How long the transaction's current holder has held it, in milliseconds; 0
  * while it is free. Read without the transaction. The health probe's read of
- * /proc/cdx_flowtable waits for it behind every caller queued for it, which
+ * /proc/ask_flowtable/status waits for it behind every caller queued for it, which
  * under a route-flap storm with traffic in software took seconds while every
  * holder let it go in turn (A411): what nothing behind it gets past is a
  * holder that keeps it, which this shows. */

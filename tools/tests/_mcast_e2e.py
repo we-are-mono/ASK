@@ -208,22 +208,26 @@ async def mdb_reports_offload(target_agent, session, group: str) -> bool:
     return False
 
 
-async def flowtable_proc(target_agent, session) -> str:
-    """The adapter's diagnostic file, decoded.
+async def flowtable_proc(target_agent, session, *names: str) -> str:
+    """The adapter's multicast rows -- or the files named, in turn -- decoded.
 
     fs_read answers with `content_hex`, because the endpoint is binary-safe
     for the probes that need it. Reading `content` instead returns nothing at
-    all, which makes every oracle built on this file quietly pass or quietly
-    fail depending on its sense.
+    all, which makes every oracle built on these files quietly pass or
+    quietly fail depending on its sense.
     """
-    r = await target_agent.fs_read(session, "/proc/cdx_flowtable",
-                                   max_bytes=16 << 20)
-    assert r.get("errno") == 0, f"/proc/cdx_flowtable: {r}"
-    return bytes.fromhex(r["content_hex"]).decode()
+    text = ""
+    for name in names or ("mcast", "mroute"):
+        path = f"/proc/ask_flowtable/{name}"
+        r = await target_agent.fs_read(session, path, max_bytes=16 << 20)
+        assert r.get("errno") == 0, f"{path}: {r}"
+        assert r.get("size", 0) < 16 << 20, f"{path}: truncated"
+        text += bytes.fromhex(r["content_hex"]).decode()
+    return text
 
 
 async def hardware_has_group(target_agent, session, group: str) -> bool:
-    """Whether the adapter's own table holds the group."""
+    """Whether either learner's rows hold the group."""
     return group in await flowtable_proc(target_agent, session)
 
 
@@ -495,14 +499,14 @@ async def mroute_line(target_agent, session, family: int, source: str,
 
 
 async def mroute_proc_row(target_agent, session, group: str) -> str:
-    for line in (await flowtable_proc(target_agent, session)).splitlines():
+    for line in (await flowtable_proc(target_agent, session, "mroute")).splitlines():
         if line.startswith("mroute ") and f"group={group} " in line:
             return line
     return ""
 
 
 def proc_field(row: str, field: str) -> str:
-    """One `field=value` of a /proc/cdx_flowtable row."""
+    """One `field=value` of a /proc/ask_flowtable row."""
     m = re.search(rf"(?:^| ){field}=(\S+)", row)
     assert m, f"no {field}= in {row!r}"
     return m.group(1)

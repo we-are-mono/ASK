@@ -208,7 +208,7 @@ async def lan_listener(r, marker):
 # its catch-all, other_errs, which folds to XfrmInError -- so only their sum
 # is held to account. It leaves out SEC's faults, which a replay burst does
 # not cause; the exact count of every refusal is ipsec_sec_refused in
-# /proc/cdx_flowtable.
+# /proc/ask_flowtable/stats.
 SEC_REFUSAL_MIBS = ("XfrmInStateSeqError", "XfrmInStateProtoError", "XfrmInError", "XfrmOutStateSeqError")
 
 

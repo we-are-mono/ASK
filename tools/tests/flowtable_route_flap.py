@@ -3,7 +3,7 @@ they carry traffic, and run the platform's health probe throughout (A402, A411).
 
 On the OpenWrt image, ~6,000 offloaded flows behind a /32 route changed every
 5 s, eight TCP streams filling the WAN among them, kept `ask-flowtable
-health`'s read of /proc/cdx_flowtable past its 5 s deadline, and three misses
+health`'s read of the adapter's /proc past its 5 s deadline, and three misses
 in a row rebooted the board. Each change retires every flow behind the route,
 the bulk streams forward in software until readmitted, and the flows' next
 packets offer them again: the read waits its turn behind hundreds of Linux's

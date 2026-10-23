@@ -97,9 +97,10 @@ and UDP tables' misses go straight to the Ethernet table, as in 1.0.7, and no
 port-less flow is admitted, so a router that never forwards such a tunnel
 keeps 1.0.7's rate for every frame no flow claims. On, it is everything this
 page describes. Read when the classifier is built, it takes a reboot to
-change -- cdx cannot be loaded twice in one boot. `/proc/cdx_flowtable` says
-which as `transit`. On OpenWrt it is a module option (`cdx transit=1` in
-`/etc/modules.d`), and fw4's rule has to offer the protocols as well (below).
+change -- cdx cannot be loaded twice in one boot.
+`/sys/module/cdx/parameters/transit` says which (`Y`/`N`). On OpenWrt it is a
+module option (`cdx transit=1` in `/etc/modules.d`), and fw4's rule has to
+offer the protocols as well (below).
 The ASK test image turns it on (`/etc/modprobe.d/ask-transit.conf`), and a
 boot with `cdx.transit=0` on the kernel's command line runs the case that
 proves it off (`flowtable_transit.py::test_transit_switched_off`).

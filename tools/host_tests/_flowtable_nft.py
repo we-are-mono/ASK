@@ -16,13 +16,16 @@ with (root / "calls").open("a") as log:
 
 
 def backend(**changes):
+    """Reflect a table change in the fake adapter's status file, laid out as
+    the kernel lays it out."""
     path = root / "backend"
     if not path.exists():
         return  # adapter not loaded: no backend to reflect the change
-    fields = dict(line.split() for line in path.read_text().splitlines())
+    fields = {k.strip(): v.strip() for k, v in
+              (line.split(":", 1) for line in path.read_text().splitlines())}
     fields.update({k: str(v) for k, v in changes.items()})
     tmp = path.with_suffix(".tmp")
-    tmp.write_text("".join(f"{k} {v}\n" for k, v in fields.items()))
+    tmp.write_text("".join(f"{k + ':':<36}{v:>12}\n" for k, v in fields.items()))
     tmp.replace(path)
 
 

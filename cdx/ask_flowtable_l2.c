@@ -1622,26 +1622,36 @@ static void ft_l2_tags(const struct cdx_ft_vlan *tags, u8 count, char *text, siz
 		at += scnprintf(text + at, size - at, "%s%u", i ? "." : "", tags[i].id);
 }
 
-/* The totals, in the header of /proc/cdx_flowtable. */
-void ft_l2_show(struct seq_file *seq)
+/* Whether pairs are switched at all, how many are in hardware, the other
+ * bridge hooks the last pass found (FT_BRIDGE_HOOK_*), and whether frames
+ * confirm pairs now: /proc/ask_flowtable/status, under the transaction. */
+void ft_l2_status(struct seq_file *seq)
 {
-	seq_printf(seq, "l2_enabled %u\nl2_entries %u\nl2_installs %llu\nl2_refused %llu\n"
-		   "l2_held %llu\nl2_retired %llu\nl2_dropped %llu\nl2_deferred %llu\n",
-		   READ_ONCE(ft_l2_enabled) && READ_ONCE(ft_l2_hooked), ft_l2_count,
-		   ft_l2_installs, ft_l2_refused, READ_ONCE(ft_l2_held), ft_l2_retired,
-		   ft_l2_dropped, ft_l2_deferred);
-	/* The other bridge hooks the last pass found (FT_BRIDGE_HOOK_*),
-	 * whether frames confirm pairs now, how many observations waited for
-	 * a confirmation, and how many ruleset changes took pairs back. */
-	seq_printf(seq, "l2_hook_kinds %u\nl2_confirming %u\nl2_unconfirmed %llu\nl2_ruleset_changes %llu\n",
-		   READ_ONCE(ft_l2_ruleset.kinds), READ_ONCE(ft_l2_confirming), ft_l2_unconfirmed,
-		   ft_l2_ruleset_changes);
+	ft_kv(seq, "l2_enabled", READ_ONCE(ft_l2_enabled) && READ_ONCE(ft_l2_hooked));
+	ft_kv(seq, "l2_entries", ft_l2_count);
+	ft_kv(seq, "l2_hook_kinds", READ_ONCE(ft_l2_ruleset.kinds));
+	ft_kv(seq, "l2_confirming", READ_ONCE(ft_l2_confirming));
 }
 
-/* The rows, one seq_file record each, after the flows' (main.c's
- * ft_position()): a read holds the transaction for one buffer of them, never
- * for all (A382). Addressed as the flows are, by hash bucket and offset in it,
- * so no pair pointer survives the transaction between reads. */
+/* What the pairs have been through since load, among it how many
+ * observations waited for a confirmation and how many ruleset changes took
+ * pairs back: /proc/ask_flowtable/stats, without the transaction. */
+void ft_l2_stats(struct seq_file *seq)
+{
+	ft_kv(seq, "l2_installs", READ_ONCE(ft_l2_installs));
+	ft_kv(seq, "l2_refused", READ_ONCE(ft_l2_refused));
+	ft_kv(seq, "l2_held", READ_ONCE(ft_l2_held));
+	ft_kv(seq, "l2_retired", READ_ONCE(ft_l2_retired));
+	ft_kv(seq, "l2_dropped", READ_ONCE(ft_l2_dropped));
+	ft_kv(seq, "l2_deferred", READ_ONCE(ft_l2_deferred));
+	ft_kv(seq, "l2_unconfirmed", READ_ONCE(ft_l2_unconfirmed));
+	ft_kv(seq, "l2_ruleset_changes", READ_ONCE(ft_l2_ruleset_changes));
+}
+
+/* The rows of /proc/ask_flowtable/l2, one seq_file record each: a read holds
+ * the transaction for one buffer of them, never for all (A382). Addressed as
+ * the flows are, by hash bucket and offset in it, so no pair pointer survives
+ * the transaction between reads. */
 unsigned int ft_l2_row_buckets(void)
 {
 	return HASH_SIZE(ft_l2_pairs);

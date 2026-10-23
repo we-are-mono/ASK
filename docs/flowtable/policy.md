@@ -66,8 +66,9 @@ text in this format.
 
 Admission requires established original-direction IPv4/IPv6 TCP/UDP traffic
 and a conntrack mark with no bits outside the backend's QoS mask and its
-route-only mask together (`qos_mark_mask` and `route_mark_mask` in
-`/proc/cdx_flowtable`); the controller renders that union into its guard.
+route-only mask together (the `qos_mark_mask` and `route_mark_mask` module
+parameters, read from `/sys/module/ask_flowtable/parameters/`); the controller
+renders that union into its guard.
 Address selectors currently express IPv4 matches; `scope any` includes both
 families. Routed TCP/UDP, source NAT (static or MASQUERADE), destination NAT and
 combined/hairpin NAT are eligible within the adapter's physical-port contract. Linux additionally refuses helper and sequence-adjusted connections. See the
@@ -275,7 +276,7 @@ measurements to prove execution. Global invalidation may leave the policy
 installed while admission is stopped. The daemon performs a full transaction
 to recover it automatically; under manual control, applying it again performs
 that boundary. While CDX restarts the datapath after a hardware retirement it
-could not prove (`fatal 1`; `bypassed 1` while the ports forward in software
+could not prove (`fatal: 1`; `bypassed: 1` while the ports forward in software
 past the classifier), the daemon leaves the table alone and checks again after
 a second, then ever less often, up to its longest interval, until the restart
 is done; it never asks for a boot, and the health probe passes. What the

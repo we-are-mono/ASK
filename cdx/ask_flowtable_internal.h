@@ -131,7 +131,7 @@ struct cdx_ft_binding {
  * the slot; an entry CDX retired without proof holds the slot itself.
  *
  * slot is NULL for a device admitted while its pool was empty: its flows
- * forward without counting, and the row in /proc/cdx_flowtable says so. The
+ * forward without counting, and the row in /proc/ask_flowtable/devices says so. The
  * answer a device got is the answer it keeps, so a live connection's counters
  * never begin halfway through its life.
  */
@@ -828,6 +828,8 @@ extern u64 ft_finals;
 extern u64 ft_stats_passes, ft_stats_requests;
 extern struct delayed_work ft_stats_work;
 void ft_stats_kick(void);
+/* One line of /proc/ask_flowtable/status or stats, in /proc/meminfo's layout. */
+void ft_kv(struct seq_file *seq, const char *key, u64 value);
 extern bool ft_ready, ft_stopping;
 extern atomic_t ft_invalid;
 extern bool ft_invalid_done;
@@ -912,7 +914,7 @@ void ft_ipsec_forget_all(void);
 void ft_ipsec_attach(struct net_device *dev);
 void ft_ipsec_detach(struct net_device *dev);
 void ft_ipsec_detach_all(void);
-void ft_sec_refusal_rows(struct seq_file *seq);
+void ft_sec_refusal_stats(struct seq_file *seq);
 
 /* ask_flowtable_mc.c */
 extern struct list_head ft_mc_groups;
@@ -1006,7 +1008,8 @@ void ft_l2_dev_changed(const struct net_device *dev);
 void ft_l2_refusals_reset(void);
 bool ft_l2_retire_batch(void);
 int ft_l2_egress_drain(const struct net_device *dev);
-void ft_l2_show(struct seq_file *seq);
+void ft_l2_status(struct seq_file *seq);
+void ft_l2_stats(struct seq_file *seq);
 unsigned int ft_l2_row_buckets(void);
 struct list_head *ft_l2_row(unsigned int bucket, unsigned int *skip);
 struct list_head *ft_l2_row_next(struct list_head *row);

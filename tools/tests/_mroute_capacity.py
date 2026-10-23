@@ -222,5 +222,5 @@ async def _preflight(target, session):
     # an oif and checks the group without sending again would fail after a
     # fresh boot and pass after a test that had stopped it.
     await stop_boot_daemon()
-    assert "mroute_groups 0\n" in await flowtable_proc(target, session), \
-        "existing multicast routes belong to another workload"
+    assert re.search(r"^mroute_groups:\s+0$", await flowtable_proc(target, session, "status"),
+                     re.M), "existing multicast routes belong to another workload"

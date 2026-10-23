@@ -152,10 +152,14 @@ def test_ipsec_adapter(tmp_path):
         source[source.index("#define FT_IPSEC_NEIGH_TRIES"):
                source.index("static int ft_ipsec_peer_mac")]
         # How each class of SEC refusal is counted, the fold that counts
-        # it, and the rows /proc/cdx_flowtable shows it in.
+        # it, and the lines /proc/ask_flowtable/stats shows it in, in the
+        # layout every status and stats line has.
         + source[source.index("/* ------------------------------------------------- what SEC refused"):
                  source.index("/* Publish one SA's counters into its state")]
-        + function(source, "ft_sec_refusal_rows")
+        + re.search(r"^#define FT_KEY_COLUMNS\s.*$", source, re.M).group() + "\n"
+        + re.search(r"^#define FT_VALUE_COLUMNS\s.*$", source, re.M).group() + "\n"
+        + function(source, "ft_kv")
+        + function(source, "ft_sec_refusal_stats")
         # The most flows one transaction retires, which an SA that many name
         # takes batches of, and the most unlinks left owed between them.
         + re.search(r"^#define FT_RETIRE_BATCH\s.*$", source, re.M).group() + "\n"

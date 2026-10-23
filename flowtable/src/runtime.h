@@ -7,9 +7,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define FT_PROC        "/proc/cdx_flowtable"
+/* The adapter's levels and its counters (docs/flowtable/procfs.md). */
+#define FT_STATUS      "/proc/ask_flowtable/status"
+#define FT_STATS       "/proc/ask_flowtable/stats"
 #define FT_CDX_MODULE  "/sys/module/cdx"
 #define FT_MULTICAST   "/sys/module/ask_flowtable/parameters/multicast"
+#define FT_QOS_MARK_MASK   "/sys/module/ask_flowtable/parameters/qos_mark_mask"
+#define FT_ROUTE_MARK_MASK "/sys/module/ask_flowtable/parameters/route_mark_mask"
 #define FT_RUNTIME     "/run/ask-flowtable"
 #define FT_LOCK      "/run/ask-flowtable/policy.lock"
 #define FT_PAUSED      "/run/ask-flowtable/paused"
@@ -21,7 +25,8 @@
 #define FT_WORKER_PID "/run/ask-flowtable/worker.pid"
 #define FT_SUPERVISOR_PID "/run/ask-flowtable/supervisor.pid"
 
-/* The header of /proc/cdx_flowtable. present=false means the adapter is not
+/* What the adapter reports: its status and stats files, and the module
+ * parameters it is configured with. present=false means the adapter is not
  * loaded. The DRAIN_FIELDS must all be zero before a rebind. */
 struct ft_backend {
 	bool     present;
@@ -56,8 +61,9 @@ int ft_recovery(struct ft_ctx *ctx, const char *verb);
 /* Emit a backend state as a JSON object (no trailing newline) to a buffer. */
 int ft_backend_json(const struct ft_backend *b, char *buf, size_t n);
 
-/* Read the /proc header. Returns 0 (b filled, b->present per availability) or
- * -1 with ctx->err on a malformed/partial read. */
+/* Read the adapter's state. Returns 0 (b filled, b->present per availability)
+ * or -1 with ctx->err on a malformed or partial read: every field is
+ * required, so none can quietly read as zero. */
 int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b);
 
 /* Turn the adapter's multicast acceleration on or off. Multicast follows no

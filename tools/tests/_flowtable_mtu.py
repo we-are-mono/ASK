@@ -135,7 +135,7 @@ DETOUR_COUNTERS = ("detour_flows", "detour_delivered", "detour_unknown", "detour
 
 
 def detour_counters(state):
-    """The offline-port detour's /proc/cdx_flowtable counters."""
+    """The offline-port detour's /proc/ask_flowtable figures."""
     return {k: state[k] for k in DETOUR_COUNTERS}
 
 

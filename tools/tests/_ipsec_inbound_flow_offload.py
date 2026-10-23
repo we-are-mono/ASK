@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import binascii
+from ask_orch.commands import read
 
 LAN_INNER = "198.18.96.2"
 PORT = 48901
@@ -59,7 +59,6 @@ async def sec_counter(session, agent, iface, name):
 
 async def flows(session, agent):
     """The adapter's installed directions, as dicts of its own key=value row."""
-    result = await agent.fs_read(session, "/proc/cdx_flowtable")
-    text = binascii.unhexlify(result.get("content_hex") or b"").decode(errors="replace")
+    text = await read(agent, session, "/proc/ask_flowtable/flows")
     return [dict(field.split("=", 1) for field in line.split()[1:] if "=" in field)
             for line in text.splitlines() if line.startswith("flow ")]

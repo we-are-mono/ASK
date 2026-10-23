@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* Egress QoS classification, /proc/cdx_flowtable, and module init and exit.
+/* Egress QoS classification, /proc/ask_flowtable, and module init and exit.
  */
 #include "ask_flowtable_internal.h"
 
@@ -13,9 +13,9 @@
  *
  * A zero mask disables classification entirely and restores the historical
  * contract exactly: any nonzero mark refuses admission, so a mark meant for
- * policy routing is never silently reinterpreted as a queue. The mask is
- * reported in the proc header, and the controller renders its own admission
- * test from that rather than restating this one.
+ * policy routing is never silently reinterpreted as a queue. The controller
+ * reads the mask from this parameter and renders its own admission test from
+ * it rather than restating this one.
  *
  * A masked value of zero is indistinguishable from an unmarked flow, as with
  * every other fwmark scheme; that case takes the default class rather than
@@ -151,26 +151,20 @@ static struct notifier_block ft_neigh_nb = { .notifier_call = ft_neigh_event };
 static struct notifier_block ft_fib_nb = { .notifier_call = ft_fib_event };
 static struct notifier_block ft_nexthop_nb = { .notifier_call = ft_nexthop_event };
 
-/* seq_file retains the transaction throughout each read iteration, including
- * the header and its rows. It resumes by position after releasing the lock;
- * userspace doing multiple reads must tolerate intervening flow changes. */
-/* Position zero is the header. Other positions encode bucket+1 in the upper
- * word and the entry offset within that bucket in the lower word. Resuming a
- * paged read therefore walks only its bucket, not all preceding flow entries.
- * No entry pointer survives release of the transaction between reads. The
- * bridged pairs' rows follow the flows', their buckets numbered on after the
- * flows' (ft_l2_row()). */
-static bool ft_position_l2(loff_t pos)
+/* /proc/ask_flowtable; docs/flowtable/procfs.md is the reference for what each
+ * file holds and why.
+ *
+ * The flows and l2 files are paged: seq_file holds the transaction for one
+ * buffer of rows and resumes by position once it has let it go, so a reader
+ * taking several reads must tolerate the table changing between them. A
+ * position is the hash bucket in the upper word and the row's offset within
+ * that bucket in the lower, so resuming walks only its own bucket rather than
+ * every row before it, and no row pointer survives the transaction between
+ * reads. */
+static void *ft_flow_at(loff_t *pos)
 {
-	/* bucket + 1 past the flows' last */
-	return (u64)pos >> 32 > HASH_SIZE(ft_cookies);
-}
-
-static void *ft_position(loff_t *pos)
-{
-	unsigned int bucket = (*pos >> 32) - 1, skip = (u32)*pos;
+	unsigned int bucket = *pos >> 32, skip = (u32)*pos;
 	struct cdx_ft_entry *entry;
-	struct list_head *row;
 
 	for (; bucket < HASH_SIZE(ft_cookies); bucket++) {
 		hlist_for_each_entry(entry, &ft_cookies[bucket], cookie_node) {
@@ -178,52 +172,68 @@ static void *ft_position(loff_t *pos)
 				skip--;
 				continue;
 			}
-			return &entry->list;
+			return entry;
 		}
-		*pos = (loff_t)(bucket + 2) << 32;
-		skip = 0;
-	}
-	for (; bucket < HASH_SIZE(ft_cookies) + ft_l2_row_buckets(); bucket++) {
-		row = ft_l2_row(bucket - HASH_SIZE(ft_cookies), &skip);
-		if (row)
-			return row;
-		*pos = (loff_t)(bucket + 2) << 32;
+		*pos = (loff_t)(bucket + 1) << 32;
 		skip = 0;
 	}
 	return NULL;
 }
 
-static void *ft_start(struct seq_file *seq, loff_t *pos)
+static void *ft_flows_start(struct seq_file *seq, loff_t *pos)
 {
 	cdx_ft_begin();
-	return *pos ? ft_position(pos) : &ft_entries;
+	return ft_flow_at(pos);
 }
 
-static void *ft_next(struct seq_file *seq, void *v, loff_t *pos)
+static void *ft_flows_next(struct seq_file *seq, void *v, loff_t *pos)
 {
-	struct cdx_ft_entry *entry;
-	struct list_head *row;
+	struct cdx_ft_entry *entry = v;
 
-	if (v != &ft_entries && ft_position_l2(*pos)) {
-		row = ft_l2_row_next(v);
-		if (row) {
-			(*pos)++;
-			return row;
-		}
-	} else if (v != &ft_entries) {
-		entry = list_entry(v, struct cdx_ft_entry, list);
-		if (entry->cookie_node.next) {
-			(*pos)++;
-			entry = hlist_entry(entry->cookie_node.next,
-					    struct cdx_ft_entry, cookie_node);
-			return &entry->list;
-		}
+	if (entry->cookie_node.next) {
+		(*pos)++;
+		return hlist_entry(entry->cookie_node.next, struct cdx_ft_entry,
+				   cookie_node);
 	}
 	*pos = ((*pos >> 32) + 1) << 32;
-	return ft_position(pos);
+	return ft_flow_at(pos);
 }
 
-static void ft_stop(struct seq_file *seq, void *v)
+/* The bridged pairs' rows, addressed the same way over ft_l2_pairs. */
+static void *ft_l2_at(loff_t *pos)
+{
+	unsigned int bucket = *pos >> 32, skip = (u32)*pos;
+	struct list_head *row;
+
+	for (; bucket < ft_l2_row_buckets(); bucket++) {
+		row = ft_l2_row(bucket, &skip);
+		if (row)
+			return row;
+		*pos = (loff_t)(bucket + 1) << 32;
+		skip = 0;
+	}
+	return NULL;
+}
+
+static void *ft_l2_start(struct seq_file *seq, loff_t *pos)
+{
+	cdx_ft_begin();
+	return ft_l2_at(pos);
+}
+
+static void *ft_l2_next(struct seq_file *seq, void *v, loff_t *pos)
+{
+	struct list_head *row = ft_l2_row_next(v);
+
+	if (row) {
+		(*pos)++;
+		return row;
+	}
+	*pos = ((*pos >> 32) + 1) << 32;
+	return ft_l2_at(pos);
+}
+
+static void ft_rows_stop(struct seq_file *seq, void *v)
 {
 	cdx_ft_end();
 }
@@ -268,9 +278,9 @@ static const char *ft_dev_stats_name(const struct cdx_ft_dev_stats *record, char
  * its units, so the two differ by exactly the framing and nothing else. A ppp
  * device's row also carries the session its last admitted direction named, in
  * the form the flow rows use in in_ppp=/out_ppp=, so the two can be joined.
- * The rows sit with the header rather than in the paged flow iteration because
- * there is one per device, which is the number of uplinks and VLANs rather
- * than the number of connections. */
+ * The devices file renders them as one record rather than paging them as the
+ * flows are, because there is one per device, which is the number of uplinks
+ * and VLANs rather than the number of connections. */
 static void ft_tunnel_text(const struct cdx_ft_tunnel *tunnel, char *text, size_t size);
 
 static void ft_dev_rows(struct seq_file *seq, enum cdx_ft_stats_kind kind, bool tunnel)
@@ -369,77 +379,100 @@ static void ft_bridge_text(const struct net_device *bridge, u16 vid, char *text,
 		strscpy(text, bridge->name, size);
 }
 
-static int ft_show(struct seq_file *seq, void *v)
+static int ft_flows_show(struct seq_file *seq, void *v)
 {
-	struct cdx_ft_dev_stats *record;
-	struct cdx_ft_entry *entry;
+	struct cdx_ft_entry *entry = v;
 	struct cdx_ft_counters stats;
-	struct cdx_detour_counters detour;
-	unsigned int session_records = 0, session_slots = 0, vlan_records = 0, vlan_slots = 0;
-	unsigned int tunnel_records = 0, tunnel_slots = 0, stats_retained;
-	unsigned int ids4, ids6, id_slots;
-	u64 stats_deferred;
 	char in_vlan[16], out_vlan[16];
 	char in_br[IFNAMSIZ + 8], out_br[IFNAMSIZ + 8];
 	char in_ppp[26], out_ppp[26];
 	char in_tnl[IFNAMSIZ + 100], out_tnl[IFNAMSIZ + 100];
 	char nexthop[sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")];
 
-	/* seq_file holds the position of the record it shows in seq->index. */
-	if (v != &ft_entries && ft_position_l2(seq->index)) {
-		ft_l2_show_row(seq, v);
-		return 0;
-	}
-	if (v != &ft_entries) {
-		entry = list_entry(v, struct cdx_ft_entry, list);
-		cdx_ft_stats(entry->hw, &stats);
-		ft_tunnel_text(&entry->rule.in_tunnel, in_tnl, sizeof(in_tnl));
-		ft_tunnel_text(&entry->rule.out_tunnel, out_tnl, sizeof(out_tnl));
-		ft_vlan_text(entry->rule.in_vlan, entry->rule.in_vlans, in_vlan, sizeof(in_vlan));
-		ft_vlan_text(entry->rule.out_vlan, entry->rule.out_vlans, out_vlan,
-			     sizeof(out_vlan));
-		ft_bridge_text(entry->rule.in_bridge, entry->rule.in_bridge_vid, in_br,
-			       sizeof(in_br));
-		ft_bridge_text(entry->rule.out_bridge, entry->rule.out_bridge_vid, out_br,
-			       sizeof(out_br));
-		ft_session_text(&entry->rule.in_session, in_ppp, sizeof(in_ppp));
-		ft_session_text(&entry->rule.out_session, out_ppp, sizeof(out_ppp));
-		/* In its own family, which is not the row's for a flow encrypted
-		 * by an SA of the other family. */
-		if (entry->rule.next_hop_family == AF_INET6)
-			snprintf(nexthop, sizeof(nexthop), "%pI6c", &entry->next_hop.in6);
-		else
-			snprintf(nexthop, sizeof(nexthop), "%pI4", &entry->next_hop.ip);
-		/* One row shape per family. Brackets keep an IPv6 address and its
-		 * port a single whitespace-free token, as the IPv4 rows already are. */
-		if (entry->rule.family == AF_INET6)
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u detour=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
-				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
-				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
-				   in_tnl, out_tnl,
-				   &entry->rule.src.in6, ntohs(entry->rule.sport),
-				   &entry->rule.dst.in6, ntohs(entry->rule.dport),
-				   &entry->rule.new_src.in6, ntohs(entry->rule.new_sport),
-				   &entry->rule.new_dst.in6, ntohs(entry->rule.new_dport),
-				   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
-				   entry->rule.sa_handle, entry->rule.in_sa_handle,
-				   entry->rule.detour,
-				   nexthop, stats.packets, stats.bytes, stats.lastused);
-		else
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u detour=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
-				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
-				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
-				   in_tnl, out_tnl,
-				   &entry->rule.src.ip, ntohs(entry->rule.sport),
-				   &entry->rule.dst.ip, ntohs(entry->rule.dport),
-				   &entry->rule.new_src.ip, ntohs(entry->rule.new_sport),
-				   &entry->rule.new_dst.ip, ntohs(entry->rule.new_dport),
-				   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
-				   entry->rule.sa_handle, entry->rule.in_sa_handle,
-				   entry->rule.detour,
-				   nexthop, stats.packets, stats.bytes, stats.lastused);
-		return 0;
-	}
+	cdx_ft_stats(entry->hw, &stats);
+	ft_tunnel_text(&entry->rule.in_tunnel, in_tnl, sizeof(in_tnl));
+	ft_tunnel_text(&entry->rule.out_tunnel, out_tnl, sizeof(out_tnl));
+	ft_vlan_text(entry->rule.in_vlan, entry->rule.in_vlans, in_vlan, sizeof(in_vlan));
+	ft_vlan_text(entry->rule.out_vlan, entry->rule.out_vlans, out_vlan, sizeof(out_vlan));
+	ft_bridge_text(entry->rule.in_bridge, entry->rule.in_bridge_vid, in_br, sizeof(in_br));
+	ft_bridge_text(entry->rule.out_bridge, entry->rule.out_bridge_vid, out_br,
+		       sizeof(out_br));
+	ft_session_text(&entry->rule.in_session, in_ppp, sizeof(in_ppp));
+	ft_session_text(&entry->rule.out_session, out_ppp, sizeof(out_ppp));
+	/* In its own family, which is not the row's for a flow encrypted by an
+	 * SA of the other family. */
+	if (entry->rule.next_hop_family == AF_INET6)
+		snprintf(nexthop, sizeof(nexthop), "%pI6c", &entry->next_hop.in6);
+	else
+		snprintf(nexthop, sizeof(nexthop), "%pI4", &entry->next_hop.ip);
+	/* One row shape per family. Brackets keep an IPv6 address and its port
+	 * a single whitespace-free token, as the IPv4 rows already are. */
+	if (entry->rule.family == AF_INET6)
+		seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u detour=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
+			   entry->cookie, entry->rule.in->name, entry->rule.out->name,
+			   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
+			   in_tnl, out_tnl,
+			   &entry->rule.src.in6, ntohs(entry->rule.sport),
+			   &entry->rule.dst.in6, ntohs(entry->rule.dport),
+			   &entry->rule.new_src.in6, ntohs(entry->rule.new_sport),
+			   &entry->rule.new_dst.in6, ntohs(entry->rule.new_dport),
+			   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
+			   entry->rule.sa_handle, entry->rule.in_sa_handle,
+			   entry->rule.detour,
+			   nexthop, stats.packets, stats.bytes, stats.lastused);
+	else
+		seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u detour=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
+			   entry->cookie, entry->rule.in->name, entry->rule.out->name,
+			   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
+			   in_tnl, out_tnl,
+			   &entry->rule.src.ip, ntohs(entry->rule.sport),
+			   &entry->rule.dst.ip, ntohs(entry->rule.dport),
+			   &entry->rule.new_src.ip, ntohs(entry->rule.new_sport),
+			   &entry->rule.new_dst.ip, ntohs(entry->rule.new_dport),
+			   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
+			   entry->rule.sa_handle, entry->rule.in_sa_handle,
+			   entry->rule.detour,
+			   nexthop, stats.packets, stats.bytes, stats.lastused);
+	return 0;
+}
+
+static int ft_l2_show(struct seq_file *seq, void *v)
+{
+	ft_l2_show_row(seq, v);
+	return 0;
+}
+
+/* A status or stats line, laid out as /proc/meminfo lays out its own: the name
+ * and its colon padded to FT_KEY_COLUMNS, then the value right-aligned in the
+ * FT_VALUE_COLUMNS after. At least one space always follows the colon, so a
+ * key too long for the column, or a value too wide for its own, still parses
+ * by splitting at the colon. */
+#define FT_KEY_COLUMNS		36
+#define FT_VALUE_COLUMNS	12
+
+void ft_kv(struct seq_file *seq, const char *key, u64 value)
+{
+	int pad = FT_KEY_COLUMNS - 1 - (int)strlen(key);
+
+	seq_printf(seq, "%s:%*s%*llu\n", key, pad < 1 ? 1 : pad, "", FT_VALUE_COLUMNS,
+		   (unsigned long long)value);
+}
+
+/* What the backend holds now, and its latches: levels, which go down as well
+ * as up. Read under the transaction, which the latch machinery's accessors
+ * require and which makes the whole file one consistent reading; it walks no
+ * flow or group, so the hold is short. This is what the controller's health
+ * probe and its drain wait read. */
+static int ft_status_show(struct seq_file *seq, void *v)
+{
+	unsigned int session_records = 0, session_slots = 0, vlan_records = 0, vlan_slots = 0;
+	unsigned int tunnel_records = 0, tunnel_slots = 0, stats_retained;
+	unsigned int ids4, ids6, id_slots;
+	struct cdx_ft_dev_stats *record;
+	struct cdx_detour_counters detour;
+	u64 stats_deferred;
+
+	cdx_ft_begin();
 	list_for_each_entry(record, &ft_dev_stats, list) {
 		if (record->kind == CDX_FT_STATS_TIMESTAMPED) {
 			session_records++;
@@ -452,215 +485,272 @@ static int ft_show(struct seq_file *seq, void *v)
 			vlan_slots += !!record->slot;
 		}
 	}
-	/* The controller reads both masks back from here rather than from
-	 * sysfs, because it already parses this header, and renders its
-	 * admission guard from their union. The guard runs before any of the
-	 * policy's own mark selectors, so none of them can widen admission. */
-	seq_printf(seq, "qos_mark_mask %u\nqos_default_class %u\nroute_mark_mask %u\n",
-		   ft_qos_mark_mask, ft_qos_default_class, ft_route_mark_mask);
-	/* Frames the software path forwarded unchanged because their header
-	 * could not be made writable for the remark their class asks for. */
-	seq_printf(seq, "qos_remark_failures %llu\n", cdx_ft_qos_remark_failures());
-	/* Control frames sent as unclassified traffic because their port's
-	 * control budget was spent. */
-	seq_printf(seq, "qos_control_overruns %llu\n", cdx_ft_qos_control_overruns());
+	ft_kv(seq, "entries", ft_count);
+	ft_kv(seq, "max_entries", CDX_FT_MAX_ENTRIES);
+	ft_kv(seq, "bindings", ft_bound);
+	ft_kv(seq, "passive", ft_passive);
+	ft_kv(seq, "parked", ft_parked);
+	ft_kv(seq, "neighbour_refs", ft_neighbour_refs);
+	ft_kv(seq, "handle_refs", ft_handle_refs);
+	ft_kv(seq, "invalidated", atomic_read(&ft_invalid));
+	ft_kv(seq, "invalidation_done", ft_invalid_complete());
 	/* fatal is CDX's latch, held from a deletion it could not prove until
 	 * it has restarted the datapath; bypassed says the classifier ports run
 	 * past the classifier meanwhile, the datapath forwarding in software,
 	 * restarts counts the restarts done, and resume_failures the classifier
 	 * ports they could not start again. What a restart waits for is CDX's
 	 * flowtable_degraded_reason. */
-	seq_printf(seq, "bypassed %u\nrestarts %u\nresume_failures %u\n",
-		   cdx_ft_bypassed(), cdx_ft_restarts(), cdx_ft_resume_failures());
-	seq_printf(seq, "observe %u\nbindings %u\npassive %u\nparked %u\nentries %u\nmax_entries %u\n"
-		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
-		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\nowed %u\n"
-		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
-		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nstp_invalidations %lld\nqos_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\nipsec_policy_invalidations %lld\nipsec_next_hop_updates %lld\n",
-		   cdx_ft_observing(), ft_bound, ft_passive, ft_parked, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
-		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
-		   ft_invalid_complete(), cdx_ft_failed(),
-		   /* Retirements whose barrier failed, or that wait on CDX's own
-		    * proof; one merely owed a barrier is counted apart, and for no
-		    * longer than until its retirement's last batch, the
-		    * FT_SETTLE_BOUND-th unlink owed or ft_settle_work. */
-		   cdx_ft_pending() - cdx_ft_owed(), cdx_ft_owed(),
-		   ft_can_rearm(), ft_rearms, ft_neighbour_refs, ft_handle_refs,
-		   atomic64_read(&ft_neigh_invalidations),
-		   atomic64_read(&ft_route_invalidations),
-		   atomic64_read(&ft_mtu_invalidations),
-		   atomic64_read(&ft_link_invalidations),
-		   atomic64_read(&ft_mac_invalidations),
-		   atomic64_read(&ft_fdb_invalidations),
-		   atomic64_read(&ft_stp_invalidations),
-		   atomic64_read(&ft_qos_invalidations),
-		   atomic64_read(&ft_admission_invalidations),
-		   atomic64_read(&ft_ipsec_invalidations),
-		   atomic64_read(&ft_ipsec_policy_invalidations),
-		   atomic64_read(&ft_ipsec_next_hop_updates));
+	ft_kv(seq, "fatal", cdx_ft_failed());
+	/* Retirements whose barrier failed, or that wait on CDX's own proof;
+	 * one merely owed a barrier is counted apart, and for no longer than
+	 * until its retirement's last batch, the FT_SETTLE_BOUND-th unlink owed
+	 * or ft_settle_work. */
+	ft_kv(seq, "quarantine", cdx_ft_pending() - cdx_ft_owed());
+	ft_kv(seq, "owed", cdx_ft_owed());
+	ft_kv(seq, "rearm_ready", ft_can_rearm());
+	ft_kv(seq, "bypassed", cdx_ft_bypassed());
+	ft_kv(seq, "restarts", cdx_ft_restarts());
+	ft_kv(seq, "resume_failures", cdx_ft_resume_failures());
 	/* The SAs this adapter installed, and every SA cdx's cache holds: an
 	 * install refused part-way has to leave both where they were. */
-	/* Linux's deletions that found the transaction held and left what
-	 * they named, if anything was in hardware, to the retirement worker. */
-	seq_printf(seq, "destroy_deferrals %lld\n", atomic64_read(&ft_destroy_deferrals));
-	/* The non-empty last deltas directions reported through their flow's
-	 * handle as they left the hardware, for whatever reason they left;
-	 * counted whether or not the table counts, which decides only whether
-	 * conntrack takes them. */
-	seq_printf(seq, "finals %llu\n", ft_finals);
-	seq_printf(seq, "stats_passes %llu\n", ft_stats_passes);
-	seq_printf(seq, "stats_requests %llu\n", ft_stats_requests);
-	seq_printf(seq, "ipsec_sas %u\nipsec_sa_cache %u\n",
-		   cdx_ipsec_sa_count(), cdx_ipsec_sa_cache_entries());
-	ft_sec_refusal_rows(seq);
+	ft_kv(seq, "ipsec_sas", cdx_ipsec_sa_count());
+	ft_kv(seq, "ipsec_sa_cache", cdx_ipsec_sa_cache_entries());
 	/* Device records this module has let go that stay out of the pool
 	 * because a retired entry naming them is not yet proven gone, of any
 	 * kind; and how many releases have had to wait that way since CDX
 	 * loaded. The first returns to zero with every completed retirement,
 	 * so one that stays up is a slot recovery never gave back. */
 	cdx_ft_stats_retention(&stats_retained, &stats_deferred);
-	seq_printf(seq, "stats_retained %u\nstats_deferred %llu\n",
-		   stats_retained, stats_deferred);
-	seq_printf(seq, "session_records %u\nsession_slots %u\n",
-		   session_records, session_slots);
-	ft_dev_rows(seq, CDX_FT_STATS_TIMESTAMPED, false);
-	seq_printf(seq, "vlan_records %u\nvlan_slots %u\n", vlan_records, vlan_slots);
-	ft_dev_rows(seq, CDX_FT_STATS_PLAIN, false);
-	seq_printf(seq, "tunnel_records %u\ntunnel_slots %u\n", tunnel_records, tunnel_slots);
-	ft_dev_rows(seq, CDX_FT_STATS_PLAIN, true);
-	/* The global switch both learners answer to (the `multicast`
-	 * parameter); at 0 nothing of either is in hardware once they have
-	 * both passed. */
-	seq_printf(seq, "mcast_enabled %u\n", READ_ONCE(ft_mc_enabled));
-	/* Whether transit tunnels are carried; cdx's `transit` parameter. */
-	seq_printf(seq, "transit %u\n", cdx_ft_transit);
-	/* The offline-port detour (cdx_detour.c): whether it is up, the
-	 * directions it carries, and what the port handed back -- given to
-	 * Linux, with no direction to give it to, not copied, or in error. */
+	ft_kv(seq, "stats_retained", stats_retained);
+	ft_kv(seq, "stats_deferred", stats_deferred);
+	/* The device records of each kind, and how many of them the pool had a
+	 * hardware counter slot for; the devices file names them. */
+	ft_kv(seq, "session_records", session_records);
+	ft_kv(seq, "session_slots", session_slots);
+	ft_kv(seq, "vlan_records", vlan_records);
+	ft_kv(seq, "vlan_slots", vlan_slots);
+	ft_kv(seq, "tunnel_records", tunnel_records);
+	ft_kv(seq, "tunnel_slots", tunnel_slots);
+	/* The offline-port detour (cdx_detour.c): whether it is up, and the
+	 * directions it carries. */
 	cdx_detour_counters(&detour);
-	seq_printf(seq, "detour %u\ndetour_flows %llu\ndetour_delivered %llu\n"
-		   "detour_unknown %llu\ndetour_failed %llu\ndetour_errors %llu\n",
-		   cdx_ft_detour_ready(), detour.flows, detour.delivered,
-		   detour.unknown, detour.failed, detour.errors);
+	ft_kv(seq, "detour", cdx_ft_detour_ready());
+	ft_kv(seq, "detour_flows", detour.flows);
 	/* Memberships the bridge reported, and the flows learned from traffic
 	 * that they and the routed learner's routes name; `installed` counts
-	 * flows, each one classifier entry. */
-	seq_printf(seq, "mcast_groups %u\nmcast_flows %u\nmcast_installed %u\nmcast_refused %llu\n"
-		   "mcast_install_errors %llu\nmcast_observed %llu\nmcast_dropped %llu\n"
-		   "mcast_hooked %u\nmcast_hook_errors %llu\n",
-		   ft_mc_count, ft_mc_flow_count, ft_mc_installed, ft_mc_refused,
-		   ft_mc_install_errors, ft_mc_observed, ft_mc_dropped,
-		   ft_mc_hooked, ft_mc_hook_errors);
-	/* Frames whose set of dedup slots had none to give them yet, which
-	 * their next frame asks for again; the bridged worker's runs, each of
-	 * which takes the transaction; and the times every slot was forgotten,
-	 * each making every stream news once more. See ft_mc_record(). */
-	seq_printf(seq, "mcast_deferred %llu\nmcast_passes %llu\nmcast_forgets %llu\n",
-		   ft_mc_deferred, READ_ONCE(ft_mc_passes), READ_ONCE(ft_mc_forgets));
-	/* Flows whose ports' netdev chains could not be judged; see
-	 * ft_mc_netdev_dependent(). */
-	seq_printf(seq, "mcast_port_probe_errors %llu\n", ft_mc_port_probe_errors);
-	/* Of those installed, the flows the bridge forwards nowhere, whose
-	 * entries drop their stream rather than hand it to the CPU; and how
-	 * many such entries have given their group id up to a stream somebody
-	 * wants. */
-	seq_printf(seq, "mcast_discarding %u\nmcast_discards_evicted %llu\n",
-		   ft_mc_discarding, ft_mc_discards_evicted);
-	/* And of those, the ones still named, waiting outside the caps for an
-	 * id (A315). */
-	seq_printf(seq, "mcast_parked %u\n", ft_mc_parked());
+	 * flows, each one classifier entry. Of those installed, `discarding`
+	 * are the flows the bridge forwards nowhere, whose entries drop their
+	 * stream rather than hand it to the CPU, and `parked` the ones still
+	 * named, waiting outside the caps for an id (A315). */
+	ft_kv(seq, "mcast_hooked", READ_ONCE(ft_mc_hooked));
+	ft_kv(seq, "mcast_groups", READ_ONCE(ft_mc_count));
+	ft_kv(seq, "mcast_flows", READ_ONCE(ft_mc_flow_count));
+	ft_kv(seq, "mcast_installed", READ_ONCE(ft_mc_installed));
+	ft_kv(seq, "mcast_discarding", READ_ONCE(ft_mc_discarding));
+	ft_kv(seq, "mcast_parked", ft_mc_parked());
 	/* The group ids both learners' groups hold, per family, and how many
 	 * each family has -- the same number for both: what a group that finds
 	 * none left, and reads refused-failed, ran out of. */
 	ids4 = cdx_mc_group_ids(AF_INET, &id_slots);
 	ids6 = cdx_mc_group_ids(AF_INET6, NULL);
-	seq_printf(seq, "mcast_group_ids4 %u\nmcast_group_ids6 %u\nmcast_group_id_slots %u\n",
-		   ids4, ids6, id_slots);
-	/* Installed groups of either learner marked for a rebuild because a
-	 * port they copy out of changed its egress -- its queues or its DSCP
-	 * map; see ft_mc_egress_changed(). */
-	seq_printf(seq, "mcast_egress_rebuilds %lld\n",
-		   atomic64_read(&ft_mc_egress_rebuilds));
-	/* The routed learner's own totals. mroute_policy_rules is the one an
-	 * operator is most likely to need: a single non-default ipmr rule
-	 * keeps every group of that family in software, and nothing else on
-	 * the box would say so. mroute_lost counts chain events dropped for
-	 * want of memory, which is the only way this learner's view can be
-	 * behind the kernel's. */
-	seq_printf(seq, "mroute_groups %u\nmroute_installed %u\nmroute_refused %llu\n"
-		   "mroute_install_errors %llu\nmroute_policy_rules %u\nmroute_lost %llu\n"
-		   "mroute_capped %llu\n",
-		   ft_mr_count, ft_mr_installed, ft_mr_refused,
-		   ft_mr_install_errors, ft_mr_policy[0] + ft_mr_policy[1],
-		   ft_mr_lost, ft_mr_capped_entries);
-	/* XFRM policy changes every routed group was asked again for; an IPv4
-	 * group a policy governs reads refused-xfrm. */
-	seq_printf(seq, "mroute_xfrm_changes %lld\n", atomic64_read(&ft_mr_xfrm_changes));
-	/* How many times an nftables commit took every routed group back to
-	 * software to be confirmed again; whether the ruleset has stood still
-	 * long enough since for copies to confirm under it -- followed only
-	 * while a routed group exists, so with none it is the last value read,
-	 * which may predate a commit; and how often the
-	 * forwarding check could not be registered or a group's watch
-	 * allocated -- which keeps groups in software with nothing else to say
-	 * why. */
-	seq_printf(seq, "mroute_ruleset_changes %llu\nmroute_ruleset_settled %d\nmroute_confirm_errors %llu\n",
-		   READ_ONCE(ft_mr_ruleset_changes), READ_ONCE(ft_mr_gen_open),
-		   READ_ONCE(ft_mr_confirm_errors));
-	/* How often a confirmed group's ruleset was too much for a port probe
-	 * to judge, which reads refused-ports or refused-xtables all the same;
-	 * and how many times an iptables-legacy table changed while a routed
-	 * group existed, each of which asked every group again. */
-	seq_printf(seq, "mroute_port_probe_errors %llu\n", READ_ONCE(ft_mr_port_probe_errors));
-	seq_printf(seq, "mroute_xtables_changes %llu\n", READ_ONCE(ft_mr_xtables_changes));
-	/* How many AP-mode devices this module currently has registered, and
-	 * how many it looked at and did not. The second is what separates "no
-	 * Wi-Fi offload because nothing asked" from "no Wi-Fi offload because
-	 * the registration failed", which are otherwise the same absence: the
-	 * per-VAP sysfs file under /sys/class/vwd/ appears only on success, so
-	 * without this a refusal leaves no trace anywhere. */
-	seq_printf(seq, "wifi_vaps %u\nwifi_refused %llu\n",
-		   ft_wifi_registered, atomic64_read(&ft_wifi_refusals));
-	ft_mc_rows(seq);
-	ft_mr_rows(seq);
-	ft_l2_show(seq);
+	ft_kv(seq, "mcast_group_ids4", ids4);
+	ft_kv(seq, "mcast_group_ids6", ids6);
+	ft_kv(seq, "mcast_group_id_slots", id_slots);
+	/* The routed learner's groups and what of them is in hardware.
+	 * policy_rules is the one an operator is most likely to need: a single
+	 * non-default ipmr rule keeps every group of that family in software,
+	 * and nothing else on the box would say so. ruleset_settled is whether
+	 * the ruleset has stood still long enough since its last commit for
+	 * copies to confirm under it -- followed only while a routed group
+	 * exists, so with none it is the last value read, which may predate a
+	 * commit. */
+	ft_kv(seq, "mroute_groups", READ_ONCE(ft_mr_count));
+	ft_kv(seq, "mroute_installed", READ_ONCE(ft_mr_installed));
+	ft_kv(seq, "mroute_policy_rules", READ_ONCE(ft_mr_policy[0]) + READ_ONCE(ft_mr_policy[1]));
+	ft_kv(seq, "mroute_ruleset_settled", READ_ONCE(ft_mr_gen_open));
+	ft_l2_status(seq);
+	/* How many AP-mode devices this module currently has registered. With
+	 * wifi_refused, it separates "no Wi-Fi offload because nothing asked"
+	 * from "no Wi-Fi offload because the registration failed", which are
+	 * otherwise the same absence: the per-VAP sysfs file under
+	 * /sys/class/vwd/ appears only on success. */
+	ft_kv(seq, "wifi_vaps", READ_ONCE(ft_wifi_registered));
+	cdx_ft_end();
 	return 0;
 }
 
-static const struct seq_operations ft_seq_ops = {
-	.start = ft_start,
-	.next = ft_next,
-	.stop = ft_stop,
-	.show = ft_show,
-};
-/* What the header record takes: the counters, and a row for each bridged
- * flow, each bridged membership waiting for one and each routed group, of
- * about this length -- 215 bytes on average at the caps; one with long port
- * lists runs to some 750, and a header that outgrows the guess doubles as
- * before. Never more than FT_HEADER_MAX up front. */
-#define FT_HEADER_BYTES		(16 * 1024)
-#define FT_HEADER_ROW_BYTES	320
-#define FT_HEADER_MAX		(4U << 20)
-
-static int ft_open(struct inode *inode, struct file *file)
+/* What has happened since the module loaded: counters, which only grow. Read
+ * without the transaction. Each is written under its own lock, a whole word
+ * at a time, and loaded here once, marked; a reader taking deltas needs
+ * nothing more, and one polling this never waits behind the backend. */
+static int ft_stats_show(struct seq_file *seq, void *v)
 {
+	struct cdx_detour_counters detour;
+
+	ft_kv(seq, "installs", READ_ONCE(ft_installs));
+	ft_kv(seq, "deletes", READ_ONCE(ft_deletes));
+	ft_kv(seq, "rejects", READ_ONCE(ft_rejects));
+	ft_kv(seq, "errors", READ_ONCE(ft_errors));
+	ft_kv(seq, "validated", READ_ONCE(ft_validated));
+	ft_kv(seq, "busy", READ_ONCE(ft_busy));
+	ft_kv(seq, "rearms", READ_ONCE(ft_rearms));
+	/* The non-empty last deltas directions reported through their flow's
+	 * handle as they left the hardware, for whatever reason they left;
+	 * counted whether or not the table counts, which decides only whether
+	 * conntrack takes them. */
+	ft_kv(seq, "finals", READ_ONCE(ft_finals));
+	/* The counter passes that reached every entry (ft_stats_workfn()), and
+	 * the requests Netfilter made for a flow's counters itself, which a
+	 * pass keeps it from making. */
+	ft_kv(seq, "stats_passes", READ_ONCE(ft_stats_passes));
+	ft_kv(seq, "stats_requests", READ_ONCE(ft_stats_requests));
+	/* Linux's deletions that found the transaction held and left what
+	 * they named, if anything was in hardware, to the retirement worker. */
+	ft_kv(seq, "destroy_deferrals", atomic64_read(&ft_destroy_deferrals));
+	ft_kv(seq, "neighbour_invalidations", atomic64_read(&ft_neigh_invalidations));
+	ft_kv(seq, "route_invalidations", atomic64_read(&ft_route_invalidations));
+	ft_kv(seq, "mtu_invalidations", atomic64_read(&ft_mtu_invalidations));
+	ft_kv(seq, "link_invalidations", atomic64_read(&ft_link_invalidations));
+	ft_kv(seq, "mac_invalidations", atomic64_read(&ft_mac_invalidations));
+	ft_kv(seq, "fdb_invalidations", atomic64_read(&ft_fdb_invalidations));
+	ft_kv(seq, "stp_invalidations", atomic64_read(&ft_stp_invalidations));
+	ft_kv(seq, "qos_invalidations", atomic64_read(&ft_qos_invalidations));
+	ft_kv(seq, "admission_invalidations", atomic64_read(&ft_admission_invalidations));
+	ft_kv(seq, "ipsec_invalidations", atomic64_read(&ft_ipsec_invalidations));
+	ft_kv(seq, "ipsec_policy_invalidations", atomic64_read(&ft_ipsec_policy_invalidations));
+	ft_kv(seq, "ipsec_next_hop_updates", atomic64_read(&ft_ipsec_next_hop_updates));
+	/* Frames the software path forwarded unchanged because their header
+	 * could not be made writable for the remark their class asks for, and
+	 * control frames sent as unclassified traffic because their port's
+	 * control budget was spent. */
+	ft_kv(seq, "qos_remark_failures", cdx_ft_qos_remark_failures());
+	ft_kv(seq, "qos_control_overruns", cdx_ft_qos_control_overruns());
+	ft_sec_refusal_stats(seq);
+	/* What the offline port handed back: given to Linux, with no direction
+	 * to give it to, not copied, or in error. */
+	cdx_detour_counters(&detour);
+	ft_kv(seq, "detour_delivered", detour.delivered);
+	ft_kv(seq, "detour_unknown", detour.unknown);
+	ft_kv(seq, "detour_failed", detour.failed);
+	ft_kv(seq, "detour_errors", detour.errors);
+	/* The bridged learner. deferred counts frames whose set of dedup slots
+	 * had none to give them yet, which their next frame asks for again;
+	 * passes the bridged worker's runs, each of which takes the
+	 * transaction; forgets the times every slot was forgotten, each making
+	 * every stream news once more (ft_mc_record()). port_probe_errors are
+	 * flows whose ports' netdev chains could not be judged
+	 * (ft_mc_netdev_dependent()); discards_evicted the discarding entries
+	 * that gave their group id up to a stream somebody wants;
+	 * egress_rebuilds the installed groups of either learner marked for a
+	 * rebuild because a port they copy out of changed its egress -- its
+	 * queues or its DSCP map (ft_mc_egress_changed()). */
+	ft_kv(seq, "mcast_refused", READ_ONCE(ft_mc_refused));
+	ft_kv(seq, "mcast_install_errors", READ_ONCE(ft_mc_install_errors));
+	ft_kv(seq, "mcast_observed", READ_ONCE(ft_mc_observed));
+	ft_kv(seq, "mcast_dropped", READ_ONCE(ft_mc_dropped));
+	ft_kv(seq, "mcast_hook_errors", READ_ONCE(ft_mc_hook_errors));
+	ft_kv(seq, "mcast_deferred", READ_ONCE(ft_mc_deferred));
+	ft_kv(seq, "mcast_passes", READ_ONCE(ft_mc_passes));
+	ft_kv(seq, "mcast_forgets", READ_ONCE(ft_mc_forgets));
+	ft_kv(seq, "mcast_port_probe_errors", READ_ONCE(ft_mc_port_probe_errors));
+	ft_kv(seq, "mcast_discards_evicted", READ_ONCE(ft_mc_discards_evicted));
+	ft_kv(seq, "mcast_egress_rebuilds", atomic64_read(&ft_mc_egress_rebuilds));
+	/* The routed learner. lost counts chain events dropped for want of
+	 * memory, which is the only way this learner's view can be behind the
+	 * kernel's; capped the entries the per-family group cap turned away
+	 * (A309); xfrm_changes the XFRM policy changes every routed group was
+	 * asked again for -- an IPv4 group a policy governs reads
+	 * refused-xfrm; ruleset_changes the nftables commits that took every
+	 * routed group back to software to be confirmed again; confirm_errors
+	 * how often the forwarding check could not be registered or a group's
+	 * watch allocated, which keeps groups in software with nothing else to
+	 * say why; port_probe_errors how often a confirmed group's ruleset was
+	 * too much for a port probe to judge, which reads refused-ports or
+	 * refused-xtables all the same; and xtables_changes how many times an
+	 * iptables-legacy table changed while a routed group existed, each of
+	 * which asked every group again. */
+	ft_kv(seq, "mroute_refused", READ_ONCE(ft_mr_refused));
+	ft_kv(seq, "mroute_install_errors", READ_ONCE(ft_mr_install_errors));
+	ft_kv(seq, "mroute_lost", READ_ONCE(ft_mr_lost));
+	ft_kv(seq, "mroute_capped", READ_ONCE(ft_mr_capped_entries));
+	ft_kv(seq, "mroute_xfrm_changes", atomic64_read(&ft_mr_xfrm_changes));
+	ft_kv(seq, "mroute_ruleset_changes", READ_ONCE(ft_mr_ruleset_changes));
+	ft_kv(seq, "mroute_confirm_errors", READ_ONCE(ft_mr_confirm_errors));
+	ft_kv(seq, "mroute_port_probe_errors", READ_ONCE(ft_mr_port_probe_errors));
+	ft_kv(seq, "mroute_xtables_changes", READ_ONCE(ft_mr_xtables_changes));
+	ft_l2_stats(seq);
+	ft_kv(seq, "wifi_refused", atomic64_read(&ft_wifi_refusals));
+	return 0;
+}
+
+/* One row per device whose encapsulation the hardware carries, under the
+ * transaction the record slots are read under. */
+static int ft_devices_show(struct seq_file *seq, void *v)
+{
+	cdx_ft_begin();
+	ft_dev_rows(seq, CDX_FT_STATS_TIMESTAMPED, false);
+	ft_dev_rows(seq, CDX_FT_STATS_PLAIN, false);
+	ft_dev_rows(seq, CDX_FT_STATS_PLAIN, true);
+	cdx_ft_end();
+	return 0;
+}
+
+/* The multicast learners' rows. Each learner's lock is taken inside the
+ * transaction, the order every path that takes both keeps. */
+static int ft_mcast_show(struct seq_file *seq, void *v)
+{
+	cdx_ft_begin();
+	ft_mc_rows(seq);
+	cdx_ft_end();
+	return 0;
+}
+
+static int ft_mroute_show(struct seq_file *seq, void *v)
+{
+	cdx_ft_begin();
+	ft_mr_rows(seq);
+	cdx_ft_end();
+	return 0;
+}
+
+static const struct seq_operations ft_flows_ops = {
+	.start = ft_flows_start,
+	.next = ft_flows_next,
+	.stop = ft_rows_stop,
+	.show = ft_flows_show,
+};
+
+static const struct seq_operations ft_l2_ops = {
+	.start = ft_l2_start,
+	.next = ft_l2_next,
+	.stop = ft_rows_stop,
+	.show = ft_l2_show,
+};
+
+/* What a multicast record takes: a row for each bridged flow, each bridged
+ * membership waiting for one and each routed group, of about this length --
+ * 215 bytes on average at the caps; one with long port lists runs to some
+ * 750, and a record that outgrows the guess doubles as before. Never more
+ * than FT_RECORD_MAX up front. */
+#define FT_ROW_BYTES		320
+#define FT_RECORD_MAX		(4U << 20)
+
+/* Room for the whole record in one go. seq_file starts from a page and
+ * doubles, rendering the record again from the start each time, and each
+ * render is a hold of the transaction of its own: six for the 517 rows a
+ * family's multicast caps make, any of which could wait behind a batch of a
+ * learner's retirement (A312). Counted without the learners' locks: a record
+ * that has outgrown the guess by the time it is read is doubled as before. */
+static int ft_open_sized(struct file *file, int (*show)(struct seq_file *, void *),
+			 size_t rows)
+{
+	size_t size = min_t(size_t, FT_RECORD_MAX, PAGE_SIZE + FT_ROW_BYTES * rows);
 	struct seq_file *seq;
-	size_t size;
 	int rc;
 
-	rc = seq_open(file, &ft_seq_ops);
+	rc = single_open(file, show, NULL);
 	if (rc)
 		return rc;
-	/* Room for the header in one go. seq_file starts from a page and
-	 * doubles, rendering the record again from the start each time, and
-	 * each render is a hold of the transaction of its own: six for the 517
-	 * rows a family's multicast caps make, any of which could wait behind
-	 * a batch of a learner's retirement (A312). Counted without the
-	 * learners' locks: a header that has outgrown the guess by the time
-	 * it is read is doubled as before. */
-	size = min_t(size_t, FT_HEADER_MAX, FT_HEADER_BYTES + FT_HEADER_ROW_BYTES *
-		     ((size_t)READ_ONCE(ft_mc_flow_count) + READ_ONCE(ft_mc_count) +
-		      READ_ONCE(ft_mr_count)));
 	if (size > PAGE_SIZE) {
 		seq = file->private_data;
 		seq->buf = kvmalloc(size, GFP_KERNEL_ACCOUNT | __GFP_NOWARN);
@@ -670,12 +760,53 @@ static int ft_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static const struct proc_ops ft_proc_ops = {
-	.proc_open = ft_open,
+static int ft_mcast_open(struct inode *inode, struct file *file)
+{
+	return ft_open_sized(file, ft_mcast_show,
+			     (size_t)READ_ONCE(ft_mc_flow_count) + READ_ONCE(ft_mc_count));
+}
+
+static int ft_mroute_open(struct inode *inode, struct file *file)
+{
+	return ft_open_sized(file, ft_mroute_show, READ_ONCE(ft_mr_count));
+}
+
+static const struct proc_ops ft_mcast_proc_ops = {
+	.proc_open = ft_mcast_open,
 	.proc_read = seq_read,
 	.proc_lseek = seq_lseek,
-	.proc_release = seq_release,
+	.proc_release = single_release,
 };
+
+static const struct proc_ops ft_mroute_proc_ops = {
+	.proc_open = ft_mroute_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+/* The directory and its files, or nothing: a file that could not be made
+ * takes the directory, and every file made in it, back with it. */
+static int ft_proc_init(void)
+{
+	struct proc_dir_entry *dir;
+
+	dir = proc_mkdir("ask_flowtable", NULL);
+	if (!dir)
+		return -ENOMEM;
+	if (!proc_create_single("status", 0400, dir, ft_status_show) ||
+	    !proc_create_single("stats", 0400, dir, ft_stats_show) ||
+	    !proc_create_single("devices", 0400, dir, ft_devices_show) ||
+	    !proc_create_seq("flows", 0400, dir, &ft_flows_ops) ||
+	    !proc_create_seq("l2", 0400, dir, &ft_l2_ops) ||
+	    !proc_create("mcast", 0400, dir, &ft_mcast_proc_ops) ||
+	    !proc_create("mroute", 0400, dir, &ft_mroute_proc_ops)) {
+		proc_remove(dir);
+		return -ENOMEM;
+	}
+	ft_proc = dir;
+	return 0;
+}
 
 /* Give back the callbacks Netfilter is still holding.
  *
@@ -782,12 +913,9 @@ static int __init ask_flowtable_init(void)
 	cdx_ft_end();
 	if (rc)
 		return rc;
-	ft_proc = ft_init_fault(1) ? NULL :
-		proc_create("cdx_flowtable", 0400, NULL, &ft_proc_ops);
-	if (!ft_proc) {
-		rc = -ENOMEM;
+	rc = ft_init_fault(1) ? -ENOMEM : ft_proc_init();
+	if (rc)
 		goto release;
-	}
 	/* Be told when a port's egress changes under its entries -- before
 	 * anything can build one. The netdev replay below attaches the ports
 	 * an SA is installed through, and a flow needs the binds after it; an

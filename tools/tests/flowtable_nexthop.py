@@ -10,7 +10,7 @@ from _topology import TARGET_WAN_IF
 from _flowtable_connections import (FLOWS, peer)
 from _flowtable_module import (table)
 from _flowtable_mtu import (table_identity)
-from _flowtable_rig import (artifact_dir, HEALTH_BASELINE, WAN_IP, command, console_command, status_text)
+from _flowtable_rig import (artifact_dir, HEALTH_BASELINE, WAN_IP, command, console_command, proc_paths, status_text)
 from _flowtable_selective_neighbour import (hardware, warm)
 from _flowtable_tcp import (software_tx)
 
@@ -50,7 +50,7 @@ async def test_object_replacement(connections):
                     await console_command(con, "ip", "-4", "nexthop", "replace", "id", NHID, "blackhole")
                     deadline = time.monotonic() + 10
                     while True:
-                        stopped = status_text((await console_command(con, "cat", "/proc/cdx_flowtable"))["stdout"])
+                        stopped = status_text((await console_command(con, "cat", *proc_paths("status", "stats")))["stdout"])
                         if stopped["invalidation_done"] and not stopped["entries"]:
                             break
                         assert time.monotonic() < deadline, stopped

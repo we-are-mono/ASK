@@ -95,7 +95,7 @@ periodically. The code is not copied; the shape is.
 
 What the hardware may be asked to replicate. Everything outside this is
 forwarded by `ip_mr_forward()` in software, exactly as it is today, and
-`/proc/cdx_flowtable` names the clause that turned it down.
+`/proc/ask_flowtable/mroute` names the clause that turned it down.
 
 **The table.** The default multicast routing table only, which is the one
 `ipmr_rules_init()` and `ip6mr_rules_init()` create and install the kernel's own
@@ -873,7 +873,7 @@ and any refresh rearmed by an in-flight worker before freeing groups.
 ## Standard-tool surfaces
 
 The house rule is that state and statistics surface through the tools an
-operator already has, and that `/proc/cdx_flowtable` is the diagnostic beside
+operator already has, and that `/proc/ask_flowtable/` is the diagnostic beside
 them rather than the only door.
 
 **`MFC_OFFLOAD`.** Set on `mfc->mfc_flags` after a successful install and
@@ -898,7 +898,8 @@ into the kernel's units first — `ip_mr_forward()` counts `skb->len`, which is
 the L3 packet, and the classifier counts the L2 frame it matched, so the ingress
 framing comes off per packet exactly as `ft_l2_overhead()` takes it off a
 flow's. The fold runs on a delayed work of its own every five seconds and again
-on every `/proc` read, so a daemon polling `SIOCGETSGCNT` sees activity within
+on every read of `/proc/ask_flowtable/mroute`, so a daemon polling
+`SIOCGETSGCNT` sees activity within
 one interval without anybody reading `/proc` at all. What the hardware matched
 after the last fold is read before a group's entry is deleted and folded then:
 by the worker's deletes of an entry that changes or goes to software, and by
@@ -943,25 +944,30 @@ staying alive through the ioctl they already use — which matters, because a
 daemon that prunes on inactivity would otherwise tear down exactly the groups
 the offload is carrying.
 
-**`/proc/cdx_flowtable`.** A summary —
+**`/proc/ask_flowtable/`.** A summary — the levels, in `status`,
 
 ```
-mroute_groups 2
-mroute_installed 1
-mroute_refused 1
-mroute_install_errors 0
-mroute_policy_rules 0
-mroute_lost 0
-mroute_capped 0
-mroute_xfrm_changes 0
-mroute_ruleset_changes 3
-mroute_ruleset_settled 1
-mroute_confirm_errors 0
-mroute_port_probe_errors 0
-mroute_xtables_changes 0
+mroute_groups:                                 2
+mroute_installed:                              1
+mroute_policy_rules:                           0
+mroute_ruleset_settled:                        1
 ```
 
-— and one row per group:
+the counters, in `stats`,
+
+```
+mroute_refused:                                1
+mroute_install_errors:                         0
+mroute_lost:                                   0
+mroute_capped:                                 0
+mroute_xfrm_changes:                           0
+mroute_ruleset_changes:                        3
+mroute_confirm_errors:                         0
+mroute_port_probe_errors:                      0
+mroute_xtables_changes:                        0
+```
+
+— and one row per group, in `mroute`:
 
 ```
 mroute family=4 table=253 group=239.8.1.5 src=10.0.0.52 in=eth4 oifs=eth3 \
@@ -1157,7 +1163,7 @@ one oif and requires the other to survive, which is the chain swap.
 Six oracles each, and the last two are ones a bridged case cannot produce:
 
 1. `ip mroute show` reports `offload` against the entry.
-2. `/proc/cdx_flowtable` has an `mroute … state=installed` row.
+2. `/proc/ask_flowtable/mroute` has an `mroute … state=installed` row.
 3. The DUT's CPU does not see the stream — the SDK driver's own software RX
    counter on the ingress port, which excludes the hardware's.
 4. The LAN VM receives at least 95%.
@@ -1265,7 +1271,7 @@ contract writes on its own. `refused-host` is proved on the rig by
 One number is worth carrying forward because it is the design working rather
 than a shortfall. `ip -s mroute` lags the hardware by up to the fold's
 five-second interval, so a reader who wants it exact reads
-`/proc/cdx_flowtable` first — that read folds. A test that asked the kernel
+`/proc/ask_flowtable/mroute` first — that read folds. A test that asked the kernel
 first saw 88% of a three-second stream and looked like a broken fold. A group
 routed through a bridge, carried on the bridged entry, reaches the MFC in two
 passes: the bridged learner's refresh hands the entry's growth to the route,

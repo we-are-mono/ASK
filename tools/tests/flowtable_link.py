@@ -8,7 +8,7 @@ from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from _flowtable_connections import (FLOWS, healthy, peer)
 from _flowtable_mtu import (table_identity)
-from _flowtable_rig import (artifact_dir, WAN_IP, console_command, read, status_text)
+from _flowtable_rig import (artifact_dir, WAN_IP, console_command, proc_paths, read, status_text)
 from _flowtable_selective_neighbour import (hardware, warm)
 
 
@@ -21,7 +21,7 @@ async def test_recovery(connections):
         await asyncio.to_thread(con.login, "root", None)
 
         async def state():
-            return status_text((await console_command(con, "cat", "/proc/cdx_flowtable"))["stdout"])
+            return status_text((await console_command(con, "cat", *proc_paths("status", "stats")))["stdout"])
 
         async def restore(dev):
             await console_command(con, "ip", "link", "set", "dev", dev, "up")

@@ -41,7 +41,7 @@ not create an nftables flowtable.
 
 Additional temporary pytest instrumentation captures before/after snapshots:
 
-- `/proc/cdx_flowtable`, conntrack and DUT software ethtool counters.
+- `/proc/ask_flowtable/`, conntrack and DUT software ethtool counters.
 - FMan MAC statistics through `FM_PORT_IOC_GET_MAC_STATISTICS` on
   `/dev/fm0-port-rx6` (LAN) and `rx7` (WAN), using the exact image's 29-u64 ABI.
 - FMan receive/transmit port frame, discard and enqueue counters.

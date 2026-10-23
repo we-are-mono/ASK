@@ -466,10 +466,10 @@ tc filter or netdev chain going, the bridge leaving promiscuous mode, the VLAN
 tunnel flag, room freed in a full hardware table -- waits out the hold.
 `l2_held` counts the observations a refusal kept from the worker.
 
-`/proc/cdx_flowtable` lists each pair as an `l2flow` row with its ports,
-addresses, VLAN, tag rewrite and counters, after the flow rows and under
-`l2_*` totals in the header. Like the flow rows, each is a record of its own,
-so a read holds the transaction for one buffer of them; and every walk over
+`/proc/ask_flowtable/l2` lists each pair as an `l2flow` row with its ports,
+addresses, VLAN, tag rewrite and counters, and `/proc/ask_flowtable/status`
+and `stats` carry the `l2_*` totals. Like the flow rows, each is a record of
+its own, so a read holds the transaction for one buffer of them; and every walk over
 the pairs -- the once-a-second sweep that reads counters and ages pairs out,
 the recheck, a global invalidation, an egress drain, unload -- goes a batch at
 a time, at most `FT_L2_VISIT_BATCH` (256) pairs visited and `FT_RETIRE_BATCH`

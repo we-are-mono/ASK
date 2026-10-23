@@ -78,7 +78,7 @@ MIN_RATE = float(os.environ.get("ASK_FLOWTABLE_L2_MIN_GBPS", "9")) * 1e9
 AGEING_CS = 1000
 BRNF_SYSCTLS = ("net.bridge.bridge-nf-call-iptables", "net.bridge.bridge-nf-call-ip6tables")
 BRNF_VLAN = "net.bridge.bridge-nf-filter-vlan-tagged"
-# FT_BRIDGE_HOOK_*, as /proc/cdx_flowtable reports l2_hook_kinds.
+# FT_BRIDGE_HOOK_*, as /proc/ask_flowtable/status reports l2_hook_kinds.
 HOOK_NFT, HOOK_BRNF, HOOK_OTHER = 1, 2, 4
 # The station's frames to the peer, as a bridge or an IP rule names them.
 DROP = f"ip saddr {STATION_ADDR} ip daddr {PEER_ADDR} drop"

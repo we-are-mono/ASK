@@ -1713,17 +1713,69 @@ static void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats) { 
 /* Registration infrastructure; backend claim semantics are exercised against
  * production CDX in flowtable_hw.c. Here each acquisition can fail in turn. */
 struct proc_dir_entry { int unused; };
-static struct proc_dir_entry proc_entry, *ft_proc;
-static int ft_proc_ops;
+static struct proc_dir_entry *ft_proc;
 static struct notifier_block ft_netdev_nb, ft_neigh_nb, ft_fib_nb, ft_nexthop_nb;
 static struct notifier_block ft_fdb_nb, ft_swdev_nb;
 static unsigned registration_step, registration_failure, canceled;
 static bool backend_claimed, netdev_registered, neigh_registered, fib_registered, nexthop_registered, indirect_registered;
 static bool fdb_registered, swdev_obj_registered;
 static bool registration_fails(void) { return ++registration_step == registration_failure; }
-static struct proc_dir_entry *proc_create(const char *name, int mode, void *parent, void *ops)
-{ assert(!strcmp(name,"cdx_flowtable") && mode == 0400 && !parent); return registration_fails() ? NULL : &proc_entry; }
-static void proc_remove(struct proc_dir_entry *entry) { assert(entry == &proc_entry); }
+/* /proc/ask_flowtable: the directory, then its files in it, in this order and
+ * each root-only; any of them can fail, and the directory's removal takes
+ * whatever was made in it. */
+static const char *const proc_files[] = {
+    "status", "stats", "devices", "flows", "l2", "mcast", "mroute",
+};
+static struct proc_dir_entry proc_dir, proc_file[ARRAY_SIZE(proc_files)];
+static unsigned proc_made;
+static bool proc_dir_made;
+static struct proc_dir_entry *proc_mkdir(const char *name, struct proc_dir_entry *parent)
+{
+    assert(!strcmp(name, "ask_flowtable") && !parent && !proc_dir_made);
+    if (registration_fails()) return NULL;
+    proc_dir_made = true;
+    return &proc_dir;
+}
+static struct proc_dir_entry *proc_child(const char *name, int mode, struct proc_dir_entry *parent)
+{
+    assert(parent == &proc_dir && proc_dir_made && mode == 0400);
+    assert(proc_made < ARRAY_SIZE(proc_files) && !strcmp(name, proc_files[proc_made]));
+    if (registration_fails()) return NULL;
+    return &proc_file[proc_made++];
+}
+/* The shows and ops behind the files; what they render is tested where it
+ * is written, and here only that each file is made with its own. */
+static int ft_status_show(struct seq_file *seq, void *v) { return 0; }
+static int ft_stats_show(struct seq_file *seq, void *v) { return 0; }
+static int ft_devices_show(struct seq_file *seq, void *v) { return 0; }
+struct seq_operations { int unused; };
+struct proc_ops { int unused; };
+static const struct seq_operations ft_flows_ops, ft_l2_ops;
+static const struct proc_ops ft_mcast_proc_ops, ft_mroute_proc_ops;
+static struct proc_dir_entry *proc_create_single(const char *name, int mode, struct proc_dir_entry *parent,
+                                                 int (*show)(struct seq_file *, void *))
+{
+    assert(show == (proc_made == 0 ? ft_status_show : proc_made == 1 ? ft_stats_show : ft_devices_show));
+    return proc_child(name, mode, parent);
+}
+static struct proc_dir_entry *proc_create_seq(const char *name, int mode, struct proc_dir_entry *parent,
+                                              const struct seq_operations *ops)
+{
+    assert(ops == (proc_made == 3 ? &ft_flows_ops : &ft_l2_ops));
+    return proc_child(name, mode, parent);
+}
+static struct proc_dir_entry *proc_create(const char *name, int mode, struct proc_dir_entry *parent,
+                                          const struct proc_ops *ops)
+{
+    assert(ops == (proc_made == 5 ? &ft_mcast_proc_ops : &ft_mroute_proc_ops));
+    return proc_child(name, mode, parent);
+}
+static void proc_remove(struct proc_dir_entry *entry)
+{
+    assert(entry == &proc_dir && proc_dir_made);
+    proc_dir_made = false;
+    proc_made = 0;
+}
 static int cdx_ft_claim(void)
 {
     assert(cdx_info->ctrl.mutex && !backend_claimed);
@@ -5975,44 +6027,50 @@ static void retire_unreached(void)
     retiring_slot = NULL;
 }
 
-/* Complete and fragmented proc iteration must enumerate every live owner once,
- * including collisions, empty buckets and a resumed read at the current row --
- * and then every bridged pair's row once, after all of them, resuming inside
- * their buckets too. */
+/* Complete and fragmented iteration of /proc/ask_flowtable/flows must
+ * enumerate every live owner once, including collisions, empty buckets and a
+ * resumed read at the current row; /proc/ask_flowtable/l2 every bridged pair's
+ * row once, resuming inside its buckets too. Each file starts at position
+ * zero, and each start takes the transaction its stop gives back. */
 static void test_iterator(unsigned expected)
 {
     bool seen[CDX_FT_MAX_ENTRIES] = {0}, l2_seen[ARRAY_SIZE(l2_rows)] = {0};
     loff_t pos = 0;
-    void *row = ft_start(NULL, &pos);
+    void *row = ft_flows_start(NULL, &pos);
     unsigned count = 0, l2 = 0;
 
-    assert(row == &ft_entries);
-    while ((row = ft_next(NULL, row, &pos))) {
-        if ((uintptr_t)row >= (uintptr_t)l2_rows &&
-            (uintptr_t)row < (uintptr_t)(l2_rows + ARRAY_SIZE(l2_rows))) {
-            unsigned i = (struct list_head *)row - l2_rows;
-
-            assert(!l2_seen[i] && ft_position_l2(pos));
-            l2_seen[i] = true;
-            l2++;
-            ft_stop(NULL, row);
-            assert(ft_start(NULL, &pos) == row);
-            continue;
-        }
-        /* Every flow row precedes every bridged pair's. */
-        assert(!l2 && !ft_position_l2(pos));
-        struct cdx_ft_entry *entry = list_entry(row, struct cdx_ft_entry, list);
+    assert(cdx_info->ctrl.mutex);
+    for (; row; row = ft_flows_next(NULL, row, &pos)) {
+        struct cdx_ft_entry *entry = row;
         unsigned index = (entry->cookie - 1000) % 100000;
+
         assert(index < CDX_FT_MAX_ENTRIES && !seen[index]);
         seen[index] = true;
         count++;
         if (!(count % 17)) {
-            ft_stop(NULL, row);
-            assert(ft_start(NULL, &pos) == row);
+            ft_rows_stop(NULL, row);
+            assert(!cdx_info->ctrl.mutex);
+            assert(ft_flows_start(NULL, &pos) == row);
         }
     }
-    ft_stop(NULL, row);
-    assert(count == expected && l2 == ARRAY_SIZE(l2_rows));
+    ft_rows_stop(NULL, row);
+    assert(count == expected && !cdx_info->ctrl.mutex);
+    /* Past the end it stays past the end. */
+    assert(!ft_flows_start(NULL, &pos));
+    ft_rows_stop(NULL, NULL);
+
+    pos = 0;
+    for (row = ft_l2_start(NULL, &pos); row; row = ft_l2_next(NULL, row, &pos)) {
+        unsigned i = (struct list_head *)row - l2_rows;
+
+        assert(i < ARRAY_SIZE(l2_rows) && !l2_seen[i]);
+        l2_seen[i] = true;
+        l2++;
+        ft_rows_stop(NULL, row);
+        assert(ft_l2_start(NULL, &pos) == row);
+    }
+    ft_rows_stop(NULL, row);
+    assert(l2 == ARRAY_SIZE(l2_rows) && !cdx_info->ctrl.mutex);
 }
 
 static void test_connections(void)
@@ -9240,7 +9298,9 @@ static void test_registration(void)
 {
     list_init(&block.cb_list);
     list_init(&table.flow_block.cb_list);
-    for (registration_failure = 0; registration_failure <= 9; registration_failure++) {
+    /* The claim, the proc directory and its seven files, then the egress
+     * hook and the six notifier chains: sixteen acquisitions. */
+    for (registration_failure = 0; registration_failure <= 16; registration_failure++) {
         /* A fresh adapter instance, backed by an independently owned CDX. */
         ft_ready=ft_stopping=false; registration_step=canceled=0;
         work_queued_invalidate = work_queued_retire = work_queued_rearm = false;
@@ -9263,7 +9323,7 @@ static void test_registration(void)
             ask_flowtable_exit();
             assert(handle.invalid && unload_sleeps == 2);
         }
-        assert(!ft_proc && !ft_ready && !backend_claimed && !live_hw && !allocated);
+        assert(!ft_proc && !proc_dir_made && !ft_ready && !backend_claimed && !live_hw && !allocated);
         assert(!registered_egress_changed);
         assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered && !indirect_registered);
         assert(!fdb_registered && !swdev_obj_registered);

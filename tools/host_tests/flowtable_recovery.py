@@ -2,7 +2,7 @@
 
 from ask_orch.process import run_process
 
-from _host_flowtable_recovery import (AUTO, POLICY, following, relist, statements)
+from _host_flowtable_recovery import (AUTO, POLICY, STATS, STATUS, following, relist, statements)
 import json
 import os
 import subprocess
@@ -14,7 +14,7 @@ import pytest
 
 def test_admission_guard_follows_both_mark_masks(controller):
     """The controller reads the adapter's class mask and its route-only mask
-    from the backend and renders their union into the admission guard -- the
+    from its parameters and renders their union into the admission guard -- the
     applied table and `render` alike -- and no guard when every bit is
     admitted."""
     c = controller
@@ -26,6 +26,27 @@ def test_admission_guard_follows_both_mark_masks(controller):
     assert "  ct mark & 0xffffc00f != 0x0 return" in c.run("render").stdout.splitlines()
     c.backend(qos_mark_mask=0, route_mark_mask=0xffffffff)
     assert "ct mark &" not in c.run("render").stdout
+
+
+def test_every_backend_key_is_required(controller):
+    """A status or stats file a key short fails the read, whichever key it is:
+    one read as zero would let a drain pass with directions still in the
+    hardware, or render an admission guard from masks that are not the
+    adapter's. So would a parameter that cannot be read."""
+    c = controller
+    for name, keys in (("backend", STATUS), ("stats", STATS)):
+        path = c.root / name
+        full = path.read_text()
+        for key in keys:
+            path.write_text("".join(line for line in full.splitlines(True)
+                                    if not line.startswith(key + ":")))
+            short = c.run("status", check=False)
+            assert short.returncode != 0 and "incomplete backend" in short.stderr, (key, short)
+        path.write_text(full)
+    assert c.status()["backend"]["present"]
+    (c.root / "qos_mark_mask").write_text("all\n")
+    garbled = c.run("status", check=False)
+    assert garbled.returncode != 0 and "qos_mark_mask" in garbled.stderr, garbled
 
 
 def test_quiet_network_retries_failed_apply(controller):
@@ -45,7 +66,6 @@ def test_health_waits_behind_a_busy_transaction(controller):
     of holders that each let it go (A411)."""
     c = controller
     hold = c.root / "cdx/parameters/flowtable_hold_ms"
-    hold.parent.mkdir(parents=True)
     (c.root / "backend").unlink()
     os.mkfifo(c.root / "backend")  # a read that never gets its turn
     hold.write_text("120\n")
@@ -74,14 +94,13 @@ def test_platform_health_and_reboot_budget(controller):
     c.backend(fatal=1, bypassed=1)
     c.run("health")
     reason = c.root / "cdx/parameters/flowtable_degraded_reason"
-    reason.parent.mkdir()
     reason.write_text("restart budget exhausted\n")
     healthy = c.run("health", check=False)
     assert healthy.returncode == 0 and not healthy.stderr, healthy
     (c.root / "backend").unlink()
     c.run("health")  # deliberately unloaded ASK, ordinary Linux networking
-    (c.root / "backend").write_text("bypassed 0\n")
-    assert c.run("health", check=False).returncode == 1
+    (c.root / "backend").write_text("bypassed:                                      0\n")
+    assert c.run("health", check=False).returncode == 1  # a status missing keys
     (c.root / "backend").unlink()
     os.mkfifo(c.root / "backend")
     started = time.monotonic()
@@ -371,7 +390,7 @@ def test_stop_and_disabled_policy_withdraw_multicast(controller):
     switch = c.root / "multicast"
 
     def multicast():
-        """The parameter as last written, None before the first write."""
+        """The parameter as last written; it starts at the module's Y."""
         return switch.read_text() if switch.exists() else None
 
     with c.daemon():

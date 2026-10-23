@@ -261,9 +261,9 @@ answer a device gets is the answer it keeps; returning a record later does not
 retrofit one, because a live connection's counters beginning halfway through it
 would be worse than none.
 
-Which is why the degradation is visible rather than silent. `/proc/cdx_flowtable`
-carries `session_records` and `session_slots` in the header and one `session`
-row per ppp device with a record:
+Which is why the degradation is visible rather than silent.
+`/proc/ask_flowtable/status` carries `session_records` and `session_slots`, and
+`/proc/ask_flowtable/devices` one `session` row per ppp device with a record:
 
 ```
 session dev=ppp0 ifindex=18 pppoe=1@00:11:22:33:44:55 lower=7 refs=2 slot=yes rx_packets=… rx_bytes=… tx_packets=… tx_bytes=…
@@ -382,10 +382,10 @@ silently assumed away.
 **Counters for a fifth session.** The firmware pool is four records deep and
 shared with the legacy owner, so a fifth session forwards without any. That is
 a bounded gap rather than an unimplemented feature: the flows install, the
-counters are the only thing missing, and `slot=none` in `/proc/cdx_flowtable`
-says which sessions it happened to. Widening the pool means moving a MURAM
-carve the legacy owner also allocates from, which belongs to item 9 rather than
-here.
+counters are the only thing missing, and `slot=none` in
+`/proc/ask_flowtable/devices` says which sessions it happened to. Widening the
+pool means moving a MURAM carve the legacy owner also allocates from, which
+belongs to item 9 rather than here.
 
 **PPPoE relay**, which is a different feature: session-to-session forwarding
 through `REPLACE_PPPOE_HDR` and the relay classifier table, deleted from CMM

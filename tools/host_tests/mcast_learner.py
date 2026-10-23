@@ -612,7 +612,7 @@ def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
         probe.index("rcu_read_unlock();")
     assert "if (rc == -EAGAIN || rc == -ENOMEM)\n\t\treturn !same || f->nf_hooked;" in probe
     assert "ft_mc_port_probe_errors++;" in probe
-    assert "mcast_port_probe_errors" in function(source, "ft_show")
+    assert '"mcast_port_probe_errors"' in function(source, "ft_stats_show")
     # Asked under RTNL and before the group lock, never under it: a block
     # walk can destroy a classifier, whose destruction reaches the egress
     # mark, which takes the group lock.
@@ -709,8 +709,8 @@ def test_streams_the_worker_can_do_nothing_with_wake_it_once():
     worker = function(source, "ft_mc_work_fn")
     assert worker.index("WRITE_ONCE(ft_mc_passes, ft_mc_passes + 1);") < \
         worker.index("cdx_ft_begin();")
-    show = function(source, "ft_show")
-    assert "mcast_passes" in show and "mcast_deferred" in show and "mcast_forgets" in show
+    show = function(source, "ft_stats_show")
+    assert '"mcast_passes"' in show and '"mcast_deferred"' in show and '"mcast_forgets"' in show
     # Seeded before the hook can be registered.
     init = function(source, "ask_flowtable_init")
     assert init.index("ft_hash_seed = get_random_u32();") < init.index("ft_mc_replay();")
@@ -794,7 +794,7 @@ def test_a_discard_gives_its_group_id_only_to_a_stream_somebody_wants():
     assert "f->interval_packets = packets;" in block[:block.index("\n\t}\n")]
     added = worker[worker.index("if (added) {"):]
     assert "target->interval_packets = U64_MAX;" in added[:added.index("}")]
-    assert "mcast_discards_evicted" in function(source, "ft_show")
+    assert '"mcast_discards_evicted"' in function(source, "ft_stats_show")
 
 
 def test_a_failed_chain_swap_takes_the_flow_out_of_hardware():
@@ -999,4 +999,4 @@ def test_a_changed_egress_rebuilds_every_group_copying_out_of_the_port():
             assert forbidden not in drain, (name, forbidden)
         assert drain.index("cdx_ft_begin();") < drain.index(f"mutex_lock(&{lock});")
         assert f"cdx_mc_group_replace(" in drain and recorded in drain, name
-    assert "mcast_egress_rebuilds" in function(source, "ft_show")
+    assert '"mcast_egress_rebuilds"' in function(source, "ft_stats_show")

@@ -27,7 +27,7 @@ import pytest
 
 from ask_orch.uart import Console
 from _topology import TARGET_WAN_IF
-from _flowtable_rig import (artifact_dir, console_python)
+from _flowtable_rig import (artifact_dir, console_python, proc_paths, read, status_text)
 
 # Addresses from the RFC 2544 benchmarking block (198.18.0.0/15), distinct from
 # every other IPsec file's so the tests can run in any order.
@@ -157,11 +157,9 @@ async def test_packet_offload_sa_install(aiohttp_session, target_agent, update_s
             assert "offload" not in out, out
             deadline = time.monotonic() + 10
             while True:
-                result = await target_agent.fs_read(aiohttp_session, "/proc/cdx_flowtable")
-                assert result["errno"] == 0, result
-                state = dict(line.split() for line in bytes.fromhex(result["content_hex"]).decode().splitlines()
-                             if len(line.split()) == 2)
-                if state["ipsec_sas"] == state["ipsec_sa_cache"] == "0":
+                state = status_text(await read(target_agent, aiohttp_session,
+                                               *proc_paths("status")))
+                if state["ipsec_sas"] == state["ipsec_sa_cache"] == 0:
                     break
                 assert time.monotonic() < deadline, state
                 await asyncio.sleep(0.1)

@@ -2061,7 +2061,7 @@ async def test_module_reload_reproves_the_profile(homelab,
     await console_command(console, "ip", "xfrm", "policy", "flush")
     await console_command(console, "ip", "xfrm", "state", "flush")
     await console_command(console, "rmmod", "ask_flowtable", timeout=30)
-    for path in ("/sys/module/ask_flowtable", "/proc/cdx_flowtable",
+    for path in ("/sys/module/ask_flowtable", "/proc/ask_flowtable",
                  "/sys/module/cdx/holders/ask_flowtable"):
         absent = await console_command(console, "test", "-e", path, check=False)
         assert absent["rc"] == 1, path

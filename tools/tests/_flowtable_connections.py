@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from _flowtable_rig import DPORT, HEALTH_BASELINE, TABLE, WAN_IP, command, dut_drops, read
+from _flowtable_rig import DPORT, HEALTH_BASELINE, TABLE, WAN_IP, command, dut_drops, proc_paths, read
 from _flowtable_rig import SPORT as BASE_SPORT
 from ask_orch.commands import console_python
 from ask_orch.uart import Console
@@ -64,9 +64,10 @@ def healthy(state, bindings=2):
 
 
 
-# /proc/cdx_flowtable is read a page at a time, and each page is a fresh
-# look: the counters at its head and the rows after them can straddle a
-# delete. A wait for rows to go also waits for the counters to agree.
+# /proc/ask_flowtable/status and the flow rows are separate reads, and the
+# rows themselves are read a page at a time, each page a fresh look: the
+# levels and the rows can straddle a delete. A wait for rows to go also waits
+# for the levels to agree.
 def consistent(state):
     rows = state["flow_count"] if "snapshot" in state else len(state["flows"])
     return state["entries"] == state["neighbour_refs"] == state["handle_refs"] == rows
@@ -360,7 +361,7 @@ for suffix in ('.py', '.pid', '.log', '.sock'):
                                 dut[path] = (await read(r.target, r.session, path)).strip()
                             except Exception as error:
                                 dut[path] = repr(error)
-                    for path in ("/proc/net/xfrm_stat", "/proc/cdx_flowtable"):
+                    for path in ("/proc/net/xfrm_stat", *proc_paths()):
                         try:
                             dut[path] = await read(r.target, r.session, path)
                         except Exception as error:

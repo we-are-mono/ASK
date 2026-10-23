@@ -24,10 +24,13 @@ def controller(tmp_path):
     src.mkdir()
     replacements = {
         "/run/ask-flowtable": str(tmp_path),
-        "/proc/cdx_flowtable": str(tmp_path / "backend"),
+        "/proc/ask_flowtable/status": str(tmp_path / "backend"),
+        "/proc/ask_flowtable/stats": str(tmp_path / "stats"),
         "/proc/sys/kernel/random/boot_id": str(tmp_path / "boot_id"),
         "/sys/module/cdx": str(tmp_path / "cdx"),
         "/sys/module/ask_flowtable/parameters/multicast": str(tmp_path / "multicast"),
+        "/sys/module/ask_flowtable/parameters/qos_mark_mask": str(tmp_path / "qos_mark_mask"),
+        "/sys/module/ask_flowtable/parameters/route_mark_mask": str(tmp_path / "route_mark_mask"),
         "/run/ask-flowtable/policy.lock": str(tmp_path / "lock"),
         "/run/ask-flowtable/paused": str(tmp_path / "paused"),
         "/etc/ask/offload.conf": str(tmp_path / "policy"),
@@ -93,15 +96,53 @@ int ft_enumerate(struct ft_policy *p) {
     ], check=True)
     shutil.copyfile(Path(__file__).with_name("_flowtable_nft.py"), tmp_path / "nft")
     (tmp_path / "nft").chmod(0o755)
-    (tmp_path / "cdx").mkdir()
+    (tmp_path / "cdx/parameters").mkdir(parents=True)
     (tmp_path / "policy").write_text(POLICY)
-    (tmp_path / "backend").write_text(
-        "bindings 0\nentries 0\nhandle_refs 0\nneighbour_refs 0\n"
-        "quarantine 0\nfatal 0\nobserve 0\ninvalidated 0\n"
-        "installs 0\ndeletes 0\nrearms 0\nerrors 0\nqos_mark_mask 0\n"
-        "mcast_enabled 1\nmcast_installed 0\nmroute_installed 0\n")
+    # The adapter as loaded: its status and stats files, in the layout the
+    # kernel writes them in, and its parameters at their defaults.
+    write_backend(tmp_path, **{key: 0 for key in STATUS + STATS},
+                  observe=0, mcast_enabled=1, qos_mark_mask=0, route_mark_mask=0)
     os.mkfifo(tmp_path / "events")
     return Controller(tmp_path, binary)
+
+
+# The keys the controller reads from /proc/ask_flowtable/status and stats.
+STATUS = ("bindings", "entries", "handle_refs", "neighbour_refs", "quarantine", "fatal",
+          "invalidated", "bypassed", "restarts", "resume_failures", "mcast_installed",
+          "mroute_installed")
+STATS = ("installs", "deletes", "rearms", "errors")
+# And where each module parameter it reads stands in this tree, as written.
+PARAMETERS = {
+    "observe": ("cdx/parameters/flowtable_observe", lambda v: "Y" if v else "N"),
+    "mcast_enabled": ("multicast", lambda v: "Y" if v else "N"),
+    "qos_mark_mask": ("qos_mark_mask", str),
+    "route_mark_mask": ("route_mark_mask", str),
+}
+
+
+def write_backend(root, **changes):
+    """Change what the fake adapter reports. A status or stats key is
+    rewritten in its file, laid out as the kernel lays it out; a parameter in
+    its own file."""
+    for name, keys in (("backend", STATUS), ("stats", STATS)):
+        mine = {k: v for k, v in changes.items() if k in keys}
+        if not mine:
+            continue
+        path = root / name
+        fields = {}
+        if path.exists():
+            fields = {k.strip(): v.strip() for k, v in
+                      (line.split(":", 1) for line in path.read_text().splitlines())}
+        fields.update({k: str(v) for k, v in mine.items()})
+        tmp = path.with_suffix(".update")
+        tmp.write_text("".join(f"{k + ':':<36}{v:>12}\n" for k, v in fields.items()))
+        tmp.replace(path)
+    for key, value in changes.items():
+        if key in PARAMETERS:
+            name, render = PARAMETERS[key]
+            (root / name).write_text(render(value) + "\n")
+        else:
+            assert key in STATUS + STATS, key
 
 
 class Controller:
@@ -139,12 +180,7 @@ class Controller:
         return [c for c in calls if verb is None or c["args"][0] == verb]
 
     def backend(self, **changes):
-        path = self.root / "backend"
-        fields = dict(line.split() for line in path.read_text().splitlines())
-        fields.update({k: str(v) for k, v in changes.items()})
-        tmp = path.with_suffix(".update")
-        tmp.write_text("".join(f"{k} {v}\n" for k, v in fields.items()))
-        tmp.replace(path)
+        write_backend(self.root, **changes)
 
     def ports(self, *names):
         """Publish the ports `devices auto` finds up."""

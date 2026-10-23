@@ -43,6 +43,7 @@ import time
 import pytest
 
 from ask_orch.artifacts import record
+from ask_orch.commands import read
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
 
 LAN_INNER = "198.18.88.2"
@@ -74,8 +75,7 @@ async def toenc(session, agent, iface):
 
 async def flows(session, agent):
     """The adapter's installed directions, as dicts of its own key=value row."""
-    result = await agent.fs_read(session, "/proc/cdx_flowtable")
-    text = bytes.fromhex(result.get("content_hex", "")).decode(errors="replace")
+    text = await read(agent, session, "/proc/ask_flowtable/flows")
     rows = []
     for line in text.splitlines():
         if not line.startswith("flow "):

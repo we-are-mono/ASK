@@ -262,7 +262,7 @@ async def test_exception_backlog_leaves_sec_its_buffers(ipv6_rig):
     what the CPU can deliver, beside offloaded TCP the other way. SEC may
     refuse frames for its own reasons (the peer's reordering against the
     replay window), but never for want of a buffer. What the CPU had no time
-    for is dropped at the offline port instead, and /proc/cdx_flowtable
+    for is dropped at the offline port instead, and /proc/ask_flowtable/stats
     counts it, as the port's own register does (A336)."""
     r = ipv6_rig
     cleanup = []

@@ -81,20 +81,34 @@ async def upper_roundtrip(r, dev):
 STATUS_ROWS = {"flow": "flows", "session": "sessions", "vlan": "vlans",
                "tunnel": "tunnels", "mcast": "mcast", "mroute": "mroute",
                "l2flow": "l2flows"}
+# The adapter's files (docs/flowtable/procfs.md): levels, counters, then the
+# row files, the flows' last because they grow with the connections.
+PROC = "/proc/ask_flowtable"
+PROC_FILES = ("status", "stats", "devices", "mcast", "mroute", "l2", "flows")
+
+
+def proc_paths(*names):
+    """The adapter's files by name, every one of them when none is named."""
+    for name in names:
+        assert name in PROC_FILES, name
+    return [f"{PROC}/{name}" for name in names or PROC_FILES]
 
 
 def status_text(text):
+    """Parse any of the adapter's files, or several catenated: `key: value`
+    lines into keys, rows by their leading tag into lists of fields."""
     state = {name: [] for name in STATUS_ROWS.values()}
     for line in text.splitlines():
         kind, _, rest = line.partition(" ")
         if kind in STATUS_ROWS:
             state[STATUS_ROWS[kind]].append(
                 dict(item.split("=", 1) for item in rest.split()))
-        else:
-            parts = line.split()
-            assert len(parts) == 2, f"unexpected /proc/cdx_flowtable line: {line!r}"
-            key, value = parts
-            state[key] = int(value) if value.isdecimal() else value
+            continue
+        key, colon, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        assert colon and key and " " not in key and value and " " not in value, \
+            f"unexpected /proc/ask_flowtable line: {line!r}"
+        state[key] = int(value) if value.isdecimal() else value
     return state
 
 

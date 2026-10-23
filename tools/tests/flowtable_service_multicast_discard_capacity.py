@@ -121,19 +121,18 @@ class Fill:
 
 @asynccontextmanager
 async def state_waits(r):
-    """How long each read of /proc/cdx_flowtable's header took, read a tenth
-    of a second apart while the block runs, as the health probe reads it: one
-    read, which renders the whole header under the transaction everything
-    that changes the datapath takes."""
+    """How long each read of /proc/ask_flowtable/status took, read a tenth of
+    a second apart while the block runs, as the health probe reads it: one
+    read, which renders the file under the transaction everything that
+    changes the datapath takes."""
     waits, done = [], asyncio.Event()
 
     async def sample():
         while not done.is_set():
             began = time.monotonic()
-            got = await r.target.fs_read(r.session, "/proc/cdx_flowtable", max_bytes=4096)
-            # Short once the rows have gone: the file is then smaller than
-            # the read.
-            assert got.get("errno", 0) == 0 and got["size"] > 0, got
+            got = await r.target.fs_read(r.session, "/proc/ask_flowtable/status", max_bytes=4096)
+            # The whole file: it holds no rows, so it is smaller than the read.
+            assert got.get("errno", 0) == 0 and 0 < got["size"] < 4096, got
             waits.append(round(time.monotonic() - began, 3))
             await asyncio.sleep(0.1)
 

@@ -1,4 +1,4 @@
-/* /proc/cdx_flowtable header parsing + the drain wait. SPDX-License-Identifier: GPL-2.0+ */
+/* /proc/ask_flowtable status and stats parsing + the drain wait. SPDX-License-Identifier: GPL-2.0+ */
 #include "runtime.h"
 #include <stdio.h>
 #include <string.h>
@@ -19,62 +19,120 @@ bool ft_cdx_present(void)
 	return !access(FT_CDX_MODULE, F_OK);
 }
 
-int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
-{
-	FILE *f = fopen(FT_PROC, "r");
-	char line[256];
-	int seen = 0, optional = 0;
+struct ft_key {
+	const char *name;
+	long *value;
+};
 
-	memset(b, 0, sizeof(*b));
+/* One of the adapter's status or stats files: a "key: value" line each, of
+ * which every key named here has to be present. A file that is not there is
+ * the adapter not being loaded -- or unloading between two reads -- and
+ * clears *present. */
+static int ft_keys_read(struct ft_ctx *ctx, const char *path, const struct ft_key *keys,
+			size_t n, bool *present)
+{
+	FILE *f = fopen(path, "r");
+	unsigned long found = 0;
+	char line[128];
+	int error;
+
 	if (!f) {
-		if (errno == ENOENT)
-			return 0;   /* adapter not loaded */
+		if (errno == ENOENT) {
+			*present = false;
+			return 0;
+		}
 		snprintf(ctx->err, sizeof(ctx->err), "cannot read backend diagnostics: %s", strerror(errno));
 		return -1;
 	}
-	b->present = true;
 	while (fgets(line, sizeof(line), f)) {
-		char key[64]; char sval[64]; long v;
-		/* The per-flow dump follows the header; stop at it. */
-		if (!strncmp(line, "flow ", 5))
-			break;
-		if (sscanf(line, "%63s %63s", key, sval) != 2)
+		char key[64];
+		long value;
+
+		if (sscanf(line, "%63[^:]: %ld", key, &value) != 2)
 			continue;
-		v = strtol(sval, NULL, 0);
-		if      (!strcmp(key, "bindings"))       { b->bindings = v; seen |= 1; }
-		else if (!strcmp(key, "entries"))        { b->entries = v; optional |= 1; }
-		else if (!strcmp(key, "handle_refs"))    { b->handle_refs = v; seen |= 2; }
-		else if (!strcmp(key, "neighbour_refs")) { b->neighbour_refs = v; seen |= 4; }
-		else if (!strcmp(key, "quarantine"))     { b->quarantine = v; seen |= 8; }
-		else if (!strcmp(key, "fatal"))          { b->fatal = v; seen |= 16; }
-		else if (!strcmp(key, "bypassed"))       { b->bypassed = v; optional |= 512; }
-		else if (!strcmp(key, "restarts"))       { b->restarts = v; optional |= 2; }
-		else if (!strcmp(key, "resume_failures")) { b->resume_failures = v; optional |= 4; }
-		else if (!strcmp(key, "observe"))        { b->observe = v; seen |= 32; }
-		else if (!strcmp(key, "invalidated"))    { b->invalidated = v; seen |= 64; }
-		else if (!strcmp(key, "installs"))       { b->installs = v; optional |= 8; }
-		else if (!strcmp(key, "deletes"))        { b->deletes = v; optional |= 16; }
-		else if (!strcmp(key, "rearms"))         { b->rearms = v; optional |= 32; }
-		else if (!strcmp(key, "errors"))         { b->errors = v; optional |= 64; }
-		else if (!strcmp(key, "qos_mark_mask"))  { b->qos_mark_mask = (uint32_t)strtoul(sval, NULL, 0); optional |= 128; }
-		else if (!strcmp(key, "route_mark_mask")) { b->route_mark_mask = (uint32_t)strtoul(sval, NULL, 0); optional |= 256; }
-		else if (!strcmp(key, "mcast_enabled"))    { b->mcast_enabled = v; seen |= 128; }
-		else if (!strcmp(key, "mcast_installed"))  { b->mcast_installed = v; seen |= 256; }
-		else if (!strcmp(key, "mroute_installed")) { b->mroute_installed = v; seen |= 512; }
-		/* Once every key read here is in, stop: the rows after the
-		 * counters are each buffer a hold of the datapath's transaction
-		 * of its own, and thousands of bridged pairs made the health
-		 * probe take it hundreds of times (A312). An adapter that prints
-		 * a key fewer is read to the end, as before. */
-		if (seen == 1023 && optional == 1023)
-			break;
+		for (size_t i = 0; i < n; i++)
+			if (!strcmp(key, keys[i].name)) {
+				*keys[i].value = value;
+				found |= 1UL << i;
+			}
 	}
-	int error = ferror(f);
+	error = ferror(f);
 	fclose(f);
-	if (error || seen != 1023) {
+	if (error || found != (1UL << n) - 1) {
 		snprintf(ctx->err, sizeof(ctx->err), "incomplete backend diagnostics");
 		return -1;
 	}
+	return 0;
+}
+
+/* A module parameter: Y or N for a bool, a number otherwise. A parameter that
+ * is not there is its module not being loaded, as above. */
+static int ft_parameter_read(struct ft_ctx *ctx, const char *path, long *value, bool *present)
+{
+	FILE *f = fopen(path, "r");
+	char text[32], *end;
+	bool ok;
+
+	if (!f) {
+		if (errno == ENOENT) {
+			*present = false;
+			return 0;
+		}
+		snprintf(ctx->err, sizeof(ctx->err), "cannot read %s: %s", path, strerror(errno));
+		return -1;
+	}
+	ok = fgets(text, sizeof(text), f) != NULL;
+	fclose(f);
+	if (ok && (text[0] == 'Y' || text[0] == 'N') && (text[1] == '\n' || !text[1])) {
+		*value = text[0] == 'Y';
+	} else if (ok) {
+		errno = 0;
+		*value = strtol(text, &end, 0);
+		ok = end != text && (*end == '\n' || !*end) && !errno;
+	}
+	if (!ok) {
+		snprintf(ctx->err, sizeof(ctx->err), "unreadable module parameter %s", path);
+		return -1;
+	}
+	return 0;
+}
+
+int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
+{
+	const struct ft_key status[] = {
+		{ "bindings", &b->bindings }, { "entries", &b->entries },
+		{ "handle_refs", &b->handle_refs }, { "neighbour_refs", &b->neighbour_refs },
+		{ "quarantine", &b->quarantine }, { "fatal", &b->fatal },
+		{ "invalidated", &b->invalidated }, { "bypassed", &b->bypassed },
+		{ "restarts", &b->restarts }, { "resume_failures", &b->resume_failures },
+		{ "mcast_installed", &b->mcast_installed },
+		{ "mroute_installed", &b->mroute_installed },
+	};
+	const struct ft_key stats[] = {
+		{ "installs", &b->installs }, { "deletes", &b->deletes },
+		{ "rearms", &b->rearms }, { "errors", &b->errors },
+	};
+	long qos_mark_mask = 0, route_mark_mask = 0;
+	bool present = true;
+
+	memset(b, 0, sizeof(*b));
+	/* status first: it is the one read under CDX's transaction, and the
+	 * one whose absence says the adapter is not loaded. */
+	if (ft_keys_read(ctx, FT_STATUS, status, sizeof(status) / sizeof(status[0]), &present) ||
+	    (present && ft_keys_read(ctx, FT_STATS, stats, sizeof(stats) / sizeof(stats[0]), &present)) ||
+	    (present && ft_parameter_read(ctx, FT_CDX_MODULE "/parameters/flowtable_observe",
+					  &b->observe, &present)) ||
+	    (present && ft_parameter_read(ctx, FT_MULTICAST, &b->mcast_enabled, &present)) ||
+	    (present && ft_parameter_read(ctx, FT_QOS_MARK_MASK, &qos_mark_mask, &present)) ||
+	    (present && ft_parameter_read(ctx, FT_ROUTE_MARK_MASK, &route_mark_mask, &present)))
+		return -1;
+	if (!present) {
+		memset(b, 0, sizeof(*b));
+		return 0;   /* adapter not loaded */
+	}
+	b->present = true;
+	b->qos_mark_mask = (uint32_t)qos_mark_mask;
+	b->route_mark_mask = (uint32_t)route_mark_mask;
 	return 0;
 }
 

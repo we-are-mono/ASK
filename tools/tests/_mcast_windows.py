@@ -15,8 +15,8 @@ cases here rather than in each of them:
     lands on the default route's device. Hosts join through the index-based
     MCAST_* calls instead (_multicast_member.py).
   - `ip -s mroute` lags the hardware by up to one fold interval. Every read of
-    the kernel's counters here follows a read of /proc/cdx_flowtable, which is
-    itself a fold.
+    the kernel's counters here follows a read of /proc/ask_flowtable/mroute,
+    which is itself a fold.
   - Streams are injected on the orchestrator's physical port, so its own
     bridge's snooping cannot decide whether they reach the DUT at all.
 """

@@ -48,7 +48,7 @@ inverse of the opposite conntrack tuple.
 The private backend rule carries complete match and translated tuples. The
 classifier key uses the match; the existing encoder's synthetic twin describes
 the inverse translated tuple. Neither this twin nor the route joins legacy CMM
-tables, timers or notification paths. `/proc/cdx_flowtable` exposes `src`, `dst`,
+tables, timers or notification paths. `/proc/ask_flowtable/flows` exposes `src`, `dst`,
 `new_src` and `new_dst`, including their ports.
 
 Neighbour lookup uses the translated destination. Route-prefix retirement

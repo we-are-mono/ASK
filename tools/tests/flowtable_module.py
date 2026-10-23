@@ -30,7 +30,7 @@ async def test_lifecycle(connections):
         provider = (await read(r.target, r.session, "/sys/module/cdx/refcnt")).strip()
 
         async def absent():
-            for path in ("/sys/module/ask_flowtable", "/proc/cdx_flowtable",
+            for path in ("/sys/module/ask_flowtable", "/proc/ask_flowtable",
                          "/sys/module/cdx/holders/ask_flowtable"):
                 assert (await console_command(con, "test", "-e", path, check=False))["rc"] == 1, path
             assert (await read(r.target, r.session, "/sys/module/cdx/refcnt")).strip() == provider

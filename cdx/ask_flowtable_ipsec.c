@@ -1928,11 +1928,11 @@ static void ft_ipsec_publish(struct xfrm_state *x,
  * stay at zero for an offloaded SA, because no per-SA count of them exists.
  * What the folded counters gain is exactly what the microcode sorted into
  * those classes, no more reliable than its sorting; the nearest to a count of
- * every refusal is the total in /proc/cdx_flowtable, which carries every
+ * every refusal is the total in /proc/ask_flowtable/stats, which carries every
  * class. The classes that are no doing of the traffic's -- SEC's own faults,
  * and resources it ran out of -- are said out loud as well. Without
  * CONFIG_XFRM_STATISTICS the fold into xfrm compiles to nothing, and
- * /proc/cdx_flowtable is where the counts are.
+ * /proc/ask_flowtable/stats is where the counts are.
  *
  * Differences, never a reset: the microcode updates these read-modify-write,
  * and a reset from here would race it. The reading taken at load is where
@@ -1943,7 +1943,7 @@ static void ft_ipsec_publish(struct xfrm_state *x,
  * namespace, so every SA these can have been counted for is init_net's.
  */
 static const struct {
-	/* The class's row in /proc/cdx_flowtable, after "ipsec_sec_refused_". */
+	/* The class's key in /proc/ask_flowtable/stats, after "ipsec_sec_refused_". */
 	const char *name;
 	/* The xfrm_stat counter it is folded into, or zero -- LINUX_MIB_XFRMNUM,
 	 * which counts nothing -- for none. */
@@ -3203,18 +3203,25 @@ void ft_ipsec_detach_all(void)
  * the increments a burst of back-to-back refusals loses, and then each class
  * the microcode counted them in, which is only as good as its sorting; see
  * ft_sec_refusal[]. Then the frames SEC produced that the offline port could
- * not enqueue. As of the accounting pass's last reading. Transaction held. */
-void ft_sec_refusal_rows(struct seq_file *seq)
+ * not enqueue, and Linux's own enqueues SEC's input group refused. As of the
+ * accounting pass's last reading, for /proc/ask_flowtable/stats: the pass
+ * writes each count whole under the transaction, and this reads each once,
+ * without it. */
+void ft_sec_refusal_stats(struct seq_file *seq)
 {
-	u64 total = 0;
+	char key[sizeof("ipsec_sec_refused_") + 24];
+	u64 counted[CDX_SEC_REFUSAL_CLASSES], total = 0;
 	unsigned int i;
 
-	for (i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++)
-		total += ft_sec_counted[i];
-	seq_printf(seq, "ipsec_sec_refused %llu\n", total);
-	for (i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++)
-		seq_printf(seq, "ipsec_sec_refused_%s %llu\n", ft_sec_refusal[i].name,
-			   ft_sec_counted[i]);
-	seq_printf(seq, "ipsec_offline_port_rejected %llu\n", ft_sec_rejected);
-	seq_printf(seq, "ipsec_sec_input_refused %llu\n", ft_sec_input_refused);
+	for (i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++) {
+		counted[i] = READ_ONCE(ft_sec_counted[i]);
+		total += counted[i];
+	}
+	ft_kv(seq, "ipsec_sec_refused", total);
+	for (i = 0; i < CDX_SEC_REFUSAL_CLASSES; i++) {
+		snprintf(key, sizeof(key), "ipsec_sec_refused_%s", ft_sec_refusal[i].name);
+		ft_kv(seq, key, counted[i]);
+	}
+	ft_kv(seq, "ipsec_offline_port_rejected", READ_ONCE(ft_sec_rejected));
+	ft_kv(seq, "ipsec_sec_input_refused", READ_ONCE(ft_sec_input_refused));
 }

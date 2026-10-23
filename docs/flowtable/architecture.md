@@ -34,7 +34,7 @@ CMM or per-flow FCI commands. CDX builds the classifier during
 | Bridged multicast learner | [ask_flowtable_mc.c](../../cdx/ask_flowtable_mc.c), [ask_flowtable_mc_hook.c](../../cdx/ask_flowtable_mc_hook.c) |
 | Routed multicast learner | [ask_flowtable_mr.c](../../cdx/ask_flowtable_mr.c), [ask_flowtable_mr_probe.c](../../cdx/ask_flowtable_mr_probe.c) |
 | Wi-Fi VAPs | [ask_flowtable_wifi.c](../../cdx/ask_flowtable_wifi.c) |
-| QoS classification, `/proc/cdx_flowtable`, module init and exit | [ask_flowtable_main.c](../../cdx/ask_flowtable_main.c) |
+| QoS classification, `/proc/ask_flowtable/` ([procfs](procfs.md)), module init and exit | [ask_flowtable_main.c](../../cdx/ask_flowtable_main.c) |
 | Private source interface | [cdx_flowtable_backend.h](../../cdx/cdx_flowtable_backend.h) |
 | Transactions, claim, port checks and fatal guard | [cdx_flowtable_backend.c](../../cdx/cdx_flowtable_backend.c) |
 | Independent directional encoding and retirement storage | [cdx_flowtable_hw.c](../../cdx/cdx_flowtable_hw.c) |
@@ -220,7 +220,7 @@ insert, the enqueue to the egress port, fragmenting included. The ingress
 policer and the Ethernet receive counters are the receive entry's; everything
 else, the session and tag counters with it, is the offline entry's, and the
 direction's packet and byte counts are the receive entry's, as it arrived.
-`/proc/cdx_flowtable` marks such a direction `detour=1`.
+`/proc/ask_flowtable/flows` marks such a direction `detour=1`.
 
 DF is the receive entry's: it carries the path's MTU with `PREEMPT_DFBIT_HONOR`,
 so a DF packet the path cannot carry goes to Linux from the port it arrived by,
@@ -247,7 +247,7 @@ port forwards -- some 530k 1500-byte packets a second on the DK, fragmented,
 6.4 Gbit/s -- loses the excess at the queue into the port; QMan discards an FMan enqueue it rejects and the buffers go back to their
 pool, so the ingress port's pool is never held. The detour's only cost is that
 throughput bound, well above any PPPoE uplink. A board without the port, an
-older device tree, comes up without the detour (`detour 0`) and keeps these
+older device tree, comes up without the detour (`detour: 0`) and keeps these
 directions in software as before, and so does cdx's `detour` parameter set to
 0 at runtime, for what is admitted from then on. The detour takes no tunnel, whose outer
 packet the fragmenter would cut, no SA, exempt already, no IPv6, which a
@@ -585,7 +585,7 @@ owed before they ask the backend, as do recovery and a claim. A failed settle
 counts as one failed deletion: its owed entries become ordinary unproven
 retirements, and global recovery takes over. Displaced cumulative nodes
 go back to their own table's spare, whichever table the barrier went through.
-`/proc/cdx_flowtable` reports owed unlinks as `owed`, separately from
+`/proc/ask_flowtable/status` reports owed unlinks as `owed`, separately from
 `quarantine`.
 
 The multicast learners retire groups the same way, 16 to a hold
@@ -595,11 +595,12 @@ about 18 ms on the KASAN image, and a family's 512 retired in one hold kept
 the transaction go until nobody waiting for it is left, up to 100 ms
 (`cdx_ft_let_waiters()`): a released mutex wakes one waiter while the releasing
 job takes it back, so batches alone let one waiter through each. And
-/proc/cdx_flowtable sizes its buffer for the header when it is opened, so the
-header renders in one hold rather than once more at every doubling of seq_file's
-buffer. The health probe reads it only as far as the counters: each buffer of
-the rows after them would be a hold of its own. That read still waits its turn
-behind every caller queued for the transaction, and under a route-flap storm
+/proc/ask_flowtable/mcast and mroute size their buffers for the whole record
+when they are opened, so a record renders in one hold rather than once more at
+every doubling of seq_file's buffer. The health probe reads
+/proc/ask_flowtable/status and stats, which hold no rows: status is one short
+hold of the transaction, and stats takes none. The status read still waits its
+turn behind every caller queued for the transaction, and under a route-flap storm
 with traffic in software -- hundreds of Linux's offers and counter reads ahead
 of it, each holder on a CPU the softirq fills running at a few percent of it --
 the turn came after the probe's 5 s deadline while every holder let the
@@ -650,8 +651,8 @@ classifier while disabled, and they start again as a resume would start them
 (an Rx port only if its netdev, in whatever namespace, is still up), with the
 fence off: a netdev opening its port meanwhile opens it as usual, past the
 classifier like the rest. The kernel log says `classifier bypassed after
-unproven deletion` once an episode, and `/proc/cdx_flowtable` reports
-`bypassed 1`. A port still busy is asked again a quarter second apart, the
+unproven deletion` once an episode, and `/proc/ask_flowtable/status` reports
+`bypassed: 1`. A port still busy is asked again a quarter second apart, the
 ports stopped meanwhile, for as long as the hardware's own answers take when it
 is well -- twelve tries, a few seconds; then every port is bypassed anyway. Its
 frame may still walk the tables, so nothing it let go of is freed until a later
@@ -696,8 +697,8 @@ software, asked again later. The adapter is then told: both multicast learners
 reconsider their groups, every SA has its peer resolved again, and a parked
 binding rearms. Live entries are never touched. The kernel log records
 `datapath restarted after unproven deletion` with what it settled, how long
-the ports were stopped and how long bypassed, and `/proc/cdx_flowtable` counts
-`restarts`. A port the restart cannot start again is named in the log and
+the ports were stopped and how long bypassed, and `/proc/ask_flowtable/status`
+counts `restarts`. A port the restart cannot start again is named in the log and
 counted in `resume_failures`; the latch stays clear, since the tables are
 settled. A receive port starts again with its netdev; an offline port, which
 has none, only when CDX is reloaded or the board reboots.
@@ -737,13 +738,15 @@ removal or release references while hardware still uses the device.
 
 ## Statistics, diagnostics and verification
 
-`/proc/cdx_flowtable` streams its header and flow rows through `seq_file`, so
-reading policy status does not require rendering the entire table. Paged
-iteration resumes by hash bucket and offset, without retaining an entry pointer
-between transactions or rescanning all preceding entries. Policy
-commands stop reading at the first flow row. Each iterator invocation holds the
-backend transaction; separate reads of a changing table are not an atomic
-snapshot. Diagnostics consumers must allow for several megabytes at capacity.
+`/proc/ask_flowtable/` ([procfs](procfs.md)) keeps the scalars apart from the
+rows, so reading policy status does not require rendering the entire table:
+the controller and its health probe read `/proc/ask_flowtable/status` and
+`stats`, which hold no rows. A full dump is `/proc/ask_flowtable/flows`,
+streamed through `seq_file`. Paged iteration resumes by hash bucket and offset,
+without retaining an entry pointer between transactions or rescanning all
+preceding entries. Each iterator invocation holds the backend transaction;
+separate reads of a changing table are not an atomic snapshot. Diagnostics
+consumers must allow for several megabytes at capacity.
 
 Hardware packet/byte counters are monotonic 64-bit classifier-hit totals. Bytes
 include Ethernet headers and minimum padding but exclude FCS: a 256-byte UDP
@@ -822,7 +825,7 @@ transaction can hold up to the admission budget's worth of dead conntracks
 until the retirement worker's batches reach them. A deletion's reply
 carries nothing. The fold honours the counter mode the table had at
 Netfilter's last command about the flow, which is what lets it outlive the
-table. `/proc/cdx_flowtable` counts the non-empty last deltas as `finals`.
+table. `/proc/ask_flowtable/stats` counts the non-empty last deltas as `finals`.
 
 Reply packets in a last delta mark the conntrack replied whatever the counter
 mode, as they do in a statistics read and as every reply the software fast path
@@ -886,11 +889,11 @@ This was previously resolved the other way: counter-enabled tables were refused
 outright and enabling counters on a live table invalidated it. That refused
 every flow under the configuration consumers actually ship — OpenWrt's firewall
 renders `counter` on every flowtable unconditionally — to avoid a per-frame
-constant that is arithmetic rather than unknowable. `/proc/cdx_flowtable`
+constant that is arithmetic rather than unknowable. `/proc/ask_flowtable/flows`
 continues to expose the raw hardware counters, so diagnostics still see what
 the classifier saw.
 
-`/proc/cdx_flowtable` exposes entries, tuple rewrites, raw counters, references,
+`/proc/ask_flowtable/` exposes entries, tuple rewrites, raw counters, references,
 invalidation causes, quarantine and recovery state. Preserve it before unload
 when per-instance diagnostics matter. The test build's one-shot add fault stages
 are 1 before allocation, 2 before hardware, 3 after hardware with rollback, and

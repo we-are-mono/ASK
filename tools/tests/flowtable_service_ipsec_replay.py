@@ -81,7 +81,7 @@ async def test_window(ipsec_service):
     CPU, and the two share one window. Every datagram is delivered to the LAN
     end exactly as often as its window allows, and every frame the window
     refuses is counted: once in the FMan microcode's refusal total, which
-    /proc/cdx_flowtable carries, and once across the /proc/net/xfrm_stat
+    /proc/ask_flowtable/stats carries, and once across the /proc/net/xfrm_stat
     counters the adapter folds the microcode's non-fault classes into, which
     is where the microcode files replays and late frames. Per SA it is counted
     nowhere; SEC keeps no such count."""
@@ -132,7 +132,7 @@ async def test_window(ipsec_service):
         # and not the ones its window refused: a replay must not age an SA.
         assert {spi: figures[spi]["packets"] for spi in accepted} == dict(accepted), (figures, accepted)
         # Every frame SEC refused, through either feeder, is counted once:
-        # by the microcode, whose total /proc/cdx_flowtable carries, and
+        # by the microcode, whose total /proc/ask_flowtable/stats carries, and
         # across the xfrm_stat counters, since the microcode files replays
         # and late frames in a class that is folded there (measured: its
         # catch-all, other_errs, never a fault class).

@@ -293,9 +293,10 @@ bytes to both, by the same reasoning the VLAN and session records follow. The
 record is one per device and serves both directions, so each half's framing is
 named from the side that feeds it, and where the two sides' under-tunnel stacks
 differ the first direction admitted publishes, exactly as a session's record
-does. `/proc/cdx_flowtable` carries `tunnel_records`/`tunnel_slots` in the
-header and one `tunnel` row per device, keyed on the same `dev/mode:local>remote`
-string the flow rows carry in `in_tnl=`/`out_tnl=`, so the two can be joined.
+does. `/proc/ask_flowtable/status` carries `tunnel_records`/`tunnel_slots`,
+and `/proc/ask_flowtable/devices` one `tunnel` row per device, keyed on the
+same `dev/mode:local>remote` string the flow rows carry in
+`in_tnl=`/`out_tnl=`, so the two can be joined.
 
 ## Eligibility
 

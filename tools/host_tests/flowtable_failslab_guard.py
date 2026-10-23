@@ -26,7 +26,9 @@ def knobs(tmp_path):
     symbols.write_text("1000 t ft_replace [ask_flowtable]\n2000 t next [ask_flowtable]\n"
                        "3000 t handle_softirqs\n4000 t after\n")
     backend, kmsg = tmp_path / "backend", tmp_path / "kmsg"
-    backend.write_text("entries 0\n")
+    backend.mkdir()
+    (backend / "status").write_text(f"{'entries:':<36}{0:>12}\n")
+    (backend / "stats").write_text(f"{'errors:':<36}{0:>12}\n")
     kmsg.touch()
     return {"debugfs": debugfs, "kallsyms": symbols, "backend": backend,
             "lock_path": tmp_path / "lock", "kmsg": kmsg}

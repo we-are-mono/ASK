@@ -18,7 +18,7 @@ from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 CONFIG = "/tmp/ask-flowtable-test.conf"
 
 # The offload engine is the C ask-flowtable daemon; the hardware-drain fields it
-# reports match the adapter's /proc header (see flowtable/src, cdx_flowtable).
+# reports match the adapter's /proc/ask_flowtable/status (see flowtable/src).
 DRAIN_FIELDS = ("bindings", "entries", "handle_refs", "neighbour_refs", "quarantine")
 
 

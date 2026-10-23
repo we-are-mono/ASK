@@ -935,7 +935,7 @@ async def test_cdx_unload(rig):
                               "nud", "permanent", "dev", dev)
     absent = await console_command(con, "test", "-e", "/sys/module/cdx", check=False)
     assert absent["rc"] == 1, absent
-    assert (await console_command(con, "test", "-e", "/proc/cdx_flowtable", check=False))["rc"] == 1
+    assert (await console_command(con, "test", "-e", "/proc/ask_flowtable", check=False))["rc"] == 1
     await console_command(con, "nft", "delete", "table", "inet", TABLE, check=False)
     await r.clear_ct()
     await r.exchange(64)

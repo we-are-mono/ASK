@@ -14,7 +14,7 @@
 struct cdx_ft_rule;
 struct cdx_detour_flow;
 
-/* For /proc/cdx_flowtable: the directions recorded, and what the offline port
+/* For /proc/ask_flowtable: the directions recorded, and what the offline port
  * handed back -- given to Linux, with no direction to give it to, not copied,
  * or on the port's error queue. */
 struct cdx_detour_counters {

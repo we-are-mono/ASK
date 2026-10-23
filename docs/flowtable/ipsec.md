@@ -533,7 +533,7 @@ installs nothing. Before, the SA was installed anyway with a key SEC never
 wrote, and every frame it authenticated failed (A226). The install waits for
 the job without a bound, as the kernel's own `gen_split_key()` does, because a
 job the ring accepted always completes and reads and writes memory that has to
-outlive it. `ipsec_sas` and `ipsec_sa_cache` in `/proc/cdx_flowtable` count the
+outlive it. `ipsec_sas` and `ipsec_sa_cache` in `/proc/ask_flowtable/status` count the
 SAs the adapter installed and the SAs cdx's cache holds, which is how a refused
 install is seen to leave nothing behind. On the test image
 (`CDX_DEBUG_SPLIT_KEY_FAIL`), `/proc/cdx_split_key_fail` halts the next N
@@ -930,7 +930,7 @@ finds no number left. An inbound overflow needs a peer sending past its own
 sequence space, which RFC 4303 forbids a sender to do and Linux's own output
 refuses.
 
-Only `ipsec_sec_refused` in `/proc/cdx_flowtable` counts every kind of
+Only `ipsec_sec_refused` in `/proc/ask_flowtable/stats` counts every kind of
 refusal, short only by what a dense burst loses. What the four xfrm counters
 gain is exactly what the microcode sorted into the classes folded there. That
 leaves out TTL and the 14 fault classes, and it is only as good as the
@@ -941,7 +941,7 @@ missed, and a replay is counted as
 The xfrm counters need `CONFIG_XFRM_STATISTICS`. Only the meta-ask test image
 enables it (`ask.cfg`). The Armbian and OpenWrt kernels leave it off. On those
 kernels the fold into xfrm compiles to nothing and `/proc/net/xfrm_stat` does
-not exist, so `/proc/cdx_flowtable` is where the counts appear.
+not exist, so `/proc/ask_flowtable/stats` is where the counts appear.
 
 The adapter's reading at load is the baseline, so nothing SEC refused before
 the adapter existed is put down to it. The pass runs only while an SA is
@@ -961,7 +961,7 @@ of them moves, one ratelimited line reports it:
 ask_flowtable: 256 IPsec frames dropped, SEC could not process them: buffer_depletion=256
 ```
 
-`/proc/cdx_flowtable` carries every class, counted since the adapter loaded
+`/proc/ask_flowtable/stats` carries every class, counted since the adapter loaded
 and as of the pass's last reading. `ipsec_sec_refused` is the total, short only
 by the increments a dense burst loses (above), and `ipsec_sec_refused_<class>`
 gives each class under the names in `ft_sec_refusal[]`. Beside them,
@@ -1290,7 +1290,7 @@ its own reference first and gives it back on the paths that consume nothing.
 A direction names its SA by handle, and handles are reused once their SA is
 deleted, so the flows have to be retired before the hardware is. They are, from
 the same callback that queues the retirement, and `ipsec_invalidations` in
-`/proc/cdx_flowtable` counts them alongside the other causes. Retiring rather
+`/proc/ask_flowtable/stats` counts them alongside the other causes. Retiring rather
 than rewriting matches every other dependency here: Linux stops using its
 cached lookup at once and the flow is readmitted from scratch on the next
 packet.
@@ -1487,7 +1487,7 @@ BMI WRED-discard counter (`fmbm_ofwdc` in its `fm_port_bmi_regs`), not in its
 filter count, and so does every other group it enqueues to (below). The
 accounting pass reads it (`dpa_cfg_port_rejected()`, through
 `FM_PORT_GetCounter()`, which patch 010 exports) and folds it into
-`/proc/cdx_flowtable` as `ipsec_offline_port_rejected` (A336). And
+`/proc/ask_flowtable/stats` as `ipsec_offline_port_rejected` (A336). And
 `ipsec_exception_pkt_handler()` copies a contiguous frame into
 an skb of its own size and gives the buffer straight back
 (`ipsec_copy_contig_fd()`); only a scatter/gather frame, which SEC does not
@@ -1599,7 +1599,7 @@ gone. A port's enqueue the group refuses is dropped by FMan and counted as a
 receive drop of
 that port (statistics.md); a frame Linux hands a packet-offloaded SA's SEC
 itself, outbound or inbound, comes back as a refused enqueue, is given back,
-and counts in `ipsec_sec_input_refused` in `/proc/cdx_flowtable` without the
+and counts in `ipsec_sec_input_refused` in `/proc/ask_flowtable/stats` without the
 warning a wedged queue still gets -- having already been counted by the driver
 as given to SEC. One group for all SAs, as for a port's flows: an SA
 holding it at the bound has the others' frames refused too. The same flood now
@@ -1911,7 +1911,7 @@ encrypted in hardware into a frame the hop drops; the sender hears nothing for
 it, and the next one after the pass is answered. That second is the residual,
 the price of sampling what no event reports (A231).
 
-`ipsec_next_hop_updates` in `/proc/cdx_flowtable` counts the rebuilds, beside
+`ipsec_next_hop_updates` in `/proc/ask_flowtable/stats` counts the rebuilds, beside
 the invalidation counters.
 
 #### Proved on hardware, 2026-09-18
