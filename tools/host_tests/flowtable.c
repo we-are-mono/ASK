@@ -3449,24 +3449,32 @@ static void test_bridge_fdb(void)
 #undef FDB_DRAIN
 
     /* Per-port VLAN membership decides whether a frame leaves tagged, and
-     * reconfiguring it emits no netdev event, so the coarse invalidation is
-     * the only thing that notices. It must never claim the object: a handled
-     * port-VLAN object makes the bridge skip vlan_vid_add() and filter the
-     * VLAN out of the port entirely. */
+     * reconfiguring it emits no netdev event, so this is the only thing that
+     * notices: every flow through the port is retired and its software flows
+     * are swept, the bindings and admission left up. It must never claim the
+     * object: a handled port-VLAN object makes the bridge skip vlan_vid_add()
+     * and filter the VLAN out of the port entirely. */
     struct switchdev_obj vlan_obj = { .id = SWITCHDEV_OBJ_ID_PORT_VLAN };
     struct switchdev_obj mdb_obj = { .id = SWITCHDEV_OBJ_ID_PORT_MDB };
     struct switchdev_notifier_port_obj_info obj = { .info.dev = &out, .obj = &vlan_obj };
+    const unsigned long vlan_events[] = { SWITCHDEV_PORT_OBJ_ADD, SWITCHDEV_PORT_OBJ_DEL };
 
     bridge_out_fixture();
     assert(ft_replace(&binding, &cls) == 0);
     assert(!atomic_read(&ft_invalid));
     unsigned vlan_changes = mc_bridge_changes;
-    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &obj) == NOTIFY_DONE);
-    assert(atomic_read(&ft_invalid) && !obj.handled);
-    atomic_set(&ft_invalid, 0);
-    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_DEL, &obj) == NOTIFY_DONE);
-    assert(atomic_read(&ft_invalid) && !obj.handled);
-    atomic_set(&ft_invalid, 0);
+    for (unsigned i = 0; i < ARRAY_SIZE(vlan_events); i++) {
+        u64 links = ft_link_invalidations;
+        unsigned sweeps = stopped_scheduled;
+        assert(ft_swdev_event(NULL, vlan_events[i], &obj) == NOTIFY_DONE);
+        assert(!atomic_read(&ft_invalid) && !obj.handled);
+        assert(handle.invalid && ft_link_invalidations == links + 1);
+        assert(stopped_scheduled == sweeps + 1);
+        nswept = swept_under_rtnl = 0;
+        ft_stopped_workfn(NULL);
+        assert(nswept == 1 && swept_under_rtnl == 1 && swept[0] == &out);
+        handle.invalid = false;
+    }
     /* The bridged multicast learner holds the same VLAN decisions for its
      * flows' copies and ingress, and hears both. */
     assert(mc_bridge_changes == vlan_changes + 2);
@@ -3476,8 +3484,10 @@ static void test_bridge_fdb(void)
      * through would retire every flow whenever any device anywhere was
      * enslaved to anything. */
     obj.info.dev = &upper;
+    unsigned unrelated_sweeps = stopped_scheduled;
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &obj) == NOTIFY_DONE);
-    assert(!atomic_read(&ft_invalid) && !obj.handled);
+    assert(!atomic_read(&ft_invalid) && !obj.handled && !handle.invalid);
+    assert(stopped_scheduled == unrelated_sweeps);
     obj.info.dev = &out;
     /* An MDB object goes to the multicast learner and must not reach the VLAN
      * arm: it is a membership to install rather than a dependency that
@@ -3504,28 +3514,38 @@ static void test_bridge_fdb(void)
      * the other two inputs to the derivation, and both arrive as attributes
      * against the bridge rather than as objects against a port. Neither emits
      * a netdev event, so dropping them would leave the hardware pushing a tag
-     * software had stopped pushing. */
+     * software had stopped pushing. Each retires every flow through the
+     * bridge and sweeps its ports -- this harness gives it one, decoy. */
     struct switchdev_attr filtering = { .id = SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING };
     struct switchdev_attr protocol = { .id = SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL };
     struct switchdev_attr ageing = { .id = SWITCHDEV_ATTR_ID_BRIDGE_AGEING_TIME };
     struct switchdev_notifier_port_attr_info set = { .info.dev = &br, .attr = &filtering };
+    struct switchdev_attr *bridge_vlan[] = { &filtering, &protocol };
 
-    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
-    assert(atomic_read(&ft_invalid) && !set.handled);
-    atomic_set(&ft_invalid, 0);
-    set.attr = &protocol;
-    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
-    assert(atomic_read(&ft_invalid) && !set.handled);
-    atomic_set(&ft_invalid, 0);
+    for (unsigned i = 0; i < ARRAY_SIZE(bridge_vlan); i++) {
+        u64 links = ft_link_invalidations;
+        unsigned sweeps = stopped_scheduled;
+        set.attr = bridge_vlan[i];
+        assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+        assert(!atomic_read(&ft_invalid) && !set.handled);
+        assert(handle.invalid && ft_link_invalidations == links + 1);
+        assert(stopped_scheduled == sweeps + 1);
+        nswept = swept_under_rtnl = 0;
+        ft_stopped_workfn(NULL);
+        assert(nswept == 1 && swept_under_rtnl == 1 && swept[0] == &decoy);
+        handle.invalid = false;
+    }
     /* Another attribute of the same bridge changes nothing this derivation
      * reads, and neither does either attribute on an unrelated bridge. */
+    unsigned bridge_sweeps = stopped_scheduled;
     set.attr = &ageing;
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
-    assert(!atomic_read(&ft_invalid) && !set.handled);
+    assert(!atomic_read(&ft_invalid) && !set.handled && !handle.invalid);
     set.attr = &filtering;
     set.info.dev = &upper;
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
-    assert(!atomic_read(&ft_invalid) && !set.handled);
+    assert(!atomic_read(&ft_invalid) && !set.handled && !handle.invalid);
+    assert(stopped_scheduled == bridge_sweeps);
     /* Multicast router, snooping and forwarding changes -- the bridge's own
      * router state among them -- refresh routed groups and ask the bridge
      * about every bridged flow again, without claiming the attribute or
@@ -4518,6 +4538,7 @@ static void ip6tnl_in_fixture(void)
 /* Declared with the device dependencies it belongs to; used here because a
  * tunnel device's events are the whole of its lifecycle. */
 static void device_event(struct net_device *dev, unsigned long event, bool invalid);
+static void upper_event(struct net_device *dev, unsigned devices);
 
 static void test_tunnel(void)
 {
@@ -7242,8 +7263,9 @@ static void test_crossed_devices(void)
     drop_dev_records();
     /* A device one flow crosses and another names is named: eth3.100 under
      * one flow's eth3.100.300 and another's own logical device. An upper
-     * change on it may change what that flow carries, and stops admission;
-     * its unregistration only retires the two flows. */
+     * change on it retires both flows and sweeps it, and the port at the
+     * bottom of it, where the forward-path walk ends; its unregistration
+     * retires them too and sweeps nothing. Neither stops admission. */
     vlan_fixture(); cls.command = FLOW_CLS_REPLACE;
     route.dst.dev = &out_qinq;
     neighbour.dev = &out_qinq;
@@ -7256,8 +7278,11 @@ static void test_crossed_devices(void)
     rule.action.num_entries = 6;
     assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && ft_count == 2);
     assert(out_tag.refs == 2 && ft_device_role(&out_tag) == FT_DEV_NAMED);
-    device_event(&out_tag, NETDEV_CHANGEUPPER, true);
-    assert(!handle.invalid);
+    links = ft_link_invalidations;
+    upper_event(&out_tag, 2);
+    assert(swept[1] == &out && handle.invalid && ft_link_invalidations == links + 1);
+    assert(out_tag.refs == 2);
+    handle.invalid = false;
     links = ft_link_invalidations;
     device_event(&out_tag, NETDEV_UNREGISTER, false);
     assert(handle.invalid && ft_link_invalidations == links + 1);
@@ -7950,6 +7975,24 @@ static void device_event(struct net_device *dev, unsigned long event, bool inval
     assert(ft_invalid == invalid && !cdx_info->ctrl.mutex && !ft_watch_lock);
 }
 
+/* An upper change on a device a binding or a flow uses retires the flows
+ * using it and queues a sweep of its software flows, which then cleans
+ * `devices` devices under RTNL, this one first; it never stops admission.
+ * One nothing here uses changes nothing. */
+static void upper_event(struct net_device *dev, unsigned devices)
+{
+    struct netdev_notifier_changeupper_info info = { .info.dev = dev };
+    unsigned sweeps = stopped_scheduled;
+    ft_invalid = 0;
+    assert(ft_netdev_event(NULL, NETDEV_CHANGEUPPER, &info) == NOTIFY_DONE);
+    assert(!ft_invalid && !cdx_info->ctrl.mutex && !ft_watch_lock);
+    assert(stopped_scheduled == sweeps + !!devices);
+    nswept = swept_under_rtnl = 0;
+    ft_stopped_workfn(NULL);
+    assert(nswept == devices && swept_under_rtnl == devices);
+    assert(!devices || swept[0] == dev);
+}
+
 static void test_device_dependencies(void)
 {
     struct net other_net;
@@ -7980,33 +8023,46 @@ static void test_device_dependencies(void)
         assert(!ft_invalid);
     }
     assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
-    for (unsigned i = 0; i < ARRAY_SIZE(events); i++) {
-        device_event(&in, events[i], true); /* Empty binding still matters. */
-        device_event(&out, events[i], false);
-        device_event(&unrelated, events[i], false);
-    }
+    /* Unregistering a bound port stops admission, an empty binding's too. An
+     * upper change on one -- joining a bridge, a VLAN device made on it --
+     * sweeps its software flows instead and stops nothing. */
+    device_event(&in, NETDEV_UNREGISTER, true);
+    device_event(&out, NETDEV_UNREGISTER, false);
+    device_event(&unrelated, NETDEV_UNREGISTER, false);
+    upper_event(&in, 1);
+    upper_event(&out, 0);
+    upper_event(&unrelated, 0);
     in.net = &other_net;
-    device_event(&in, NETDEV_CHANGEUPPER, false);
+    upper_event(&in, 0);
     in.net = NULL;
     device_event(&in, NETDEV_REGISTER, false);
     struct flow_block_cb *cb = flow_block_cb_lookup(&block, ft_rule_callback, &in);
     assert(cb && ft_replace(cb->cb_priv, &cls) == 0);
     assert(ft_bound == 1 && in.refs == 1 && out.refs == 1);
-    for (unsigned i = 0; i < ARRAY_SIZE(events); i++) {
-        device_event(&out, events[i], true); /* Egress has no binding. */
-        device_event(&in, events[i], true);
-        device_event(&unrelated, events[i], false);
-    }
-    device_event(&out, NETDEV_CHANGEUPPER, true);
+    device_event(&out, NETDEV_UNREGISTER, true); /* Egress has no binding. */
+    device_event(&in, NETDEV_UNREGISTER, true);
+    device_event(&unrelated, NETDEV_UNREGISTER, false);
+    /* An upper change on either port retires the flow through it, counted as
+     * a link change, with the binding and admission left up. */
+    u64 upper_links = ft_link_invalidations;
+    upper_event(&unrelated, 0);
+    assert(!handle.invalid && ft_link_invalidations == upper_links);
+    upper_event(&out, 1);
+    assert(handle.invalid && ft_link_invalidations == upper_links + 1 && ft_bound == 1);
+    handle.invalid = false;
+    upper_event(&in, 1);
+    assert(handle.invalid && ft_link_invalidations == upper_links + 2 && ft_bound == 1);
+    device_event(&out, NETDEV_UNREGISTER, true);
     ft_invalidate_work(NULL);
     assert(ft_invalid_done && !ft_count && !ft_handle_refs && !ft_neighbour_refs && !out.refs);
     assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
     assert(!ft_bound && !in.refs && !allocated && !live_hw);
     /* No stale watch can follow the released binding into its replacement. */
     assert(bind_device(&unrelated, FLOW_BLOCK_BIND) == 0);
-    device_event(&in, NETDEV_CHANGEUPPER, false);
-    device_event(&out, NETDEV_CHANGEUPPER, false);
-    device_event(&unrelated, NETDEV_CHANGEUPPER, true);
+    upper_event(&in, 0);
+    upper_event(&out, 0);
+    upper_event(&unrelated, 1);
+    device_event(&unrelated, NETDEV_UNREGISTER, true);
     ft_invalid = 0;
     assert(bind_device(&unrelated, FLOW_BLOCK_UNBIND) == 0);
     assert(!unrelated.refs && !ft_bound && !allocated);

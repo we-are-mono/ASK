@@ -1976,10 +1976,11 @@ async def test_ipsec_sa_is_replaced(homelab, splat_window):
 async def test_bridge_vlan_change_retires(homelab, splat_window):
     """A VLAN is withdrawn from the LAN port and given back.
 
-    PORT_VLAN changes deliberately drain the shared flowtable and stop
-    admission until the policy is reapplied. The guest must stop receiving,
-    trusted traffic must survive in software, and both must return to hardware
-    after membership is restored and the controller reconciles its policy.
+    A PORT_VLAN change retires every flow through the port and sweeps its
+    software flows, leaving the table, its bindings and admission up (A418).
+    The guest must stop receiving while its VLAN is gone, trusted traffic must
+    return to hardware on its next packets, and both must be in hardware again
+    once membership is restored, with no policy reapplied.
     """
     ctx = homelab
     guest, trusted = BY_NAME["c"], BY_NAME["a"]
@@ -1992,9 +1993,11 @@ async def test_bridge_vlan_change_retires(homelab, splat_window):
                   TARGET_LAN_IF, "vid", str(VID_C))
     try:
         retired = await ctx.wait(
-            lambda s: s["invalidated"] == s["invalidation_done"] == 1
-            and not s["entries"] and not s["neighbour_refs"] and not s["handle_refs"],
+            lambda s: not s["entries"] and not s["neighbour_refs"] and not s["handle_refs"]
+            and s["link_invalidations"] > before["link_invalidations"],
             timeout=30)
+        assert retired["invalidated"] == 0 and retired["rearms"] == before["rearms"], retired
+        assert retired["bindings"] == before["bindings"], retired
         assert retired["errors"] == before["errors"], retired
         assert retired["fatal"] == retired["quarantine"] == 0, retired
         assert not retired["flows"], retired
@@ -2002,31 +2005,23 @@ async def test_bridge_vlan_change_retires(homelab, splat_window):
                                    sport=PORT_C, count=8, tolerate_loss=True,
                                    label="vlan-change-blocked")
         assert blocked == {"echoed": 0, "lost": 8}, blocked
-        software_before = await _software_rx(ctx)
-        surviving = await _exchange(ctx, trusted, peer=INTERNET, dport=PORT_A,
-                                     sport=PORT_A, count=16,
-                                     label="vlan-change-software")
-        software_after = await _software_rx(ctx)
-        assert surviving == {"echoed": 16, "lost": 0}, surviving
-        assert software_after[TARGET_LAN_IF] - software_before[TARGET_LAN_IF] >= 16
-        assert not (await ctx.state())["entries"]
-        ctx.record("home-vlan-withdrawn", {"retired": retired, "blocked": blocked,
-                                          "surviving": surviving})
+        forward, reverse = await _accounted(ctx, trusted, peer=INTERNET, dport=PORT_A,
+                                            sport=PORT_A, label="vlan-change-trusted-readmitted")
+        _assert_wan(ctx, forward, reverse, client=trusted)
+        ctx.record("home-vlan-withdrawn", {"retired": retired, "blocked": blocked})
     finally:
         await command(ctx.target, ctx.session, "bridge", "vlan", "add", "dev",
                       TARGET_LAN_IF, "vid", str(VID_C))
     await _reachable(ctx, guest, INTERNET)
-    await apply(ctx.console, _policy(), r=ctx)
-    ready = await ctx.wait(lambda s: not s["invalidated"] and s["bindings"] == 2)
-    assert ready["rearms"] > before["rearms"], (before, ready)
     forward, reverse = await _accounted(ctx, trusted, peer=INTERNET, dport=PORT_A,
                                         sport=PORT_A, label="vlan-change-trusted-after")
     _assert_wan(ctx, forward, reverse, client=trusted)
     forward, reverse = await _accounted(ctx, guest, peer=INTERNET, dport=PORT_C,
                                         sport=PORT_C, label="vlan-change-after")
     _assert_wan(ctx, forward, reverse, client=guest)
-    ctx.record("home-vlan-change", {"before": before, "retired": retired,
-                                    "after": await ctx.state()})
+    after = await ctx.state()
+    assert after["invalidated"] == 0 and after["rearms"] == before["rearms"], (before, after)
+    ctx.record("home-vlan-change", {"before": before, "retired": retired, "after": after})
 
 
 async def test_module_reload_reproves_the_profile(homelab,

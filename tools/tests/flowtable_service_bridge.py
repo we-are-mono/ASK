@@ -92,18 +92,20 @@ async def test_membership(bridge_service):
             await warm(r, p, [0, 1, 2, 3], label + "-readmitted", flows[:4])
             ready_seconds = time.monotonic() - restored_at
             assert ready_seconds < 20, (ready_seconds, status)
-            # Converged: what it took to reinstall, counted before the
-            # hardware proof, whose burst then covers a complete health-check
-            # period in which the controller must not reinstall a healthy,
-            # unchanged policy.
+            # Nothing to reinstall: a membership change retires the flows
+            # through the port and leaves the table bound (A418). Counted before
+            # the hardware proof, whose burst then covers a complete
+            # health-check period in which the controller must not reinstall a
+            # healthy, unchanged policy either.
             after_attempts = await attempts(r)
-            assert 1 <= after_attempts - before_attempts <= 4, (before_attempts, after_attempts)
+            assert after_attempts == before_attempts, (before_attempts, after_attempts)
             after = await hardware(r, p, label + "-hardware", flows[:4])
             hardware_seconds = time.monotonic() - restored_at
             assert hardware_seconds < 40, hardware_seconds
             balanced(after, initial["errors"])
             bridge_paths(after, r)
-            assert after["rearms"] > before["rearms"], (before, after)
+            assert after["rearms"] == before["rearms"] and not after["invalidated"], (before, after)
+            assert after["link_invalidations"] > before["link_invalidations"], (before, after)
             assert all(after[k] == initial[k] for k in ("vlan_records", "vlan_slots")), (initial, after)
             assert await attempts(r) == after_attempts
             for ident in (5, 6):

@@ -411,6 +411,49 @@ async def test_rule_change(ipv6_rig):
         await _drop_tables(r)
 
 
+async def test_vlan_device_change(ipv6_rig):
+    """A VLAN device made on the LAN port and deleted again retires the
+    offloaded flow through the port each time, and it comes back on its next
+    packets: the table, its bindings and admission stay up throughout, and
+    nothing is rearmed (A415)."""
+    r = ipv6_rig
+    sport, dport = PORTS["upper"]
+    loop = asyncio.get_running_loop()
+    transport, _ = await loop.create_datagram_endpoint(
+        Echo, local_addr=(WAN_IPV6, dport), family=socket.AF_INET6)
+    vlan = f"{TARGET_LAN_IF}.3998"
+    links = json.loads((await command(r.target, r.session, "ip", "-j", "link", "show"))["stdout"])
+    assert vlan not in {link["ifname"] for link in links}, links
+    changes = [("add", ["add", "link", TARGET_LAN_IF, "name", vlan, "type", "vlan", "id", "3998"]),
+               ("del", ["del", "dev", vlan])]
+    made = False
+
+    async def send(count=8):
+        return await _udp_exchange(r, sport, WAN_IPV6, dport, count, (WAN_IPV6, dport),
+                                   "flowtable_v6_upper")
+    try:
+        await _offload_table(r, f'ip6 saddr {LAN_IPV6} udp sport {sport} udp dport {dport}')
+        before = await _drive(r, send, lambda s: s["entries"] == 2, "IPv6 flow did not install")
+        for label, args in changes:
+            await command(r.target, r.session, "ip", "link", *args)
+            made = label == "add"
+            retired = await r.wait(lambda s: s["entries"] == 0 and
+                                   s["link_invalidations"] > before["link_invalidations"])
+            assert retired["invalidated"] == 0 and retired["errors"] == r.errors, retired
+            assert retired["bindings"] == before["bindings"], retired
+            assert retired["rearms"] == before["rearms"], retired
+            back = await _drive(r, send, lambda s: s["entries"] == 2, "IPv6 flow did not come back")
+            assert back["installs"] == before["installs"] + 2, (before, back)
+            assert await send(64) == {"echoed": 64, "lost": 0}
+            r.record(f"ipv6-vlan-device-{label}", {"before": before, "retired": retired, "back": back})
+            before = back
+    finally:
+        if made:
+            await command(r.target, r.session, "ip", "link", "del", "dev", vlan, check=False)
+        transport.close()
+        await _drop_tables(r)
+
+
 @pytest.mark.rfc("8200", section="4.5")
 @pytest.mark.rfc("5722")
 async def test_fragments(ipv6_rig):

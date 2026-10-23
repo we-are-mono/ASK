@@ -152,20 +152,13 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A418 — bridge VLAN configuration stops hardware admission globally, and every bridge join raises it.** The
-  switchdev handler latches `ft_invalidate()` for a device a flow uses on `SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING`/
-  `_PROTOCOL` and on a `SWITCHDEV_OBJ_ID_PORT_VLAN` add or delete. A port joining a bridge raises both
-  (`nbp_vlan_init()` sets the port's VLAN-filtering attribute and adds the default PVID) besides A415's
-  `NETDEV_CHANGEUPPER`, so a join latches three ways and A415's fix has to cover all three; `bridge vlan add/del` and a
-  netifd reload of `bridge-vlan` sections latch on their own. Fix with A415: a membership or filtering change on a port
-  retires that port's flows and bridged pairs; a toggle on the bridge, its ports'.
+- [x] **A418 — bridge VLAN configuration stopped hardware admission globally, and every bridge join raised it.** A
+  membership, filtering or protocol change now retires the flows using the device and sweeps its software flows, a
+  bridge's on every port (_:/^cdx: retire a device's flows on an upper or bridge VLAN change_).
 
-- [ ] **A417 — every nexthop-object event stops hardware admission globally.** `ft_nexthop_event()` latches on all but
-  stats reports. The flow retirement A414 uses is not safe here: a resilient group's bucket migration notifies from
-  `nh_res_table_upkeep_dw()` without RTNL and without a route-cache flush (only a replace flushes,
-  `nh_rt_cache_flush()`), so nothing excludes a queued admission's stale route. Low priority: netifd uses no nexthop
-  objects; only `ip nexthop` users (FRR's nexthop groups) see it. Fix direction: track a flow's nexthop-object
-  dependency rather than its prefix.
+- [-] **A417 — every nexthop-object event stops hardware admission globally.** Wontfix: netifd creates no nexthop
+  objects, and retiring flows is unsafe here, since a resilient group's bucket migration notifies without RTNL or a
+  route-cache flush (`nh_res_table_upkeep_dw()`); only per-flow nexthop tracking would do, for FRR users alone.
 
 - [ ] **A416 — removing a device a flow leaves by stops hardware admission globally, and an open Wi-Fi VAP is one.**
   `NETDEV_UNREGISTER` of an `FT_DEV_PORT` falls through to the upper-change latch (`ft_netdev_event()`). A port is any
@@ -175,18 +168,9 @@ result independently of those temporary files.
   as for a non-port device; keep the latch for a bound port's removal. Proving it needs a Wi-Fi client on the rig
   (none attached since 2026-10-11).
 
-- [ ] **A415 — an upper-device change on a bound port stops hardware admission globally.** A port joining or leaving a
-  bridge, or a VLAN device created or deleted on it (`NETDEV_CHANGEUPPER`, `ft_netdev_event()`), latches
-  `ft_invalidate()`: every hardware flow is flushed and nothing is admitted until ask-flowtable sees `invalidated` and
-  replaces the table (≤0.5 s after a link or address event, else its 5 s health check). OpenWrt raises it at boot
-  when netifd builds bridges after the daemon bound, and on network reloads; a field boot log showed two cycles in 2 s.
-  Retiring the port's flows is not enough on its own: Linux flushes its software flows only on `NETDEV_DOWN`
-  (`nft_flow_offload_netdev_event()`), so today only the latch worker's `nf_flow_table_cleanup()` drops software flows
-  cached against the old topology. Fix direction: retire the port's flows and clean its software flows (Linux's own
-  `NETDEV_DOWN` path runs that cleanup from the notifier), keeping the bindings; multicast (`ft_mc_port_moved()`) and
-  bridged pairs (`ft_l2_dev_changed()`) already follow. A join also latches through switchdev (A418), so fix both
-  together. Test bridge join/leave and VLAN create/delete under traffic, in both families, with a multicast group and a
-  bridged pair on the port.
+- [x] **A415 — an upper-device change on a bound port stopped hardware admission globally.** A bridge join or leave,
+  or a VLAN device made or deleted on a port or a flow's device, now retires the flows using it and sweeps its software
+  flows as an STP stop does (_:/^cdx: retire a device's flows on an upper or bridge VLAN change_).
 
 - [x] **A414 — every `ip rule` add or delete stopped hardware admission until the table was recreated.** netifd adds one
   per delegated IPv6 prefix whenever the WAN comes up. A rule change now retires every flow as nexthop sync does, both

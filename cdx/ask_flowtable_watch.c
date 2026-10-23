@@ -420,13 +420,15 @@ static void ft_port_stopping(const struct net_device *dev)
 }
 
 /* A port, or a VLAN of one, that stops forwarding has to stop carrying
- * software flows as well as hardware ones. ft_device_retire() reaches only
- * entries this adapter admitted. A flow it refused, never saw, or that
- * another table owns keeps a valid handle, and one naming the port as its
- * ingress is matched by the flowtable hook, which __netif_receive_skb_core()
- * runs before the bridge's rx_handler -- so br_handle_frame() never gets to
- * drop the frame. The forward-path walk refuses such a port from now on;
- * this takes away what it described before.
+ * software flows as well as hardware ones, and so does a device whose uppers
+ * or bridge VLAN settings changed. ft_device_retire() reaches only entries
+ * this adapter admitted. A flow it refused, never saw, or that another table
+ * owns keeps a valid handle, and one naming the port as its ingress is
+ * matched by the flowtable hook, which __netif_receive_skb_core() runs before
+ * the bridge's rx_handler -- so br_handle_frame() never gets to drop the
+ * frame. The forward-path walk refuses a stopped port from now on, and
+ * describes a changed device as it now is; this takes away what it described
+ * before.
  *
  * Native cleanup does the teardown, but it sleeps: it takes flowtable_lock
  * and flushes the offload work that runs this module's rule callbacks. An
@@ -688,27 +690,6 @@ int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 			ft_device_retire(dev, &ft_link_invalidations);
 			break;
 		}
-		fallthrough;
-	case NETDEV_CHANGEUPPER:
-		/* A port joining or leaving a bridge, which no switchdev event
-		 * reports for a multicast flow's ingress; and when leaving,
-		 * the bridge it left. */
-		if (event == NETDEV_CHANGEUPPER) {
-			struct netdev_notifier_changeupper_info *upper = ptr;
-
-			ft_mc_port_moved(dev, upper->linking ? NULL :
-					      upper->upper_dev);
-			/* A port leaving its bridge takes its pairs along. */
-			ft_l2_dev_changed(dev);
-		}
-		/* A device paths only cross gaining or losing an upper changes
-		 * those paths and nothing any flow names; retire them the same
-		 * way. Anywhere else an upper change may change what a port or
-		 * a flow's own device carries, and stops admission globally. */
-		if (event == NETDEV_CHANGEUPPER && ft_device_role(dev) == FT_DEV_CROSSED) {
-			ft_device_retire(dev, &ft_link_invalidations);
-			break;
-		}
 		spin_lock_bh(&ft_watch_lock);
 		/* Latch before releasing the watch lock: a concurrent last unbind
 		 * and fresh bind must not redirect this event to a new table. */
@@ -716,6 +697,30 @@ int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 			ft_invalidate();
 		spin_unlock_bh(&ft_watch_lock);
 		break;
+	case NETDEV_CHANGEUPPER: {
+		struct netdev_notifier_changeupper_info *upper = ptr;
+		enum ft_device_role role;
+
+		/* A port joining or leaving a bridge, which no switchdev event
+		 * reports for a multicast flow's ingress; and when leaving, the
+		 * bridge it left. */
+		ft_mc_port_moved(dev, upper->linking ? NULL : upper->upper_dev);
+		/* A port leaving its bridge takes its pairs along. */
+		ft_l2_dev_changed(dev);
+		/* A port or a flow's own device gaining or losing an upper --
+		 * joining a bridge, a VLAN device made on it -- may change what it
+		 * carries: every flow using it is retired, and readmitted against
+		 * the new topology, which admission derives afresh under RTNL. Its
+		 * software flows go as a stopped port's do, since the flowtable
+		 * hook runs before the new upper's rx_handler. A device paths only
+		 * cross changes only those paths, and retiring them is enough. */
+		role = ft_device_role(dev);
+		if (role != FT_DEV_UNUSED)
+			ft_device_retire(dev, &ft_link_invalidations);
+		if (role == FT_DEV_PORT || role == FT_DEV_NAMED)
+			ft_port_stopped(dev);
+		break;
+	}
 	}
 	return NOTIFY_DONE;
 }
@@ -1136,13 +1141,18 @@ int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 	ft_mr_kick();
 	ft_mc_bridge_changed(dev);
 	ft_l2_dev_changed(dev);
-	spin_lock_bh(&ft_watch_lock);
-	/* Latch before releasing the watch lock, exactly as the netdev
-	 * upper-device event does: a concurrent last unbind and fresh bind must
-	 * not redirect this event to a new table. */
-	if (ft_device_used(dev))
-		ft_invalidate();
-	spin_unlock_bh(&ft_watch_lock);
+	/* A unicast flow through the port, or through the bridge for the
+	 * bridge's own settings, was admitted with the tag decision this
+	 * changes: it is retired and readmitted against the new one, and the
+	 * device's software flows are swept as an upper change sweeps them, a
+	 * bridge's on every port of it. A device nothing here uses changes
+	 * nothing: every bridge installs its default PVID on a port the moment
+	 * it is enslaved, so anything wider would retire flows whenever any
+	 * device was enslaved to anything. */
+	if (ft_device_role(dev) != FT_DEV_UNUSED) {
+		ft_device_retire(dev, &ft_link_invalidations);
+		ft_port_stopped(dev);
+	}
 	return NOTIFY_DONE;
 }
 

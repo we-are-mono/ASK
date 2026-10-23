@@ -50,7 +50,8 @@ for operating the supported flowtable/CDX path.
 | Rename | Preserve physical identity, installed cookies and fresh binding under the new name |
 | Transient matching admission contention | Decline the direction and keep any installed one; Linux's periodic offer retries it while software forwards it. Where nothing offers it again -- an xfrm policy configured, or a direction arriving through a tunnel -- retire the partial generation; native GC and fresh traffic retry both directions |
 | Routing rule added or deleted | Retire every generation and ask every SA to follow its path; fresh route lookup readmits with the table and admission up |
-| Nexthop-object or unsupported topology change | Globally stop admission; recreate/apply the table after configuration settles |
+| Upper-device change (bridge join/leave, VLAN device) or bridge VLAN change on a device a flow uses | Retire the generations using it and sweep its software flows; fresh traffic readmits with the table and admission up |
+| Nexthop-object change or a port's unregistration | Globally stop admission; recreate/apply the table after configuration settles |
 | Healthy adapter unload | Drain hardware; existing sockets forward in Linux; reload and recreate the table to regain hardware |
 | Actual physical driver removal | Retire flow references; full CDX teardown releases remaining configuration/queue pins before driver removal completes |
 | Recoverable hardware barrier failure | Retry safe retirement according to the provider contract; quarantine remains accounted for |

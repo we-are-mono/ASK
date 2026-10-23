@@ -34,19 +34,21 @@ async def test_automatic_recovery(service, fault):
         await blocked_probe(r, p)
         started = time.monotonic()
         if fault == "invalidated-backend":
-            # Rule events invalidate the backend but do not alter policy or
-            # produce the LINK/ADDR notifications subscribed by the daemon.
-            priority = "32007"
-            rules = json.loads((await command(r.target, r.session, "ip", "-j", "rule", "show"))["stdout"])
-            assert not any(rule.get("priority") == int(priority) for rule in rules), rules
-            await command(r.target, r.session, "ip", "rule", "add", "pref", priority,
-                          "from", "198.18.254.0/24", "table", "main")
+            # Nexthop-object events invalidate the backend but do not alter
+            # policy or produce the LINK/ADDR notifications subscribed by the
+            # daemon.
+            nexthop_id = "32007"
+            listed = await command(r.target, r.session, "ip", "-j", "nexthop", "show", check=False)
+            nexthops = json.loads(listed["stdout"] or "[]")
+            assert not any(nexthop.get("id") == int(nexthop_id) for nexthop in nexthops), nexthops
+            await command(r.target, r.session, "ip", "nexthop", "add", "id", nexthop_id,
+                          "dev", TARGET_LAN_IF)
             try:
                 invalid = await r.wait(lambda s: s["invalidated"] == 1 or s["rearms"] > initial["rearms"], timeout=3)
                 assert not invalid["fatal"], invalid
-                r.record("service-rule-invalidation", invalid)
+                r.record("service-nexthop-invalidation", invalid)
             finally:
-                await command(r.target, r.session, "ip", "rule", "del", "pref", priority)
+                await command(r.target, r.session, "ip", "nexthop", "del", "id", nexthop_id)
         else:
             if fault in ("failed-apply", "hung-apply", "lost-reply"):
                 mode = "once" if fault == "failed-apply" else fault

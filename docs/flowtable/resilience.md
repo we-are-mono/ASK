@@ -382,6 +382,10 @@ resumed normal policy on boot `f9bfb4a5-1875-4e6e-b40d-e8572800e06c`.
 Accumulated installs/deletes both reached 230, with 12 rearms retained and zero
 entries, flow references, VLAN records/slots or backend errors. Failslab settings,
 kernel taint and running binaries were unchanged, with no kernel splats.
+
+Since A418 a membership change retires only the flows through the port and
+leaves the table bound, so the test now requires no policy install and no
+rearm across a cycle; the outage requirements are unchanged.
 No reboot or counter reset was used.
 
 ## Route and next-hop recovery — 2026-09-22
@@ -751,10 +755,10 @@ The following observations motivated the work:
   a fresh binding/reconciliation boundary; recovery must preserve that barrier.
   An atomic reload is such a boundary once the old bindings are gone (see
   [above](#atomic-reload-during-invalidation)).
-- The [homelab profile](../../tools/tests/profile_homelab.py) explicitly
-  reapplies policy after bridge VLAN-membership invalidation. That is useful
-  lifecycle coverage. The separate service bridge test above establishes
-  recovery without a test-issued policy repair.
+- The [homelab profile](../../tools/tests/profile_homelab.py) withdraws and
+  restores a VLAN on the LAN port with no policy reapplied: the flows through
+  the port retire and return to hardware with the table bound. The separate
+  service bridge test above proves the same under the shipping controller.
 - The [IPsec failslab sweep](../../tools/tests/ipsec_failslab.py) exercises
   native XFRM installation with isolated `fail-nth` injection. It is a useful
   pattern for allocation coverage, with additional recovery assertions needed.

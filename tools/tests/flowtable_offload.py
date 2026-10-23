@@ -9,7 +9,7 @@ fresh boot before using ASK again.
 """
 from __future__ import annotations
 
-from _flowtable_rig import (artifact_dir, DPORT, HEALTH_BASELINE, SPORT, TABLE, WAN_IP, ct_bytes, ct_counts, ct_listing, hardware_proof, latch_barrier_failure, links_restored, rearm_ready, terminal_stream, upper_roundtrip)
+from _flowtable_rig import (artifact_dir, DPORT, HEALTH_BASELINE, SPORT, TABLE, WAN_IP, ct_bytes, ct_counts, ct_listing, hardware_proof, latch_barrier_failure, links_restored, rearm_ready)
 
 import asyncio
 import errno
@@ -450,7 +450,7 @@ async def test_add_failures(rig):
 
 
 async def test_rearm(rig):
-    """Recover after upper-device and nexthop-object changes and a retried delete barrier."""
+    """Recover after a nexthop-object change and a retried delete barrier."""
     r = rig
     initial = await r.state()
     if initial["observe"]:
@@ -465,20 +465,11 @@ async def test_rearm(rig):
     await r.table()
     await r.admit(128, promiscuous=False)
     try:
-        for cycle, trigger in enumerate(("device", "nexthop", "barrier"), 1):
+        for cycle, trigger in enumerate(("nexthop", "barrier"), 1):
             before = await r.state()
-            traffic = None
             knob = "/proc/fm_ehash_hcsync_fail"
             try:
-                if trigger == "device":
-                    received = len(r.echo.received)
-                    traffic = asyncio.create_task(terminal_stream(r, duration=6))
-                    deadline = time.monotonic() + 5
-                    while len(r.echo.received) < received + 16:
-                        assert not traffic.done() and time.monotonic() < deadline
-                        await asyncio.sleep(0.02)
-                    await upper_roundtrip(r, TARGET_LAN_IF)
-                elif trigger == "nexthop":
+                if trigger == "nexthop":
                     await command(r.target, r.session, "ip", "nexthop", "add", "id", nexthop_id,
                                   "dev", TARGET_LAN_IF)
                     nexthop_added = True
@@ -495,8 +486,6 @@ async def test_rearm(rig):
                 assert invalid["bindings"] == (0 if trigger == "barrier" else 2)
                 assert invalid["rearm_ready"] == (1 if trigger == "barrier" else 0)
             finally:
-                if traffic:
-                    r.record("rearm-transition", await traffic)
                 if trigger == "barrier":
                     result = await r.target.fs_write(r.session, knob, "0")
                     assert result["errno"] == 0, result
@@ -516,7 +505,7 @@ async def test_rearm(rig):
             assert software_after - software_before >= 64
             assert blocked["entries"] == 0 and blocked["installs"] == before["installs"]
             assert blocked["invalidated"] == 1 and blocked["rearms"] == before["rearms"]
-            if trigger == "device":
+            if trigger == "nexthop":
                 # Hook removal alone leaves cached Linux flows. Such a table
                 # must not reopen hardware admission, even with zero bindings.
                 await r.nft(f"delete flowtable inet {TABLE} fast {{ "
@@ -601,6 +590,43 @@ async def test_rule_change(rig):
     finally:
         if added:
             await command(r.target, r.session, "ip", "rule", "del", *rule, check=False)
+        await r.delete_table()
+
+
+async def test_vlan_device_change(rig):
+    """A VLAN device made on the LAN port and deleted again retires the
+    offloaded connection through the port each time, and it comes back on its
+    next packets: the table, its bindings and admission stay up throughout,
+    and nothing is rearmed (A415)."""
+    r = rig
+    if (await r.state())["observe"]:
+        pytest.skip("upper-change retirement requires installed hardware")
+    vlan = f"{TARGET_LAN_IF}.3998"
+    links = json.loads((await command(r.target, r.session, "ip", "-j", "link", "show"))["stdout"])
+    assert vlan not in {link["ifname"] for link in links}, links
+    changes = [("add", ["add", "link", TARGET_LAN_IF, "name", vlan, "type", "vlan", "id", "3998"]),
+               ("del", ["del", "dev", vlan])]
+    made = False
+    await r.table()
+    before = await r.admit()
+    try:
+        for label, args in changes:
+            await command(r.target, r.session, "ip", "link", *args)
+            made = label == "add"
+            retired = await r.wait(lambda s: s["entries"] == 0 and
+                                   s["link_invalidations"] > before["link_invalidations"])
+            assert retired["invalidated"] == retired["fatal"] == retired["quarantine"] == 0, retired
+            assert retired["errors"] == before["errors"], retired
+            assert retired["bindings"] == before["bindings"] == 2, retired
+            assert retired["rearms"] == before["rearms"], retired
+            back = await r.admit()
+            assert back["installs"] == before["installs"] + 2, (before, back)
+            assert back["invalidated"] == 0 and back["rearms"] == before["rearms"], back
+            r.record(f"vlan-device-{label}", {"before": before, "retired": retired, "back": back})
+            before = back
+    finally:
+        if made:
+            await command(r.target, r.session, "ip", "link", "del", "dev", vlan, check=False)
         await r.delete_table()
 
 

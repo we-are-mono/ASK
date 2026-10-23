@@ -5,10 +5,8 @@ import json
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from _flowtable_connections import (FLOWS, by_key, peer)
-from _flowtable_module import (table)
 from _flowtable_rig import (HEALTH_BASELINE, command, upper_roundtrip)
 from _flowtable_selective_neighbour import (hardware, unchanged, warm)
-from _flowtable_tcp import (software_tx)
 
 DUMMY, RENAMED, BRIDGE = "askftdev0", "askftdev1", "askftdevbr"
 
@@ -62,7 +60,9 @@ async def test_flowtable_device_dependencies(connections):
             r.record("devices-unrelated-transfers", reports)
             await hardware(r, p, "devices-unrelated-hardware", flows)
 
-            # Upper-device changes remain conservative on either real port.
+            # An upper-device change on either real port retires every flow
+            # through it, and Linux readmits each on its next packets: the
+            # table, its bindings and admission stay up throughout (A415).
             # MTU, MAC and link recovery have separate proofs.
             for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
                 before = await r.state()
@@ -70,28 +70,21 @@ async def test_flowtable_device_dependencies(connections):
                 await p.rpc("start", [0], count=0, interval=0.01, allow_loss=True)
                 await p.rpc("start", [1], count=0, interval=0.01)
                 await upper_roundtrip(r, dev)
-                retired = await r.wait(lambda s: s["invalidation_done"] == 1 and not s["entries"])
-                assert retired["invalidated"] == 1 and retired["bindings"] == 2, retired
-                assert retired["handle_refs"] == retired["neighbour_refs"] == retired["quarantine"] == 0, retired
-                assert retired["fatal"] == 0 and retired["errors"] == HEALTH_BASELINE["errors"], retired
-                assert retired["installs"] == before["installs"] and retired["deletes"] == before["deletes"] + 4
-                assert retired["rearms"] == before["rearms"], retired
                 transition = await p.rpc("stop", ids)
-                tx_before = await software_tx(r)
-                reports = await p.batch(ids, count=128, interval=0.01)
-                tx_after = await software_tx(r)
-                tx = {d: tx_after[d] - tx_before[d] for d in tx_before}
-                assert all(tx[d] >= 128 for d in (TARGET_LAN_IF, TARGET_WAN_IF)), tx
-                blocked = await r.state()
-                assert blocked["entries"] == 0 and blocked["installs"] == before["installs"], blocked
-                await r.delete_table()
-                await table(r)
+                # Traffic ran throughout, so a flow may be back already.
+                retired = await r.state()
+                assert retired["link_invalidations"] > before["link_invalidations"], (before, retired)
+                assert retired["deletes"] >= before["deletes"] + 4, (before, retired)
+                assert retired["invalidated"] == 0 and retired["bindings"] == 2, retired
+                assert retired["fatal"] == retired["quarantine"] == 0, retired
+                assert retired["errors"] == HEALTH_BASELINE["errors"], retired
+                assert retired["rearms"] == before["rearms"], retired
                 await warm(r, p, ids, "devices-" + dev + "-readmitted", flows)
                 after = await hardware(r, p, "devices-" + dev + "-hardware", flows)
-                assert after["rearms"] == before["rearms"] + 1, after
+                assert after["installs"] >= before["installs"] + 4, (before, after)
+                assert after["rearms"] == before["rearms"] and after["invalidated"] == 0, after
                 r.record("devices-" + dev, {"before": before, "retired": retired,
-                                           "transition": transition, "software_transfers": reports,
-                                           "software_tx": tx, "after": after})
+                                           "transition": transition, "after": after})
     finally:
         # Remove only names checked absent before the test.
         try:

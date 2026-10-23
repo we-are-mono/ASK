@@ -61,7 +61,7 @@ async def ct_bytes(r):
 
 
 async def upper_roundtrip(r, dev):
-    """Exercise unsupported upper-device topology, restoring it through UART."""
+    """Enslave `dev` to a temporary bridge and release it again, through UART."""
     temporary = "askftupper"
     with Console.target(log_path=str(artifact_dir() / "upper-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
