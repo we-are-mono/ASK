@@ -170,13 +170,16 @@
 			/* Charged only for the ports the SDK initialises: the host
 			 * command port (0xa00), the three offline ports, the three 1G
 			 * MACs' receive and transmit ports, and the two 10G MACs'.
-			 * With the 10G receive ports at 0xc000 that is 0x3cc00 of
-			 * 0x3e500, leaving 0x1900: room for neither another offline
-			 * port at 0x3200 nor another 1G MAC's pair at 0x6400. A
-			 * disabled MAC's port is never initialised, so its node below
-			 * is never charged.
+			 * With the 10G receive ports at 0x14000 that is all of
+			 * 0x4cc00. The pool is carved from the FMan's 384 KB MURAM at
+			 * init, ahead of the classifier's tables and cdx's statistics,
+			 * which are sized once and never grow; this leaves ~33 KB of
+			 * MURAM free (fm_muram_free_size). Another offline port
+			 * (0x3200) or 1G MAC pair (0x6400) needs this raised by as
+			 * much. A disabled MAC's port is never initialised, so its
+			 * node below is never charged.
 			 */
-			total-fifo-size = <0x3e500>;
+			total-fifo-size = <0x4cc00>;
 
 			/* Each port's buffer-layout is <headroom alignment>. The
 			 * headroom is where the microcode inserts the headers an
@@ -322,16 +325,18 @@
 
 			/* MAC9 (ethernet@f0000) - 10G cell-index 0.
 			 * A 10G receive port's FIFO is what holds a burst at line
-			 * rate while FMan classifies it; NXP's 24 KB (0x6000) let
-			 * the MAC's own FIFO overflow under back-to-back 128 KB
-			 * TCP records with IPsec offloaded, dropping frames no
-			 * FMan counter saw (A352). 48 KB lost none, and holds five
-			 * 9600-byte frames rather than two.
+			 * rate while FMan classifies it and writes it to memory;
+			 * NXP's 24 KB (0x6000) let the MAC's own FIFO overflow
+			 * under back-to-back 128 KB TCP records with IPsec
+			 * offloaded, dropping frames no FMan counter saw (A352).
+			 * The cores' memory traffic stalls those writes as well:
+			 * with one core copying memory beside line-rate NAT, 80 KB
+			 * misses ~40% fewer frames than 48 KB (A399).
 			 */
 			fman0_rx6-extended-args {
 				cell-index = <0x00>;
 				compatible = "fsl,fman-port-10g-rx-extended-args";
-				fifo-size = <0xc000 0x00>;
+				fifo-size = <0x14000 0x00>;
 				buffer-layout = <0x60 0x40>;
 				vsp-window = <0x02 0x00>;
 			};
@@ -347,7 +352,7 @@
 			fman0_rx7-extended-args {
 				cell-index = <0x01>;
 				compatible = "fsl,fman-port-10g-rx-extended-args";
-				fifo-size = <0xc000 0x00>;
+				fifo-size = <0x14000 0x00>;
 				buffer-layout = <0x60 0x40>;
 				vsp-window = <0x02 0x00>;
 			};

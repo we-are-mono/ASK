@@ -241,12 +241,9 @@ result independently of those temporary files.
   `e_ENET_MODE_SGMII_2500` exactly. Fix direction: pass 2.5G to memac separately from the mode's speed field. Neither
   shipping RCW (0x1133, 0x1333) runs MAC9/MAC10 at 2.5G today.
 
-- [ ] **A399 — a 10G receive port can still overflow its MAC FIFO by a few frames under 128 KB TCP records with inbound
-  IPsec.** `test_ipsec_decrypted_frames_intact_under_overlap[cbc-sha256]` counted 3, then 1, `rx_missed_errors` on eth4
-  in 2 of 5 runs on a 9.5 h-old boot (full-suite run 7); it passed on the same boot hours earlier. A352 gave the 10G
-  receive ports 48 KB, which then lost none; A385's offline port took the budget's slack, leaving 0x1900, not theirs.
-  Fix direction: measure the miss rate on a fresh boot and against offered rate; then either more FIFO for the 10G
-  receive ports (from a 1G pair) or what slows the drain (parser cycles since A370/A372, SEC back-pressure).
+- [x] **A399 — a 10G receive port can still overflow its MAC FIFO by a few frames under 128 KB TCP records with inbound
+  IPsec.** A core streaming memory beside line rate exceeds the DUT's ~5 GB/s; 80 KB FIFOs from free MURAM cut the
+  misses ~40%, and no FMan or CCI-400 priority setting helped (_:/^dts: give the 10G receive ports 80 KB_).
 
 - [ ] **A397 — the multicast egress drains rebuild every marked group in one hold, under the RTNL a tc command holds.**
   `ft_mc_egress_drain()` and `ft_mr_egress_drain()` replace each group a port's queues or DSCP map changed under, all

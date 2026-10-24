@@ -304,8 +304,10 @@ then throws away as a bad frame, not as a BMI discard: neither reaches
 as well (`port_mac_rx_advance()`), from where it stood when CDX took the port
 and past any reset of the MAC's counters (A352). It moved during line-rate
 bursts of 128 KB TCP records with IPsec offloaded while the 10G receive ports
-had NXP's 24 KB FIFOs; the board's device tree gives them 48 KB, under which
-the same bursts lost none.
+had NXP's 24 KB FIFOs, and 48 KB lost none of those bursts. It still moves
+whenever a core streams memory beside line rate, which delays FMan's writes;
+the board's device tree gives the ports 80 KB, which cuts those misses by
+about 40% (A399).
 
 Measured with the LAN VM pausing the LAN port by 802.3x PAUSE frames while the
 WAN host sends down an offloaded flow
