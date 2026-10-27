@@ -57,7 +57,8 @@ MODULE_PARM_DESC(l2_idle_ms, "Milliseconds a bridged pair no frame hits stays in
  * again: soon, but not at once, which would spin while RTNL is held. */
 #define FT_L2_RETRY	(HZ / 20)
 /* How often every installed pair is asked of the bridge again: nothing
- * reports a tc filter, a netdev chain or a port flag changing under one. */
+ * reports a netdev chain or a port flag changing under one. A change in what
+ * tc runs is the tc sample's worker's to report (ask_flowtable_tc.c). */
 #define FT_L2_RECHECK	(5 * HZ)
 /* Pairs, bounded well below what the Ethernet tables of the ports hold. */
 #define FT_L2_MAX	4096
@@ -915,6 +916,22 @@ static bool ft_l2_stack_hooked(const struct cdx_ft_vlan *tags, u8 count, bool in
 	return false;
 }
 
+/* Whether the last tc sample (ask_flowtable_tc.c) has `bit' for a bridge port
+ * or any device below it, down to its physical port: the VLAN devices
+ * ft_l2_lower() recorded, each by index, and the port itself. tc is not asked
+ * here: the learner decides inside the backend transaction, where walking a
+ * filter block can deadlock (ft_dev_tc_soft_for()). */
+static bool ft_l2_tc_soft(const struct net_device *port, const struct cdx_ft_vlan *tags,
+			  u8 count, const struct net_device *physical, u8 bit)
+{
+	u8 soft = ft_tc_dev_bits(port) | ft_tc_dev_bits(physical);
+	u8 i;
+
+	for (i = 0; i < count; i++)
+		soft |= ft_tc_index_bits(tags[i].ifindex);
+	return soft & bit;
+}
+
 /* How the bridge carries `vid` through `port`: whether the port is a member
  * and whether it sends the VLAN untagged. A bridge that does not filter
  * carries everything untagged. Under RTNL. */
@@ -988,8 +1005,14 @@ static bool ft_l2_resolve(const struct ft_l2_seen *s, struct ft_l2_pair *p)
 	    br_port_flag_is_set(in, BR_VLAN_TUNNEL) || br_port_flag_is_set(out, BR_VLAN_TUNNEL))
 		return false;
 	/* What tc or a netdev chain runs on either port runs on every frame the
-	 * bridge forwards in software and on none an entry forwards. */
-	if (ft_dev_stack_tc_soft(in, true) || ft_dev_stack_tc_soft(out, false) ||
+	 * bridge forwards in software and on none an entry forwards. tc as the
+	 * last sample found it, every filter counted on the way in: the
+	 * hardware polices no pair -- no flower profile is bound to one, and the
+	 * port's rate limiter meets only its TCP, UDP and ESP frames
+	 * (cdx_police_reaches()). The tags recorded so far are the port's VLAN
+	 * devices alone; the bridge's own goes on below. */
+	if (ft_l2_tc_soft(in, p->rule.in_vlan, p->rule.in_vlans, lower_in, FT_TC_RX) ||
+	    ft_l2_tc_soft(out, p->rule.out_vlan, p->rule.out_vlans, lower_out, FT_TC_TX) ||
 	    ft_dev_nf_ingress_hooked(lower_in) || ft_l2_nf_egress_hooked(lower_out) ||
 	    ft_l2_stack_hooked(p->rule.in_vlan, p->rule.in_vlans, true) ||
 	    ft_l2_stack_hooked(p->rule.out_vlan, p->rule.out_vlans, false))
@@ -1128,6 +1151,10 @@ static int ft_l2_admit(const struct ft_l2_seen *s, unsigned int kinds)
 		ft_l2_refusal(s, events);
 		return -ENOSPC;
 	}
+	/* No tc sample yet, the binding a moment old: soon, rather than a
+	 * refusal held for FT_L2_REFUSE_HOLD. */
+	if (!ft_tc_known())
+		return -EAGAIN;
 	p = kzalloc(sizeof(*p), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
@@ -1595,6 +1622,13 @@ int ft_l2_egress_drain(const struct net_device *dev)
 static bool ft_l2_any(const struct ft_l2_pair *p, const void *arg)
 {
 	return true;
+}
+
+/* Whether any pair is installed: the tc sample is kept while one is, whose
+ * recheck reads it. Any context. */
+bool ft_l2_paired(void)
+{
+	return READ_ONCE(ft_l2_count) != 0;
 }
 
 /* Global invalidation, from its worker, and unload: everything goes, and the

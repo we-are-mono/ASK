@@ -619,6 +619,10 @@ static int ft_stats_show(struct seq_file *seq, void *v)
 	ft_kv(seq, "ipsec_invalidations", atomic64_read(&ft_ipsec_invalidations));
 	ft_kv(seq, "ipsec_policy_invalidations", atomic64_read(&ft_ipsec_policy_invalidations));
 	ft_kv(seq, "ipsec_next_hop_updates", atomic64_read(&ft_ipsec_next_hop_updates));
+	/* Offers refused, and installed directions retired, because tc runs in
+	 * software on a device the direction crosses (ask_flowtable_tc.c). */
+	ft_kv(seq, "tc_refused", READ_ONCE(ft_tc_refused));
+	ft_kv(seq, "tc_invalidations", atomic64_read(&ft_tc_invalidations));
 	/* Frames the software path forwarded unchanged because their header
 	 * could not be made writable for the remark their class asks for, and
 	 * control frames sent as unclassified traffic because their port's
@@ -1038,7 +1042,9 @@ netdev:
 	 * and ft_mc_replay() asks every bridge port for its port groups -- so a
 	 * failure after those points has memberships, flows, hardware entries
 	 * and pinned devices to give back, and a worker holding a pointer into
-	 * text about to go. */
+	 * text about to go. The tc sample's worker first: it wakes the learners
+	 * and marks bridged pairs. */
+	ft_tc_exit();
 	ft_mc_exit();
 	ft_mr_exit();
 	ft_l2_exit();
@@ -1117,6 +1123,11 @@ static void __exit ask_flowtable_exit(void)
 	 * any of the work it queues is cancelled below; this also waits out a
 	 * call already inside it. */
 	cdx_unregister_ft_egress();
+	/* The tc sample's worker wakes the learners and marks bridged pairs, so
+	 * it stops before any of them does. Offers still arriving until the
+	 * bindings drain find nothing known and are refused, as ft_stopping,
+	 * set above, refuses them anyway. */
+	ft_tc_exit();
 	/* After the switchdev chain is gone, so nothing can add a membership
 	 * while the groups drain, and before the module's text does -- the
 	 * worker holds a pointer into it. */

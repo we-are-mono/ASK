@@ -79,6 +79,11 @@ atomic64_t ft_destroy_deferrals = ATOMIC64_INIT(0);
 atomic64_t ft_ipsec_invalidations = ATOMIC64_INIT(0);
 atomic64_t ft_ipsec_genid = ATOMIC64_INIT(0);
 atomic64_t ft_ipsec_policy_invalidations = ATOMIC64_INIT(0);
+/* Installed directions retired because tc came to run in software on their
+ * path (ask_flowtable_tc.c), and offers refused for it; the second under the
+ * backend transaction, which every offer is answered in. */
+atomic64_t ft_tc_invalidations = ATOMIC64_INIT(0);
+u64 ft_tc_refused;
 u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 u64 ft_rearms;
 /* The non-empty last deltas reported as directions left the hardware.
@@ -1841,6 +1846,218 @@ static bool ft_mtu_refused(const struct flow_cls_offload *cls, const struct net_
 	return refused;
 }
 
+/* Software traffic control on a direction's path.
+ *
+ * An offloaded direction's frames go from the port they arrive on straight to
+ * the queues of the port they leave by: no qdisc and no tc filter on the way
+ * sees them. So the hardware carries a direction only where it does what
+ * Linux's own path would, no more and no less: where that path runs tc in
+ * software -- on the way out a filter, a tcx program or a qdisc that shapes or
+ * schedules, which is where SQM's cake sits; on the way in a filter, tcx or
+ * XDP -- the direction stays in software, and only what the hardware does
+ * itself lets one through: an `htb offload` tree, the DSCP map's filters, and
+ * the police filters it applies to the direction (ft_dev_tc_soft(),
+ * cdx_police_reaches()).
+ *
+ * The way out is every device the walk took, top to bottom: software sends
+ * on the logical device Linux routed through and down through every qdisc
+ * below it -- a tag's device, the one under a session, a bridge, the tunnel's
+ * own and the one under it, the port -- every device the walk crossed
+ * (ft_crossed_hold_all()) and every one the rule names. So cake on the WAN port
+ * keeps the upload in software and leaves the download, which leaves by the
+ * LAN port, in hardware.
+ *
+ * The way in is what Linux's path would cross, which depends on which path
+ * that is (ft_fast_path()). The software fast path takes a frame at the
+ * flowtable hook on the bound port, nf_ingress in __netif_receive_skb_core():
+ * after the port's generic XDP, tcx and tc ingress, and before the frame
+ * reaches any device above the port. A tag is out of the frame by then --
+ * skb_vlan_untag() runs first, the DPAA driver stripping none in hardware --
+ * and nf_flow_skb_encap_protocol() reads a second tag or a PPPoE session from
+ * the frame itself, so a tagged port, QinQ, a session over a tag and a bridge
+ * port that is a VLAN device are all taken there, and the bridge's rx_handler
+ * runs after the hook too. So where the fast path carries a direction only the
+ * port's ingress counts: SQM's ifb on a ppp device shapes no download Linux
+ * forwards there either, and refusing it would cost the hardware and shape
+ * nothing. Where the fast path does not, the slow path crosses every device
+ * of the receive stack, as the walk took it.
+ *
+ * tc is not asked here: admission decides inside the backend transaction,
+ * where walking a filter block can deadlock (ft_dev_tc_soft_for()). It reads
+ * the sample ask_flowtable_tc.c takes of every device under RTNL instead,
+ * about once a second, and that worker retires what a change keeps out.
+ *
+ * What a direction arrives through is met with every filter but the police
+ * the hardware applies to the packet that crosses the port's ingress, which
+ * is not always the direction's own (ft_tc_rx_bit()). */
+
+/* Whether Linux's software fast path carries a direction now: nothing else
+ * offers it again (ft_software_reoffers()), and nothing else takes its frames
+ * at the bound port (above). nf_flow_offload_ip_hook() and its IPv6 twin hand
+ * a table with hardware handles' every packet to the normal stack while any
+ * xfrm policy or a default other than accept is configured, and any packet
+ * with a secpath -- what a direction an SA decrypts arrives as. And a
+ * direction that arrives through a tunnel never meets the fast path at all:
+ * its tuple names the port below the tunnel, where the fast path sees only
+ * the outer packet and cannot parse it, and the inner packet the tunnel device
+ * delivers arrives on a device the tuple does not name. Read as things stand
+ * now, every time it is asked. */
+static bool ft_fast_path(bool tunnel_in, bool decrypted)
+{
+	return xfrm_flowtable_enabled(&init_net) && !tunnel_in && !decrypted;
+}
+
+/* Whether Linux will offer this direction again on its own. flow_offload_refresh()
+ * does, at most about once a second, for as long as the software fast path
+ * forwards the direction's packets: it queues the whole flow, and
+ * flow_offload_work_add() offers both directions. The normal stack never offers
+ * a flow that already exists, so a direction whose packets never reach the
+ * fast path is never offered again by its own traffic: whatever
+ * ft_fast_path() says no to. The offer cannot say whether an SA will decrypt
+ * the direction, which only the walk finds -- through a policy
+ * (ft_ipsec_handle()), and a configured policy already says no.
+ *
+ * A direction through a tunnel is offered again only by its sibling's
+ * software traffic, which stops the moment the sibling is in hardware; and in
+ * either case it is then the sibling's hardware counters that keep the
+ * generation alive. */
+static bool ft_software_reoffers(const struct flow_cls_offload *cls)
+{
+	return cls->nf_tunnel_reverse &&
+	       ft_fast_path(cls->nf_tunnel_reverse->lower_ifindex, false);
+}
+
+/* Which FT_TC_RX* answer counts against a direction on the way in: the one
+ * for the packet that crosses the bound port's ingress, which tc meters in
+ * software and the hardware's police meet or do not (cdx_police_reaches()).
+ * A direction that arrives through a tunnel crosses it as the outer packet,
+ * IPv6 in IPv4 or IPv4 in IPv6, which neither a flower profile, bound to the
+ * inner tuple, nor the port's rate limiter, which meets TCP, UDP and ESP
+ * frames alone, meters in hardware: every filter counts. One an SA decrypts
+ * crosses it as ESP, which the rate limiter meters in hardware and a flower
+ * profile does not; tc meters the inner packet once more, when decapsulation
+ * hands it back to the port, which the hardware does not repeat
+ * (docs/flowtable/architecture.md, "What remains"). Any other crosses it as itself: both apply to TCP and
+ * UDP, the rate limiter to ESP, neither to anything else. Admission, its
+ * pre-RTNL refusal and the recheck all ask this. */
+static u8 ft_tc_rx_bit(bool tunnel_in, bool decrypted, u8 proto)
+{
+	if (tunnel_in)
+		return FT_TC_RX;
+	if (decrypted)
+		return FT_TC_RX_ESP;
+	switch (proto) {
+	case IPPROTO_TCP:
+	case IPPROTO_UDP:
+		return FT_TC_RX_L4;
+	case IPPROTO_ESP:
+		return FT_TC_RX_ESP;
+	default:
+		return FT_TC_RX;
+	}
+}
+
+/* What the sample says of one side's devices, together. */
+static u8 ft_tc_side(const struct net_device *port, const struct net_device *logical,
+		     const struct net_device *bridge, const struct cdx_ft_vlan *vlan, u8 vlans,
+		     const struct cdx_ft_session *session, const struct cdx_ft_tunnel *tunnel)
+{
+	u8 soft = ft_tc_dev_bits(port) | ft_tc_dev_bits(logical) | ft_tc_dev_bits(bridge);
+	u8 i;
+
+	for (i = 0; i < vlans; i++)
+		soft |= ft_tc_index_bits(vlan[i].ifindex);
+	if (session->present)
+		soft |= ft_tc_index_bits(session->lower_ifindex);
+	if (tunnel->present)
+		soft |= ft_tc_index_bits(tunnel->ifindex) | ft_tc_index_bits(tunnel->lower_ifindex);
+	return soft;
+}
+
+/* Whether tc runs something in software on what Linux's own path for this
+ * direction would cross, as the last sample found it and as that path is now:
+ * the port alone on the way in while the fast path carries the direction,
+ * every device the walk took otherwise, and every one on the way out; on the
+ * way in by what crosses the port (ft_tc_rx_bit()). Any context; cheap while
+ * no device has anything to say. Read afresh at each recheck, so a policy
+ * configured since admission widens the way in, and the readmission that
+ * follows a retirement decides again. Admission asks it of the rule as the
+ * recheck will find it, the SA that decrypts the direction included. */
+bool ft_rule_tc_soft(const struct cdx_ft_rule *rule)
+{
+	u8 in;
+
+	if (!ft_tc_any())
+		return false;
+	if (ft_fast_path(rule->in_tunnel.present, rule->in_sa_handle))
+		in = ft_tc_dev_bits(rule->in);
+	else
+		in = ft_tc_side(rule->in, rule->in_logical, rule->in_bridge, rule->in_vlan,
+				rule->in_vlans, &rule->in_session, &rule->in_tunnel);
+	return (in & ft_tc_rx_bit(rule->in_tunnel.present, rule->in_sa_handle, rule->proto)) ||
+	       (ft_tc_side(rule->out, rule->out_logical, rule->out_bridge, rule->out_vlan,
+			   rule->out_vlans, &rule->out_session, &rule->out_tunnel) & FT_TC_TX);
+}
+
+/* The same decided from the offer alone, before RTNL and the walk, for the
+ * devices it names: the port it arrives on and the one the redirect sends it
+ * to, the two logical devices its destinations name, and the devices under a
+ * session or a tunnel either side records -- on the way in only where the fast
+ * path does not carry the direction, by the same ft_fast_path(). Each is one
+ * the walk takes, on that side, and what counts there is asked by the same
+ * ft_tc_rx_bit(): a tunnel the offer records arrives as the walk will find it.
+ * An SA that decrypts the direction only the walk finds, and judging it here
+ * as the plain direction is the narrower question -- a filter that counts
+ * against a TCP or UDP direction counts against ESP too -- so the way in can
+ * only be wider after the walk, a refusal here is one the walk would make too,
+ * and software offering the direction again every second while it carries
+ * traffic does not take RTNL each time to hear it. A protocol the offer does
+ * not name exactly is judged with every filter counted, which only the walk
+ * could narrow -- and the decoder refuses such an offer anyway. */
+static bool ft_tc_offer_refused(const struct flow_cls_offload *cls, const struct net_device *port)
+{
+	struct flow_rule *rule = cls->rule;
+	const struct flow_action_entry *action;
+	struct flow_match_basic basic;
+	bool fast = ft_software_reoffers(cls);
+	bool tunnel_in = cls->nf_tunnel_reverse && cls->nf_tunnel_reverse->lower_ifindex;
+	u8 rx = FT_TC_RX, in, out = 0;
+
+	if (!rule || !cls->nf_dst || !cls->nf_dst_reverse || !ft_tc_any())
+		return false;
+	if (rule->match.dissector->used_keys & BIT_ULL(FLOW_DISSECTOR_KEY_BASIC)) {
+		flow_rule_match_basic(rule, &basic);
+		if (basic.mask->ip_proto == 0xff)
+			rx = ft_tc_rx_bit(tunnel_in, false, basic.key->ip_proto);
+	}
+	if (rule->action.num_entries) {
+		action = &rule->action.entries[rule->action.num_entries - 1];
+		if (action->id == FLOW_ACTION_REDIRECT)
+			out = ft_tc_dev_bits(action->dev);
+	}
+	/* Compared, never followed: a destination's device can be swapped for
+	 * the blackhole one while its own unregisters (ft_mtu_refused()). */
+	rcu_read_lock();
+	in = ft_tc_dev_bits(port);
+	if (!fast)
+		in |= ft_tc_dev_bits(READ_ONCE(cls->nf_dst_reverse->dev));
+	out |= ft_tc_dev_bits(READ_ONCE(cls->nf_dst->dev));
+	rcu_read_unlock();
+	if (!fast && cls->nf_session_reverse)
+		in |= ft_tc_index_bits(cls->nf_session_reverse->lower_ifindex);
+	if (!fast && cls->nf_tunnel_reverse)
+		in |= ft_tc_index_bits(cls->nf_tunnel_reverse->lower_ifindex);
+	if (cls->nf_session)
+		out |= ft_tc_index_bits(cls->nf_session->lower_ifindex);
+	if (cls->nf_tunnel)
+		out |= ft_tc_index_bits(cls->nf_tunnel->lower_ifindex);
+	if (!(in & rx) && !(out & FT_TC_TX))
+		return false;
+	ask_dbg(ASK_DBG_DEVICE, "tc in software on the path (in %#x out %#x) before RTNL\n",
+		in, out);
+	return true;
+}
+
 static bool ft_tunnel_inbound_allowed(const struct cdx_ft_tunnel *tunnel)
 {
 	struct flowi flow = {};
@@ -2158,6 +2375,19 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    !ft_ipsec_handle(cls, out, out->out_logical, out->in_logical) ||
 	    cls->nf_mtu > out->out_logical->mtu)
 		return ask_refuse(-EOPNOTSUPP);
+	/* tc on any device Linux's path for the direction crosses, now that the
+	 * walk has named them all and found the SA that decrypts the direction,
+	 * if one does: what crosses the port then is ESP (ft_tc_rx_bit()). So
+	 * this is the rule the recheck of the installed direction asks of
+	 * (ft_entry_bounded()), and the two cannot trade it back and forth. A
+	 * sample there is: an offer made before the first one was taken is
+	 * answered busy (ft_rule_callback()). */
+	if (ft_rule_tc_soft(out)) {
+		ft_tc_refused++;
+		ask_dbg(ASK_DBG_DEVICE, "tc in software on %s or %s, or a device between\n",
+			netdev_name(out->in_logical), netdev_name(out->out_logical));
+		return ask_refuse(-EOPNOTSUPP);
+	}
 	/* The route's MTU, and no more than the port carries (ft_port_mtu()):
 	 * what the bridge would drop above it, the hardware punts or is never
 	 * given, as for any path smaller than what may arrive. */
@@ -2471,6 +2701,13 @@ static bool ft_entry_bounded(struct cdx_ft_entry *entry)
 		ft_handle_invalidate(entry->handle, &ft_mtu_invalidations);
 		return false;
 	}
+	/* tc that came to run in software on its path after the sample it was
+	 * admitted by, which the sample's worker retires too, unless the entry
+	 * was published after the worker looked (ask_flowtable_tc.c). */
+	if (ft_rule_tc_soft(&entry->rule)) {
+		ft_handle_invalidate(entry->handle, &ft_tc_invalidations);
+		return false;
+	}
 	return true;
 }
 
@@ -2690,29 +2927,6 @@ static bool ft_request_owned(const struct cdx_ft_binding *binding,
 	return cls->nf_ingress_ifindex == binding->dev->ifindex;
 }
 
-/* Whether Linux will offer this direction again on its own. flow_offload_refresh()
- * does, at most about once a second, for as long as the software fast path
- * forwards the direction's packets: it queues the whole flow, and
- * flow_offload_work_add() offers both directions. The normal stack never offers
- * a flow that already exists, so a direction whose packets never reach the
- * fast path is never offered again by its own traffic. Two kinds never do:
- *
- * - every direction, while any xfrm policy or a default other than accept is
- *   configured: nf_flow_offload_ip_hook() and its IPv6 twin then hand every
- *   packet of a table with hardware handles to the normal stack;
- * - one that arrives through a tunnel. For a table with neighbour output its
- *   tuple names the port below the tunnel, where the fast path sees only the
- *   outer packet and cannot parse it, and the inner packet the tunnel device
- *   delivers arrives on a device the tuple does not name.
- *
- * The second is offered again only by its sibling's software traffic, which
- * stops the moment the sibling is in hardware; and in either case it is then
- * the sibling's hardware counters that keep the generation alive. */
-static bool ft_software_reoffers(const struct flow_cls_offload *cls)
-{
-	return xfrm_flowtable_enabled(&init_net) && cls->nf_tunnel_reverse &&
-	       !cls->nf_tunnel_reverse->lower_ifindex;
-}
 
 /* Whether an offer names a direction this generation already has in hardware,
  * with no global latch pending. Such an offer is answered without RTNL and
@@ -2808,8 +3022,9 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 		/* Linux re-offers a flow while software forwards any part of
 		 * it, installed half included, so the offers that cannot change
 		 * anything are answered first, without RTNL: a direction already
-		 * installed, one whose MTU bound is certain to refuse it, and one
-		 * a full table would refuse.
+		 * installed, one whose MTU bound is certain to refuse it, one tc
+		 * running in software on a device it names keeps out, and one a
+		 * full table would refuse.
 		 *
 		 * Never wait for RTNL here: device teardown under RTNL may be
 		 * flushing this workqueue. An offer that cannot take it retires
@@ -2823,6 +3038,12 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 			rc = ft_offer_routes_current(cls) && ft_entry_bounded(entry) ?
 			     0 : ask_refuse(-EOPNOTSUPP);
 		} else if (!entry && ft_mtu_refused(cls, binding->dev)) {
+			rc = ask_refuse(-EOPNOTSUPP);
+		} else if (!entry && ft_tc_offer_refused(cls, binding->dev)) {
+			/* tc runs in software on a device the offer names: a
+			 * refusal, as one on the MTU bound is, never busy, and
+			 * retiring nothing. */
+			ft_tc_refused++;
 			rc = ask_refuse(-EOPNOTSUPP);
 		} else if (!entry && ft_count >= CDX_FT_MAX_ENTRIES &&
 			   ft_software_reoffers(cls)) {
@@ -2841,7 +3062,12 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 			 * and once ft_rearm() has made this binding live that offer
 			 * is admitted with no reload. */
 			rc = -EOPNOTSUPP;
-		} else if (ft_admission_fault(cls) || cdx_ft_admission_begin()) {
+		} else if (ft_admission_fault(cls) || !ft_tc_known() ||
+			   cdx_ft_admission_begin()) {
+			/* No tc sample yet, the first binding a moment old, is
+			 * as busy as a lost RTNL trylock: nothing is known that
+			 * could admit the direction or refuse it, and a few
+			 * milliseconds will tell (ask_flowtable_tc.c). */
 			ft_busy++;
 			if (!ft_software_reoffers(cls) && !cdx_ft_observing() && !ft_stopping &&
 			    !atomic_read(&ft_invalid) && !cdx_ft_failed())
@@ -3284,6 +3510,9 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 		spin_unlock_bh(&ft_watch_lock);
 		/* A bridged pair refused for want of this binding. */
 		ft_l2_refusals_reset();
+		/* What tc runs on each device, sampled now rather than at the
+		 * next interval: admission waits for it. */
+		ft_tc_kick();
 		if (binding->parked) {
 			WRITE_ONCE(ft_parked, ft_parked + 1);
 			/* A table that already holds flows -- one gaining a

@@ -33,6 +33,7 @@ CMM or per-flow FCI commands. CDX builds the classifier during
 | IPsec packet offload | [ask_flowtable_ipsec.c](../../cdx/ask_flowtable_ipsec.c) |
 | Bridged multicast learner | [ask_flowtable_mc.c](../../cdx/ask_flowtable_mc.c), [ask_flowtable_mc_hook.c](../../cdx/ask_flowtable_mc_hook.c) |
 | Routed multicast learner | [ask_flowtable_mr.c](../../cdx/ask_flowtable_mr.c), [ask_flowtable_mr_probe.c](../../cdx/ask_flowtable_mr_probe.c) |
+| What tc runs in software on each device, sampled for admission and the bridged learner | [ask_flowtable_tc.c](../../cdx/ask_flowtable_tc.c), asking through [ask_flowtable_mr_probe.c](../../cdx/ask_flowtable_mr_probe.c) |
 | Wi-Fi VAPs | [ask_flowtable_wifi.c](../../cdx/ask_flowtable_wifi.c) |
 | QoS classification, `/proc/ask_flowtable/` ([procfs](procfs.md)), module init and exit | [ask_flowtable_main.c](../../cdx/ask_flowtable_main.c) |
 | Private source interface | [cdx_flowtable_backend.h](../../cdx/cdx_flowtable_backend.h) |
@@ -322,6 +323,150 @@ have focused routed-UDP evidence for TTL/MTU exceptions, options and fragments.
 Each new feature combination still needs its own exception proof; the first
 static TCP/UDP SNAT increment does not establish every NAT exception combination.
 
+### Software traffic control on the path
+
+An offloaded direction's frames go from the port they arrive on straight to
+the queues of the port they leave by: no qdisc and no tc filter on the way sees
+them. A shaper is where that shows. OpenWrt's SQM puts `cake` at the WAN
+device's root for the upload, and for the download an `ingress` qdisc whose one
+u32 filter redirects every received frame to an ifb carrying another `cake`;
+against offloaded flows both shaped the few packets Linux forwarded before
+admission and nothing after, and `tc -s` read as an idle shaper.
+
+The hardware has to do what Linux's own path for a direction would do, no more
+and no less. So a direction stays in software where that path runs tc in
+software (`ft_rule_tc_soft()`, `ft_dev_tc_soft()`):
+
+- **on the way out**, on any device the direction leaves through: a filter in
+  an egress block or on any class of the qdisc tree, a tcx program, or a qdisc
+  that shapes or schedules. A qdisc of a work-conserving kind Linux attaches by
+  default counts for nothing, because the egress port's own queues, bounded
+  and served per flow hash (A313), stand in for one: `noqueue`, `noop`, `mq`,
+  `pfifo_fast`, `pfifo`, `bfifo` and `fq_codel` however they came there, and
+  `fq` and whatever `net.core.default_qdisc` names only as the kernel attached
+  them itself, with handle 0 (`ft_qdisc_schedules()`). One tc created always
+  has a major, and is the operator's: an `fq` with a `maxrate` paces, which
+  nothing here reads, and a `cake` is SQM's shaper whatever the default is.
+  Every other kind counts, `cake`, `tbf`, `prio`, `hfsc` and an HTB the
+  hardware does not run among them, and so does a kind nothing names (fail
+  closed). An `htb offload` tree is the hardware's own
+  scheduler: under its root, which sch_htb flags `TCQ_F_OFFLOADED`, the leaves'
+  FIFOs and a RED curve are the QoS plane's, and only a shaper grafted under a
+  leaf, which runs on what the CPU sends there alone, still counts;
+- **on the way in**, on a device Linux's path takes the direction's frames
+  through (below): a filter, a tcx program, XDP. A police filter the hardware
+  applies, as tc would, to the packet that crosses the port counts for nothing
+  (`cdx_police_reaches()`, `ft_tc_rx_bit()`): a flower police filter is bound
+  to each TCP or UDP direction it matches at admission, and the port's matchall
+  rate limiter meets every TCP, UDP and ESP frame the port receives. That
+  packet is not always the direction's own. One arriving through a tunnel
+  crosses the port as the outer IPv6-in-IPv4 or IPv4-in-IPv6 packet, which
+  neither meters in hardware, so for it every filter counts; one an SA
+  decrypts crosses it as ESP, so only the rate limiter is the hardware's. A
+  port-less direction -- GRE, IP in IP (A386) -- meets neither either, so for
+  it every filter counts;
+- the DSCP map's egress filters count for nothing, as before
+  (`cdx_tc_filter_mirrored()`).
+
+Each side is judged by its own devices. The way out is every device the walk
+took: software sends on the logical device Linux routed through and down
+through every qdisc below it -- a tag's device, the one under a session, a
+bridge, the tunnel's own and the one under it, the port -- every device the
+walk records and every one it holds (`ft_crossed_hold_all()`). So `cake` on the
+WAN port keeps the upload in software and leaves the download, which leaves by
+the LAN port, in hardware, and SQM's ifb on the WAN port's ingress does the
+reverse.
+
+The way in is what Linux's path for the direction crosses, and that depends on
+which path it is (`ft_fast_path()`):
+
+- **the software fast path**, which carries a direction unless an xfrm policy
+  or a default other than accept is configured, an SA decrypts it, or it
+  arrives through a tunnel. It takes the frame at the flowtable hook on the
+  bound port, `nf_ingress` in `__netif_receive_skb_core()`, after the port's
+  generic XDP, tcx and tc ingress and before the frame reaches any device above
+  the port. A tag is out of the frame by then -- `skb_vlan_untag()` runs first,
+  and the DPAA driver strips none in hardware -- and
+  `nf_flow_skb_encap_protocol()` reads a second tag or a PPPoE session off the
+  frame itself, so a tagged port, QinQ, a session over a tag and a bridge port
+  that is a VLAN device are all taken there; the bridge's `rx_handler` runs
+  after the hook as well. Only the port's ingress counts, then: SQM's ifb on
+  `pppoe-wan` -- the commonest SQM setup -- shapes no download Linux forwards
+  there either, and the download stays in hardware;
+- **the slow path** otherwise: an xfrm policy hands every packet of a table
+  with hardware handles to the normal stack (`nf_flow_offload_ip_hook()`), as
+  a secpath does a decrypted one, and a tunnel's tuple names the port below
+  it, where the fast path sees only the outer packet. That path crosses every
+  device of the receive stack, as the walk took it, and every one counts.
+
+The pre-RTNL refusal, the check after the walk and the recheck of an installed
+direction all ask the same `ft_fast_path()` and `ft_tc_rx_bit()`, read as
+things stand at the time of asking: a policy configured since admission widens
+the way in, the recheck retires what that keeps out, and readmission decides
+afresh. The check after the walk runs once the walk has found the SA that
+decrypts the direction, so it judges the rule the recheck will; the pre-RTNL
+refusal cannot know of an SA and judges the direction as a plain one, the
+narrower question.
+`ft_software_reoffers()` is the same question from the offer alone: the fast
+path is also what offers a direction again.
+
+tc cannot be asked where admission decides, inside the backend transaction
+(see the lock ordering below), and a refused direction is offered again about
+once a second for as long as it carries traffic, which under SQM is every
+upload. So a worker (`ask_flowtable_tc.c`) asks every device under RTNL, about
+once a second while a binding or a bridged pair exists and at once when a
+binding appears, and publishes the ones with something to say through RCU.
+Admission reads it before RTNL for the devices an offer names -- refused there
+as an MTU refusal is, counted in `rejects` and `tc_refused`, never `busy`,
+retiring nothing -- and after the walk for every device the walk crossed. An
+offer made before the first sample after a binding appears is answered as one
+that lost the RTNL trylock is: busy, and where software will not offer the
+direction again its generation is retired, so native GC brings it back. When a
+device's answer changes the worker says so in the log and wakes both multicast
+learners. Where it tightened, the worker retires every installed direction the
+new answer keeps out (`tc_invalidations`) and every bridged pair through the
+device; the counter pass and an installed direction's offers recheck the same
+against the sample, which catches a direction published after the worker
+looked. Where it only loosened, nothing is retired -- a pair admitted under
+the tighter answer is still right -- and the bridged pairs refused lately are
+asked again. A direction the answer lets through again is offered again only
+where software would offer it anyway; see what remains, below.
+
+Two costs are accepted. The retire scan walks every installed direction with
+bottom halves off, but only after an answer tightened. And RTNL held for the
+walk, about once a second, is RTNL an admission's trylock can lose meanwhile:
+slightly more offers answered busy.
+
+The bridged learner reads the same sample for a pair's ports and the devices
+below them, every filter counted: no flower profile is bound to a pair, and the
+port's rate limiter meets only a pair's TCP, UDP and ESP frames. Both multicast
+learners ask tc themselves, outside the transaction, so a qdisc that shapes now
+keeps a group in software as a filter did (refused-tc).
+
+What remains:
+
+- a police filter is sampled at admission, as the conntrack mark is: one added
+  after a direction was installed does not reach it until the direction is
+  readmitted, and adding the filter retires nothing;
+- a direction software never offers again -- every direction while an xfrm
+  policy or a blocking default is configured, and one arriving through a tunnel
+  while its sibling stays in hardware (`ft_software_reoffers()`) -- stays in
+  software until it ends once tc has refused it, even after the tc goes;
+- an offloaded SA's inbound ESP is decrypted by SEC and reaches the classifier
+  on the offline port, so it never crosses an ifb on a ppp device above the
+  port, whatever is decided for the flow inside it;
+- an ingress filter on a device above the port -- SQM's ifb on `pppoe-wan`
+  first of all -- shapes a download only while Linux takes it up the slow
+  path: with no policy configured, it shapes nothing in software or hardware.
+  That is Linux's fast path, which the hardware follows rather than corrects
+  (`flowtable_qos_software.py::test_sqm_on_the_session_follows_linux`);
+- a matchall police on the port meters a tunnel-mode direction an SA decrypts
+  twice in software -- the ESP, then the inner packet, which decapsulation
+  hands back to the same port's receive path (`xfrm_input()`,
+  `gro_cells_receive()`) -- and once in hardware, the ESP alone. The rate
+  limiter is left to admit such a direction rather than refuse it to repeat
+  the second count.
+
 ## References and directional resources
 
 | Object | Lifetime |
@@ -453,6 +598,14 @@ The required ordering and wait boundaries are:
   callbacks take the transaction) already do.
 - Neighbour callbacks nest `ft_watch_lock` inside the neighbour lock. No path
   takes a neighbour lock or begins a transaction while holding the watch lock.
+- tc is asked only under RTNL and outside the transaction. A step of a filter
+  block's walk can put the last reference to a classifier a concurrent delete
+  unlinked (flower and matchall delete without RTNL), and its destroy can
+  drain the port's egress, which takes the transaction: a walk inside it
+  deadlocks on the control mutex. `ft_dev_tc_soft()` asserts as much under
+  lockdep (`cdx_ft_assert_not_held()`). The multicast workers ask before they
+  take their own locks; routed admission and the bridged learner, which decide
+  inside the transaction, read the sample `ask_flowtable_tc.c` takes instead.
 
 Binding and dependency publication/removal follow this same exclusion. An empty
 binding still watches its device, and installed egress dependencies are watched

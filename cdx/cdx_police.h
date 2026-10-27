@@ -30,4 +30,12 @@ u8 cdx_police_lookup(const struct cdx_ft_rule *rule);
 void cdx_police_profile_ref(u8 profile);
 void cdx_police_profile_unref(u8 profile);
 
+/* Which routed unicast directions arriving on a port the hardware polices by
+ * the ingress filter tc knows as `cookie' there, exactly as the software
+ * filter would: a TCP or UDP one (CDX_POLICE_L4), an ESP one
+ * (CDX_POLICE_ESP). Zero for a filter this file does not hold. */
+#define CDX_POLICE_L4	0x1u
+#define CDX_POLICE_ESP	0x2u
+unsigned int cdx_police_reaches(struct net_device *dev, unsigned long cookie);
+
 #endif /* _CDX_POLICE_H_ */

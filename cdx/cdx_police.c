@@ -906,6 +906,38 @@ static int cdx_police_block_cb(enum tc_setup_type type, void *type_data,
 	}
 }
 
+/* What the flowtable adapter asks of a filter it finds running on a port's
+ * ingress in software too, before it offloads a routed unicast direction
+ * arriving there (ask_flowtable_tc.c). A filter this file holds is one the
+ * hardware applies to such a direction as tc would, so it keeps nothing in
+ * software; anything else does.
+ *
+ * A flower filter's profile is bound to each TCP or UDP direction it matches
+ * at that direction's admission (cdx_police_lookup()), and matches none it
+ * would not match in software -- one direction, one port. A port-less
+ * direction is not counted: ESP, GRE and IP in IP are keyed in the
+ * three-tuple tables, where no case has proved the profile is met. The
+ * matchall is the port's rate limiter, which the soft parser hands every
+ * unicast TCP, UDP and ESP frame the port receives and no other: a GRE or
+ * IP-in-IP transit direction (A386) passes it unmetered, where the software
+ * filter would meter it (cdx_tc_filter_mirrored() says the same of a
+ * multicast stream). A bridged pair carries whatever its stations send, and
+ * the learner asks with no exception at all. */
+unsigned int cdx_police_reaches(struct net_device *dev, unsigned long cookie)
+{
+	unsigned int reach = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	if (cdx_police_filter_find(dev, cookie))
+		reach = CDX_POLICE_L4;
+	else if (cdx_police_port_find(dev, cookie))
+		reach = CDX_POLICE_L4 | CDX_POLICE_ESP;
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	return reach;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_police_reaches, ASK_CDX_FLOWTABLE);
+
 static LIST_HEAD(cdx_police_block_list);
 
 /* Ingress only. A clsact qdisc offers both directions and egress is the

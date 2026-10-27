@@ -746,7 +746,10 @@ arrives or where a bridged copy leaves:
   program on the ingress port, or an nftables `netdev` ingress chain (or an
   `inet` one at ingress).
 - **Where a copy leaves:** a tc egress filter, a filter on any class of the
-  port's qdisc tree, or a `netdev` egress chain.
+  port's qdisc tree, a qdisc that shapes or schedules -- `cake`, an HTB
+  without `offload`, anything but the work-conserving kinds Linux attaches by
+  default, `fq` and the `net.core.default_qdisc` kind only as the kernel
+  attached them -- or a `netdev` egress chain.
 - **Where the bridge hands it up:** for a flow the bridge also hands up to the
   host as a multicast router or a promiscuous bridge, the copy it hands up
   crosses the bridge's own `input` hook, the bridge device's ingress and that
@@ -756,7 +759,11 @@ arrives or where a bridged copy leaves:
 
 tc uses the routed learner's own predicate (`ft_dev_stack_tc_soft()`): a filter
 that skips software, or one the hardware applies as it is, counts for nothing,
-and `/proc` says `refused-tc`. A port's `netdev` chains are judged the way the
+and `/proc` says `refused-tc`. A shaping qdisc counts the way a filter does: the
+classifier sends a copy past it as it sends a unicast flow's frames
+([architecture](architecture.md#software-traffic-control-on-the-path)), so SQM's
+`cake` on a listener port keeps the group in software; an `htb offload` tree
+and the default kinds do not. A port's `netdev` chains are judged the way the
 routed learner judges its groups', by `nft_port_dependent()` (patch 148). The
 flow is asked about as a bridged stream, which walks netdev ingress up the
 input's stack and netdev egress down each listener port's, with no conntrack

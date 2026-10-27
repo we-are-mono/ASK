@@ -11,11 +11,16 @@ typedef uint8_t u8;
 #define CONFIG_NET_CLS_ACT 1
 #define CONFIG_NET_SCHED 1
 #define CONFIG_NET_XGRESS 1
+#define TCQ_F_BUILTIN 1
 #define TCQ_F_INGRESS 2
+#define TCQ_F_OFFLOADED 0x200
+#define TC_H_MAJ(h) ((h) & 0xFFFF0000U)
 #define TC_H_MIN(h) ((h) & 0x0000FFFFU)
 #define TC_H_MIN_INGRESS 0xFFF2U
 #define TC_H_MIN_EGRESS 0xFFF3U
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define READ_ONCE(x) (x)
 typedef struct { int counter; } atomic_t;
 #define atomic_read(v) ((v)->counter)
 
@@ -28,6 +33,10 @@ static void rcu_read_lock(void) { rcu_depth++; }
 static void rcu_read_unlock(void) { assert(rcu_depth > 0); rcu_depth--; }
 #define rcu_dereference(p) ({ assert(rcu_depth > 0); (p); })
 #define rtnl_dereference(p) ({ assert(rtnl); (p); })
+/* CDX's transaction, which no helper may run inside: a walk can run a
+ * classifier's destroy, and that can take it. Never held here. */
+static bool transaction;
+static void cdx_ft_assert_not_held(void) { assert(!transaction); }
 
 /* ---- classifiers ----------------------------------------------------------
  *
@@ -178,11 +187,15 @@ struct Qdisc_class_ops {
     void (*walk)(struct Qdisc *, struct qdisc_walker *);
 };
 struct Qdisc_ops {
+    char id[16];
     const struct Qdisc_class_ops *cl_ops;
 };
 struct Qdisc {
     const struct Qdisc_ops *ops;
     unsigned flags;
+    /* 0 for one the kernel attached itself; tc gives every one it creates
+     * a major (created()). */
+    unsigned handle;
     struct tcf_block *block;
     struct tcf_block *class_block[3];
     unsigned classes;
@@ -213,10 +226,25 @@ static const struct Qdisc_class_ops classful_ops = {
 };
 /* mq: classes, but no filters of its own. */
 static const struct Qdisc_class_ops blockless_ops = { .walk = classful_walk };
-static const struct Qdisc_ops classful = { .cl_ops = &classful_ops };
-static const struct Qdisc_ops blockless = { .cl_ops = &blockless_ops };
+static const struct Qdisc_ops classful = { .id = "htb", .cl_ops = &classful_ops };
+static const struct Qdisc_ops blockless = { .id = "mq", .cl_ops = &blockless_ops };
 /* pfifo_fast, noqueue: no classes at all. */
-static const struct Qdisc_ops classless = { .cl_ops = NULL };
+static const struct Qdisc_ops classless = { .id = "pfifo_fast", .cl_ops = NULL };
+/* By kind, for what a qdisc does to what it is given: the ones Linux attaches
+ * by default, which only order it, and ones that shape or schedule it. */
+static const struct Qdisc_ops fq_codel_ops = { .id = "fq_codel", .cl_ops = &classful_ops };
+static const struct Qdisc_ops pfifo_ops = { .id = "pfifo", .cl_ops = NULL };
+static const struct Qdisc_ops bfifo_ops = { .id = "bfifo", .cl_ops = NULL };
+static const struct Qdisc_ops fq_ops = { .id = "fq", .cl_ops = NULL };
+static const struct Qdisc_ops noqueue_ops = { .id = "noqueue", .cl_ops = NULL };
+static const struct Qdisc_ops noop_ops = { .id = "noop", .cl_ops = NULL };
+static const struct Qdisc_ops red_ops = { .id = "red", .cl_ops = &classful_ops };
+static const struct Qdisc_ops cake_ops = { .id = "cake", .cl_ops = &classful_ops };
+static const struct Qdisc_ops tbf_ops = { .id = "tbf", .cl_ops = &classful_ops };
+static const struct Qdisc_ops sfq_ops = { .id = "sfq", .cl_ops = &classful_ops };
+static const struct Qdisc_ops unknown_ops = { .id = "unheard_of", .cl_ops = NULL };
+/* net.core.default_qdisc, which a case may set. */
+static const struct Qdisc_ops *default_qdisc_ops = &classless;
 /* sch_ingress.c's two: clsact answers by direction, and ingress has its one
  * block whatever is asked. */
 static struct tcf_block *clsact_tcf_block(struct Qdisc *q, unsigned long cl,
@@ -240,8 +268,8 @@ static struct tcf_block *ingress_tcf_block(struct Qdisc *q, unsigned long cl,
 }
 static const struct Qdisc_class_ops clsact_cops = { .tcf_block = clsact_tcf_block };
 static const struct Qdisc_class_ops ingress_cops = { .tcf_block = ingress_tcf_block };
-static const struct Qdisc_ops clsact_qops = { .cl_ops = &clsact_cops };
-static const struct Qdisc_ops ingress_qops = { .cl_ops = &ingress_cops };
+static const struct Qdisc_ops clsact_qops = { .id = "clsact", .cl_ops = &clsact_cops };
+static const struct Qdisc_ops ingress_qops = { .id = "ingress", .cl_ops = &ingress_cops };
 
 /* ---- devices -------------------------------------------------------------- */
 /* As in the kernel: clsact gives only the ingress miniq its block, which
@@ -341,6 +369,27 @@ static void mirror(struct net_device *dev, struct filter *f)
     mirrors[nmirrors++] = (struct mirrored){ dev, (unsigned long)f };
 }
 
+/* What the policer holds, by port and cookie, and the kinds of routed
+ * direction (CDX_POLICE_*) each reaches. Every question is counted. */
+struct policed { struct net_device *dev; unsigned long cookie; unsigned reach; };
+static struct policed policed[4];
+static unsigned npoliced, police_asks;
+static unsigned cdx_police_reaches(struct net_device *dev, unsigned long cookie)
+{
+    unsigned i;
+
+    police_asks++;
+    for (i = 0; i < npoliced; i++)
+        if (policed[i].dev == dev && policed[i].cookie == cookie)
+            return policed[i].reach;
+    return 0;
+}
+static void police(struct net_device *dev, struct filter *f, unsigned reach)
+{
+    assert(npoliced < 4);
+    policed[npoliced++] = (struct policed){ dev, (unsigned long)f, reach };
+}
+
 struct ft_mr_plan {
     int oif[MAXVIFS];
     int parent;
@@ -372,6 +421,8 @@ static void reset(void)
     memset(queues, 0, sizeof(queues));
     nblocks = nchains = nprotos = nfilters = nqdiscs = ntcxs = nqueues = 0;
     nmirrors = mirror_asks = mirror_asks_ingress = chain_lookups = 0;
+    npoliced = police_asks = 0;
+    default_qdisc_ops = &classless;
     for (i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
         struct net_device *d = devices[i];
         int ifindex = d->ifindex;
@@ -490,6 +541,16 @@ static struct Qdisc *qdisc(const struct Qdisc_ops *ops, struct tcf_block *own, u
     q->ops = ops;
     q->block = own;
     q->flags = flags;
+    q->handle = 0;
+    return q;
+}
+/* `q' as tc creates it: qdisc_create() gives it the handle asked for, whose
+ * minor tc_modify_qdisc() requires to be zero, or one qdisc_alloc_handle()
+ * picks from 8000: up. Either way a major. */
+static struct Qdisc *created(struct Qdisc *q, unsigned major)
+{
+    assert(major && major <= 0xffff);
+    q->handle = major << 16;
     return q;
 }
 static void hashed(struct net_device *dev, struct Qdisc *q)
@@ -513,6 +574,22 @@ static bool filtered(void)
     assert(!held && !rcu_depth);
     for (i = 0; i < nchains; i++)
         assert(!chains[i].refs);
+    for (i = 0; i < nprotos; i++)
+        assert(!protos[i].refs);
+    return soft;
+}
+
+/* What a routed unicast direction of the kind `reach' names meets on its
+ * way in through `dev', with the same bookkeeping filtered() checks. */
+static bool routed(struct net_device *dev, unsigned reach)
+{
+    bool soft;
+    unsigned i;
+
+    rtnl = true;
+    soft = ft_dev_tc_soft_routed(dev, reach);
+    rtnl = false;
+    assert(!held && !rcu_depth);
     for (i = 0; i < nprotos; i++)
         assert(!protos[i].refs);
     return soft;
@@ -652,10 +729,10 @@ int main(void)
     reset();
     oif_b_port.qdisc = qdisc(&classful, one(&flower, true, NULL), 0);
     assert(filtered());
-    /* A class filter that only skips software, a qdisc with classes but no
-     * filters, and one with no classes. */
+    /* A class filter that only skips software on an offloaded tree, a qdisc
+     * with classes but no filters, and one with no classes. */
     reset();
-    q = qdisc(&classful, NULL, 0);
+    q = qdisc(&classful, NULL, TCQ_F_OFFLOADED);
     q->classes = 1;
     q->class_block[0] = one(&flower, false, NULL);
     oif_a.qdisc = q;
@@ -680,6 +757,146 @@ int main(void)
     hashed(&oif_a, qdisc(&classless, NULL, 0));
     hashed(&oif_a, q);
     assert(filtered());
+
+    /* A qdisc that shapes or schedules what a copy leaves by holds back
+     * frames the hardware sends at once, filters or none: cake at an oif's
+     * root, HTB that is not offloaded, cake under mq on the port below an
+     * oif, and a kind nothing here knows. */
+    reset();
+    oif_a.qdisc = qdisc(&cake_ops, NULL, 0);
+    assert(filtered());
+    reset();
+    oif_b_port.qdisc = qdisc(&classful, NULL, 0);
+    assert(filtered());
+    reset();
+    oif_b_port.qdisc = qdisc(&blockless, NULL, 0);
+    hashed(&oif_b_port, qdisc(&classless, NULL, 0));
+    hashed(&oif_b_port, qdisc(&cake_ops, NULL, 0));
+    assert(filtered());
+    reset();
+    oif_a.qdisc = qdisc(&unknown_ops, NULL, 0);
+    assert(filtered());
+    /* One that only orders what it is given is no shaper: fq_codel at the
+     * root, mq over fq_codel, pfifo_fast, noqueue, the builtin noop, and
+     * whatever net.core.default_qdisc names. */
+    reset();
+    oif_a.qdisc = qdisc(&fq_codel_ops, NULL, 0);
+    oif_b.qdisc = qdisc(&noqueue_ops, NULL, 0);
+    oif_b_port.qdisc = qdisc(&blockless, NULL, 0);
+    hashed(&oif_b_port, qdisc(&fq_codel_ops, NULL, 0));
+    hashed(&oif_b_port, qdisc(&fq_codel_ops, NULL, 0));
+    assert(!filtered());
+    reset();
+    oif_a.qdisc = qdisc(&noop_ops, NULL, TCQ_F_BUILTIN);
+    oif_b_port.qdisc = qdisc(&classless, NULL, 0);
+    assert(!filtered());
+    reset();
+    default_qdisc_ops = &sfq_ops;
+    oif_a.qdisc = qdisc(&blockless, NULL, 0);
+    hashed(&oif_a, qdisc(&sfq_ops, NULL, 0));
+    assert(!filtered());
+    default_qdisc_ops = &classless;
+    hashed(&oif_a, qdisc(&sfq_ops, NULL, 0));
+    assert(filtered());
+    /* The default kind and fq stand for the port's queues only as the
+     * kernel attaches them, with handle 0: at a single-queue device's root,
+     * as mq's children, and fq however the default has moved since. One tc
+     * created is the operator's -- fq with a maxrate paces, and a default of
+     * cake is still cake -- and counts. */
+    reset();
+    oif_a.qdisc = qdisc(&fq_ops, NULL, 0);
+    oif_b_port.qdisc = qdisc(&blockless, NULL, 0);
+    hashed(&oif_b_port, qdisc(&fq_ops, NULL, 0));
+    hashed(&oif_b_port, qdisc(&fq_ops, NULL, 0));
+    assert(!filtered());
+    reset();
+    oif_a.qdisc = created(qdisc(&fq_ops, NULL, 0), 1);
+    assert(filtered());
+    reset();
+    oif_b_port.qdisc = created(qdisc(&blockless, NULL, 0), 0x8001);
+    hashed(&oif_b_port, qdisc(&fq_ops, NULL, 0));
+    hashed(&oif_b_port, created(qdisc(&fq_ops, NULL, 0), 0x8002));
+    assert(filtered());
+    reset();
+    default_qdisc_ops = &sfq_ops;
+    oif_a.qdisc = created(qdisc(&sfq_ops, NULL, 0), 1);
+    assert(filtered());
+    /* net.core.default_qdisc=cake: SQM's own cake at the root is a shaper,
+     * and the cake the kernel attached under mq, unshaped, is not -- under
+     * an mq tc created as well, whose children the kernel still attaches. */
+    reset();
+    default_qdisc_ops = &cake_ops;
+    oif_a.qdisc = created(qdisc(&cake_ops, NULL, 0), 1);
+    assert(filtered());
+    reset();
+    default_qdisc_ops = &cake_ops;
+    oif_a.qdisc = qdisc(&blockless, NULL, 0);
+    hashed(&oif_a, qdisc(&cake_ops, NULL, 0));
+    oif_b_port.qdisc = created(qdisc(&blockless, NULL, 0), 1);
+    hashed(&oif_b_port, qdisc(&cake_ops, NULL, 0));
+    assert(!filtered());
+    /* The kinds that never shape count for nothing however they came:
+     * fq_codel, pfifo_fast, the FIFOs and mq, created by tc. */
+    reset();
+    oif_a.qdisc = created(qdisc(&fq_codel_ops, NULL, 0), 1);
+    oif_b.qdisc = created(qdisc(&classless, NULL, 0), 1);
+    oif_b_port.qdisc = created(qdisc(&blockless, NULL, 0), 1);
+    hashed(&oif_b_port, created(qdisc(&pfifo_ops, NULL, 0), 2));
+    hashed(&oif_b_port, created(qdisc(&bfifo_ops, NULL, 0), 3));
+    assert(!filtered());
+    /* An offloaded HTB tree is the hardware scheduler's: its pfifo leaves
+     * and a RED curve under a class are its business. A shaper grafted
+     * under one of its leaves is not -- it runs on what the CPU sends to
+     * that leaf, and an offloaded flow's frames pass it. */
+    reset();
+    oif_a.qdisc = qdisc(&classful, NULL, TCQ_F_OFFLOADED);
+    hashed(&oif_a, qdisc(&pfifo_ops, NULL, 0));
+    hashed(&oif_a, qdisc(&red_ops, NULL, TCQ_F_OFFLOADED));
+    hashed(&oif_a, qdisc(&red_ops, NULL, 0));
+    assert(!filtered());
+    hashed(&oif_a, qdisc(&tbf_ops, NULL, 0));
+    assert(filtered());
+    /* Ingress and clsact shape nothing; their filters are asked for
+     * through the tcx entry, by direction. */
+    reset();
+    clsact(&oif_a, true, NULL, false);
+    hashed(&oif_b, qdisc(&ingress_qops, NULL, TCQ_F_INGRESS));
+    assert(!filtered());
+
+    /* A routed unicast direction meets the port's police filters in
+     * hardware, as far as the policer says: the rate limiter's matchall for
+     * TCP, UDP and ESP, a flower profile for TCP and UDP alone. A multicast
+     * stream meets neither, and the plain question is unchanged. */
+    reset();
+    clsact(&parent_port, true, one(&matchall, true, &f), true);
+    police(&parent_port, f, CDX_POLICE_L4 | CDX_POLICE_ESP);
+    assert(!routed(&parent_port, CDX_POLICE_L4) && !routed(&parent_port, CDX_POLICE_ESP));
+    assert(police_asks == 2);
+    assert(filtered());
+    reset();
+    clsact(&parent_port, true, one(&flower, true, &f), true);
+    police(&parent_port, f, CDX_POLICE_L4);
+    assert(!routed(&parent_port, CDX_POLICE_L4) && routed(&parent_port, CDX_POLICE_ESP));
+    /* One the policer does not hold -- a filter tc keeps in software, or
+     * one on another port -- counts, and so does a foreign filter beside a
+     * held one. */
+    reset();
+    clsact(&parent_port, true, one(&matchall, true, &f), true);
+    police(&oif_b_port, f, CDX_POLICE_L4 | CDX_POLICE_ESP);
+    assert(routed(&parent_port, CDX_POLICE_L4));
+    reset();
+    b = one(&flower, true, &f);
+    filter(&protos[0]);
+    clsact(&parent_port, true, b, true);
+    police(&parent_port, f, CDX_POLICE_L4);
+    assert(routed(&parent_port, CDX_POLICE_L4));
+    /* XDP is no filter of the policer's, nor is a tcx program. */
+    reset();
+    parent_port.xdp = 1;
+    assert(routed(&parent_port, CDX_POLICE_L4) && !police_asks);
+    reset();
+    clsact(&parent_port, true, NULL, false)->total = 1;
+    assert(routed(&parent_port, CDX_POLICE_L4));
 
     /* XDP on the way in, and only there. */
     reset();

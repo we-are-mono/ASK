@@ -543,8 +543,12 @@ it read. So tc is ruled out per device rather than per rule, and ahead of the
 confirmations: a group is `refused-tc` while anything tc runs in software sits
 on the parent VIF's device or a device below it, on the way in, or on an oif's
 or one below it, on the way out. That is a filter in a clsact or ingress block
-that runs in software, an egress filter on any class of a qdisc tree, a tcx BPF
-program, and on the input side an XDP program. A block runs in software when
+that runs in software, an egress filter on any class of a qdisc tree, a qdisc
+that shapes or schedules on the way out -- every kind but the work-conserving
+ones Linux attaches by default (`fq` and the `net.core.default_qdisc` kind
+only as the kernel attached them), an `htb offload` tree and the FIFOs and RED
+curves under its leaves (`ft_qdisc_schedules()`) -- a tcx BPF program, and on
+the input side an XDP program. A block runs in software when
 its `useswcnt` is not zero, which is what `tc_run()` bypasses it on, so a block
 of `skip_sw` filters alone counts for nothing. Every device of a stack counts,
 because a frame crosses each of them; a bridge oif therefore counts all its
@@ -856,7 +860,7 @@ family over:
 | A bridge hook registered at `input` -- ebtables, an nftables bridge chain, but not br_netfilter's | nothing reports it: asked at every derivation | a group whose parent VIF is on a bridge is `refused-filter` |
 | A rule that could treat two packets of a group apart -- by port, rate or anything the port walk does not model -- or a device it cannot follow joining a VIF's stack | a commit, which takes every confirmation back; a stack change is found by the walk itself, run at every derivation of a confirmed group | `refused-ports` once the group is confirmed again |
 | An iptables-legacy table registered, replaced or removed | the kernel's count `net->nf.xt_seq` (patch 148): read every second while any group exists, and at every worker pass | every group re-derived and `mroute_xtables_changes` counted, no confirmation taken back; a confirmed group whose packets the legacy rules could tell apart is `refused-xtables` |
-| A tc filter, qdisc tree filter, tcx program or XDP program on a device of the parent's or an oif's stack | nothing reports it: asked at every derivation, which the five-second refresh runs for every group | `refused-tc`, confirmed or not, unless the filter is an offloaded DSCP filter on a port whose map is published |
+| A tc filter, qdisc tree filter, shaping qdisc, tcx program or XDP program on a device of the parent's or an oif's stack | nothing reports it but the tc sample's worker, which wakes the learner when a device's answer changes: asked at every derivation, which the five-second refresh runs for every group | `refused-tc`, confirmed or not, unless the filter is an offloaded DSCP filter on a port whose map is published |
 | The host joining the group on the parent VIF or an oif | nothing reports it | `refused-host` at the next derivation; the five-second refresh finds it |
 | A root this learner gives up | its own worker | a group refused its key is asked again in the same pass |
 | The bridged group carrying a route installs or retires | the bridged worker kicks this one | re-derived; the route's state follows, and `MFC_OFFLOAD` with it |

@@ -500,6 +500,14 @@ static void verbs(void)
     assert(offer_on(&dev, MALL_COOKIE + 1, base()) == -EOPNOTSUPP && plcr_attempts == tried);
     assert(ack.msg && strstr(ack.msg, "already has a police filter"));
     assert(mall_cmd(&dev, MALL_COOKIE + 1, TC_CLSMATCHALL_STATS, &s) == -ENOENT);
+    /* What the flowtable adapter is told of a filter it finds running in
+     * software on the port's ingress: the limiter meets every routed TCP,
+     * UDP and ESP direction arriving there, as the software filter would;
+     * the refused second matchall, which tc keeps in software, none; and a
+     * cookie the port does not hold, or another port's, nothing either. */
+    assert(cdx_police_reaches(&dev, MALL_COOKIE) == (CDX_POLICE_L4 | CDX_POLICE_ESP));
+    assert(cdx_police_reaches(&dev, MALL_COOKIE + 1) == 0);
+    assert(cdx_police_reaches(&dev, 999) == 0 && cdx_police_reaches(&other, MALL_COOKIE) == 0);
     assert(offer_on(&other, MALL_COOKIE + 1, base()) == 0);
     assert_meter(p3, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
     assert_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
@@ -510,6 +518,7 @@ static void verbs(void)
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0);
     assert_port_boot(&eth4);
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == -ENOENT);
+    assert(cdx_police_reaches(&dev, MALL_COOKIE) == 0);
 
     /* ---- flower: a meter for some of the port's flows ---- */
 
@@ -522,6 +531,10 @@ static void verbs(void)
     assert(last_profile() == 1);             /* profile 0 is the default */
     assert_meter(meter(1), 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
     assert(cdx_police_lookup(&flow) == 1);
+    /* Bound at a TCP or UDP direction's admission and to nothing else: a
+     * port-less one keyed in the three-tuple tables is not counted. */
+    assert(cdx_police_reaches(&dev, 1) == CDX_POLICE_L4);
+    assert(cdx_police_reaches(&other, 1) == 0);
     /* And a flow the flowtable admits naming it is told to meter by it. */
     assert(fman.ingress_policer_info[1].profile_id &&
            cdx_get_policer_profile_id(FMAN_INDEX, 1) == fman.ingress_policer_info[1].profile_id);
@@ -547,6 +560,7 @@ static void verbs(void)
     assert_flow_profile_off(meter(1));
     assert(cdx_get_policer_profile_id(FMAN_INDEX, 1) == 0);
     assert(cdx_police_lookup(&flow) == 0);
+    assert(cdx_police_reaches(&dev, 1) == 0);
     assert(flower_del(&dev, 1) == -ENOENT);
 
     /* Priority, not insertion order: an operator who adds a higher-priority

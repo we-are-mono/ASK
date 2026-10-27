@@ -179,6 +179,7 @@ the module is loaded. The reader loads each one with `READ_ONCE()` or
 | admission | `installs`, `deletes`, `rejects`, `errors`, `validated`, `busy`, `rearms`, `finals`, `destroy_deferrals` |
 | counter reports | `stats_passes` (counter passes that reached every entry), `stats_requests` (Netfilter's own requests for a flow's counters, which a pass keeps it from making) |
 | retirement causes | `neighbour_invalidations`, `route_invalidations`, `mtu_invalidations`, `link_invalidations`, `mac_invalidations`, `fdb_invalidations`, `stp_invalidations`, `qos_invalidations`, `admission_invalidations`, `ipsec_invalidations`, `ipsec_policy_invalidations`, `ipsec_next_hop_updates` |
+| software traffic control | `tc_refused` (offers refused because tc runs in software on a device the direction crosses, also counted in `rejects`), `tc_invalidations` (installed directions retired when it came to) |
 | QoS | `qos_remark_failures`, `qos_control_overruns` |
 | IPsec | `ipsec_sec_refused` and `ipsec_sec_refused_<class>` for each class in `ft_sec_refusal[]`; `ipsec_offline_port_rejected`, `ipsec_sec_input_refused` |
 | detour | `detour_delivered`, `detour_unknown`, `detour_failed`, `detour_errors` |

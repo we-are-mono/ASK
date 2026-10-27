@@ -578,16 +578,30 @@ unlock:
  * bypasses it on the way in, and each classifier passes over its own skip_sw
  * filters on the way out -- and counts for nothing, and so does a filter the
  * hardware applies as it is to every frame it replicates
- * (cdx_tc_filter_mirrored()).
+ * (cdx_tc_filter_mirrored()). On the way out a qdisc that shapes or schedules
+ * counts as a filter does (ft_qdisc_schedules()): the hardware sends a copy
+ * past it as it sends a flow's frames.
  *
  * Nothing reports a filter added or removed, so a group already carried is
  * asked again at the refresh, every FT_MR_STATS_INTERVAL.
+ *
+ * The same predicate answers for the bridged unicast learner and for routed
+ * unicast admission, through the sample ask_flowtable_tc.c takes of every
+ * device, since both decide inside the backend transaction. A routed unicast
+ * direction is the one kind of flow the port's police filters reach in
+ * hardware, so that sample also asks with those excepted
+ * (ft_dev_tc_soft_routed()). Never asked inside the transaction: see
+ * ft_dev_tc_soft_for().
  */
 
 struct ft_tc_filters {
 	struct tcf_walker w;
 	struct net_device *dev;
 	bool ingress;
+	/* CDX_POLICE_*: the kinds of routed direction asked about, for which a
+	 * police filter the hardware applies to them counts for nothing; 0 for
+	 * a multicast stream or a bridged pair, which none reaches. */
+	unsigned int reach;
 	bool soft;
 };
 
@@ -601,6 +615,9 @@ static int ft_tc_filter(struct tcf_proto *tp, void *node, struct tcf_walker *arg
 
 	if (cdx_tc_filter_mirrored(walk->dev, walk->ingress, (unsigned long)node))
 		return 0;
+	if (walk->reach && walk->ingress &&
+	    (cdx_police_reaches(walk->dev, (unsigned long)node) & walk->reach) == walk->reach)
+		return 0;
 	walk->soft = true;
 	return -1;
 }
@@ -611,10 +628,10 @@ static int ft_tc_filter(struct tcf_proto *tp, void *node, struct tcf_walker *arg
  * visited, to the end: each iterator holds what it returned until asked for
  * the next, and only cls_api can let go of it otherwise. */
 static bool ft_tc_block_soft(struct tcf_block *block, struct net_device *dev,
-			     bool ingress)
+			     bool ingress, unsigned int reach)
 {
 #if IS_ENABLED(CONFIG_NET_CLS)
-	struct ft_tc_filters walk = { .dev = dev, .ingress = ingress };
+	struct ft_tc_filters walk = { .dev = dev, .ingress = ingress, .reach = reach };
 	struct tcf_chain *chain;
 	struct tcf_proto *tp;
 
@@ -663,7 +680,7 @@ static int ft_tc_class(struct Qdisc *q, unsigned long cl,
 	struct ft_tc_classes *walk = container_of(arg, struct ft_tc_classes, w);
 
 	if (!ft_tc_block_soft(q->ops->cl_ops->tcf_block(q, cl, NULL),
-			      walk->dev, false))
+			      walk->dev, false, 0))
 		return 0;
 	walk->soft = true;
 	return -1;
@@ -677,7 +694,7 @@ static bool ft_qdisc_soft(struct Qdisc *q, struct net_device *dev)
 
 	if (!cops || !cops->tcf_block)
 		return false;
-	if (ft_tc_block_soft(cops->tcf_block(q, 0, NULL), dev, false))
+	if (ft_tc_block_soft(cops->tcf_block(q, 0, NULL), dev, false, 0))
 		return true;
 	if (cops->walk) {
 		walk.w.fn = ft_tc_class;
@@ -687,18 +704,80 @@ static bool ft_qdisc_soft(struct Qdisc *q, struct net_device *dev)
 }
 #endif
 
+#if IS_ENABLED(CONFIG_NET_SCHED)
+/* Whether a qdisc holds back or reorders what it is given in a way the
+ * hardware does not: a shaper, a scheduler, anything of a kind not listed.
+ * An offloaded flow's frames go from the classifier straight to the egress
+ * port's queues, which are bounded and served per flow hash (A313): they stand
+ * in for a work-conserving qdisc of the kinds Linux attaches by default, and
+ * for nothing else. So the kinds that never shape -- the builtin ones, mq
+ * over its children, the FIFOs, pfifo_fast and fq_codel -- count for nothing
+ * however they came to be there. fq and whatever net.core.default_qdisc names
+ * count for nothing only as the kernel attached them itself: an fq tc created
+ * is there to pace by its maxrate, which nothing here reads, and a cake tc
+ * created is SQM's shaper, the default cake or not. Every other kind, cake and
+ * an HTB the hardware does not run among them, keeps a flow leaving through it
+ * in software. A kind nothing here knows counts: fail closed.
+ *
+ * What the kernel attaches itself has handle 0, and what tc creates never has
+ * (v6.12.112). qdisc_create_dflt() sets none (sch_generic.c:1005-1031), and it
+ * is what attaches them all: the default at a single-queue device's root,
+ * a ppp device's among them (attach_one_default_qdisc(), sch_generic.c:
+ * 1171-1190; ppp_generic.c:1638, 3368), mq at a multiqueue one's
+ * (attach_default_qdiscs(), sch_generic.c:1206) and mq's children
+ * (mq_init(), sch_mq.c:90). qdisc_create() gives a qdisc tc creates the handle
+ * asked for, whose minor tc_modify_qdisc() requires to be zero
+ * (sch_api.c:1676), or one qdisc_alloc_handle() picks from 8001: up
+ * (sch_api.c:775-790, 1333-1345): a major either way. The kernel reads handle
+ * 0 so itself: "It may be default qdisc" (sch_api.c:1666), "the default
+ * qdiscs we created" (sch_generic.c:1413-1416). fq is let through by name too
+ * because a default changed since leaves what it attached in place.
+ *
+ * Under an offloaded root -- an `htb offload` tree, whose root sch_htb flags
+ * TCQ_F_OFFLOADED once, at init -- the hardware schedules, and what sits
+ * under its classes is the hardware QoS plane's: the FIFO each leaf starts
+ * with and a RED curve, offloaded or refused with a log line of its own
+ * (cdx_htb.c). A shaper grafted under a leaf is not: it runs on what the CPU
+ * sends to that leaf, and an offloaded flow's frames pass it by. */
+static bool ft_qdisc_schedules(const struct Qdisc *q, bool offloaded_root)
+{
+	static const char *const plain[] = {
+		"noop", "noqueue", "mq", "pfifo_fast", "pfifo", "bfifo", "fq_codel",
+	};
+	unsigned int i;
+
+	if (q->flags & TCQ_F_BUILTIN)
+		return false;
+	for (i = 0; i < ARRAY_SIZE(plain); i++)
+		if (!strcmp(q->ops->id, plain[i]))
+			return false;
+	/* The default compared by pointer: its module can change under a
+	 * concurrent sysctl write, which RTNL does not exclude, and its ops
+	 * are only ever named here, never read. */
+	if (!TC_H_MAJ(q->handle) &&
+	    (q->ops == READ_ONCE(default_qdisc_ops) || !strcmp(q->ops->id, "fq")))
+		return false;
+	if (offloaded_root && ((q->flags & TCQ_F_OFFLOADED) || !strcmp(q->ops->id, "red")))
+		return false;
+	return true;
+}
+#endif
+
 /* The root qdisc and every qdisc below it but the ingress one, whose block
- * tc_run() reaches through the device's tcx entry instead. */
+ * tc_run() reaches through the device's tcx entry instead: a filter on any of
+ * them, or a qdisc that schedules (ft_qdisc_schedules()). */
 static bool ft_qdisc_tree_soft(struct net_device *dev)
 {
 #if IS_ENABLED(CONFIG_NET_SCHED)
 	struct Qdisc *q = rtnl_dereference(dev->qdisc);
+	bool offloaded = q && (q->flags & TCQ_F_OFFLOADED);
 	unsigned int b;
 
-	if (q && ft_qdisc_soft(q, dev))
+	if (q && (ft_qdisc_soft(q, dev) || (!offloaded && ft_qdisc_schedules(q, false))))
 		return true;
 	hash_for_each(dev->qdisc_hash, b, q, hash)
-		if (!(q->flags & TCQ_F_INGRESS) && ft_qdisc_soft(q, dev))
+		if (!(q->flags & TCQ_F_INGRESS) &&
+		    (ft_qdisc_soft(q, dev) || ft_qdisc_schedules(q, offloaded)))
 			return true;
 #endif
 	return false;
@@ -727,14 +806,26 @@ static struct tcf_block *ft_tc_xgress_block(struct net_device *dev, bool ingress
 #endif
 
 /* Whether tc runs anything in software on frames `dev' receives, or sends,
- * that the hardware does not run as it is. Under RTNL. */
-bool ft_dev_tc_soft(struct net_device *dev, bool ingress)
+ * that the hardware does not run as it is, `reach' the kinds of routed
+ * direction asked for (struct ft_tc_filters). Under RTNL.
+ *
+ * Never inside the backend transaction. Each iterator step can put the last
+ * reference to a classifier a concurrent delete unlinked -- flower and
+ * matchall delete without RTNL -- and its destroy then runs here: a DSCP
+ * map's filter turning the map off drains the port's egress
+ * (ft_egress_drain()), which flushes the retirement work and takes the
+ * transaction itself. So the bridged learner and routed admission, which
+ * decide inside it, read the sample ask_flowtable_tc.c takes instead. */
+static bool ft_dev_tc_soft_for(struct net_device *dev, bool ingress, unsigned int reach)
 {
 #if IS_ENABLED(CONFIG_NET_XGRESS)
 	struct bpf_mprog_entry *entry;
 	struct tcf_block *block = NULL;
 	struct mini_Qdisc *miniq;
+#endif
 
+	cdx_ft_assert_not_held();
+#if IS_ENABLED(CONFIG_NET_XGRESS)
 	entry = rtnl_dereference(ingress ? dev->tcx_ingress : dev->tcx_egress);
 	if (entry) {
 		/* A tcx BPF program, which nothing here can read. */
@@ -750,13 +841,29 @@ bool ft_dev_tc_soft(struct net_device *dev, bool ingress)
 		rcu_read_unlock();
 		if (miniq)
 			block = ft_tc_xgress_block(dev, ingress);
-		if (ft_tc_block_soft(block, dev, ingress))
+		if (ft_tc_block_soft(block, dev, ingress, reach))
 			return true;
 	}
 #endif
 	if (ingress)
 		return dev_xdp_prog_count(dev) > 0;
 	return ft_qdisc_tree_soft(dev);
+}
+
+/* Whether tc runs anything in software on frames `dev' receives, or sends,
+ * that the hardware does not run as it is. Under RTNL, never inside the
+ * transaction (ft_dev_tc_soft_for()). */
+bool ft_dev_tc_soft(struct net_device *dev, bool ingress)
+{
+	return ft_dev_tc_soft_for(dev, ingress, 0);
+}
+
+/* The same of what `dev' receives, for a routed unicast direction of the
+ * kind `reach' names (CDX_POLICE_*): a police filter the hardware applies to
+ * such a direction as tc would (cdx_police_reaches()) counts for nothing. */
+bool ft_dev_tc_soft_routed(struct net_device *dev, unsigned int reach)
+{
+	return ft_dev_tc_soft_for(dev, true, reach);
 }
 
 struct ft_tc_lowers {

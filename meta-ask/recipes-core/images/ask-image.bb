@@ -84,6 +84,8 @@ IMAGE_INSTALL:append = " \
     libubootenv-bin \
     kernel-module-dummy \
     kernel-module-act-mirred \
+    kernel-module-sch-cake \
+    kernel-module-ifb \
     kernel-module-nft-meta-bridge \
     python3-core \
     python3-aiohttp \

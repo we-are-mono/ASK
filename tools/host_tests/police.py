@@ -4,6 +4,7 @@ a stub FMan, and exercise it."""
 from ask_orch.process import run_process
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -27,7 +28,10 @@ def binary(tmp_path_factory):
     tmp_path = tmp_path_factory.mktemp("police")
     policer_layer(tmp_path)
     (tmp_path / "police_production.inc").write_text(
-        after_includes((ROOT / "cdx/cdx_police.c").read_text()))
+        # What cdx_police_reaches() answers in, as the header defines it.
+        "\n".join(re.findall(r"^#define CDX_POLICE_\w+\s.*$",
+                             (ROOT / "cdx/cdx_police.h").read_text(), re.M)) + "\n"
+        + after_includes((ROOT / "cdx/cdx_police.c").read_text()))
     binary = tmp_path / "police"
     run_process([
         compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",

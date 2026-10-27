@@ -345,6 +345,12 @@ void cdx_ft_assert_held(void)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_assert_held, ASK_CDX_FLOWTABLE);
 
+void cdx_ft_assert_not_held(void)
+{
+	lockdep_assert_not_held(&cdx_info->ctrl.mutex);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_assert_not_held, ASK_CDX_FLOWTABLE);
+
 bool cdx_ft_failed(void)
 {
 	cdx_ft_assert_held();

@@ -2550,6 +2550,42 @@ with its own init script. QoS should look the same.
 | Scheduler tree | `tc` HTB offload via `ndo_setup_tc` | Armbian: `tc` directly. OpenWrt: render UCI to `tc`. Bench: script it. |
 | Classification | `ct mark`, set by nftables or iptables | Whatever firewall the distribution already runs |
 | Policy and state | `/etc/ask/` configuration plus a libc-only tool | Package the file; no code |
+| Software shaping | Any qdisc or tc filter that runs in software: SQM's `cake` at a WAN root, its `ingress` + u32 mirred to an ifb carrying `cake`, an HTB without `offload` | Nothing: the directions it would shape stay in software |
+
+**Software shaping is honoured by keeping what it shapes in software.** An
+offloaded flow's frames never reach a qdisc or a tc filter, so a direction
+whose path runs tc in software -- a qdisc that shapes or schedules on the way
+out, a filter, tcx or XDP either way -- is refused, and one already installed
+is retired within about a second of the shaper appearing. When it goes,
+software offers the direction again where it forwards the direction's packets
+itself: not while an xfrm policy is configured, nor for one arriving through a
+tunnel while its sibling stays in hardware, which then stay in software until
+their flow ends ([architecture](architecture.md#software-traffic-control-on-the-path)).
+Each direction is judged on its own path, so SQM on the WAN port keeps the
+upload in software and the download in hardware, or the reverse for its
+ingress half. The hardware follows Linux's own path, no more and no less:
+Linux's software fast path takes a download at the port, before a device
+above it receives it, so SQM's ingress half on `pppoe-wan` shapes no download
+in software unless an xfrm policy sends it up the slow path, and the download
+stays in hardware just the same. A qdisc of the kinds Linux attaches by
+default that never shape (`fq_codel`, `pfifo_fast`, `mq` over them, the
+FIFOs) keeps nothing out, however it came there; `fq` and whatever
+`net.core.default_qdisc` names keep nothing out as the kernel attaches them,
+but one tc created counts -- an `fq` with a `maxrate` paces, and SQM's `cake`
+shapes whatever the default is. HTB offload stays the hardware scheduler:
+its tree, its leaves' FIFOs and RED curves are this plane's, and a direction
+under it is in hardware at the rate it sets. The DSCP map is applied in
+hardware and keeps nothing out of it. So are the police filters this plane
+offloads -- a matchall rate limiter, flower per-flow meters -- for the routed
+directions they reach, judged by the packet that reaches the port: they keep
+no routed TCP or UDP direction that arrives as itself out of hardware, and the
+rate limiter no ESP one either, nor one an SA decrypts, which arrives as ESP
+(a flower meter does keep that one out). One arriving through a tunnel arrives
+as the outer packet, which neither meters in hardware, so either keeps it out.
+A bridged pair, a multicast group or another protocol's direction, which they
+do not meter whole, stays in software under them. A police filter is sampled
+at admission, like the mark. `tc_refused` and `tc_invalidations` in
+`/proc/ask_flowtable/stats` count what software shaping kept out.
 
 This is the decisive argument against a userspace FCI writer. `tc` is in
 iproute2 on every distribution, is already the vocabulary for hardware queue

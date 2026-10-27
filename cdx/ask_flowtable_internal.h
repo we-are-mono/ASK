@@ -1061,8 +1061,32 @@ void ft_mr_watch_arm(struct ft_mr_group *g, const struct ft_mr_plan *plan);
 void ft_mr_watch_drop(struct ft_mr_group *g);
 bool ft_dev_tc_soft(struct net_device *dev, bool ingress);
 bool ft_dev_stack_tc_soft(struct net_device *dev, bool ingress);
+bool ft_dev_tc_soft_routed(struct net_device *dev, unsigned int reach);
 enum ft_mr_state ft_mr_admit(struct ft_mr_group *g,
 			     const struct ft_mr_plan *plan);
+
+/* ask_flowtable_tc.c: what tc runs in software on each device, as the last
+ * sample found it, for the decisions taken inside the backend transaction.
+ * FT_TC_RX counts every filter on the way in, as a multicast stream or a
+ * bridged pair meets them; the two after it count the same less the police
+ * filters the hardware applies to a routed TCP or UDP direction, or an ESP
+ * one (cdx_police_reaches()). */
+#define FT_TC_TX	BIT(0)
+#define FT_TC_RX	BIT(1)
+#define FT_TC_RX_L4	BIT(2)
+#define FT_TC_RX_ESP	BIT(3)
+bool ft_tc_known(void);
+bool ft_tc_any(void);
+u8 ft_tc_dev_bits(const struct net_device *dev);
+u8 ft_tc_index_bits(int ifindex);
+void ft_tc_kick(void);
+void ft_tc_exit(void);
+/* ask_flowtable_core.c, against that sample. */
+extern u64 ft_tc_refused;
+extern atomic64_t ft_tc_invalidations;
+bool ft_rule_tc_soft(const struct cdx_ft_rule *rule);
+/* ask_flowtable_l2.c, for that sample's worker. */
+bool ft_l2_paired(void);
 
 /* ask_flowtable_wifi.c */
 extern unsigned int ft_wifi_registered;

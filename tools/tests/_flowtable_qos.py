@@ -57,7 +57,14 @@ PORT_HELD_A, PORT_HELD_B, PORT_HELD_C = PORT + 25, PORT + 26, PORT + 27
 PORTS_STRANDED = (PORT + 28, PORT + 29, PORT + 30, PORT + 31)
 # Both UDP ports of the routed groups streamed through such a tree.
 PORT_STRANDED_GROUP = PORT + 32
-PORTS_LAST = PORT_STRANDED_GROUP
+# flowtable_qos_software.py's flows: an upload shaped by cake from the start,
+# one shaped once it is already in hardware, a download shaped on its way in,
+# an echo under a root qdisc that does not shape, and an upload under an fq
+# the operator created.
+PORT_SQM_UPLOAD, PORT_SQM_LIVE = PORT + 33, PORT + 34
+PORT_SQM_DOWNLOAD, PORT_SQM_DEFAULT = PORT + 35, PORT + 36
+PORT_SQM_FQ = PORT + 37
+PORTS_LAST = PORT_SQM_FQ
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
 # unshaped and far above what the CPU can: see the module docstring.
@@ -207,12 +214,15 @@ print('LAN-DOWN')
 
 # ---- the orchestrator's side ----------------------------------------------
 
-async def iperf(r, port, *, seconds=IPERF_SECONDS, udp_mbit=None, streams=1, datagram=DATAGRAM):
-    """One iperf3 run from here to the LAN VM, and its report.
+async def iperf(r, port, *, seconds=IPERF_SECONDS, udp_mbit=None, streams=1, datagram=DATAGRAM,
+                reverse=False):
+    """One iperf3 run from here to the LAN VM, and its report; with `reverse`,
+    from the LAN VM to here, over a connection this host still opens.
 
-    The receiver's intervals come back in `server_output_json`, which is where a
-    steady-state rate is read: the sender's own figure for UDP is what it
-    offered, not what arrived.
+    The receiver's intervals are where a steady-state rate is read: the
+    sender's own figure for UDP is what it offered, not what arrived. They
+    come back in `server_output_json`, or in the report's own intervals when
+    the run was reversed and this host received (receiver_intervals()).
     """
     argv = ["iperf3", "-c", r.lan_ip, "-B", WAN_IP, "-p", str(port), "-t", str(seconds),
             "-J", "--get-server-output"]
@@ -220,6 +230,8 @@ async def iperf(r, port, *, seconds=IPERF_SECONDS, udp_mbit=None, streams=1, dat
         argv += ["-u", "-b", f"{udp_mbit}M", "-l", str(datagram)]
     if streams > 1:
         argv += ["-P", str(streams)]
+    if reverse:
+        argv.append("-R")
     proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE,
                                                 stderr=asyncio.subprocess.PIPE)
     try:
@@ -234,17 +246,25 @@ async def iperf(r, port, *, seconds=IPERF_SECONDS, udp_mbit=None, streams=1, dat
     return report
 
 
+def receiver_intervals(report):
+    """The receiving end's intervals: the server's, or this host's own when
+    the run was reversed."""
+    if report["start"]["test_start"].get("reverse"):
+        return report["intervals"]
+    return report["server_output_json"]["intervals"]
+
+
 def received_bps(report, after=SETTLE):
     """What the receiver counted per second once the transfer had settled."""
-    intervals = [i["sum"] for i in report["server_output_json"]["intervals"]
+    intervals = [i["sum"] for i in receiver_intervals(report)
                  if i["sum"]["start"] >= after - 0.01]
-    assert intervals, report["server_output_json"]
+    assert intervals, receiver_intervals(report)
     return sum(i["bytes"] for i in intervals) * 8 / sum(i["seconds"] for i in intervals)
 
 
 def received_loss(report, after=SETTLE):
     """The fraction of a UDP transfer the receiver never saw, once settled."""
-    intervals = [i["sum"] for i in report["server_output_json"]["intervals"]
+    intervals = [i["sum"] for i in receiver_intervals(report)
                  if i["sum"]["start"] >= after - 0.01]
     packets = sum(i["packets"] for i in intervals)
     assert packets, report["server_output_json"]

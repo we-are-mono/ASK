@@ -519,6 +519,30 @@ static void ft_l2_fdb_event(unsigned long event, const u8 *addr, u16 vid,
 static void ft_l2_dev_changed(const struct net_device *dev) { (void)dev; l2_devices_changed++; }
 static unsigned l2_refusal_resets;
 static void ft_l2_refusals_reset(void) { l2_refusal_resets++; }
+/* The tc sample (ask_flowtable_tc.c): what a case says a device runs in
+ * software, found by pointer or by index as the adapter asks for it. Known
+ * and empty unless a case says otherwise. */
+static struct { const struct net_device *dev; int ifindex; u8 soft; } tc_sample[6];
+static unsigned tc_samples, tc_kicks, tc_exits;
+static bool tc_unknown;
+static bool ft_tc_known(void) { return !tc_unknown; }
+static bool ft_tc_any(void) { return !tc_unknown && tc_samples; }
+static u8 ft_tc_dev_bits(const struct net_device *dev)
+{
+    for (unsigned i = 0; dev && i < tc_samples; i++)
+        if (tc_sample[i].dev == dev)
+            return tc_sample[i].soft;
+    return 0;
+}
+static u8 ft_tc_index_bits(int ifindex)
+{
+    for (unsigned i = 0; ifindex && i < tc_samples; i++)
+        if (tc_sample[i].ifindex == ifindex)
+            return tc_sample[i].soft;
+    return 0;
+}
+static void ft_tc_kick(void) { tc_kicks++; }
+static void ft_tc_exit(void) { tc_exits++; }
 static bool ft_l2_retire_batch(void) { l2_retire_alls++; return false; }
 /* Three buckets of bridged pairs' rows after the flows': two rows, none and
  * one, which the /proc walk has to hand off to, step through and resume
@@ -823,6 +847,7 @@ static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy,
 static u64 ft_finals;
 static u64 ft_stats_passes, ft_stats_requests;
 static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_stp_invalidations, ft_qos_invalidations, ft_admission_invalidations, ft_destroy_deferrals;
+static u64 ft_tc_refused, ft_tc_invalidations;
 static void atomic64_inc(u64 *v) { (*v)++; }
 static u64 atomic64_inc_return(u64 *v) { return ++*v; }
 static u64 atomic64_read_acquire(u64 *v) { return *v; }
@@ -7334,6 +7359,278 @@ static void test_crossed_devices(void)
     }
 }
 
+/* What a case says one device runs in software, the rest saying nothing. */
+static void tc_only(const struct net_device *dev, int ifindex, u8 soft)
+{
+    tc_unknown = false;
+    tc_sample[0].dev = dev;
+    tc_sample[0].ifindex = ifindex;
+    tc_sample[0].soft = soft;
+    tc_samples = 1;
+}
+
+/* One UDP direction per way of crossing the ingress port: as itself, as the
+ * outer packet of a 6in4 tunnel, and as the ESP an SA then decrypts. */
+enum tc_arrival { TC_PLAIN, TC_TUNNELLED, TC_DECRYPTED, TC_ARRIVALS };
+static void tc_arrival(enum tc_arrival kind)
+{
+    if (kind == TC_TUNNELLED) {
+        sit_in_fixture();
+        return;
+    }
+    fixture();
+    if (kind == TC_DECRYPTED) {
+        xfrm_policies = true;
+        ipsec_in_sa = 8;
+    }
+}
+
+/* tc running in software on a device Linux's own path for a direction
+ * crosses keeps the direction out of hardware, as the sample says
+ * (ask_flowtable_tc.c): the way out by every device the walk took, the way in
+ * by the port alone while the software fast path carries the direction and by
+ * every device below the logical one when it does not, with the police the
+ * hardware applies to a direction of its protocol aside -- before RTNL for
+ * the devices the offer names, after the walk for all of them, and again for
+ * an installed one. */
+static void test_software_tc(void)
+{
+    const u8 every_rx = FT_TC_RX | FT_TC_RX_L4 | FT_TC_RX_ESP;
+    struct cdx_ft_rule decoded;
+    u64 refused, rejects, retired, admission;
+    unsigned trylocks;
+
+    /* Nothing sampled yet, the binding a moment old: busy, as a lost RTNL
+     * trylock is -- the generation retired where software will not offer the
+     * direction again, so native GC brings it back -- and no RTNL taken. */
+    for (unsigned policies = 0; policies < 2; policies++) {
+        fixture(); cls.command = FLOW_CLS_REPLACE;
+        xfrm_policies = policies;
+        tc_unknown = true;
+        u64 busy = ft_busy;
+        admission = ft_admission_invalidations; trylocks = rtnl_trylocks;
+        assert(!ft_tc_offer_refused(&cls, binding.dev));
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EAGAIN);
+        assert(ft_busy == busy + 1 && rtnl_trylocks == trylocks && !ft_count);
+        assert(handle.invalid == !!policies &&
+               ft_admission_invalidations == admission + !!policies);
+        xfrm_policies = false;
+    }
+    /* A device the flow does not cross says nothing about it. */
+    fixture();
+    tc_only(&decoy, decoy.ifindex, FT_TC_TX | every_rx);
+    assert(!ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+
+    /* cake at the egress port's root: refused before RTNL, counted, as a
+     * reject and never busy, retiring nothing. */
+    tc_only(&out, out.ifindex, FT_TC_TX);
+    cls.command = FLOW_CLS_REPLACE;
+    refused = ft_tc_refused; rejects = ft_rejects; trylocks = rtnl_trylocks;
+    u64 busy = ft_busy;
+    assert(ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EOPNOTSUPP);
+    assert(ft_tc_refused == refused + 1 && ft_rejects == rejects + 1 && ft_busy == busy);
+    assert(rtnl_trylocks == trylocks && !ft_count && !handle.invalid);
+    /* And by the walk alike. */
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    assert(ft_tc_refused == refused + 2);
+    /* What the egress port receives, and what the ingress port sends, are
+     * no part of this direction: the other one's. */
+    tc_only(&out, out.ifindex, every_rx);
+    assert(!ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    tc_only(&in, in.ifindex, FT_TC_TX);
+    assert(!ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+
+    /* A filter on the ingress port, which no police exception covers for a
+     * UDP direction: refused. One whose only filters are police the
+     * hardware applies to TCP and UDP: carried. One the hardware applies to
+     * ESP alone, as the port's limiter is not here, refuses UDP. */
+    tc_only(&in, in.ifindex, every_rx);
+    assert(ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    tc_only(&in, in.ifindex, FT_TC_RX | FT_TC_RX_ESP);
+    assert(!ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    tc_only(&in, in.ifindex, FT_TC_RX | FT_TC_RX_L4);
+    assert(ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    /* A protocol the offer cannot name exactly is judged with every filter
+     * counted, before RTNL. */
+    bm.ip_proto = 0;
+    tc_only(&in, in.ifindex, FT_TC_RX);
+    assert(ft_tc_offer_refused(&cls, binding.dev));
+    bm.ip_proto = 0xff;
+
+    /* The logical devices the destinations name: a tag's on the way out,
+     * by what it sends, which software sends through. */
+    egress_tag_fixture();
+    tc_only(&out_tag, out_tag.ifindex, FT_TC_TX);
+    assert(ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    /* On the way in the fast path takes the frame at the port, before the
+     * tag's device receives it: a filter there runs on none of the
+     * direction's frames in software either, and keeps nothing out. */
+    ingress_tag_fixture();
+    tc_only(&in_tag, in_tag.ifindex, every_rx);
+    assert(!ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    /* While a policy is configured software takes every packet up the
+     * stack, through the tag's device: then it does, by the walk (an SA it
+     * finds is what admits such a direction at all) and, read afresh, by
+     * the recheck of one already installed. */
+    ingress_tag_fixture(); xfrm_policies = true; ipsec_sa = 7;
+    refused = ft_tc_refused;
+    assert(ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    assert(ft_tc_refused == refused + 1);
+    tc_samples = 0;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    tc_only(&in_tag, in_tag.ifindex, every_rx);
+    assert(ft_rule_tc_soft(&decoded));
+    xfrm_policies = false; ipsec_sa = 0;
+    assert(!ft_rule_tc_soft(&decoded));
+    /* A tunnel's arrivals never meet the fast path: the tunnel's own device
+     * and the port's count, through the slow path's whole stack. */
+    sit_in_fixture();
+    tc_only(&in_sit, in_sit.ifindex, every_rx);
+    assert(ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    sit_in_fixture();
+    tc_only(NULL, in.ifindex, every_rx);
+    assert(ft_tc_offer_refused(&cls, binding.dev));
+    /* A session on the way in: the fast path reads it off the frame at the
+     * port, and the ppp device's ingress -- SQM's ifb on pppoe-wan -- is
+     * never crossed. */
+    pppoe_in_fixture();
+    tc_only(&in_ppp, in_ppp.ifindex, every_rx);
+    assert(!ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    tc_only(&in, in.ifindex, every_rx);
+    assert(ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    /* A device only the walk finds: the inner tag's under a QinQ egress,
+     * named by index. Not before RTNL; by the walk. */
+    vlan_fixture();
+    {
+        const u16 push_qinq[] = { 100, 300 };
+
+        route.dst.dev = &out_qinq;
+        neighbour.dev = &out_qinq;
+        encap_actions(0, push_qinq, ARRAY_SIZE(push_qinq));
+    }
+    tc_only(NULL, out_tag.ifindex, FT_TC_TX);
+    assert(!ft_tc_offer_refused(&cls, binding.dev));
+    refused = ft_tc_refused;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    assert(ft_tc_refused == refused + 1);
+    /* A session's lower device, by index, before RTNL and after. */
+    pppoe_out_fixture();
+    tc_only(NULL, out.ifindex, FT_TC_TX);
+    assert(ft_tc_offer_refused(&cls, binding.dev));
+    tc_only(&ppp, ppp.ifindex, FT_TC_TX);
+    assert(ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+
+    /* Installed, and then tc runs on its path: the offer that finds it in
+     * hardware retires the generation without RTNL, counted as a tc
+     * invalidation, and so does the counter pass. */
+    for (unsigned pass = 0; pass < 2; pass++) {
+        fixture(); cls.command = FLOW_CLS_REPLACE;
+        tc_samples = 0;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0 && ft_count == 1);
+        retired = ft_tc_invalidations; trylocks = rtnl_trylocks;
+        tc_only(&out, out.ifindex, FT_TC_TX);
+        if (pass) {
+            cdx_ft_begin();
+            ft_stats_report(ft_find(&binding, cls.cookie));
+            cdx_ft_end();
+        } else {
+            assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EOPNOTSUPP);
+        }
+        assert(handle.invalid && ft_tc_invalidations == retired + 1 && rtnl_trylocks == trylocks);
+        ft_retire_workfn(NULL);
+        assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated && !live_hw);
+    }
+    tc_samples = 0;
+    tc_unknown = false;
+}
+
+/* The police the hardware applies are judged by what crosses the port's
+ * ingress, which is not always the direction's own packet: a tunnel's arrives
+ * as the outer packet and an SA's as ESP. tc in software meters that packet;
+ * the hardware binds a flower profile to the inner tuple and its rate limiter
+ * meets TCP, UDP and ESP frames alone. Whatever the sample says, admission and
+ * the recheck of the direction it admitted answer alike. */
+static void test_software_tc_arrival(void)
+{
+    static const u8 samples[] = {
+        0, FT_TC_RX, FT_TC_RX | FT_TC_RX_ESP, FT_TC_RX | FT_TC_RX_L4 | FT_TC_RX_ESP,
+    };
+    struct cdx_ft_rule decoded, installed;
+    u64 refused;
+
+    /* Through a tunnel the port's ingress sees IPv6 in IPv4, which neither
+     * a flower profile bound to the inner tuple nor the port's rate limiter
+     * meters in hardware: a police filter on the port counts as any filter
+     * does, before RTNL and after the walk. */
+    tc_arrival(TC_TUNNELLED);
+    tc_only(&in, in.ifindex, FT_TC_RX | FT_TC_RX_ESP);
+    assert(ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    tc_arrival(TC_TUNNELLED);
+    tc_only(&in, in.ifindex, FT_TC_RX);
+    assert(ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    /* An SA's direction arrives as ESP, which the rate limiter meters in
+     * hardware: the matchall alone admits it. A flower police filter, which
+     * tc runs on the inner packet decapsulation hands back to the port and
+     * the hardware binds to no ESP direction, keeps it out -- by the walk,
+     * which finds the SA. Before
+     * RTNL the offer cannot tell, and judges it as a plain direction, a
+     * narrower question. */
+    tc_arrival(TC_DECRYPTED);
+    tc_only(&in, in.ifindex, FT_TC_RX);
+    assert(!ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.in_sa_handle);
+    tc_arrival(TC_DECRYPTED);
+    tc_only(&in, in.ifindex, FT_TC_RX | FT_TC_RX_ESP);
+    assert(!ft_tc_offer_refused(&cls, binding.dev));
+    refused = ft_tc_refused;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    assert(ft_tc_refused == refused + 1);
+    /* A plain one is the direction's own packet: both police filters are
+     * the hardware's. */
+    tc_arrival(TC_PLAIN);
+    tc_only(&in, in.ifindex, FT_TC_RX | FT_TC_RX_ESP);
+    assert(!ft_tc_offer_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+
+    /* The recheck asks what admission asked, of the rule admission built:
+     * one it would retire is one admission refuses, and one admission keeps
+     * it keeps. Otherwise the two would trade the direction every second.
+     * The pre-RTNL refusal is never wider than either. */
+    for (unsigned kind = 0; kind < TC_ARRIVALS; kind++)
+        for (unsigned i = 0; i < ARRAY_SIZE(samples); i++) {
+            tc_arrival(kind);
+            tc_samples = 0;
+            assert(ft_parse(&binding, &cls, &installed, &next_hop) == 0);
+            assert(!installed.in_sa_handle == (kind != TC_DECRYPTED));
+            assert(installed.in_tunnel.present == (kind == TC_TUNNELLED));
+            tc_arrival(kind);
+            tc_only(&in, in.ifindex, samples[i]);
+            bool retired = ft_rule_tc_soft(&installed);
+            assert(retired == (ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP));
+            assert(retired || !ft_tc_offer_refused(&cls, binding.dev));
+        }
+    tc_samples = 0;
+    tc_unknown = false;
+    xfrm_policies = false;
+    ipsec_in_sa = 0;
+}
+
 /* A direction the MTU bound keeps out, offered again for as long as software
  * forwards it: refused before RTNL, never counted busy, retiring nothing. */
 static void test_mtu_before_admission(void)
@@ -9669,6 +9966,8 @@ int main(void)
     test_installed_reoffer();
     test_tunnel_arrival_retry();
     test_crossed_devices();
+    test_software_tc();
+    test_software_tc_arrival();
     test_mtu_before_admission();
     test_mtu_refusal_sound();
     test_mtu_port_bound();

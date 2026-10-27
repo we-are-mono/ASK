@@ -741,8 +741,11 @@ def test_legacy_tables_and_tc_are_judged_as_well():
     assert "ft_dev_stack_tc_soft(dev, false)" in filtered
     assert "netdev_walk_all_lower_dev(dev, ft_tc_lower, &priv);" in \
         function(source, "ft_dev_stack_tc_soft")
-    dev = function(source, "ft_dev_tc_soft")
+    dev = function(source, "ft_dev_tc_soft_for")
     assert dev.index("if (ingress)") < dev.index("dev_xdp_prog_count(dev)")
+    # The plain question excepts no police filter: none meters a multicast
+    # stream.
+    assert "return ft_dev_tc_soft_for(dev, ingress, 0);" in function(source, "ft_dev_tc_soft")
     # Only an egress DSCP filter is the hardware's own: the port's rate
     # limiter never meters a multicast frame.
     htb = (ROOT / "cdx/cdx_htb.c").read_text()

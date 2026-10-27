@@ -421,6 +421,8 @@ void cdx_ft_begin(void);
 bool cdx_ft_trybegin(void);
 void cdx_ft_end(void);
 void cdx_ft_assert_held(void);
+/* For a caller whose work can reach cdx_ft_begin() itself. */
+void cdx_ft_assert_not_held(void);
 /* Between two batches of a long job, with the transaction let go: until those
  * waiting for it have had it, up to a bound. Sleeps. */
 void cdx_ft_let_waiters(void);

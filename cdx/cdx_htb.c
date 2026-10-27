@@ -3160,7 +3160,8 @@ static int cdx_setup_tc(struct net_device *dev, enum tc_setup_type type,
  * hands that profile only unicast TCP, UDP and ESP frames: it stops parsing a
  * multicast frame at the IP header and leaves it to the classifier unmetered,
  * where the software path would police it. And flower's per-flow profiles
- * are bound to flowtable entries, which a multicast entry is not. */
+ * are bound to flowtable entries, which a multicast entry is not. A routed
+ * unicast direction does meet both, as far as cdx_police_reaches() says. */
 bool cdx_tc_filter_mirrored(struct net_device *dev, bool ingress,
 			    unsigned long cookie)
 {
