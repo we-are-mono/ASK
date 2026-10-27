@@ -167,7 +167,13 @@ struct cdx_expt_ratelimit_info {
 
 #ifdef ENABLE_INGRESS_QOS
 
-#define INGRESS_FLOW_POLICER_QUEUES 		8
+/* The per-flow ingress profiles: profile 0, the default every flow meters by
+ * when nothing names another, and the sixty-three a tc flower filter on any
+ * port can be given (cdx_police.c) -- as many as the class layout's six-bit
+ * policer field names (CDX_FT_QOS_MAX_POLICER). They are shared profiles, one
+ * FMan-wide pool every port's filters draw from, not a port's: a share per
+ * port would strand profiles on ports without filters. */
+#define INGRESS_FLOW_POLICER_QUEUES 		64
 
 #ifdef SEC_PROFILE_SUPPORT
 #define SEC_POLICER_QUEUES		1

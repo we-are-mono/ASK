@@ -32,7 +32,8 @@ def refusal_classes(source):
 
 def files():
     source = flowtable_source()
-    status = function(source, "ft_status_show") + function(source, "ft_l2_status")
+    status = (function(source, "ft_status_show") + function(source, "ft_l2_status")
+              + function(source, "ft_qos_status"))
     stats = (function(source, "ft_stats_show") + function(source, "ft_l2_stats")
              + function(source, "ft_sec_refusal_stats"))
     return source, status, stats
@@ -60,6 +61,11 @@ def test_levels_under_the_transaction_counts_without_it():
     show = function(flowtable_source(), "ft_status_show")
     assert show.index("cdx_ft_begin();") < show.index("ft_kv(") and \
         show.rindex("ft_kv(") < show.index("cdx_ft_end();")
+    # The hardware QoS budget comes last, read after the transaction is let
+    # go: cdx's QoS mutex is no part of what the health probe times.
+    assert show.index("cdx_ft_end();") < show.index("ft_qos_status(seq);")
+    qos = function(flowtable_source(), "ft_qos_status")
+    assert "cdx_qos_budget(" in qos and "cdx_ft_begin(" not in qos
     for accessor in HELD:
         assert accessor not in stats, accessor
     # Each count is loaded once, marked; none is read plain.
@@ -78,8 +84,9 @@ def test_parameters_are_not_repeated():
 def test_the_directory_and_its_files():
     init = function(flowtable_source(), "ft_proc_init")
     assert 'proc_mkdir("ask_flowtable", NULL)' in init
-    made = re.findall(r'proc_create(?:_single|_seq)?\("([a-z0-9]+)", 0400, dir, ', init)
-    assert made == ["status", "stats", "devices", "flows", "l2", "mcast", "mroute"], made
+    made = re.findall(r'proc_create(?:_single|_seq)?\("([a-z0-9_]+)", 0400, dir, ', init)
+    assert made == ["status", "stats", "devices", "flows", "l2", "mcast", "mroute",
+                    "qos_ports", "qos_classes"], made
     doc = DOC.read_text()
     for name in made:
         assert re.search(rf"^  {name}\s", doc, re.M), name
@@ -88,4 +95,30 @@ def test_the_directory_and_its_files():
     # Nothing outside the directory.
     source = flowtable_source()
     assert source.count("proc_mkdir(") == 1
-    assert len(re.findall(r"\bproc_create(?:_single|_seq)?\(", source)) == 7
+    assert len(re.findall(r"\bproc_create(?:_single|_seq)?\(", source)) == 9
+
+
+def test_qos_rows_and_the_class_width():
+    """The two QoS row files are documented field by field, take neither the
+    transaction nor RTNL, and the flows rows print the class at the width of
+    all its twenty-three bits, as the class rows do."""
+    source = flowtable_source()
+    doc = DOC.read_text()
+    for tag, show, fields in (
+        ("port", "ft_qos_ports_show",
+         ("dev", "tree", "channels", "spare", "held", "leaves", "leaves_free", "policers")),
+        ("class", "ft_qos_classes_show",
+         ("dev", "classid", "parent", "kind", "channel", "queue", "slot", "qos", "mark")),
+    ):
+        body = function(source, show)
+        assert "cdx_ft_begin(" not in body and "rtnl_lock(" not in body, show
+        rendered = body + (function(source, "ft_qos_class_row") if tag == "class" else "")
+        printed = re.findall(r"\b([a-z_]+)=%", rendered)
+        assert printed == list(fields), (tag, printed)
+        assert f'"{tag} dev=' in rendered, tag
+        entry = re.search(rf"^- \*\*`qos_{tag}[a-z]*`\*\*: `{tag} (.*?)`\.$", doc, re.M | re.S)
+        assert entry, f"qos_{tag}... has no fields line in {DOC.name}"
+        assert entry.group(1).split() == [f + "=" for f in fields], entry.group(1)
+    flows = function(source, "ft_flows_show")
+    assert flows.count("qos=%06x") == 2 and "qos=%05x" not in flows
+    assert '"%06x"' in function(source, "ft_qos_class_row")

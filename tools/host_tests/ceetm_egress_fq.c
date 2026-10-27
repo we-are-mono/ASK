@@ -17,9 +17,11 @@
 #include <string.h>
 
 typedef uint8_t u8; typedef uint32_t u32;
-#define CDX_CEETM_MAX_CHANNELS			8
-#define CDX_CEETM_MAX_QUEUES_PER_CHANNEL	16
+/* The channel ceiling and the queues per channel, as the production header
+ * states them. */
+#include "egress_fq_constants.inc"
 #define ceetm_dbg(...)				do { } while (0)
+#define BIT(n)					(1UL << (n))
 
 /* The kernel's fls: one-based index of the highest set bit, zero for zero. */
 static int fls(unsigned int x)
@@ -44,6 +46,9 @@ struct ceetm_chnl_info {
 struct tQM_context_ctl { uint32_t chnl_map; };
 
 static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];
+/* How many of them the device tree gave, as ceetm_init_channels() read it. */
+static uint32_t channel_count = CDX_CEETM_MAX_CHANNELS;
+uint32_t ceetm_channel_count(void) { return channel_count; }
 
 /* What a classifier entry hands cdx_get_txfqid(): a mark's egress pair, on a
  * port whose driver state says whether CEETM is on. */
@@ -229,6 +234,43 @@ int main(void)
     other_eth.net_dev = NULL;
     assert(cdx_get_txfqid(&other_eth, &named, 7) == 0);
     assert(dpa_netdev_is_dpaa(&dev) && !dpa_netdev_is_dpaa(NULL));
+
+    /* ---- every channel the SoC has ---- */
+
+    /* Thirty-two: the last is mark channel 32, and the port's own when it is
+     * the highest the port holds -- bit 31 of its map, which a signed shift
+     * would have made negative. One past it names nothing. */
+    assert(CDX_CEETM_MAX_CHANNELS == 32);
+    struct tQM_context_ctl wide = { .chnl_map = 1u << 4 | 1u << 31 };
+    provide(4, 2, 0x000502, &wide);
+    provide(31, 2, 0x003102, &wide);
+    fq = ceetm_get_egressfq(&wide, 32, 2);
+    assert(fq && fq->fqid == 0x003102);
+    fq = ceetm_get_egressfq(&wide, 0, 2);
+    assert(fq && fq->fqid == 0x003102);
+    fq = ceetm_get_egressfq(&wide, 5, 2);
+    assert(fq && fq->fqid == 0x000502);
+    assert(ceetm_get_egressfq(&wide, 33, 2) == NULL);
+    /* The mark carries the channel whole: six bits, so 32 survives the
+     * union a classifier entry holds it in. */
+    unsigned last = 32;
+    named.markval = 0;
+    named.chnl_id = last;
+    named.queue = 2;
+    assert(named.chnl_id == 32);
+    dev.priv.ceetm_en = true;
+    dev.priv.qm_ctx = &wide;
+    tree_live = false;
+    assert(cdx_get_txfqid(&eth, &named, 0) == 0x003102);
+    /* Only as many as the device tree gave: a channel past them is refused
+     * by its number, before its record -- which no channel was built into --
+     * is read. */
+    channel_count = 8;
+    assert(ceetm_get_egressfq(&wide, 32, 2) == NULL);
+    assert(ceetm_get_egressfq(&wide, 9, 2) == NULL);
+    fq = ceetm_get_egressfq(&wide, 5, 2);
+    assert(fq && fq->fqid == 0x000502);
+    channel_count = CDX_CEETM_MAX_CHANNELS;
 
     puts("CEETM egress fq: channel resolution, bounds, an fqid reading that "
          "leaves the queue alone, and the tree's answer for a classifier entry");

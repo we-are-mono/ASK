@@ -33,8 +33,9 @@
  * can be quiesced the moment a callback returns. The exceptions are two works,
  * which run without RTNL: the one that grows class queues once frames other
  * queues held have left (cdx_htb_regrow_work()), under this file's mutex
- * throughout, and the one that gives a torn-down tree's channels back once its
- * port's flowtable entries no longer send to them (cdx_htb_release_work()),
+ * throughout, and the one that gives a torn-down tree's channels back, and
+ * the frame of budget each class queue a change gave back is charged, once
+ * its port's flowtable entries no longer send to them (cdx_htb_release_work()),
  * which drops the mutex while it waits for the flowtable and reads again what
  * it was releasing once it has it back. RTNL is
  * also what serialises the commands against each other; the hardware layer
@@ -42,10 +43,14 @@
  * channel another port holds, and TC_HTB_CREATE below will not take a port
  * that is already configured.
  */
+#include <linux/bitmap.h>
+#include <linux/bitops.h>
 #include <linux/list.h>
 #include <linux/netdevice.h>
+#include <linux/preempt.h>
 #include <linux/rcupdate.h>
 #include <linux/rtnetlink.h>
+#include <linux/seqlock.h>
 #include <linux/slab.h>
 #include <linux/srcu.h>
 #include <net/pkt_cls.h>
@@ -95,11 +100,27 @@
 /* No such queue, no such class. Both maps below are byte arrays, so one
  * sentinel serves for a whole memset. */
 #define CDX_HTB_NONE		0xffu
+static_assert(CDX_HTB_MAX_LEAVES < CDX_HTB_NONE,
+	      "a leaf slot is a byte, and the sentinel is none of them");
+static_assert(CDX_HTB_NONE == CDX_QOS_NONE,
+	      "the report says none as the maps it is read from do");
 
-/* Every egress destination a decoded conntrack mark can name. */
-#define CDX_HTB_CLASSES		256
+/* Every egress destination a decoded conntrack mark can name, which is the
+ * class map's index: the channel field above the class queue
+ * (CDX_FT_QOS_EGRESS_MASK). CDX_HTB_CLASS() is how this file spells one, the
+ * channel field one-based or zero for the top channel, as a mark has it. */
+#define CDX_HTB_CLASSES		(CDX_FT_QOS_EGRESS_MASK + 1)
+#define CDX_HTB_CLASS(field, cq) \
+	((u32)(field) << CDX_FT_QOS_CHANNEL_SHIFT | (u32)(cq) << CDX_FT_QOS_QUEUE_SHIFT)
 static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
 	      "class_txq[] must cover every egress class the adapter can decode");
+static_assert(CDX_HTB_CLASS(CDX_CEETM_MAX_CHANNELS, MAX_SCHEDULER_QUEUES - 1) <
+	      CDX_HTB_CLASSES,
+	      "every channel's every class queue has an entry in the class map");
+
+/* A port's claimed channels are a bitmap of them, one word. */
+static_assert(CDX_CEETM_MAX_CHANNELS <= 32,
+	      "cdx_htb_port.channels has a bit for every channel");
 
 /* Frames a leaf's class queue asks to hold before tail drop.
  *
@@ -119,7 +140,8 @@ static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
  * A frame on a class queue holds a buffer until the port sends it, however
  * short the frame: one of the pool every DPAA port receives into, or for an
  * IPsec flow one of SEC's output pool. Sixteen leaves at CDX_HTB_CQ_DEPTH
- * would hold 2,048 frames, more than SEC's pool kept for them, and a RED limit
+ * held 2,048 frames, more than SEC's pool kept for them -- sixty-four would
+ * hold eight times what it keeps (CDX_HTB_MAX_LEAVES) -- and a RED limit
  * of four megabytes counted in bytes held every buffer of the Ethernet pool
  * with 64-byte frames: the ports missed what they received, the gateway's own
  * frames included (A337). So every class queue counts frames, and a tree holds
@@ -140,21 +162,64 @@ static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
  * all of SEC's pool, and SEC refused every SA's jobs (A348). So each queue is
  * charged what it holds as well (cdx_htb_cap_charge()), and a queue grows only
  * into what is left; the rest of its share waits until those frames have gone
- * (cdx_htb_regrow_work()).
+ * (cdx_htb_regrow_work()). And the tree's own queues share out only what the
+ * charges outside them leave of the budget -- the queues it gave back, below,
+ * a departing port's, frames queues no tree uses hold, and for SEC's share
+ * every other tree's (cdx_htb_cap_shares()): shares of the whole budget would
+ * promise frames those charges hold, which no shrink of the tree's own gives
+ * back.
  *
- * That holds but for one frame per class queue a change has just configured
- * or given back, and never more than one: a queue configured while other
- * queues' frames fill the budget still starts at a frame (CDX_HTB_CQ_START),
- * until those frames leave; and a queue a class gave back, charged only what
- * it holds, is parked at a frame (CEETM_PARKED_CQ_DEPTH), which the classifier
- * entries that named it can still fill until they have been retired or
- * rebuilt after the change. A change touches at most the eighteen class
- * queues of its tree, against the 128 frames of SEC's pool left over for its
- * own jobs. On a tree taken down, that frame lands after the drain, on a
- * channel its port no longer serves, quarantined for the port until nothing in
- * the flowtable sends to it; it stays, charged, until the quarantine's release
- * pops it (cdx_htb_release_work()), or the port takes the channel back and
- * sends it.
+ * A queue a change gives back -- a leaf deleted or moved to another priority,
+ * a leaf turned into a channel, queues 0 and 7 when the top channel moves,
+ * every queue of a tree taken down -- is parked at a frame
+ * (CEETM_PARKED_CQ_DEPTH), which the classifier entries that named it can
+ * still put on it until they have been retired or rebuilt after the change.
+ * Counted only by what it holds, it would leave that frame out: a change
+ * touches no more queues than its tree has, but changes add up, and with
+ * thirty-two channels there are 512 class queues -- two large trees changed
+ * in one retirement window, or one tree churned through many queues, would
+ * put more frames on them than the 128 of SEC's pool left over for its own
+ * jobs. So each is charged the depth it is parked at, or what it holds if
+ * more, against its tree's budget and SEC's share alike, from the moment the
+ * tree stops using it until the port's entries have been shown retired or
+ * rebuilt since (cdx_htb_given_back(), cdx_htb_release_work()). The bound
+ * then holds for any number of changes and trees, at the cost of a frame of
+ * budget a queue given back for the moments the retirement takes, which the
+ * tree's own queues' shares give up meanwhile: however fast a tree is built
+ * or churned, its classes go in. On a tree
+ * taken down, that frame lands after the drain, on a channel its port no
+ * longer serves, quarantined for the port until nothing in the flowtable
+ * sends to it; it stays, charged, until the quarantine's release pops it, or
+ * the port takes the channel back and sends it.
+ *
+ * A class queue starts at a frame (CDX_HTB_CQ_START), never none, and the cap
+ * grows it from there; but the frame is taken before the cap runs. The cap
+ * makes room for it by shrinking the tree's queues to their new shares, drawn
+ * around what is charged outside them -- which is why those cost a queue
+ * starting out nothing -- but frames the tree's own queues hold above their
+ * shares, on a paused port or behind a busy sibling, no shrink takes back. So
+ * a command that would configure a class queue for a class -- a leaf added
+ * under the root or under a channel, a leaf's first child taking its place, a
+ * leaf moved to another priority or into the weighted group -- is refused when
+ * every queue, counted at what it may hold once the cap has shrunk what the
+ * new shares shrink, would leave no room for that frame in its tree's budget
+ * or in SEC's share, unless the change adds nothing; refused before anything
+ * is claimed or programmed, and taken once those frames have gone
+ * (cdx_htb_admit()).
+ *
+ * The bound then holds but for two things, per change and never more. The one
+ * change no command can be refused: the top channel moving, as a class under
+ * the root comes or goes, takes queues 0 and 7 with it
+ * (cdx_htb_implicit_sync()), each configured at its starting frame on the new
+ * top channel as the old one's are given back -- at most two frames past the
+ * budget a change that moves it, and only while frames the tree's queues hold
+ * fill it. Deleting a leaf, its last child, or the tree configures no class
+ * queue but those two. And the starting frame of a command admitted against
+ * counts read before its own shrinks are written: a busy tree can refill the
+ * queues the cap is about to shrink to their old depths meanwhile, and the
+ * shrink then leaves them holding above their new shares until they send --
+ * one frame past, that command's. It does not compound: the next command's
+ * admission reads the refilled counts, and refuses until they have gone.
  */
 #define CDX_HTB_ETH_FRAMES	((u64)CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT * num_possible_cpus() / 2)
 #define CDX_HTB_SEC_FRAMES	IPSEC_QDISC_FRAMES
@@ -167,10 +232,13 @@ static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
  * its share once every other queue of the tree has made room: configured at
  * a full depth, a new queue would take the tree past its budget until the
  * others had shrunk. Never zero, which a congestion group takes as no tail
- * drop at all -- so a queue configured while frames other queues hold fill
- * the budget takes it a frame past, until they leave. A queue given back is
- * parked at no more (CEETM_PARKED_CQ_DEPTH), which is what holds the frames
- * that can still reach it to one as well (CDX_HTB_ETH_FRAMES). */
+ * drop at all -- so a class's queue is not configured while frames other
+ * queues hold leave the budget no room for it (cdx_htb_admit()), and only the
+ * top channel's queues 0 and 7, moving with it, can take the budget a frame
+ * past each, until those frames leave. A queue given back is parked at no
+ * more (CEETM_PARKED_CQ_DEPTH), which is what holds the frames that can still
+ * reach it, and its charge until they cannot, to one as well
+ * (CDX_HTB_ETH_FRAMES). */
 #define CDX_HTB_CQ_START	1
 static_assert(CEETM_PARKED_CQ_DEPTH <= CDX_HTB_CQ_START,
 	      "a queue given back may take no more than one starting out");
@@ -211,10 +279,10 @@ static_assert(CEETM_PARKED_CQ_DEPTH <= CDX_HTB_CQ_START,
  * class no leaf holds -- takes the leaf `default' names, as software HTB sends
  * it there. With no default leaf it takes the top channel's class queue 0, the
  * lowest strict priority, below the weighted group: the queue the hardware has
- * always resolved a mark with no class to (cdx_get_txfqid() with zero
- * nibbles). That holds forwarded or not, tracked or not, so a flow's frames
- * land on the same queue before and after it is offloaded, and a frame whose
- * connection nothing classified is never anywhere better than that.
+ * always resolved a mark with no class to (cdx_get_txfqid() with a zero
+ * channel and queue). That holds forwarded or not, tracked or not, so a flow's
+ * frames land on the same queue before and after it is offloaded, and a frame
+ * whose connection nothing classified is never anywhere better than that.
  *
  * Control traffic is the exception: what the gateway sends itself -- from its
  * sockets, and the link frames it originates, ARP, neighbour discovery, PPPoE
@@ -299,7 +367,9 @@ struct cdx_htb_port {
 	struct tQM_context_ctl *qm_ctx;
 	struct list_head classes;
 	u16 cq_used[CDX_CEETM_MAX_CHANNELS];
-	u16 channels;		/* channels claimed for this port */
+	/* The channels claimed for this port, a bit for each of the CEETM
+	 * instance's: a u16 would drop channels 16 to 31. */
+	u32 channels;
 	u16 major;		/* the qdisc handle's major */
 	u16 defcls;
 	u16 leaves;		/* qids in use, dense from CDX_HTB_QID_BASE */
@@ -311,6 +381,10 @@ struct cdx_htb_port {
 	 * the queue (cdx_htb_implicit_forget()). */
 	u8 implicit_channel;
 	u16 implicit;
+	/* The class queues the cap last charged as the tree's, per channel: the
+	 * ones it lists (cdx_htb_cap_queues()). One that leaves them has been
+	 * given back, by whichever change it was (cdx_htb_given_back()). */
+	u16 charged[CDX_CEETM_MAX_CHANNELS];
 	/* What the Tx path reads, and the only part of this structure it may.
 	 * Plain byte arrays rather than a walk of the class list, because both
 	 * are read from ndo_select_queue and cpe_fp_tx without RTNL while that
@@ -345,21 +419,26 @@ struct cdx_htb_port {
 	bool told_stuck, told_unread;
 };
 
-/* The release of the channels a tree taken down left quarantined for its port
- * (ceetm_stop_qos()), one a port, under cdx_htb_mutex. Kept apart from the
- * port, which cdx_htb_port_gone() clears whole and a new tree starts afresh,
- * while this outlives both until the release is done or the port goes.
+/* What waits on a port's flowtable entries being retired or rebuilt, one a
+ * port, under cdx_htb_mutex: the release of the channels a tree taken down
+ * left quarantined for the port (ceetm_stop_qos()), `due', and the class
+ * queues its trees gave back, per channel, which are charged until then
+ * (`given', cdx_htb_given_back()). Kept apart from the port, which
+ * cdx_htb_port_gone() clears whole and a new tree starts afresh, while this
+ * outlives both until the release is done or the port goes.
  *
- * `dev' is the port's netdev, held while a release is due. Every teardown on
- * the port moves `gen' on, and the HTB command that made it, having marked the
- * port's flowtable entries for re-installation, sets `marked' to it
- * (cdx_htb_release_arm()): a release waits for the marking that follows the
- * teardown, and one that saw `gen' move while it waited gives back nothing a
- * later teardown quarantined. `told' says the log was told the entries could
- * not yet be shown retired or rebuilt. */
+ * `dev' is the port's netdev, held while either waits. Every change that
+ * tears a tree down or gives a queue back moves `gen' on, and the HTB command
+ * that made it, having marked the port's flowtable entries for
+ * re-installation, sets `marked' to it (cdx_htb_release_arm()): the release
+ * waits for the marking that follows the change, and one that saw `gen' move
+ * while it waited gives back nothing a later change quarantined or gave
+ * back. `told' says the log was told the entries could not yet be shown
+ * retired or rebuilt. */
 struct cdx_htb_release {
 	struct net_device *dev;
 	unsigned long gen, marked;
+	u16 given[CDX_CEETM_MAX_CHANNELS];
 	bool due, told;
 };
 
@@ -388,21 +467,45 @@ static DECLARE_DELAYED_WORK(cdx_htb_regrow, cdx_htb_regrow_work);
 static unsigned int cdx_htb_regrow_ms;
 static bool cdx_htb_regrowing;
 
-/* The class queues the tree of a port that went had in use, per channel
- * (cdx_htb_port_gone()). They are no live tree's any more, but until the port's
- * CEETM context is released and drained (cdx_htb_port_released()) they can
- * still hold frames up to their depth, and are charged so. Under
- * cdx_htb_mutex. */
+/* The class queues the tree of a port that went had in use, and those its
+ * trees gave back that were still charged, per channel (cdx_htb_port_gone()).
+ * They are no live tree's any more, but until the port's CEETM context is
+ * released and drained (cdx_htb_port_released()) they can still hold frames
+ * up to their depth, and are charged so. Under cdx_htb_mutex. */
 static u16 cdx_htb_departing[CDX_CEETM_MAX_CHANNELS];
 
-/* The releases of torn-down trees' channels, indexed as the ports are, and the
- * work that carries them out (cdx_htb_release_work()) at its pace. Under
+/* What waits on each port's entries, indexed as the ports are, and the work
+ * that carries it out (cdx_htb_release_work()) at its pace. Under
  * cdx_htb_mutex, which the work takes only around what it reads and writes
  * here: it waits for the flowtable without it. */
 static struct cdx_htb_release cdx_htb_releases[MAX_PHY_PORTS];
 static void cdx_htb_release_work(struct work_struct *work);
 static DECLARE_DELAYED_WORK(cdx_htb_release, cdx_htb_release_work);
 static unsigned int cdx_htb_release_ms;
+
+/* The netdev of each port of cdx's, indexed as the ports are: set once the
+ * port's CEETM context is whole (cdx_htb_port_added()) and cleared as its tree
+ * is dropped (cdx_htb_port_gone()), both under cdx_htb_mutex, and both while
+ * the port's interface record holds the netdev -- before it is taken and
+ * after it is let go. So under that mutex a netdev found here is there to be
+ * read, which a context's own pointer is not: that is set before the context
+ * is made, which can fail, and cleared under the control mutex alone. What
+ * the hardware QoS report reads a port's name from. */
+static struct net_device *cdx_htb_netdevs[MAX_PHY_PORTS];
+
+/* The SoC-wide levels the adapter's status reports (cdx_qos_budget()): the
+ * channels the device tree gave, how many are mapped to a port for its tree
+ * and how many no tree may claim yet, and how many leaves a tree may have. A
+ * snapshot rather than a census taken on asking, because the status read is
+ * what the controller's health probe and its drain wait read, and must not
+ * wait for cdx_htb_mutex, which a tc command holds throughout and the cap
+ * across a read of every class queue. Taken again under that mutex wherever
+ * the census can move (cdx_htb_levels_update()), the write made with
+ * preemption off, so a reader retries across a few words at most and never
+ * sleeps. The policer pool's counts are read on asking, under its own
+ * spinlock. */
+static struct cdx_qos_budget cdx_htb_levels;
+static seqcount_t cdx_htb_levels_seq = SEQCNT_ZERO(cdx_htb_levels_seq);
 
 static struct cdx_htb_port *cdx_htb_entry(struct tQM_context_ctl *qm_ctx)
 {
@@ -532,9 +635,14 @@ struct cdx_htb_cap_queue {
 	struct cdx_htb_class *cl;	/* NULL for one no leaf holds */
 	u32 want;			/* frames it asks for */
 	u32 depth;			/* frames it is given */
+	u32 full;			/* what the whole budget would give it */
 	u32 held;			/* frames it holds now */
 	u8 channel, cq;
 };
+/* The cap's list of one tree's queues (cdx_htb_cap()). At sixty-six queues
+ * it is too large for a stack frame, so one list serves every tree in turn,
+ * under cdx_htb_mutex, which every caller of the cap holds. */
+static struct cdx_htb_cap_queue cdx_htb_cap_list[CDX_HTB_CAP_QUEUES];
 
 /* The class queues a tree uses: each leaf's, and the top channel's queues
  * unclassified and control traffic take while no leaf holds them
@@ -544,7 +652,8 @@ struct cdx_htb_cap_queue {
  * unused, and drains as they come -- behind a class that takes every token it
  * may, not until that class goes quiet, and not at all while the port is
  * paused. So it is still charged what it holds (cdx_htb_cap_charge()), and
- * its frames still count against what the tree's own queues may grow into. */
+ * until the port's entries can no longer name it its parked depth at least,
+ * and that still counts against what the tree's own queues may grow into. */
 static unsigned int cdx_htb_cap_queues(struct cdx_htb_port *port,
 				       struct cdx_htb_cap_queue *q)
 {
@@ -595,6 +704,19 @@ static u16 cdx_htb_tree_mask(struct cdx_htb_port *port, u8 channel)
 	if (channel == port->top)
 		mask |= BIT(CDX_HTB_UNCLASSIFIED_CQ) | BIT(CDX_HTB_CONTROL_CQ);
 	return mask;
+}
+
+/* The class queues of `channel' a tree gave back, on whichever port, that its
+ * port's entries may still name (cdx_htb_given_back()): every tree's cap
+ * charges them at their depth too. */
+static u16 cdx_htb_given(u8 channel)
+{
+	unsigned int ii;
+	u16 given = 0;
+
+	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_releases); ii++)
+		given |= cdx_htb_releases[ii].given[channel];
+	return given;
 }
 
 /* The live tree whose port holds `channel', or NULL. ceetm_assign_chnl() gives
@@ -672,41 +794,50 @@ static int cdx_htb_cap_write(struct cdx_htb_port *port,
  *
  * A queue a tree uses is charged the larger of its depth and what it holds:
  * below its depth it may fill up to it, and above it, a depth lowered under
- * what was queued, the count only falls. Any other queue is charged what it
- * holds -- one a leaf gave back or the top channel stopped using, reset with
- * its frames still on it, and one of a channel no tree holds: given back with
- * its tree or its port, or whose drain at teardown failed. Every such queue is
- * parked at a frame (CEETM_PARKED_CQ_DEPTH), and nothing names it once the
- * classifier entries on its port have been retired or rebuilt after the
- * change; until then they can put that frame on it, beyond what it is charged.
- * On a channel no tree holds, that frame stays charged until the channel's
- * quarantine ends, it is claimed again or the module goes, each of which pops
- * it first (ceetm_pop_leftovers()). What each of
- * this tree's own queues holds goes into `q', where the growth that has to fit
- * into what is left starts from. The queues a departing port's tree used count
- * as a tree's until its context is released (cdx_htb_departing).
+ * what was queued, the count only falls. So is a queue a tree gave back -- a
+ * leaf's, one the top channel stopped using, any of a tree taken down -- until
+ * its port's classifier entries have been shown retired or rebuilt since
+ * (cdx_htb_given()): it is parked at a frame (CEETM_PARKED_CQ_DEPTH), which
+ * until then they can still put on it, and a park that failed leaves it the
+ * depth it had, which they can fill as far. So are the queues a departing
+ * port's tree used, or gave back, until its context is released
+ * (cdx_htb_departing). Any other queue is charged what it holds, which nothing
+ * names any more: one given back whose port's entries have been shown gone
+ * since, and one of a channel whose drain at teardown failed. On a channel no
+ * tree holds, what it holds stays charged until the channel's quarantine
+ * ends, it is claimed again or the module goes, each of which pops it first
+ * (ceetm_pop_leftovers()). What each of this tree's own queues holds goes into
+ * `q', where the growth that has to fit into what is left starts from, and
+ * what they are charged together into `own', when asked for.
  *
- * The caller reads this after it has written every shrink, never before: a
- * count read under the old, higher depth could still have risen before the
- * new one took, and one read above the new depth can only fall. */
+ * The caller reads this after it has written every shrink, never before, to
+ * bound what grows: a count read under the old, higher depth could still have
+ * risen before the new one took, and one read above the new depth can only
+ * fall. What is charged outside the tree's own queues it may read before: none
+ * of that can rise until the next change (cdx_htb_cap_shares()). */
 static int cdx_htb_cap_charge(struct cdx_htb_port *port,
 			      struct cdx_htb_cap_queue *q, unsigned int n,
-			      u32 *tree, u32 *all)
+			      u32 *tree, u32 *all, u32 *own)
 {
 	struct cdx_htb_port *owner;
 	unsigned int cq, ii;
 	u32 held, depth;
-	bool curve;
+	bool curve, mine;
 	u16 used;
 	u8 ch;
 	int rc;
 
 	*tree = 0;
 	*all = 0;
-	for (ch = 0; ch < CDX_CEETM_MAX_CHANNELS; ch++) {
+	if (own)
+		*own = 0;
+	/* The channels the hardware layer built, which it refuses past: a
+	 * refusal here would read as a count it cannot give. */
+	for (ch = 0; ch < ceetm_channel_count(); ch++) {
 		owner = cdx_htb_channel_port(ch);
-		used = owner ? cdx_htb_tree_mask(owner, ch) :
-			       cdx_htb_departing[ch];
+		used = cdx_htb_departing[ch] | cdx_htb_given(ch);
+		if (owner)
+			used |= cdx_htb_tree_mask(owner, ch);
 		for (cq = 0; cq < MAX_SCHEDULER_QUEUES; cq++) {
 			rc = ceetm_class_queue_backlog(ch, cq, &held);
 			/* A queue never built holds nothing. */
@@ -714,15 +845,20 @@ static int cdx_htb_cap_charge(struct cdx_htb_port *port,
 				held = 0;
 			else if (rc)
 				return rc;
+			mine = false;
 			for (ii = 0; owner == port && ii < n; ii++)
-				if (q[ii].channel == ch && q[ii].cq == cq)
+				if (q[ii].channel == ch && q[ii].cq == cq) {
 					q[ii].held = held;
+					mine = true;
+				}
 			if ((used & BIT(cq)) &&
 			    !ceetm_class_queue_state(ch, cq, &depth, &curve))
 				held = max(held, depth);
 			*all += held;
 			if (owner == port)
 				*tree += held;
+			if (mine && own)
+				*own += held;
 		}
 	}
 	return 0;
@@ -741,7 +877,7 @@ static u32 cdx_htb_cap_room(struct cdx_htb_port *port,
 	u32 tree, all;
 	int rc;
 
-	rc = cdx_htb_cap_charge(port, q, n, &tree, &all);
+	rc = cdx_htb_cap_charge(port, q, n, &tree, &all, NULL);
 	if (rc) {
 		if (!port->told_unread)
 			pr_warn("cdx: %s keeps its class queues short of their share: what they hold cannot be read (%d)\n",
@@ -752,6 +888,48 @@ static u32 cdx_htb_cap_room(struct cdx_htb_port *port,
 	port->told_unread = false;
 	return min(tree < budget ? budget - tree : 0,
 		   all < sec ? sec - all : 0);
+}
+
+/* Draw the shares of the tree's own queues (cdx_htb_cap_share()) from what is
+ * left them: its budget and SEC's share, each less what is charged outside
+ * them -- the queues it gave back that its port's entries may still name, a
+ * departing port's, the frames queues no tree uses hold, and for SEC's share
+ * every other tree's queues (cdx_htb_cap_charge()). Drawn from the whole
+ * budget instead, the shares would promise frames those charges hold, which no
+ * shrink of the tree's own gives back: its queues would keep depths that fill
+ * the budget, and a queue starting out would find no room for its frame
+ * (cdx_htb_admit()). Nothing outside, they are the whole budget's.
+ *
+ * Read before the shrinks are written, which the growth's bound is not: each
+ * of these is charged at what it may hold, which cannot rise until the next
+ * change. What the queues hold that cannot be read leaves the whole budget's
+ * shares, and the growth no room (cdx_htb_cap_room()).
+ *
+ * Returns whether that leaves any queue short of what the whole budget would
+ * give it: the tree is kept short for those charges as for frames that leave
+ * a queue no room, and looked at again until they go (cdx_htb_regrow_work()).
+ * A release that stops charging the queues given back redraws every tree's
+ * shares itself. */
+static bool cdx_htb_cap_shares(struct cdx_htb_port *port,
+			       struct cdx_htb_cap_queue *q, unsigned int n)
+{
+	const u32 budget = cdx_htb_budget(), sec = CDX_HTB_SEC_FRAMES;
+	u32 tree, all, own, left;
+	bool kept = false;
+	unsigned int ii;
+
+	cdx_htb_cap_share(q, n, budget);
+	for (ii = 0; ii < n; ii++)
+		q[ii].full = q[ii].depth;
+	if (cdx_htb_cap_charge(port, q, n, &tree, &all, &own))
+		return false;
+	left = min(budget - min(budget, tree - own), sec - min(sec, all - own));
+	if (left == budget)
+		return false;
+	cdx_htb_cap_share(q, n, left);
+	for (ii = 0; ii < n; ii++)
+		kept |= q[ii].depth < q[ii].full;
+	return kept;
 }
 
 /* Program what cdx_htb_cap_share() gave each queue: every queue that shrinks,
@@ -779,20 +957,22 @@ static bool cdx_htb_cap_apply(struct cdx_htb_port *port,
 			      struct cdx_htb_class *asking, bool *withheld)
 {
 	bool stuck = false, lost = false, charged = false, curve, shrinks;
-	u32 done = 0, now, depth, base, room = 0;
+	DECLARE_BITMAP(done, CDX_HTB_CAP_QUEUES);
+	u32 now, depth, base, room = 0;
 	unsigned int pass, ii;
 	int rc;
 
 	*withheld = false;
+	bitmap_zero(done, CDX_HTB_CAP_QUEUES);
 	for (pass = 0; pass < 2; pass++) {
 		for (ii = 0; ii < n; ii++) {
-			if ((done & BIT(ii)) ||
+			if (test_bit(ii, done) ||
 			    ceetm_class_queue_state(q[ii].channel, q[ii].cq, &now, &curve))
 				continue;
 			shrinks = q[ii].depth < now;
 			if (shrinks != (pass == 0))
 				continue;
-			done |= BIT(ii);
+			__set_bit(ii, done);
 			depth = q[ii].depth;
 			if (stuck) {
 				depth = min(depth, now);
@@ -853,31 +1033,93 @@ static bool cdx_htb_cap_apply(struct cdx_htb_port *port,
 	return lost;
 }
 
+/* A change on `port' left something waiting until the port's flowtable
+ * entries are retired or rebuilt: its release from then on proves only a
+ * marking made after this change, and holds the port's netdev to wait with
+ * until it is done (cdx_htb_release_one()). A tree is built only on a port
+ * with a netdev, so one without is warned of: it has no entries to wait for,
+ * and what it gave back stays charged until the port goes. Returns whether
+ * the port had one. */
+static bool cdx_htb_release_hold(struct cdx_htb_port *port)
+{
+	struct cdx_htb_release *r = &cdx_htb_releases[port - cdx_htb_ports];
+	struct net_device *dev = port->qm_ctx ? port->qm_ctx->net_dev : NULL;
+
+	if (WARN_ON_ONCE(!dev))
+		return false;
+	if (!r->dev) {
+		dev_hold(dev);
+		r->dev = dev;
+		r->told = false;
+	}
+	r->gen++;
+	return true;
+}
+
+/* Note the class queues the tree has stopped using since the cap last ran,
+ * whichever change it was -- a leaf deleted, moved to another priority or
+ * turned into a channel, the top channel moving, the tree taken down -- so
+ * that every cap charges each at its depth until the port's entries are
+ * shown retired or rebuilt (cdx_htb_given(), cdx_htb_release_work()). A tree
+ * no longer live uses none. A queue the tree takes up again is the tree's,
+ * charged as such; it leaves the set only with the rest. Any queue leaving
+ * moves the release on, a second time too: entries installed while it was
+ * the tree's again name it as well. */
+static void cdx_htb_given_back(struct cdx_htb_port *port)
+{
+	struct cdx_htb_release *r = &cdx_htb_releases[port - cdx_htb_ports];
+	bool gave = false;
+	u16 now, gone;
+	u8 ch;
+
+	for (ch = 0; ch < ceetm_channel_count(); ch++) {
+		now = port->live ? cdx_htb_tree_mask(port, ch) : 0;
+		gone = port->charged[ch] & ~now;
+		port->charged[ch] = now;
+		if (!gone)
+			continue;
+		r->given[ch] |= gone;
+		gave = true;
+	}
+	if (gave)
+		cdx_htb_release_hold(port);
+}
+
 /* Size every class queue of a port's tree to its share of what the tree may
- * hold (CDX_HTB_ETH_FRAMES), and program it. Redone whole whenever a share
- * can move: a change to the tree's queues (cdx_htb_publish()), to a RED
- * leaf's curve (cdx_htb_red()), to the port's MTU, which RED's frames are
- * counted in (cdx_htb_mtu_changed()), and to the number of trees SEC's share
- * is divided between (cdx_htb_cap_trees()) -- and, while frames other queues
- * hold keep some queue short of its share, until none is
+ * hold (CDX_HTB_ETH_FRAMES) -- of what is left it beside the charges outside
+ * its own queues (cdx_htb_cap_shares()) -- and program it. Redone whole
+ * whenever a share can move: a change to the tree's queues
+ * (cdx_htb_publish()), to a RED leaf's curve (cdx_htb_red()), to the port's
+ * MTU, which RED's frames are counted in (cdx_htb_mtu_changed()), to the
+ * number of trees SEC's share is divided between (cdx_htb_cap_trees()), and
+ * to what is charged outside the tree, as a release stops charging the queues
+ * given back (cdx_htb_release_work()) -- and, while frames other queues hold
+ * keep some queue short of what the whole budget would give it, until none is
  * (cdx_htb_regrow_work()). Every depth and every curve a class queue of a live
  * tree is given comes from here, but for the frame a queue starts with
  * (CDX_HTB_CQ_START). Ends, because each round but the last takes a RED leaf's
  * curve away. Returns whether a queue was kept short; the regrow work is
  * armed for it here, other than from the work itself, which keeps its own
- * pace. */
+ * pace.
+ *
+ * Every change to which queues a tree uses ends here, through the publish,
+ * that of a tree taken down included: so this is where a queue the tree gave
+ * back is noted (cdx_htb_given_back()), before any share is drawn. */
 static bool cdx_htb_cap(struct cdx_htb_port *port, struct cdx_htb_class *asking)
 {
-	struct cdx_htb_cap_queue q[CDX_HTB_CAP_QUEUES];
-	bool withheld;
+	struct cdx_htb_cap_queue *q = cdx_htb_cap_list;
+	bool withheld, kept;
 	unsigned int n;
 
+	lockdep_assert_held(&cdx_htb_mutex);
+	cdx_htb_given_back(port);
 	if (!port->live)
 		return false;
 	do {
 		n = cdx_htb_cap_queues(port, q);
-		cdx_htb_cap_share(q, n, cdx_htb_budget());
+		kept = cdx_htb_cap_shares(port, q, n);
 	} while (cdx_htb_cap_apply(port, q, n, asking, &withheld));
+	withheld |= kept;
 	if (withheld && !cdx_htb_regrowing) {
 		cdx_htb_regrow_ms = CDX_HTB_REGROW_FIRST_MS;
 		mod_delayed_work(system_wq, &cdx_htb_regrow,
@@ -899,8 +1141,9 @@ static void cdx_htb_cap_trees(struct cdx_htb_port *port)
 
 /* Look again at every live tree, for the queues the cap kept short of their
  * share because frames other queues held left no room for them -- a queue
- * shrunk under what it held, one a leaf gave back, another tree's -- or
- * because the hardware refused a shrink, which is tried again. Those frames
+ * shrunk under what it held, one a leaf gave back, another tree's -- or drew
+ * their shares down (cdx_htb_cap_shares()), or because the hardware refused a
+ * shrink, which is tried again. Those frames
  * leave as their ports send them, and nothing announces it, so this polls:
  * soon after the change that left a queue short (CDX_HTB_REGROW_FIRST_MS),
  * then half as often each time one still is, down to once a second
@@ -908,7 +1151,8 @@ static void cdx_htb_cap_trees(struct cdx_htb_port *port)
  * paused for good keeps it polling at that slowest pace, each time reading the
  * count of every class queue once per live tree, and so do the frames a tree
  * taken down under traffic can leave on its channels, a frame a queue at most
- * (CEETM_PARKED_CQ_DEPTH), until their release pops them
+ * (CEETM_PARKED_CQ_DEPTH), and the frame each queue a change gave back is
+ * charged, until the release pops the one and stops charging the other
  * (cdx_htb_release_work()), which redraws every tree's shares then.
  *
  * It holds cdx_htb_mutex and no RTNL, so it waits for no tc command, and the
@@ -949,7 +1193,7 @@ static void cdx_htb_regrow_work(struct work_struct *work)
  * under RTNL, and cheap enough to redo whole rather than patch in place.
  *
  * A class names its channel the way a conntrack mark does, where a channel
- * nibble of zero means "whichever channel this port owns" rather than channel
+ * field of zero means "whichever channel this port owns" rather than channel
  * zero. The top channel is the answer both paths give: the highest channel a
  * class under the root holds, which is also where every frame that names no
  * leaf goes, so it has to be one that is shaped. A channel this port claimed
@@ -989,7 +1233,7 @@ static void cdx_htb_publish(struct cdx_htb_port *port)
 
 	memset(port->class_txq, CDX_HTB_NONE, sizeof(port->class_txq));
 	memset(port->txq_channel, CDX_HTB_NONE, sizeof(port->txq_channel));
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+	for (ii = 0; ii < ceetm_channel_count(); ii++) {
 		if (!(port->channels & BIT(ii)))
 			continue;
 		claimed = ii;
@@ -1011,9 +1255,9 @@ static void cdx_htb_publish(struct cdx_htb_port *port)
 			continue;
 		port->txq_cq[slot] = cl->cq;
 		WRITE_ONCE(port->txq_channel[slot], cl->channel);
-		WRITE_ONCE(port->class_txq[((cl->channel + 1) << 4) | cl->cq], slot);
+		WRITE_ONCE(port->class_txq[CDX_HTB_CLASS(cl->channel + 1, cl->cq)], slot);
 		if (cl->channel == top)
-			WRITE_ONCE(port->class_txq[cl->cq], slot);
+			WRITE_ONCE(port->class_txq[CDX_HTB_CLASS(0, cl->cq)], slot);
 		if (port->defcls && cl->classid == port->defcls) {
 			default_slot = slot;
 			unclassified = cl->channel << 8 | cl->cq;
@@ -1103,46 +1347,139 @@ static int cdx_htb_resize(struct cdx_htb_port *port, u16 leaves)
 					    CDX_HTB_QID_BASE + leaves);
 }
 
+/* How the SoC's channels stand, for a refusal and for the report: mapped to a
+ * port for its tree (`used'), and kept from every claim (`held') --
+ * quarantined for a port whose tree went, `retiring' of them until that
+ * port's flowtable entries are retired or rebuilt, or out of service for good
+ * after a drain failed. The rest a claim can have. Under cdx_htb_mutex, which
+ * every claim, teardown and end of a quarantine is made under, a port
+ * context's release aside (ceetm_channel_holder()). */
+static void cdx_htb_channel_census(u32 *used, u32 *held, u32 *retiring)
+{
+	struct tQM_context_ctl *mapped, *quarantine;
+	bool failed;
+	u32 ii;
+
+	lockdep_assert_held(&cdx_htb_mutex);
+	*used = *held = *retiring = 0;
+	for (ii = 0; ii < ceetm_channel_count(); ii++) {
+		if (ceetm_channel_holder(ii, &mapped, &quarantine, &failed))
+			continue;
+		if (mapped) {
+			(*used)++;
+		} else if (failed) {
+			(*held)++;
+		} else if (quarantine) {
+			(*held)++;
+			(*retiring)++;
+		}
+	}
+}
+
+/* Take the census again into the snapshot the status read reads
+ * (cdx_htb_levels), wherever it can have moved, each under cdx_htb_mutex: a
+ * claim and a tree taken down, failed drains and all, in the command that
+ * makes them (cdx_htb_setup_tc()); a quarantine's end (cdx_htb_release_one());
+ * a port's context released, which clears the channels it held
+ * (cdx_htb_port_released()); and module load. */
+static void cdx_htb_levels_update(void)
+{
+	struct cdx_qos_budget b = {
+		.channels = ceetm_channel_count(),
+		.leaves = CDX_HTB_MAX_LEAVES,
+	};
+	u32 retiring;
+
+	lockdep_assert_held(&cdx_htb_mutex);
+	cdx_htb_channel_census(&b.channels_used, &b.channels_held, &retiring);
+	preempt_disable();
+	write_seqcount_begin(&cdx_htb_levels_seq);
+	cdx_htb_levels = b;
+	write_seqcount_end(&cdx_htb_levels_seq);
+	preempt_enable();
+}
+
+/* The channel this port's next claim would get (ceetm_claim_channel()), or
+ * CDX_HTB_NONE when it would get none: the lowest one mapped to no port, kept
+ * out of service by no failed drain, and quarantined for no other port --
+ * which may be one quarantined for this one. A claim that met a channel whose
+ * leftovers could not be popped would take the next instead; that is the one
+ * case this does not foresee. Under cdx_htb_mutex, as the claim is. */
+static u8 cdx_htb_claim_pick(struct cdx_htb_port *port)
+{
+	struct tQM_context_ctl *mapped, *quarantine;
+	bool failed;
+	u8 ch;
+
+	lockdep_assert_held(&cdx_htb_mutex);
+	for (ch = 0; ch < ceetm_channel_count(); ch++) {
+		if (ceetm_channel_holder(ch, &mapped, &quarantine, &failed))
+			continue;
+		if (mapped || failed || (quarantine && quarantine != port->qm_ctx))
+			continue;
+		return ch;
+	}
+	return CDX_HTB_NONE;
+}
+
+/* A channel this port has claimed that no class holds any more, which its next
+ * class under the root takes before it claims another (cdx_htb_channel_get()).
+ * Returns whether there is one. */
+static bool cdx_htb_channel_spare(struct cdx_htb_port *port, u8 *channel)
+{
+	u8 ii;
+
+	for (ii = 0; ii < ceetm_channel_count(); ii++)
+		if ((port->channels & BIT(ii)) && !cdx_htb_channel_owned(port, ii)) {
+			*channel = ii;
+			return true;
+		}
+	return false;
+}
+
 /* A channel for a class directly under the qdisc root.
  *
  * Channels are returned to the global pool only when the qdisc goes away. One
  * this port has already claimed but no class holds any more is handed out
  * again instead of being detached and rebound: detaching a live channel means
- * draining it while frames are still being classified onto it, and a claim that
- * lasts as long as the qdisc costs nothing but a bit in chnl_map.
+ * draining it while frames are still being classified onto it. The claim
+ * lasts as long as the qdisc instead, a bit in chnl_map, and keeps the
+ * channel from other ports' trees meanwhile; the report counts it as the
+ * port's spare (cdx_qos_port_next()).
+ *
+ * A refusal says how many of the SoC's channels are held, mapped to a port or
+ * kept from every claim, of how many the device tree gave.
  */
 static int cdx_htb_channel_get(struct cdx_htb_port *port, u8 *channel,
 			       struct netlink_ext_ack *extack)
 {
-	uint32_t claimed;
+	u32 claimed, used, held, retiring;
 	int rc;
-	u8 ii;
 
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++)
-		if ((port->channels & BIT(ii)) && !cdx_htb_channel_owned(port, ii)) {
-			*channel = ii;
-			return 0;
-		}
+	if (cdx_htb_channel_spare(port, channel))
+		return 0;
 	rc = ceetm_claim_channel(port->qm_ctx, &claimed);
+	if (!rc) {
+		port->channels |= BIT(claimed);
+		*channel = claimed;
+		return 0;
+	}
+	cdx_htb_channel_census(&used, &held, &retiring);
 	/* Every channel left is held for another port until its flowtable
 	 * entries are retired or rebuilt (cdx_htb_release_work()), normally a
 	 * matter of moments: worth saying so, or the operator is told the SoC
 	 * has none and stops trying. */
 	if (rc == -EBUSY) {
-		NL_SET_ERR_MSG_MOD(extack,
-				   "a CEETM channel is held until another port's flowtable entries are retired or rebuilt; try again shortly");
+		NL_SET_ERR_MSG_FMT_MOD(extack,
+				       "no CEETM channel free yet (%u of %u held, %u retiring)",
+				       used + held, ceetm_channel_count(), retiring);
 		pr_warn_ratelimited("cdx: %s found the only CEETM channels left held until another port's flowtable entries are retired or rebuilt\n",
 				    cdx_htb_port_name(port));
 		return -EBUSY;
 	}
-	if (rc) {
-		NL_SET_ERR_MSG_MOD(extack,
-				   "no CEETM channel left; the SoC has eight and every port shares them");
-		return -ENOSPC;
-	}
-	port->channels |= BIT(claimed);
-	*channel = claimed;
-	return 0;
+	NL_SET_ERR_MSG_FMT_MOD(extack, "no CEETM channel free (%u of %u held)",
+			       used + held, ceetm_channel_count());
+	return -ENOSPC;
 }
 
 /* Which class queue a leaf's scheduling parameters name.
@@ -1156,20 +1493,26 @@ static int cdx_htb_channel_get(struct cdx_htb_port *port, u8 *channel,
  * GET_CEETM_PRIORITY() inverts the strict range: configuration index 0 is CEETM
  * queue 7, the lowest priority. Indexing from the top of the range is what
  * makes prio 0 the queue that actually wins.
+ *
+ * `used' is the channel's class queues other classes hold: a class moving
+ * leaves its own out, so it may keep its priority, and a channel yet to be
+ * claimed has none.
  */
-static int cdx_htb_cq_get(struct cdx_htb_port *port, u8 channel, u8 prio,
-			  u32 quantum, u8 *cq, struct netlink_ext_ack *extack)
+static int cdx_htb_cq_get(u16 used, u8 prio, u32 quantum, u8 *cq,
+			  struct netlink_ext_ack *extack)
 {
 	u8 ii;
 
 	if (quantum) {
 		for (ii = NUM_PQS; ii < MAX_SCHEDULER_QUEUES; ii++)
-			if (!(port->cq_used[channel] & BIT(ii))) {
+			if (!(used & BIT(ii))) {
 				*cq = ii;
 				return 0;
 			}
-		NL_SET_ERR_MSG_MOD(extack,
-				   "no weighted class queue left on this channel; there are eight");
+		/* The weighted group is the queues above the strict ones. */
+		NL_SET_ERR_MSG_FMT_MOD(extack,
+				       "no weighted class queue free on this channel (%u of %u held)",
+				       hweight16(used >> NUM_PQS), (unsigned int)NUM_WBFQS);
 		return -ENOSPC;
 	}
 	if (prio >= NUM_PQS) {
@@ -1178,13 +1521,211 @@ static int cdx_htb_cq_get(struct cdx_htb_port *port, u8 channel, u8 prio,
 		return -EINVAL;
 	}
 	ii = NUM_PQS - 1 - prio;
-	if (port->cq_used[channel] & BIT(ii)) {
+	if (used & BIT(ii)) {
 		NL_SET_ERR_MSG_MOD(extack,
 				   "another class already holds this priority on this channel; give a quantum to share instead");
 		return -EEXIST;
 	}
 	*cq = ii;
 	return 0;
+}
+
+/* What every class queue would be charged once a command has configured the
+ * queue of `probe' at its starting frame and given back the queue of
+ * `leaving', and the cap has shrunk the tree's own queues `q' to their new
+ * shares: `tree' for this port's channels and `all' for every channel, as
+ * cdx_htb_cap_charge() counts them -- and what they are charged now,
+ * `tree_now' and `all_now'. Called with the port's list as the change would
+ * leave it, which `q' was drawn from; every other tree's is as it is.
+ *
+ * The shares are drawn as the cap draws them, from what the charges outside
+ * the tree's own queues leave (cdx_htb_cap_shares()): the queue given back
+ * among those, at its parked frame or what it holds. Each of the tree's own is
+ * then charged its new share or what it holds, the larger, and the new queue
+ * its starting frame or what it holds.
+ *
+ * With `claim', the probe's channel is the one the class would claim
+ * (cdx_htb_claim_pick()), and becomes the tree's: what its queues hold is
+ * popped before it is mapped (ceetm_assign_chnl()), so they are charged only
+ * what the entries still naming them can put there -- its queues given back,
+ * at their depth -- and the new queue its starting frame. No other channel is
+ * the tree's for it: not one a failed drain keeps out of service, which no
+ * claim hands out, nor another quarantined for the port. */
+static int cdx_htb_start_charge(struct cdx_htb_port *port,
+				struct cdx_htb_cap_queue *q, unsigned int n,
+				const struct cdx_htb_class *probe,
+				const struct cdx_htb_class *leaving, bool claim,
+				u32 *tree, u32 *all, u32 *tree_now, u32 *all_now)
+{
+	const u32 budget = cdx_htb_budget(), sec = CDX_HTB_SEC_FRAMES;
+	u32 held, depth, charge, now, outside = 0;
+	struct cdx_htb_port *owner;
+	bool curve, ours, mine;
+	unsigned int cq, ii;
+	u16 used, was;
+	u8 ch;
+	int rc;
+
+	*all = *tree_now = *all_now = 0;
+	for (ii = 0; ii < n; ii++)
+		q[ii].held = 0;
+	for (ch = 0; ch < ceetm_channel_count(); ch++) {
+		owner = cdx_htb_channel_port(ch);
+		used = cdx_htb_departing[ch] | cdx_htb_given(ch);
+		/* This tree's queues before the change are the ones its cap
+		 * last charged; its list is the changed one now. */
+		was = used | (owner == port ? port->charged[ch] :
+			      owner ? cdx_htb_tree_mask(owner, ch) : 0);
+		if (owner)
+			used |= cdx_htb_tree_mask(owner, ch);
+		ours = owner == port || (claim && ch == probe->channel);
+		for (cq = 0; cq < MAX_SCHEDULER_QUEUES; cq++) {
+			rc = ceetm_class_queue_backlog(ch, cq, &held);
+			if (rc == -ENODEV)
+				held = 0;
+			else if (rc)
+				return rc;
+			if (ceetm_class_queue_state(ch, cq, &depth, &curve))
+				depth = 0;
+			now = (was & BIT(cq)) ? max(held, depth) : held;
+			*all_now += now;
+			if (owner == port)
+				*tree_now += now;
+			if (claim && ch == probe->channel) {
+				/* Popped as the claim maps it; the new
+				 * queue is the tree's own, below. */
+				held = 0;
+				if (cq == probe->cq)
+					continue;
+			}
+			mine = false;
+			for (ii = 0; owner == port && ii < n; ii++)
+				if (q[ii].channel == ch && q[ii].cq == cq) {
+					q[ii].held = held;
+					mine = true;
+				}
+			if (mine)
+				continue;
+			if (leaving && ch == leaving->channel && cq == leaving->cq)
+				charge = max_t(u32, held, CEETM_PARKED_CQ_DEPTH);
+			else if (used & BIT(cq))
+				charge = max(held, depth);
+			else
+				charge = held;
+			*all += charge;
+			if (ours)
+				outside += charge;
+		}
+	}
+	/* The tree's own queues share what the rest leaves, and are charged
+	 * at what the cap would leave them, the new one at its first frame --
+	 * on a channel yet to be claimed, holding nothing. */
+	cdx_htb_cap_share(q, n, min(budget - min(budget, outside), sec - min(sec, *all)));
+	*tree = outside;
+	for (ii = 0; ii < n; ii++) {
+		if (q[ii].cl == probe) {
+			charge = max_t(u32, q[ii].held, CDX_HTB_CQ_START);
+		} else {
+			if (ceetm_class_queue_state(q[ii].channel, q[ii].cq, &depth, &curve))
+				depth = 0;
+			charge = max(q[ii].held, min(depth, q[ii].depth));
+		}
+		*tree += charge;
+		*all += charge;
+	}
+	return 0;
+}
+
+/* Whether a command may configure a class queue at its starting frame for a
+ * class (CDX_HTB_CQ_START): `probe', the class as the change would make it --
+ * added, moved, or a leaf's first child taking its place -- with the channel
+ * it holds or CDX_HTB_NONE for one it is yet to claim, and the class queue it
+ * would take; and `leaving', the class whose queue the change gives back, if
+ * any. Asked before anything is claimed or programmed, so a refusal leaves the
+ * tree as it found it.
+ *
+ * That frame is taken before the cap runs, and the cap can make room for it
+ * only by shrinking the tree's queues to their new shares, which are drawn
+ * around what is charged outside them (cdx_htb_cap_shares()): queues given
+ * back, a departing port's, other trees' cost a queue starting out nothing.
+ * Frames the tree's own queues hold above their new shares, on a paused port
+ * or behind a busy sibling, no shrink takes back. So the change is refused,
+ * -ENOBUFS, when every class queue, counted at what it may hold once the cap
+ * has shrunk them (cdx_htb_start_charge()), would take the tree past its
+ * budget or every tree past SEC's share (CDX_HTB_ETH_FRAMES) -- unless it
+ * would take them no further past than they are, which a change giving back
+ * as much as it takes does not. The refusal says what the queues would hold
+ * beside the new queue's frame, of the budget that binds: fewer frames than
+ * the buffer pools have, under 100,000, of no more than 1,280, which keeps
+ * the message inside an extack's eighty bytes. The same command goes through
+ * once the port has sent those frames, or once the frames that fill SEC's
+ * share outside the tree have gone. What the queues hold that cannot be read
+ * leaves no bound, as for the cap's growth (cdx_htb_cap_room()), and nothing
+ * is configured.
+ *
+ * The question is put to the tree as the change would leave it: `probe' is
+ * linked into the class list, `leaving' marked inner, and the class queue
+ * bits moved, all under cdx_htb_mutex, which the Tx path never reads them
+ * under, and all put back before this returns. A class yet to claim a
+ * channel is put on the one the claim would pick (cdx_htb_claim_pick()); with
+ * none to pick, the claim refuses it itself, saying why. The top channel stays
+ * where it is: a change that moves it moves queues 0 and 7 too, the one
+ * exception the bound keeps (CDX_HTB_ETH_FRAMES). */
+static int cdx_htb_admit(struct cdx_htb_port *port, struct cdx_htb_class *probe,
+			 struct cdx_htb_class *leaving, struct netlink_ext_ack *extack)
+{
+	const u32 budget = cdx_htb_budget(), sec = CDX_HTB_SEC_FRAMES;
+	struct cdx_htb_cap_queue *q = cdx_htb_cap_list;
+	u16 probe_used = 0, leaving_used = 0;
+	u32 tree, all, tree_now, all_now;
+	bool inner = false, claim = false;
+	unsigned int n;
+	int rc;
+
+	lockdep_assert_held(&cdx_htb_mutex);
+	if (probe->channel == CDX_HTB_NONE) {
+		probe->channel = cdx_htb_claim_pick(port);
+		if (probe->channel == CDX_HTB_NONE)
+			return 0;
+		claim = true;
+	}
+	if (leaving) {
+		inner = leaving->inner;
+		leaving_used = port->cq_used[leaving->channel];
+		leaving->inner = true;
+		port->cq_used[leaving->channel] &= (u16)~BIT(leaving->cq);
+	}
+	probe_used = port->cq_used[probe->channel];
+	port->cq_used[probe->channel] |= BIT(probe->cq);
+	list_add_tail(&probe->list, &port->classes);
+	n = cdx_htb_cap_queues(port, q);
+	rc = cdx_htb_start_charge(port, q, n, probe, leaving, claim, &tree, &all,
+				  &tree_now, &all_now);
+	list_del(&probe->list);
+	port->cq_used[probe->channel] = probe_used;
+	if (claim)
+		probe->channel = CDX_HTB_NONE;
+	if (leaving) {
+		port->cq_used[leaving->channel] = leaving_used;
+		leaving->inner = inner;
+	}
+	if (rc) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "cannot read what the class queues hold; retry shortly");
+		return rc;
+	}
+	if (tree > budget && tree > tree_now) {
+		NL_SET_ERR_MSG_FMT_MOD(extack,
+				       "no tail-drop room (%u of %u frames held); retry shortly",
+				       tree - CDX_HTB_CQ_START, budget);
+	} else if (all > sec && all > all_now) {
+		NL_SET_ERR_MSG_FMT_MOD(extack,
+				       "no tail-drop room (%u of %u frames held); retry shortly",
+				       all - CDX_HTB_CQ_START, sec);
+	} else {
+		return 0;
+	}
+	return -ENOBUFS;
 }
 
 /* A class queue cdx_htb_implicit_sync() configured is being configured or
@@ -1292,9 +1833,10 @@ static void cdx_htb_class_free(struct cdx_htb_port *port, struct cdx_htb_class *
 
 /* Keep the qid range dense by moving the last leaf into the hole, and report
  * which class moved so sch_htb can migrate that class's qdisc with it. Skipping
- * this fragments a budget of sixteen slots per port. Only the netdev queue
- * index moves: a leaf's channel and class queue are what its frames actually
- * reach, and neither changes. Returns the moved class's id, or zero. */
+ * this fragments a budget of CDX_HTB_MAX_LEAVES slots per port. Only the
+ * netdev queue index moves: a leaf's channel and class queue are what its
+ * frames actually reach, and neither changes. Returns the moved class's id,
+ * or zero. */
 static u16 cdx_htb_qid_free(struct cdx_htb_port *port, u16 qid)
 {
 	struct cdx_htb_class *last;
@@ -1349,23 +1891,20 @@ static int cdx_htb_create(struct cdx_htb_port *port, struct tc_htb_qopt_offload 
 /* A tree on `port' was taken down and its channels are quarantined for the
  * port (ceetm_stop_qos()): a release of them is due, holding the port's netdev
  * until it is done. Armed only once the command has marked the port's
- * flowtable entries (cdx_htb_release_arm()). */
+ * flowtable entries (cdx_htb_release_arm()). A tree has no channels on a port
+ * with no netdev; the context release ends the quarantine should there be
+ * one. */
 static void cdx_htb_release_due(struct cdx_htb_port *port)
 {
 	struct cdx_htb_release *r = &cdx_htb_releases[port - cdx_htb_ports];
-	struct net_device *dev = port->qm_ctx->net_dev;
 
-	/* A tree has no channels on a port with no netdev; the context
-	 * release ends the quarantine should there be one. */
-	if (WARN_ON_ONCE(!dev))
+	if (!cdx_htb_release_hold(port))
 		return;
-	if (!r->due) {
-		dev_hold(dev);
-		r->dev = dev;
-		r->due = true;
+	/* Channels kept out of service are news to the log, even where it was
+	 * told of a wait for queues given back already. */
+	if (!r->due)
 		r->told = false;
-	}
-	r->gen++;
+	r->due = true;
 }
 
 /* Teardown, for a command whose return value sch_htb discards.
@@ -1401,7 +1940,8 @@ static void cdx_htb_destroy(struct cdx_htb_port *port)
 	 * the channels back, the implicit ones with them. */
 	port->implicit = 0;
 	port->implicit_channel = CDX_HTB_NONE;
-	/* Stop the Tx path naming a leaf before the queues stop existing. */
+	/* Stop the Tx path naming a leaf before the queues stop existing. The
+	 * cap it ends in notes every queue the tree used as given back. */
 	cdx_htb_publish(port);
 	if (cdx_htb_resize(port, 0))
 		pr_warn("cdx: %s kept Tx queues no class is using\n",
@@ -1409,8 +1949,8 @@ static void cdx_htb_destroy(struct cdx_htb_port *port)
 	if (claimed)
 		cdx_htb_release_due(port);
 	/* And the trees left grow into the share of SEC's pool this one gave
-	 * back. Its queues are drained and parked by now; what its entries
-	 * put on them until the release is charged as what they hold. */
+	 * back. Its queues are drained and parked by now, and stay charged at
+	 * the frame its entries can still put on each until the release. */
 	cdx_htb_cap_trees(port);
 }
 
@@ -1418,30 +1958,49 @@ static int cdx_htb_leaf_alloc(struct cdx_htb_port *port,
 			      struct tc_htb_qopt_offload *opt)
 {
 	bool root = opt->parent_classid == TC_HTB_CLASSID_ROOT;
-	struct cdx_htb_class *parent, *cl;
+	struct cdx_htb_class *parent, *cl, probe = {};
 	u8 channel, cq;
 	int rc;
 
+	/* Each leaf takes one of the Tx queues patch 150 reserved, whichever
+	 * channel it is on. */
 	if (port->leaves == CDX_HTB_MAX_LEAVES) {
-		NL_SET_ERR_MSG_MOD(opt->extack,
-				   "no Tx queue left for another leaf class on this port");
+		NL_SET_ERR_MSG_FMT_MOD(opt->extack,
+				       "no HTB leaf free on this port (%u of %u held)",
+				       (unsigned int)port->leaves,
+				       (unsigned int)CDX_HTB_MAX_LEAVES);
 		return -ENOSPC;
 	}
 	if (cdx_htb_find(port, opt->classid))
 		return -EEXIST;
+	/* A class under the root takes a channel the port has spare, or one it
+	 * claims once the class is sure to be made: its queue on a channel yet
+	 * to be claimed is the first free one of a channel with none in use. */
 	if (root) {
-		rc = cdx_htb_channel_get(port, &channel, opt->extack);
-		if (rc)
-			return rc;
+		if (!cdx_htb_channel_spare(port, &channel))
+			channel = CDX_HTB_NONE;
 	} else {
 		parent = cdx_htb_find(port, (u16)opt->parent_classid);
 		if (!parent || !parent->inner)
 			return -ENOENT;
 		channel = parent->channel;
 	}
-	rc = cdx_htb_cq_get(port, channel, opt->prio, opt->quantum, &cq, opt->extack);
+	rc = cdx_htb_cq_get(channel == CDX_HTB_NONE ? 0 : port->cq_used[channel],
+			    opt->prio, opt->quantum, &cq, opt->extack);
 	if (rc)
 		return rc;
+	probe.classid = opt->classid;
+	probe.parent = root ? 0 : (u16)opt->parent_classid;
+	probe.channel = channel;
+	probe.cq = cq;
+	rc = cdx_htb_admit(port, &probe, NULL, opt->extack);
+	if (rc)
+		return rc;
+	if (channel == CDX_HTB_NONE) {
+		rc = cdx_htb_channel_get(port, &channel, opt->extack);
+		if (rc)
+			return rc;
+	}
 	cl = kzalloc(sizeof(*cl), GFP_KERNEL);
 	if (!cl)
 		return -ENOMEM;
@@ -1506,7 +2065,7 @@ err_class:
 static int cdx_htb_leaf_to_inner(struct cdx_htb_port *port,
 				 struct tc_htb_qopt_offload *opt)
 {
-	struct cdx_htb_class *parent, *cl;
+	struct cdx_htb_class *parent, *cl, probe = {};
 	u8 cq;
 	int rc;
 
@@ -1520,17 +2079,26 @@ static int cdx_htb_leaf_to_inner(struct cdx_htb_port *port,
 	}
 	if (cdx_htb_find(port, opt->classid))
 		return -EEXIST;
+	/* The child's queue is chosen with the parent's counted free, so a
+	 * child that asks for the priority its parent held gets it; and asked
+	 * for before the parent's is given back, so a child refused leaves
+	 * the parent as it was. */
+	rc = cdx_htb_cq_get(port->cq_used[parent->channel] & (u16)~BIT(parent->cq),
+			    opt->prio, opt->quantum, &cq, opt->extack);
+	if (rc)
+		return rc;
+	probe.classid = opt->classid;
+	probe.parent = parent->classid;
+	probe.channel = parent->channel;
+	probe.cq = cq;
+	rc = cdx_htb_admit(port, &probe, parent, opt->extack);
+	if (rc)
+		return rc;
 	cl = kzalloc(sizeof(*cl), GFP_KERNEL);
 	if (!cl)
 		return -ENOMEM;
-	/* Free the parent's queue before choosing the child's, so a child that
-	 * asks for the priority its parent held gets it. */
 	cdx_htb_cq_release(port, parent->channel, parent->cq);
-	rc = cdx_htb_cq_get(port, parent->channel, opt->prio, opt->quantum, &cq,
-			    opt->extack);
-	if (!rc)
-		rc = cdx_htb_cq_configure(port, parent->channel, cq, opt->quantum,
-					  opt->extack);
+	rc = cdx_htb_cq_configure(port, parent->channel, cq, opt->quantum, opt->extack);
 	if (rc) {
 		cdx_htb_cq_restore(port, parent);
 		kfree(cl);
@@ -1623,7 +2191,7 @@ static int cdx_htb_leaf_del_last(struct cdx_htb_port *port,
 static int cdx_htb_node_modify(struct cdx_htb_port *port,
 			       struct tc_htb_qopt_offload *opt)
 {
-	struct cdx_htb_class *cl = cdx_htb_find(port, opt->classid);
+	struct cdx_htb_class *cl = cdx_htb_find(port, opt->classid), probe;
 	u8 cq;
 	int rc;
 
@@ -1639,10 +2207,25 @@ static int cdx_htb_node_modify(struct cdx_htb_port *port,
 		cdx_htb_publish(port);
 		return rc;
 	}
+	/* Its own queue counted free, so it may keep its priority; and asked
+	 * for before that queue is given back, so a refusal leaves the leaf
+	 * where it was. Moved to another queue, the leaf takes that queue's
+	 * starting frame, its curve going with it; kept on its own, the frame
+	 * it starts at again is one it had. */
+	rc = cdx_htb_cq_get(port->cq_used[cl->channel] & (u16)~BIT(cl->cq),
+			    opt->prio, opt->quantum, &cq, opt->extack);
+	if (rc)
+		return rc;
+	if (cq != cl->cq) {
+		probe = *cl;
+		probe.cq = cq;
+		probe.quantum = opt->quantum;
+		rc = cdx_htb_admit(port, &probe, cl, opt->extack);
+		if (rc)
+			return rc;
+	}
 	cdx_htb_cq_release(port, cl->channel, cl->cq);
-	rc = cdx_htb_cq_get(port, cl->channel, opt->prio, opt->quantum, &cq, opt->extack);
-	if (!rc)
-		rc = cdx_htb_cq_configure(port, cl->channel, cq, opt->quantum, opt->extack);
+	rc = cdx_htb_cq_configure(port, cl->channel, cq, opt->quantum, opt->extack);
 	if (rc) {
 		cdx_htb_cq_restore(port, cl);
 		cdx_htb_publish(port);
@@ -1966,8 +2549,20 @@ void cdx_ft_egress_restarted(void)
  * workers have not got to, and waits for the rest) -- nor anything a walk begun
  * before an unlink may still be inside, which only a completed barrier proves
  * (cdx_ft_proven()) -- and only then ends the quarantine, popping what the
- * entries left (ceetm_end_quarantine()). Until then what they left is charged
- * as what the queues hold, as the cap charges any queue no tree uses.
+ * entries left (ceetm_end_quarantine()). Until then every queue the tree used
+ * is charged at the frame they can put on it, or what it holds if more.
+ *
+ * A change short of a teardown gives queues back too -- a leaf deleted or
+ * moved, a leaf turned into a channel, the top channel moving -- and the same
+ * entries go on naming them until they are retired or rebuilt, a frame each,
+ * on a channel the port still serves. Their channels stay the tree's, so
+ * nothing is quarantined, but every tree's cap charges each such queue at its
+ * depth until then (cdx_htb_given_back()), and the same release waits for the
+ * same proof before it stops: the charge holds for any number of changes,
+ * where counting each queue only by what it held left out a frame for every
+ * queue a change had touched since the entries were last shown gone. A
+ * teardown's release clears what the port's earlier changes gave back with
+ * it.
  *
  * Locks. The drain sleeps on the flowtable's own work, which takes the control
  * mutex, whose holder takes cdx_htb_mutex in cdx_htb_port_gone(): so the work
@@ -1977,10 +2572,15 @@ void cdx_ft_egress_restarted(void)
  * the control mutex or of cdx_htb_mutex ever waits for the work; only
  * cdx_htb_exit() cancels it, holding nothing. A port that goes meanwhile
  * (cdx_htb_port_gone()) just forgets its release, whose quarantine ends with
- * the port's context, classification stopped by then. */
+ * the port's context, classification stopped by then, and whose queues given
+ * back stay charged until then as the departing tree's. The adapter's row
+ * files take cdx_htb_mutex last too, holding the control mutex or not
+ * (cdx_qos_port_next()), and wait for nothing while they have it; its status
+ * read takes none (cdx_qos_budget()). */
 
-/* One port's release, if it is due and its port's entries have been marked
- * since its last teardown. Returns whether it has to be tried again. */
+/* One port's release, if anything waits on its entries and they have been
+ * marked since the last change it waits for. Returns whether it has to be
+ * tried again. */
 static bool cdx_htb_release_one(unsigned int ii)
 {
 	struct cdx_htb_release *r = &cdx_htb_releases[ii];
@@ -1990,7 +2590,7 @@ static bool cdx_htb_release_one(unsigned int ii)
 	int rc;
 
 	mutex_lock(&cdx_htb_mutex);
-	if (!r->due || r->marked != r->gen) {
+	if (!r->dev || r->marked != r->gen) {
 		mutex_unlock(&cdx_htb_mutex);
 		return false;
 	}
@@ -2002,30 +2602,39 @@ static bool cdx_htb_release_one(unsigned int ii)
 	rc = cdx_ft_egress_drain(dev);
 
 	mutex_lock(&cdx_htb_mutex);
-	/* Gone with its port, or taken down again while the drain ran: what
-	 * was proven does not cover the later teardown, whose own marking
-	 * arms this again. */
-	if (!r->due || r->gen != gen) {
+	/* Gone with its port, or changed again while the drain ran: what was
+	 * proven does not cover the later change, whose own marking arms this
+	 * again. */
+	if (!r->dev || r->gen != gen) {
 		mutex_unlock(&cdx_htb_mutex);
 		dev_put(dev);
 		return false;
 	}
 	if (rc) {
-		if (!r->told)
-			pr_warn("cdx: %s keeps the CEETM channels of its last tree out of service until its flowtable entries have been retired or rebuilt (%d)\n",
-				netdev_name(dev), rc);
+		if (!r->told) {
+			if (r->due)
+				pr_warn("cdx: %s keeps the CEETM channels of its last tree out of service until its flowtable entries have been retired or rebuilt (%d)\n",
+					netdev_name(dev), rc);
+			else
+				pr_warn("cdx: %s keeps the class queues its tree gave back charged until its flowtable entries have been retired or rebuilt (%d)\n",
+					netdev_name(dev), rc);
+		}
 		r->told = true;
 		again = true;
 	} else {
-		if (ceetm_end_quarantine(&gQMCtx[ii]))
+		if (r->due && ceetm_end_quarantine(&gQMCtx[ii]))
 			pr_warn("cdx: %s left frames on a CEETM channel of its last tree that could not be freed; the channel stays out of service\n",
 				netdev_name(dev));
 		put = r->dev;
 		r->dev = NULL;
 		r->due = false;
-		/* What the entries left was charged, and is gone: a tree kept
-		 * short for it can grow now. */
+		memset(r->given, 0, sizeof(r->given));
+		/* Nothing names the queues given back any more, and what the
+		 * entries left on a quarantined channel is gone: a tree kept
+		 * short for either can grow now, and the channels are any
+		 * port's. */
 		cdx_htb_cap_trees(NULL);
+		cdx_htb_levels_update();
 	}
 	mutex_unlock(&cdx_htb_mutex);
 	dev_put(dev);
@@ -2036,7 +2645,8 @@ static bool cdx_htb_release_one(unsigned int ii)
 
 /* Release what is due, and look again later at what cannot be yet: soon, then
  * less often (CDX_HTB_RELEASE_FIRST_MS, CDX_HTB_RELEASE_LAST_MS). A channel
- * the flowtable can never show nothing sends to is never released. */
+ * the flowtable can never show nothing sends to is never released, and a
+ * queue given back stays charged. */
 static void cdx_htb_release_work(struct work_struct *work)
 {
 	bool again = false;
@@ -2057,16 +2667,18 @@ static void cdx_htb_release_work(struct work_struct *work)
 	mutex_unlock(&cdx_htb_mutex);
 }
 
-/* `port''s entries have been marked for re-installation after a teardown that
- * made a release due: the release may go ahead, once they have been retired
- * or rebuilt. Called by the command, after cdx_ft_egress_changed(), with no
- * lock held. */
+/* `port''s entries have been marked for re-installation after a change that
+ * left something waiting on them -- a teardown's release, a queue given back:
+ * the release may go ahead, once they have been retired or rebuilt. Called by
+ * the command, after cdx_ft_egress_changed(), with no lock held. A command
+ * that left nothing new to wait for leaves a release already waiting at its
+ * own pace. */
 static void cdx_htb_release_arm(struct cdx_htb_port *port)
 {
 	struct cdx_htb_release *r = &cdx_htb_releases[port - cdx_htb_ports];
 
 	mutex_lock(&cdx_htb_mutex);
-	if (r->due) {
+	if (r->dev && r->marked != r->gen) {
 		r->marked = r->gen;
 		cdx_htb_release_ms = CDX_HTB_RELEASE_FIRST_MS;
 		mod_delayed_work(system_wq, &cdx_htb_release, 0);
@@ -2095,6 +2707,9 @@ static int cdx_htb_setup_tc(struct net_device *dev, struct tc_htb_qopt_offload *
 
 	mutex_lock(&cdx_htb_mutex);
 	rc = cdx_htb_command(port, opt);
+	/* A claim or a teardown, failed drains and all, moved the channels'
+	 * census, which the status read reads a snapshot of. */
+	cdx_htb_levels_update();
 	mutex_unlock(&cdx_htb_mutex);
 	/* Whatever the tree now is, a DSCP filter naming a class in it has to
 	 * be told: a class that moved or went away leaves the map pointing at a
@@ -2104,15 +2719,17 @@ static int cdx_htb_setup_tc(struct net_device *dev, struct tc_htb_qopt_offload *
 	/* And every entry transmitting on the port, for the same reason one
 	 * level down: each names the queue it was installed with. Even after
 	 * a failed command, which may have got as far as switching the mode;
-	 * re-installing what did not need it only costs a readmission. */
-	if (opt->command != TC_HTB_LEAF_QUERY_QUEUE)
+	 * re-installing what did not need it only costs a readmission.
+	 *
+	 * A tree taken down left its channels quarantined, and a change gave
+	 * class queues back, charged meanwhile: the release of either waits for
+	 * the entries this and the commands before it marked to have been
+	 * retired or rebuilt. Armed only now: a release that drained before the
+	 * last marking proves nothing. */
+	if (opt->command != TC_HTB_LEAF_QUERY_QUEUE) {
 		cdx_ft_egress_changed(dev);
-	/* A tree taken down left its channels quarantined, and their release
-	 * waits for the entries this and the leaf deletions before it marked to
-	 * have been retired or rebuilt. Armed only now: a release that drained
-	 * before the last marking proves nothing. */
-	if (opt->command == TC_HTB_DESTROY)
 		cdx_htb_release_arm(port);
+	}
 	return rc;
 }
 
@@ -2190,6 +2807,129 @@ out:
 	return rc;
 }
 
+/* ---- what the hardware qdisc has, for the adapter's status --------------
+ *
+ * The status read's levels are a snapshot, and its policer counts the pool's
+ * own under its spinlock: it takes no sleeping lock (cdx_qos_budget()). The
+ * row files' walk of the ports reads under cdx_htb_mutex and, inside it, the
+ * pool's spinlock, and nothing else (cdx_flowtable.h says who may ask). That
+ * mutex is the last lock taken wherever it is taken with another -- after
+ * RTNL for a tc command, after the control mutex for a port's going, after
+ * the DSCP mutex for a filter naming a class -- and nothing holding it waits
+ * for any of those, so a walk holding the flowtable's transaction, which is
+ * the control mutex, takes it in the order a port's going does. The pool's
+ * lock is a spinlock whose holders take nothing further, so this is the one
+ * order the two are ever taken in. */
+
+/* A port's CEETM context is whole: its LNI made, and its netdev pointing at
+ * it. From here until cdx_htb_port_gone() the port is one of cdx's to the
+ * report. Called under the control mutex, as a context is made. */
+void cdx_htb_port_added(struct tQM_context_ctl *qm_ctx)
+{
+	struct cdx_htb_port *port = cdx_htb_entry(qm_ctx);
+
+	if (!port)
+		return;
+	mutex_lock(&cdx_htb_mutex);
+	cdx_htb_netdevs[port - cdx_htb_ports] = qm_ctx->net_dev;
+	mutex_unlock(&cdx_htb_mutex);
+}
+
+/* What cdx_qos_port_next() answers for the port at `ii', which has a netdev.
+ * Its name is read as the adapter's procfs rows read a device's, without
+ * RTNL: one being renamed meanwhile may read as either name. */
+static void cdx_qos_port_fill(unsigned int ii, struct cdx_qos_port *p)
+{
+	struct tQM_context_ctl *mapped, *quarantine, *ctx = &gQMCtx[ii];
+	struct cdx_htb_port *port = &cdx_htb_ports[ii];
+	struct net_device *dev = cdx_htb_netdevs[ii];
+	struct cdx_htb_class *cl;
+	u32 owned = 0, ch;
+	bool failed;
+
+	lockdep_assert_held(&cdx_htb_mutex);
+	memset(p, 0, sizeof(*p));
+	strscpy(p->name, dev->name, sizeof(p->name));
+	p->ifindex = dev->ifindex;
+	p->tree = port->live;
+	p->channels = port->channels;
+	p->leaves = port->leaves;
+	/* A class under the root holds its channel; what the port claimed
+	 * beyond those, its classes' deletions left it. */
+	list_for_each_entry(cl, &port->classes, list)
+		if (!cl->parent)
+			owned |= BIT(cl->channel);
+	p->spare = hweight32(port->channels & ~owned);
+	/* Quarantined for this port, and coming back to it or the pool: a
+	 * channel whose drain failed comes back to neither. */
+	for (ch = 0; ch < ceetm_channel_count(); ch++)
+		if (!ceetm_channel_holder(ch, &mapped, &quarantine, &failed) &&
+		    !mapped && !failed && quarantine == ctx)
+			p->held |= BIT(ch);
+	p->policers = cdx_police_port_profiles(dev);
+}
+
+/* The classes cdx_qos_port_next() gives for a port. A port with no tree has
+ * none: its list is emptied with the tree, and the major it had is stale. */
+static int cdx_qos_class_fill(struct cdx_htb_port *port, struct cdx_qos_class *classes,
+			      unsigned int max)
+{
+	struct cdx_htb_class *cl;
+	unsigned int n = 0;
+
+	lockdep_assert_held(&cdx_htb_mutex);
+	list_for_each_entry(cl, &port->classes, list) {
+		if (n == max)
+			return -ENOSPC;
+		classes[n++] = (struct cdx_qos_class){
+			.classid = TC_H_MAKE((u32)port->major << 16, cl->classid),
+			.parent = cl->parent,
+			.channel = cl->channel,
+			.queue = cl->inner ? CDX_QOS_NONE : cl->cq,
+			.slot = cl->inner ? CDX_QOS_NONE : (u8)(cl->qid - CDX_HTB_QID_BASE),
+			.inner = cl->inner,
+		};
+	}
+	return n;
+}
+
+/* The status read's: the snapshot of the SoC-wide levels (cdx_htb_levels),
+ * read again should a write overlap it, and the policer pool's counts under
+ * the pool's spinlock -- no lock it could wait on while a command or a
+ * release holds cdx_htb_mutex. */
+void cdx_qos_budget(struct cdx_qos_budget *b)
+{
+	unsigned int seq;
+
+	do {
+		seq = read_seqcount_begin(&cdx_htb_levels_seq);
+		*b = cdx_htb_levels;
+	} while (read_seqcount_retry(&cdx_htb_levels_seq, seq));
+	b->policers = CDX_FT_QOS_MAX_POLICER;
+	b->policers_used = cdx_police_pool_used();
+}
+EXPORT_SYMBOL_NS_GPL(cdx_qos_budget, ASK_CDX_FLOWTABLE);
+
+int cdx_qos_port_next(unsigned int *index, struct cdx_qos_port *p,
+		      struct cdx_qos_class *classes, unsigned int max)
+{
+	unsigned int ii;
+	int rc = -ENOENT;
+
+	mutex_lock(&cdx_htb_mutex);
+	for (ii = *index; ii < ARRAY_SIZE(cdx_htb_netdevs); ii++) {
+		if (!cdx_htb_netdevs[ii])
+			continue;
+		*index = ii;
+		cdx_qos_port_fill(ii, p);
+		rc = classes ? cdx_qos_class_fill(&cdx_htb_ports[ii], classes, max) : 0;
+		break;
+	}
+	mutex_unlock(&cdx_htb_mutex);
+	return rc;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_qos_port_next, ASK_CDX_FLOWTABLE);
+
 void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
 {
 	struct cdx_htb_port *port = cdx_htb_entry(qm_ctx);
@@ -2204,14 +2944,20 @@ void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
 	 * caller holds the control mutex, which the release's wait on the
 	 * flowtable needs. Releasing the context ends the quarantine, with
 	 * classification stopped by then; a release running now finds the
-	 * port's record gone when it looks again, and gives nothing back. */
+	 * port's record gone when it looks again, and gives nothing back. The
+	 * queues the port's trees gave back are charged at their depth until
+	 * then all the same, as the departing tree's own are. */
 	r = &cdx_htb_releases[port - cdx_htb_ports];
 	mutex_lock(&cdx_htb_mutex);
-	if (r->due) {
-		put = r->dev;
-		r->dev = NULL;
-		r->due = false;
-	}
+	put = r->dev;
+	r->dev = NULL;
+	r->due = false;
+	for (ii = 0; ii < ceetm_channel_count(); ii++)
+		cdx_htb_departing[ii] |= r->given[ii];
+	memset(r->given, 0, sizeof(r->given));
+	/* No port of cdx's to the report from here: its netdev is let go once
+	 * the context is released. */
+	cdx_htb_netdevs[port - cdx_htb_ports] = NULL;
 	mutex_unlock(&cdx_htb_mutex);
 	if (put)
 		dev_put(put);
@@ -2233,7 +2979,7 @@ void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
 	 * this tree used can still hold frames up to their depth -- classifier
 	 * entries still name them -- and every other tree's cap charges them
 	 * so. */
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++)
+	for (ii = 0; ii < ceetm_channel_count(); ii++)
 		if (port->channels & BIT(ii))
 			cdx_htb_departing[ii] |= cdx_htb_tree_mask(port, ii);
 	/* The caller is releasing the whole CEETM context, so the hardware is
@@ -2264,6 +3010,10 @@ void cdx_htb_port_released(void)
 	mutex_lock(&cdx_htb_mutex);
 	memset(cdx_htb_departing, 0, sizeof(cdx_htb_departing));
 	cdx_htb_cap_trees(NULL);
+	/* The release unmapped the port's channels and ended its quarantines,
+	 * under the control mutex alone: the status read's snapshot of them
+	 * follows only now. */
+	cdx_htb_levels_update();
 	mutex_unlock(&cdx_htb_mutex);
 }
 
@@ -2903,7 +3653,7 @@ static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 	found = cdx_htb_fragment_class(&f, found, &class, &at, &family);
 	if (found < 0)
 		return DPA_SELECT_QUEUE_NONE;
-	/* Only the egress nibbles index the table. The class the adapter
+	/* Only the egress fields index the table. The class the adapter
 	 * decodes is wider than an egress destination -- it also names an
 	 * ingress policer profile and a remark, neither of which has any
 	 * bearing on which queue a frame leaves by -- and this table is sized
@@ -3002,9 +3752,11 @@ bool cdx_htb_resolve_class(struct tQM_context_ctl *qm_ctx, u32 *channel, u32 *cq
 	top = READ_ONCE(port->top);
 	if (top == CDX_HTB_NONE)
 		return false;
-	if (*channel <= CDX_CEETM_MAX_CHANNELS && *cq < MAX_SCHEDULER_QUEUES &&
+	/* A channel past the ones the device tree gave holds no leaf, and the
+	 * class map has an entry for every one that can. */
+	if (*channel <= ceetm_channel_count() && *cq < MAX_SCHEDULER_QUEUES &&
 	    (*channel || *cq))
-		slot = READ_ONCE(port->class_txq[*channel << 4 | *cq]);
+		slot = READ_ONCE(port->class_txq[CDX_HTB_CLASS(*channel, *cq)]);
 	if (slot != CDX_HTB_NONE && slot < CDX_HTB_MAX_LEAVES) {
 		leaf_channel = READ_ONCE(port->txq_channel[slot]);
 		if (leaf_channel != CDX_HTB_NONE) {
@@ -3174,10 +3926,15 @@ int cdx_htb_init(void)
 	unsigned int ii;
 	int rc;
 
+	/* Nothing else runs yet, but the publish reaches the cap, which keeps
+	 * what it notes under the mutex as everywhere else. */
+	mutex_lock(&cdx_htb_mutex);
 	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_ports); ii++) {
 		INIT_LIST_HEAD(&cdx_htb_ports[ii].classes);
 		cdx_htb_publish(&cdx_htb_ports[ii]);
 	}
+	cdx_htb_levels_update();
+	mutex_unlock(&cdx_htb_mutex);
 	rc = dpa_register_qdisc_ops(&cdx_htb_qdisc_ops);
 	if (rc)
 		return rc;

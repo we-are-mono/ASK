@@ -95,9 +95,9 @@ direction inside the hardware conntrack entry:
 | 8 | `dscp_mark_flag` | `create_update_dscp_hm()` (`cdx/cdx_ehash.c:2122`) |
 | 9-14 | `dscp_mark_value` | same |
 | 15 | `vlan_pbits_valid` | *nothing* |
-| 16-19 | `iqid` | `fill_actions()` ingress policer select (`cdx/cdx_ehash.c:917`) |
+| 16-21 | `iqid` | `fill_actions()` ingress policer select (`cdx/cdx_ehash.c:917`); four bits until [increment 12](#12-the-ceilings-raised-to-the-hardwares) |
 | 23 | `iqid_valid` | same |
-| 24-27 | `chnl_id` | `ceetm_get_egressfq()` → CEETM channel 0-7 |
+| 24-29 | `chnl_id` | `ceetm_get_egressfq()` → CEETM channel 0-31; four bits, channels 0-7, until increment 12 |
 | 31 | `ds_info_valid` | direction split |
 
 Two readers consume it. On the **software** TX path, `dpa_tx()` resolves a
@@ -632,10 +632,12 @@ Some things the contract makes sharp:
   as well as its depth (A337, A348). Increment 6 also offers WRED in place of
   plain tail drop.
 
-Limits, all of them the hardware's: eight channels for the whole SoC shared by
-every port, eight weighted leaves per channel until WBFS group B is claimed
+Limits, as built here: eight channels for the whole SoC shared by every port,
+eight weighted leaves per channel, all in WBFS group A
 (`qman_ceetm_cq_claim_A`), eight strict priorities, sixteen leaves per port,
-and two levels. `tc qdisc replace` on a port that already has one is refused,
+and two levels. [Increment 12](#12-the-ceilings-raised-to-the-hardwares)
+raised the channels to the device tree's thirty-two and the leaves to
+sixty-four; the budget table at the end states both columns. `tc qdisc replace` on a port that already has one is refused,
 because `sch_htb` creates the new qdisc before destroying the old; delete and
 add instead. mlx5 refuses the same sequence.
 
@@ -1077,14 +1079,27 @@ evenly between them: a class queue
 carries SEC's frames among the rest and cannot tell them apart. With one tree
 the SEC share binds, 1,024 frames; with two, 512 each. The queues counted are
 each leaf's and the top channel's queues 0 and 7 that unclassified and control
-traffic take while no leaf holds them, eighteen at most; queue 0 keeps a single
+traffic take while no leaf holds them, sixty-six at most (eighteen before
+[increment 12](#12-the-ceilings-raised-to-the-hardwares)); queue 0 keeps a single
 frame and takes no share while a `default` leaf takes the unclassified traffic.
 Each asks for a depth — 128 frames for a plain leaf or one of those two queues,
-its limit for a RED leaf — and the budget is shared max-min fair
-(`cdx_htb_cap()`): a queue asking for no more than an even share gets what it
-asks for, and the rest split what is left evenly. A small tree's three queues
+its limit for a RED leaf. What the tree's own queues may share is its budget,
+and the 1,024 across trees, less what is charged outside them: the queues it
+gave back while their entries may still name them, a departing port's queues,
+frames on queues no tree uses, and, for the 1,024, every other tree's queues
+(`cdx_htb_cap_shares()`). Shares of the whole budget would promise frames those
+charges hold, which no shrink of the tree's own gives back. That is shared
+max-min fair (`cdx_htb_cap()`): a queue asking for no more than an even share
+gets what it asks for, and the rest split what is left evenly. With nothing
+charged outside, the shares are the whole budget's: a small tree's three queues
 get their 128 each; sixteen leaves and the two queues get 56 each, where 128
-each would be 2,304. The class above, alone in its tree beside those two
+each would be 2,304; thirty device leaves and queue 0 get 33 each alone and 16
+beside a second tree (34 and 17 with a `default` leaf). While something is
+charged outside, the tree's queues share what it leaves and are kept short for
+it, and the regrow work looks again until it has gone. Thirty classes added
+under the root back to back beside a second tree — each moving the top channel
+and giving back the last one's queue 0 — get 15 each until the release has run,
+then 16. The class above, alone in its tree beside those two
 queues, asks for 2,594 frames and gets the 768 they leave. A RED leaf given
 less than its limit has its band scaled by what it got against what it asked
 for, so the curve keeps its shape below the shallower tail drop: that class's
@@ -1123,21 +1138,58 @@ its CEETM context has been released and drained, and a channel whose drain
 failed stays charged what it holds. The same three leaves on the rig held 920
 buffers.
 
-A queue given back is charged only what it holds, but it is not quite left
-alone: the classifier entries installed while it was a class's can still send
-to it until they have been retired or rebuilt after the change — a flow's
-retirement starts with the command, a multicast group's listener entries wait
-for a worker that needs RTNL. So the hardware layer parks it at one frame
-rather than at its module-load default of eight (`CEETM_PARKED_CQ_DEPTH`),
-and a tree taken down, or one whose port goes, has every queue of its
-channels parked the same way before they are drained (`ceetm_quiesce_port()`).
-The bound therefore holds but for one frame per class queue a change has just
-touched, never more: a queue given back takes at most that frame from the
-entries, until they are retired or rebuilt, and a queue configured while other
-queues' frames fill the budget starts at a frame no tail drop can go below,
-until those frames leave. A change touches at most the eighteen queues of its
-tree, against the 128 frames of SEC's pool left over for its own jobs; with
-eight, eighteen of them could have held 144 frames.
+A queue given back is not left alone: the classifier entries installed while
+it was a class's can still send to it until they have been retired or rebuilt
+after the change — a flow's retirement starts with the command, a multicast
+group's listener entries wait for a worker that needs RTNL. So the hardware
+layer parks it at one frame rather than at its module-load default of eight
+(`CEETM_PARKED_CQ_DEPTH`), and a tree taken down, or one whose port goes, has
+every queue of its channels parked the same way before they are drained
+(`ceetm_quiesce_port()`). And the cap charges it that frame, or what it holds
+if more, against its tree's budget and the 1,024 across trees, from the moment
+the tree stops using it — a leaf deleted, moved to another priority or turned
+into a channel, queues 0 and 7 when the top channel moves, every queue of a
+tree taken down — until the flowtable has shown the port's entries retired or
+rebuilt since (`cdx_htb_given_back()`). The release below waits for that as it
+does for a teardown, and redraws every tree's shares once it has. Counted only
+by what it holds, each such queue left a frame out per change, and changes add
+up: that was safe only while the SoC had 128 class queues in all, as many as the
+frames of SEC's pool left over for its own jobs. With thirty-two channels there
+are 512, and two 32-leaf trees churned and taken down in one retirement window
+gave back 130 (A423). Charged, they cost a frame of budget each for the moments
+the retirement takes, which the tree's own queues' shares give up meanwhile:
+however fast a tree is built or churned, its classes go in, and the bound holds
+for any number of changes and trees.
+A port that goes moves what it gave back into its departing tree's queues,
+charged at their depth until its context is released.
+
+A class queue starts at one frame, never none, before the cap grows it, and
+that frame is taken before the cap runs. The cap makes room for it by
+shrinking the tree's queues to their new shares, and because those shares are
+drawn around what is charged outside the tree's queues, the queues it gave
+back, a departing port's and other trees' cost a starting queue nothing: a tree
+built or churned however fast takes every class. What no shrink takes back is
+frames the tree's own queues hold above their new shares — on a paused port, or
+behind a busy sibling. So a command that would configure a class queue for a
+class — a leaf added under the root or under a channel, a leaf's first child
+taking its place (`TC_HTB_LEAF_TO_INNER`), a leaf moved to another priority or
+into the weighted group (`TC_HTB_NODE_MODIFY`) — is refused with `-ENOBUFS`
+when every queue, counted at what it may hold once the cap has shrunk it, would
+leave no room for that frame in the tree's budget or in the 1,024 across trees,
+unless the change adds nothing (a leaf kept on its own queue, a class's rate).
+tc says `no tail-drop room (N of M frames held); retry shortly`, for whichever
+budget binds. Nothing is claimed or programmed first, and the command goes
+through once those frames have gone. The bound then holds but for two things,
+each at most once per change. First, the top channel moving — a class under the
+root added above it, or the one holding it deleted — takes queues 0 and 7 with
+it, each starting at a frame on the new top channel: at most two frames past
+the budget, and only while frames the tree's queues hold fill it. Second, a
+command admitted against queue counts read before its own shrinks: a busy tree
+can refill the queues about to shrink to their old depths in between, leaving
+that command's start frame past the budget until they send. Neither compounds:
+the next command's admission reads the refilled counts and refuses until they
+have gone. Deleting a leaf, its last child or the tree configures no class
+queue but queues 0 and 7.
 
 **A tree taken down keeps its channels until its entries are gone (A350).**
 Its port's transmit path stops and its queues are drained at once, so egress
@@ -1167,8 +1219,9 @@ a drain the flowtable never confirms holds off for as long. The port's
 own next tree may take one back at once — frames on it then leave by the port
 they were meant for.
 
-The release is a work item (`cdx_htb_release_work()`), armed by the command
-only after it has marked the port's entries for re-installation. It holds the
+The release is a work item (`cdx_htb_release_work()`), armed by any command
+that tears a tree down or gives a class queue back, and only after it has
+marked the port's entries for re-installation. It holds the
 netdev and waits, with no lock of CDX's held and no RTNL, for the flowtable to
 say every entry it marked has been retired or rebuilt (`cdx_ft_egress_drain()`,
 which rebuilds itself the multicast groups their workers have not got to, and
@@ -1197,11 +1250,12 @@ hold the claim, and a queue that will not give them up keeps the channel out
 of service, as a failed drain does.
 
 The locks, in order: RTNL, then `cdx_htb_mutex` (every tc command); the control
-mutex, then `cdx_htb_mutex` (a port's going); the DSCP mutex, then
-`cdx_htb_mutex` (a filter naming a class). The release takes `cdx_htb_mutex`
-only around its own bookkeeping and never across its wait on the flowtable,
-whose work takes the control mutex; nothing holding either of those waits for
-the release. It takes no RTNL: the drain rebuilds multicast groups under the
+mutex, then `cdx_htb_mutex` (a port's going, and the adapter's status read of
+the channels, leaves and classes when it holds the flowtable's transaction);
+the DSCP mutex, then `cdx_htb_mutex` (a filter naming a class). The release
+takes `cdx_htb_mutex` only around its own bookkeeping and never across its
+wait on the flowtable, whose work takes the control mutex; nothing holding
+either of those waits for the release. It takes no RTNL: the drain rebuilds multicast groups under the
 flowtable's transaction and the learners' own locks, as it does for a tc
 command holding RTNL, and waits for no worker that takes RTNL. The regrow work
 and the release share only `cdx_htb_mutex`, each
@@ -1215,14 +1269,20 @@ been put right and comes back.
 A RED curve the group already holds is not written again.
 `tools/host_tests/htb_offload.py` checks both budgets on every write, counting
 each queue at the larger of its depth and what the test has filled it with,
-and a queue given back by the frame its entries can still add; it walks the
+and a queue given back by the frame its entries can still add, with no slack
+beyond the budget for either; it walks the
 sequence above, a deleted leaf, a priority change, a leaf that becomes a
 channel, the top channel moving, a second tree arriving, a port going, and a
 shrink the hardware refuses, and a torn-down tree's release: another port's
 tree given other channels until it has run, the flowtable asked without the
 mutex, `-EAGAIN` retried, a claim refused as busy while only a held channel
 is left, a teardown or the port's going while it waits, the same port taking
-its channel back, and unloading with it due.
+its channel back, and unloading with it due; a wide tree built with the
+release never run between commands — thirty classes under the root beside a
+second tree, sixty-four leaves on one port — takes every class, its queues
+short by exactly what was given back until the release has run; and a queue's
+starting frame is refused, with the count, only while a paused port's own
+frames or another tree's fill the budget.
 `tools/host_tests/qos_lifecycle.py` checks that a port going parks its queues,
 that leftovers are popped before a channel is mapped again and before it is
 freed, that a quarantined channel is refused to another port and given to its
@@ -1553,12 +1613,14 @@ takes Kbit/s (`GetInfoRateReg()` does `tmp *= 1000`), so the conversion is
 `rate_bytes_ps * 8 / 1000` — the same unit confusion that made CMM validate a
 packets-per-second range against a byte-mode profile.
 
-**Eight meters is the budget, and finite meters are ordinary.** Profile 0 stays
-the default for everything unclassified, leaving seven for distinct police
-actions; the SEC profile is numbered separately and is not in this pool. An
-eighth distinct action returns `-EOPNOTSUPP` and tc leaves the filter in
-software, which is exactly how a driver with finite meters is expected to
-behave.
+**The meters are a finite pool, and finite meters are ordinary.** Profile 0
+stays the default for everything unclassified, leaving the rest for distinct
+police actions -- seven when this was built, sixty-three since
+[increment 12](#12-the-ceilings-raised-to-the-hardwares); the SEC profile is
+numbered separately and is not in this pool. One more distinct action than the
+pool holds returns `-EOPNOTSUPP`, with the count, and tc leaves the filter in
+software unless it was `skip_sw`, which is exactly how a driver with finite
+meters is expected to behave.
 
 **`TC_SETUP_BLOCK` is not handled today** — `cdx_setup_tc()` answers HTB, RED,
 `TC_SETUP_ROOT_QDISC` and `TC_SETUP_FT`, and everything else falls to
@@ -2463,6 +2525,223 @@ counters on the rig.
 
 *Effort: 3–4 days.*
 
+### 12. The ceilings, raised to the hardware's
+
+A limit per device -- a channel each for the download, an ingress profile each
+for the upload, with the mark picking the device's leaf -- needs some thirty of
+each on one LAN port. ASK offered eight channels and seven profiles, and
+neither number was the hardware's.
+
+**Channels: the device tree's, thirty-two on LS1046A.** One QMan CEETM
+instance has thirty-two channel schedulers, and the board says so:
+`qman-ceetm@0` carries `fsl,ceetm-channel-range = <0 32>`
+(`qoriq-qman-portals-sdk.dtsi`, read back from the rig's `/proc/device-tree`).
+fsl_qbman seeds its channel allocator from that property and keeps no count, so
+cdx reads the property itself (`ceetm_channel_count()`), from the node whose
+LFQID range names the first FMan's DCP portal -- the test `fsl_ceetm_init()`
+tells instances apart by. That count is how many channels
+`ceetm_init_channels()` builds at load, sixteen class queues each, and the bound
+every claim and lookup checks. `CDX_CEETM_MAX_CHANNELS`, now 32, is only what
+the tables are sized to, one instance's architectural maximum; a tree offering
+more is clamped, with a warning, and one offering none fails the load as a
+failed first allocation always did. Two walks had stopped at eight regardless,
+`NUM_CHANNEL_SHAPERS` in `ceetm_enable_or_disable_qos()`, so a channel past the
+eighth would have kept whatever shaper it last had across a QoS enable or
+disable; both walk the channels the board has now.
+
+**Profiles: one pool for the FMan, not a share per port.** The seven were never
+per port, which changes the question this was first put as. The per-flow
+profiles are *shared* FMan profiles (`e_FM_PCD_PLCR_SHARED`), one set in
+`struct cdx_fman_info` for the whole FMan, and a `flower` filter on any port
+takes one from the same pool (`cdx_police_profile_get()`). There is no per-port
+share of the 256 to pick: any port can already name every profile in the pool,
+and partitioning it would strand profiles on ports with no filters. What bounded
+the pool was `INGRESS_FLOW_POLICER_QUEUES`, now 64 -- profile 0, the default
+everything unclassified meters against, and 63 a filter can take -- so one port
+can hold all 63.
+
+The 256 are spent like this:
+
+| Profiles | Kind | Use |
+| --- | --- | --- |
+| relative 0-3 | shared | the punt path, one per exception type (`CDX_EXPT_MAX_EXPT_LIMIT_TYPES`) |
+| relative 4-67 | shared | ingress profile 0, the default, and the 63 per-flow profiles |
+| relative 68 | shared | the SEC meter (`INGRESS_SEC_POLICER_QUEUE_NUM`) |
+| relative 69-143 | shared | spare |
+| one per Ethernet port, at most 8 | port-private | the port's own rate limiter, `matchall`'s profile |
+| the rest, 104 at least | unpartitioned | spare |
+
+The shared count is the FMD's partition, which patch 010 sets to 144
+(`LNXWRP_FM_NUM_OF_SHARED_PROFILES`, sized for NXP's 128 egress class-queue
+profiles, long removed; see [what CMM actually does](#what-cmm-actually-does)).
+A profile created past it fails `FM_PCD_PlcrProfileSet()`, so cdx asserts at
+build time that its last shared profile sits inside that header's number.
+
+**Leaves: sixty-four per port.** Sixteen leaf classes would not hold thirty
+devices, so patch 150 reserves sixty-four Tx queues of headroom
+(`DPAA_ETH_CEETM_LEAF_QUEUES`) and `CDX_HTB_MAX_LEAVES` follows it. That is
+still well below what the hardware could give one port -- every channel's
+sixteen class queues, 512 -- and stays there for three reasons. The frame
+budget below already leaves sixty-four busy leaves about eight frames each, so
+more leaves would be queues too shallow to shape with. Every Tx queue
+`alloc_etherdev_mq()` allocates gets a child of the port's default qdisc from
+`mq` while no hardware qdisc owns the port, so the headroom costs memory on
+every port whether or not it is used: some 350 bytes of `netdev_queue` each,
+and under OpenWrt's default `fq_codel` some 68 KiB, 3.2 MiB a port for the 48
+queues this adds -- given back the moment a tree attaches. And `ethtool -S`
+names three counters for each leaf slot, always: `ceetm rejected frames
+[leaf 63]` fills `ETH_GSTRING_LEN` to the byte, so a three-digit slot would not
+fit, which `dpaa_ethtool.c` asserts (at most 100).
+
+**The class grows to twenty-three bits, and every field above the class queue
+moves.** The channel field needs thirty-three values -- zero for "this port's
+top channel" and one per channel -- and the policer field sixty-four, so each
+takes six bits:
+
+| Bits of the class | Field | Values |
+| --- | --- | --- |
+| 0-3 | class queue | 0-15 |
+| 4-9 | channel | 0 = the egress port's top channel; *n* names channel *n*-1, up to 32 |
+| 10-15 | ingress policer | 0 = the default profile; 1-63 |
+| 16 | remark flag | |
+| 17-22 | DSCP to remark to | 0-63 |
+
+`CDX_FT_QOS_*_SHIFT` and `_BITS` in `cdx/cdx_flowtable_backend.h` state each
+field once, and everything else -- the masks, the Tx path's class table, the
+status report -- is drawn from them. A channel field of 33 to 63 is refused at
+admission rather than truncated; one naming a channel the board does not have,
+or one no tree on the port holds, resolves to the port's unclassified queue as
+it always did. `union ctentry_qosmark`'s `chnl_id` and `iqid` widen into
+reserved bits beside them; nothing else in it moves. The Tx path's class table
+(`class_txq[]`) covers the ten-bit egress class, 1,024 entries a port.
+
+**This is a contract change.** A mark written for the nineteen-bit layout names
+something else under this one: its policer nibble lands across the channel and
+policer fields, its remark flag in the policer's. The class queue is where it
+was, so the common case -- a mask that stops at the queue, such as the test
+image's `0xf0` -- marks exactly as before. Consumers stop restating the layout
+at all: [the consumer contract](#the-consumer-contract) has the running adapter
+report it.
+
+**The mask has to be contiguous now**, and a mask with a hole in it is refused
+at load. A field is read from one run of bits shifted down, so a hole never
+made a narrower field, only one whose upper part came from somewhere else in the
+mark; and the layout the adapter reports is one position and one width.
+
+**Where it fits beside mwan3 and pbr.** The class queue, channel and policer
+fields are sixteen bits together, one half of the word, and that is chosen:
+
+| Also installed | Free runs of `ct->mark` | `qos_mark_mask` | What it carries |
+| --- | --- | --- | --- |
+| nothing | all 32 bits | `0xfffffe00` | the whole class, remark included, at the top |
+| mwan3 (`mmx_mask 0x3f00`) | 14-31, 0-7 | `0xffff0000` | queue, channel, policer |
+| pbr (`fw_mask 0x00ff0000`) | 0-15, 24-31 | `0x0000ffff` | queue, channel, policer |
+| both | 0-7, 14-15, 24-31 | `0xff000000` | queue, and channels 0-14 only (field values 1-15) |
+
+A remark needs all twenty-three bits, which fits beside neither; beside mwan3
+the nineteen-bit class had fitted only with codepoints below 32 anyway. Beside
+pbr the class sits in the low half, where strongSwan's `%unique` connmarks land
+too ([the consumer contract](#the-consumer-contract)), so a box with both moves
+one of them. Beside **both** mwan3 and pbr at their defaults no layout fits:
+the largest free run is eight bits, and naming thirty-two channels takes ten
+with the class queue. That box moves pbr's `fw_mask` to `0x000000ff` -- pbr
+takes any eight bits -- and QoS takes `0xffff0000` again. A per-device upload
+limit costs no mark bits in any of these, because a `flower` filter selects its
+profile at admission.
+
+**Tail drop, thirty leaves deep.** The cap itself is unchanged; what changes is
+how many queues share it. Thirty device leaves on the LAN port, one channel each
+at `prio 0` -- so each holds its channel's class queue 7 -- and the top
+channel's class queue 0 for unclassified traffic make thirty-one queues asking
+128 frames each. Alone, that tree's budget is the 1,024 frames of SEC's share
+and each queue gets 33; with a WAN tree live beside it the share halves and
+each gets 16. With `default` naming one of the leaves, class queue 0 keeps one
+frame and takes no share: 34, or 17. Sixteen frames is about 2 ms at a
+100 Mbit/s device limit and 0.5 ms at 400 Mbit/s -- shallow for one fast TCP
+flow over a long path, generous for a slow device. What bounds it is SEC's
+output pool, which a class queue cannot tell from the Ethernet pool; raising
+it means a larger SEC pool or a share that charges only IPsec traffic, and is
+filed as A421.
+
+**What stays below the hardware, and why.**
+
+- Leaves, 64 of 512 per port: the frame budget, the memory every allocated Tx
+  queue costs, and the ethtool names.
+- Per-flow profiles, 63, with 179 of the 256 still unused: the policer field is
+  six bits, so that the destination-and-meter part of the class stays one
+  half-word. A `flower` filter could name more without spending mark bits, but
+  the rule and the mark share one layout, and splitting them would give a
+  flow's class two encodings.
+
+Channels, the strict and weighted class queues of each and the single DSCP map
+port are at the hardware's.
+
+**What a consumer can read, and what tc is told.** The capacity the hardware has
+left is reported rather than left to be inferred
+([the consumer contract](#the-consumer-contract)). A request beyond it is
+refused with the resource and the count, never accepted and left in software:
+
+```
+Error: cdx: no CEETM channel free (32 of 32 held)
+Error: cdx: no CEETM channel free yet (32 of 32 held, 2 retiring)
+Error: cdx: no HTB leaf free on this port (64 of 64 held)
+Error: cdx: no weighted class queue free on this channel (8 of 8 held)
+Error: cdx: no tail-drop room (512 of 512 frames held); retry shortly
+Error: cdx: flower: no ingress policer profile free (63 of 63 held)
+```
+
+The tail-drop refusal is the one that clears by itself: it means frames the
+tree's own queues hold fill its budget, which a port that is sending gives
+back within milliseconds ([increment 6](#6-wred)).
+
+The HTB refusals fail the command, since HTB offload has no software half. A
+`flower` filter added without `skip_sw` is kept by tc in software, and tc prints
+the refusal as a warning; that flow's direction then stays in software too,
+because a filter on its path runs there. A consumer that wants the refusal to
+fail the command passes `skip_sw`.
+
+*Proved on the host.* `htb_offload.py`, `police.py`, `qos_lifecycle.py`,
+`flowtable.py`, `flowtable_qos_report.py` and their neighbours hold the layout,
+the device-tree count, the pool, the sixty-four leaves, the full-load depths,
+the given-back charge, the start-frame refusal and the report.
+
+*Proved on hardware, 2026-10-27*, on the KASAN image, with the rig's 2 Gbit/s
+cap and three times it offered, one flow at a time.
+
+`test_sixteen_channels_shape_on_one_port`: sixteen classes under the LAN
+port's root took channels 0 to 15 -- `qos_channels 32`, `qos_channels_used 16`,
+the port's row `channels=0,...,15 leaves=16 leaves_free=48` -- and each flow
+carried the mark its class's `qos_classes` row gave, `mark=0x170` for channel 0
+up to `0x1070` for channel 15, whose channel field of 16 the old nibble could
+not hold. Every flow's entry carried its class (`qos=000017` ... `000107`), and
+every leaf held its flow at the cap:
+
+| channels | shaped, leaf counters | goodput | rejected per dequeued | software frames |
+| --- | --- | --- | --- | --- |
+| 0-7 | 1999.3-2000.7 Mbit/s | 1909.4-1909.9 Mbit/s | 2.14 | 0-1 |
+| 8-15 | 1999.5-2002.3 Mbit/s | 1909.9 Mbit/s | 2.14 | 0-1 |
+
+`test_sixteen_policers_meter_on_one_port`: sixteen `skip_sw` flower filters on
+the WAN port's ingress took profiles 1 to 16 (`qos_policers_used 16`, the
+port's row `policers=16`), each flow's entry named its own (`qos=000400` ...
+`004000`), and each meter held its flow at 1957.5 Mbit/s of goodput with
+2.87-2.89 million red frames, the hardware's count equal to the flow's
+packets.
+
+`test_capacity_refusals_name_the_count`: thirty-two classes under one root held
+every channel, sixty-four leaves on four channels filled the LAN port, and the
+pool's sixty-three profiles went to filters; then:
+
+```
+Error: cdx: no CEETM channel free (32 of 32 held).
+Error: cdx: no HTB leaf free on this port (64 of 64 held).
+Error: cdx: flower: no ingress policer profile free (63 of 63 held).
+```
+
+No KASAN, BUG, WARNING or lockdep output; `debug_locks` stayed 1.
+
+*Effort: 3–4 days.*
+
 ### Order and total
 
 Increments 1 and 2a are independent, and both are written. 2b depends on 2a
@@ -2551,6 +2830,7 @@ with its own init script. QoS should look the same.
 | Classification | `ct mark`, set by nftables or iptables | Whatever firewall the distribution already runs |
 | Policy and state | `/etc/ask/` configuration plus a libc-only tool | Package the file; no code |
 | Software shaping | Any qdisc or tc filter that runs in software: SQM's `cake` at a WAN root, its `ingress` + u32 mirred to an ifb carrying `cake`, an HTB without `offload` | Nothing: the directions it would shape stay in software |
+| Capacity and the mark's layout | `/proc/ask_flowtable/status` (`qos_*`), `qos_ports`, `qos_classes`; `ask-flowtable status`, its `qos` object | Read what is free before asking `tc`; build marks from the layout and the class rows, not from constants |
 
 **Software shaping is honoured by keeping what it shapes in software.** An
 offloaded flow's frames never reach a qdisc or a tc filter, so a direction
@@ -2586,6 +2866,41 @@ A bridged pair, a multicast group or another protocol's direction, which they
 do not meter whole, stays in software under them. A police filter is sampled
 at admission, like the mark. `tc_refused` and `tc_invalidations` in
 `/proc/ask_flowtable/stats` count what software shaping kept out.
+
+**Capacity is read from the adapter, not derived.** A consumer deciding per
+device whether a limit goes to hardware or stays in software -- and saying
+"hardware full" when it is -- reads what is free rather than counting what it
+has asked for, because other consumers, a quarantined channel or a profile still
+named by a retired filter's flows all hold capacity it did not ask for. These
+are the supported interface, and the [procfs reference](procfs.md) has every
+field:
+
+- `/proc/ask_flowtable/status`, levels: `qos_channels`, `qos_channels_used`,
+  `qos_channels_held` (quarantined for the port whose tree went, until its
+  flowtable entries are gone) and `qos_channels_free`, SoC-wide;
+  `qos_policers`, `qos_policers_used` (a profile whose filter has gone is used
+  until its last flow is) and `qos_policers_free`, for the FMan's one pool;
+  `qos_leaves_per_port`.
+- The layout: `qos_class_<field>_shift` and `_bits` for `queue`, `channel`,
+  `policer`, `remark` and `dscp`, where each sits in the class -- which is also
+  what a flows row's `qos=` prints -- and `qos_mark_shift` and
+  `qos_mark_bits`, where the active `qos_mark_mask` puts the class in
+  `ct->mark`. A field the mask does not reach cannot be named by a mark.
+- `/proc/ask_flowtable/qos_ports`, one row per port: its tree, the channels it
+  holds and any held for it, its leaves in use and free, and the pool profiles
+  its filters hold.
+- `/proc/ask_flowtable/qos_classes`, one row per class of every live tree: the
+  channel and class queue `tc` was given, the class value that names it, and
+  `mark=`, the bits that select it in `ct->mark`. This is how a consumer learns
+  which channel a class it created got: the hardware picks the channel, and a
+  mark must name it.
+- `ask-flowtable status` prints all of it as one `qos` object beside the raw
+  `qos_mark_mask`.
+
+A mark for a leaf is `ct mark set ct mark & ~mask | mark`, with `mark` from the
+leaf's row. When `tc` asks for more than is free it is refused with the
+resource and the count, as listed under [increment
+12](#12-the-ceilings-raised-to-the-hardwares).
 
 This is the decisive argument against a userspace FCI writer. `tc` is in
 iproute2 on every distribution, is already the vocabulary for hardware queue
@@ -2813,25 +3128,30 @@ being built, and the reasoning is worth keeping so it is not proposed again.
 
 ### The budgets, in one place
 
-What ASK does owe its consumers is the hardware's limits stated once, so that
-OpenWrt, Armbian, VyOS and a bench image do not each re-derive them from the
-driver. Every number here is the hardware's or the driver's, not a policy:
+What ASK does owe its consumers is the limits stated once, so that OpenWrt,
+Armbian, VyOS and a bench image do not each re-derive them from the driver --
+the hardware's, and beside them ASK's where it stops short, with the reason.
+What is free of each at a given moment is not a number to compute from this
+table: the running adapter reports it ([the consumer
+contract](#the-consumer-contract)), under the names in the last column.
 
-| Resource | Bound | Scope | Where it is enforced |
-| --- | --- | --- | --- |
-| CEETM channels | 8 | the whole SoC, shared by every port | `CDX_CEETM_MAX_CHANNELS`, `cdx/cdx_ceetm_app.h:54` |
-| Leaf classes | 16 per port | per port | `CDX_CEETM_MAX_QUEUES_PER_CHANNEL`, `:59` |
-| Weighted leaves | 8 per channel | until WBFS group B is claimed | `qman_ceetm_cq_claim_A` |
-| Strict priorities | 8 | per channel | CEETM |
-| Tail-drop depth | 128 frames per leaf, or a RED leaf's limit in frames, asked for; the whole tree within the port's Ethernet share (1,280 with four CPUs) and, across every live tree, 1,024 of SEC's 2,560 buffers shared evenly, each queue counted at the larger of its depth and what it holds | per tree, and across trees | `cdx_htb_cap()`, shared max-min fair; the hardware default is 8, far too shallow |
-| Ingress policer profiles | 8, of which **7** are addressable | per port | profile 0 is the default for everything unclassified; `CDX_FT_QOS_MAX_POLICER` |
-| DSCP→class egress map | **1 port at a time** | SoC-wide | "Now supporting only one interface", and the second port is refused |
-| Flowtable bindings | `MAX_PHY_PORTS` per table, 2 tables | one per cdx-backed port per table; the second table is a replacement or a probe | `CDX_FT_MAX_TABLE_DEVICES`, `CDX_FT_MAX_TABLES`; was 2 until A152 |
-| Offloaded flows | 32768 | global, all ports together | `CDX_FT_MAX_ENTRIES`; admission budget, no eviction |
+| Resource | Hardware | ASK | Scope | Where ASK enforces it | Reported as |
+| --- | --- | --- | --- | --- | --- |
+| CEETM channels | 32 (one CEETM instance; the device tree's `fsl,ceetm-channel-range`) | the same: the device tree's count | the whole SoC, shared by every port | `ceetm_channel_count()`, ceiling `CDX_CEETM_MAX_CHANNELS` | `qos_channels`, `_used`, `_held`, `_free`; each port's `channels=` in `qos_ports` |
+| Leaf classes | 512 per port (32 channels × 16 class queues) | 64 per port: the frame budget, per-queue memory and the ethtool names ([increment 12](#12-the-ceilings-raised-to-the-hardwares)) | per port | `DPAA_ETH_CEETM_LEAF_QUEUES` (patch 150), `CDX_HTB_MAX_LEAVES` | `qos_leaves_per_port`; each port's `leaves=`, `leaves_free=` |
+| Weighted leaves | 8 per channel (class queues 8-15, as one group or as A and B) | the same, all in group A | per channel | `qman_ceetm_cq_claim_A` | the refusal |
+| Strict priorities | 8 per channel | the same | per channel | CEETM | the refusal |
+| Tail-drop depth | the pools: what every queue holds is a buffer | 128 frames per leaf, or a RED leaf's limit in frames, asked for; the whole tree within the port's Ethernet share (1,280 with four CPUs) and, across every live tree, 1,024 of SEC's 2,560 buffers shared evenly, each queue counted at the larger of its depth and what it holds | per tree, and across trees | `cdx_htb_cap()`, shared max-min fair; the hardware default is 8, far too shallow | -- |
+| Per-flow ingress profiles | 256 profiles on the FMan, of which 144 are the FMD's shared partition (patch 010) | 64 in one pool for every port, of which **63** are addressable: the policer field's six bits | the whole FMan, shared by every port | `INGRESS_FLOW_POLICER_QUEUES`, `CDX_FT_QOS_MAX_POLICER` | `qos_policers`, `_used`, `_free`; each port's `policers=` |
+| Ingress rate limiter | 1 profile per port, private | the same | per port | `matchall`, one per port | -- |
+| DSCP→class egress map | **1 port at a time** | the same | SoC-wide | "Now supporting only one interface", and the second port is refused | the refusal |
+| Mark bits | 32 of `ct->mark` | a 23-bit class, anywhere in the word, contiguous | per box | `qos_mark_mask`, validated at load | `qos_mark_shift`, `qos_mark_bits`, `qos_class_*` |
+| Flowtable bindings | -- | `MAX_PHY_PORTS` per table, 2 tables | one per cdx-backed port per table; the second table is a replacement or a probe | `CDX_FT_MAX_TABLE_DEVICES`, `CDX_FT_MAX_TABLES`; was 2 until A152 | `bindings` |
+| Offloaded flows | the external hash table | 32768 | global, all ports together | `CDX_FT_MAX_ENTRIES`; admission budget, no eviction | `entries`, `max_entries` |
 
-The two that bite a real configuration first are the eight channels, because
-they are SoC-wide rather than per-port and a two-port gateway shaping both
-directions has already spent a quarter of them, and the single DSCP map port.
+The one that bites a real configuration first is now the single DSCP map
+port. The channels, which are SoC-wide, are the next: a two-port gateway with a
+tree on each and thirty devices limited on its LAN port has spent all but one.
 
 ## What the original ASK did with asymmetry
 

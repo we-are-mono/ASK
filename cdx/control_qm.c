@@ -127,6 +127,10 @@ int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 		priv = netdev_priv(qm_ctx->net_dev);
 		priv->qm_ctx = qm_ctx;
 	}
+	/* Whole now, so a port of cdx's to the hardware QoS report. Not
+	 * before: a failure above clears the context, and the caller then lets
+	 * the interface's netdev go, with nothing to tell the report. */
+	cdx_htb_port_added(qm_ctx);
 #endif
 	return SUCCESS;
 }

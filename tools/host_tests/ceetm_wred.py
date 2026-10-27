@@ -38,6 +38,9 @@ def test_curve(tmp_path):
              "ceetm_set_class_depth", "ceetm_class_queue_state",
              "ceetm_set_class_queue", "ceetm_park_class_queue",
              "ceetm_reset_class_queue"]
+    (tmp_path / "wred_constants.inc").write_text(
+        # The channel ceiling the tables are sized by, as the header has it.
+        re.search(r"^#define CDX_CEETM_MAX_CHANNELS\s.*$", header, re.M).group() + "\n")
     (tmp_path / "wred_production.inc").write_text(
         # The depth a queue given back is parked at, as the header has it.
         re.search(r"^#define\s+CEETM_PARKED_CQ_DEPTH\s.*$", header, re.M).group() + "\n"

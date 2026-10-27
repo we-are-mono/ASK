@@ -26,7 +26,7 @@ typedef uint16_t U16;
 
 #define CEETM_SUCCESS			0
 #define CEETM_FAILURE			-1
-#define CDX_CEETM_MAX_CHANNELS		8
+#include "wred_constants.inc"
 #define NUM_PQS				8
 #define NUM_WBFQS			8
 #define MAX_SCHEDULER_QUEUES		(NUM_PQS + NUM_WBFQS)
@@ -140,6 +140,9 @@ struct ceetm_chnl_info {
 	struct classque_info cq_info[MAX_SCHEDULER_QUEUES];
 };
 static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];
+/* How many of them the device tree gave, as ceetm_init_channels() read it. */
+static uint32_t channel_count = CDX_CEETM_MAX_CHANNELS;
+uint32_t ceetm_channel_count(void) { return channel_count; }
 
 /* What the hardware was last told. */
 static struct qm_ceetm_ccg_params last_params;
@@ -333,6 +336,22 @@ int main(void)
 				    1u << 26, 4000) == -EINVAL);
 	assert(ceetm_set_class_wred(0, MAX_SCHEDULER_QUEUES, 10, 100,
 				    1u << 26, 4000) == -EINVAL);
+	/* A channel past the ones the device tree gave is out of range too,
+	 * though the table has a row for it, for every verb: its queues were
+	 * never built. */
+	channel_count = 4;
+	assert(ceetm_set_class_wred(4, 3, 10, 100, 1u << 26, 4000) == -EINVAL);
+	assert(ceetm_clear_class_wred(4, 3, 128) == -EINVAL);
+	assert(ceetm_set_class_depth(4, 3, 56) == -EINVAL);
+	assert(ceetm_set_class_queue(4, 3, 0, 56) == -EINVAL);
+	assert(ceetm_reset_class_queue(4, 3) == -EINVAL);
+	{
+		uint32_t depth;
+		bool curve;
+
+		assert(ceetm_class_queue_state(4, 3, &depth, &curve) == -EINVAL);
+	}
+	channel_count = CDX_CEETM_MAX_CHANNELS;
 	/* A class queue with no congestion group has nothing to configure. */
 	qm_chnl_info[0].cq_info[4].ccg = NULL;
 	assert(ceetm_set_class_wred(0, 4, 10, 100, 1u << 26, 4000) == -ENODEV);

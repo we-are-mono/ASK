@@ -35,6 +35,35 @@
 #define BIT(n) (1UL << (n))
 #define BIT_ULL(n) (1ULL << (n))
 #define WARN_ON_ONCE(x) (x)
+
+/* The kernel's bitmaps, over as many longs as the bits need. */
+#define BITS_PER_LONG (8 * sizeof(long))
+#define BITS_TO_LONGS(n) (((n) + BITS_PER_LONG - 1) / BITS_PER_LONG)
+#define DECLARE_BITMAP(name, bits) unsigned long name[BITS_TO_LONGS(bits)]
+static inline bool test_bit(unsigned nr, const unsigned long *map)
+{ return map[nr / BITS_PER_LONG] >> (nr % BITS_PER_LONG) & 1; }
+static inline void __set_bit(unsigned nr, unsigned long *map)
+{ map[nr / BITS_PER_LONG] |= 1UL << (nr % BITS_PER_LONG); }
+static inline void __clear_bit(unsigned nr, unsigned long *map)
+{ map[nr / BITS_PER_LONG] &= ~(1UL << (nr % BITS_PER_LONG)); }
+static inline unsigned long find_next_zero_bit(const unsigned long *map, unsigned long size,
+                                               unsigned long offset)
+{
+    for (; offset < size; offset++)
+        if (!test_bit(offset, map))
+            return offset;
+    return size;
+}
+static inline unsigned bitmap_weight(const unsigned long *map, unsigned nbits)
+{
+    unsigned n = 0;
+
+    for (unsigned i = 0; i < nbits; i++)
+        n += test_bit(i, map);
+    return n;
+}
+static inline void bitmap_zero(unsigned long *map, unsigned nbits)
+{ memset(map, 0, BITS_TO_LONGS(nbits) * sizeof(*map)); }
 #define EXPORT_SYMBOL_NS_GPL(sym, ns)
 
 static u64 div_u64(u64 n, u32 d) { return n / d; }
@@ -66,9 +95,20 @@ struct flow_action_entry {
     } police;
 };
 struct flow_action { unsigned num_entries; struct flow_action_entry entries[4]; };
-struct netlink_ext_ack { const char *msg; };
+struct netlink_ext_ack { const char *msg; char _msg_buf[80]; };
 /* As the kernel's: the message must be a string literal. */
 #define NL_SET_ERR_MSG_MOD(e, m) do { static const char __msg[] = m; if (e) (e)->msg = __msg; } while (0)
+/* As the kernel's too: formatted into the ack's own 80 bytes, the module's
+ * name in front, and a message that does not fit is a bug the kernel only
+ * warns about -- so here it fails. */
+#define NL_SET_ERR_MSG_FMT_MOD(e, fmt, ...) do {                                \
+    if (e) {                                                                    \
+        int __n = snprintf((e)->_msg_buf, sizeof((e)->_msg_buf),               \
+                           "cdx: " fmt, ##__VA_ARGS__);                         \
+        assert(__n >= 0 && (size_t)__n < sizeof((e)->_msg_buf));                \
+        (e)->msg = (e)->_msg_buf;                                               \
+    }                                                                           \
+} while (0)
 static bool flow_offload_has_one_action(const struct flow_action *a)
 { return a->num_entries == 1; }
 
@@ -166,10 +206,8 @@ struct cdx_ft_rule {
     union nf_inet_addr src, dst;
     __be16 sport, dport;
     u8 family, proto;
-    u16 qos;
+    u32 qos;
 };
-#define CDX_FT_QOS_POLICER_MASK  0xf00u
-#define CDX_FT_QOS_POLICER_SHIFT 8
 
 #include "plcr_types.inc"
 #include "plcr_qos.inc"
@@ -1012,6 +1050,108 @@ static void locking(void)
     assert(!plcr_unlocked && !lockdep_misses);
 }
 
+/* ---- flower: the whole pool ---------------------------------------------
+ *
+ * Sixty-three profiles past the default, one FMan-wide pool every port's
+ * filters draw from. Each filter has a profile of its own, programmed on its
+ * own record; the one after the last is told how many are held, so an
+ * operator reading the refusal knows it is the pool and not the filter. */
+static void pool(void)
+{
+    enum { POOL = CDX_FT_QOS_MAX_POLICER };
+    static bool seen[CDX_FT_QOS_MAX_POLICER + 1];
+    struct flow_rule fr;
+    char want[80];
+
+    /* What the adapter's status reports of the pool, and of each port's
+     * share of it: nothing yet. */
+    assert(cdx_police_pool_used() == 0);
+    assert(cdx_police_port_profiles(&dev) == 0 && cdx_police_port_profiles(&other) == 0);
+    for (unsigned i = 1; i <= POOL; i++) {
+        fr = flower_rule();
+        fr.ports.dst = 5000 + i;
+        /* Half on either port: the pool is the FMan's, not a port's. */
+        assert(flower_add(i & 1 ? &dev : &other, 100 + i, &fr) == 0 && !ack.msg);
+        unsigned p = last_profile();
+        assert(p >= 1 && p <= POOL && !seen[p]);
+        seen[p] = true;
+        assert_meter(meter(p), 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+        assert(cdx_get_policer_profile_id(FMAN_INDEX, p) == fman.ingress_policer_info[p].profile_id);
+    }
+    /* Every profile a distinct hardware one, none of them the SEC profile
+     * that sits after the pool. */
+    for (unsigned a = 1; a <= POOL; a++) {
+        assert(fman.ingress_policer_info[a].profile_id !=
+               fman.ingress_policer_info[INGRESS_SEC_POLICER_QUEUE_NUM].profile_id);
+        for (unsigned b = a + 1; b <= POOL; b++)
+            assert(fman.ingress_policer_info[a].profile_id !=
+                   fman.ingress_policer_info[b].profile_id);
+    }
+    fr = flower_rule(); fr.ports.dst = 6000;
+    assert(flower_add(&dev, 999, &fr) == -EOPNOTSUPP);
+    snprintf(want, sizeof(want),
+             "cdx: flower: no ingress policer profile free (%u of %u held)", POOL, POOL);
+    assert(ack.msg && !strcmp(ack.msg, want));
+    /* Every profile spoken for, thirty-two by the odd filters on one port and
+     * thirty-one by the even ones on the other; the refused one holds none. */
+    assert(cdx_police_pool_used() == POOL);
+    assert(cdx_police_port_profiles(&dev) == 32 && cdx_police_port_profiles(&other) == 31);
+
+    /* A profile whose filter is gone while a flow still names it is held, and
+     * counted as held: the next filter is refused rather than given a meter a
+     * live flow still runs against. Above the eight the pool once had, so a
+     * narrow bitmap or count would drop it. */
+    unsigned held = 0;
+    for (unsigned i = 1; i <= POOL; i++) {
+        struct cdx_ft_rule flow = flow_on(i & 1 ? &dev : &other);
+        flow.dport = 5000 + i;
+        if (cdx_police_lookup(&flow) == POOL) {
+            held = i;
+            break;
+        }
+    }
+    assert(held);
+    cdx_police_profile_ref(POOL);
+    cdx_police_profile_ref(POOL);
+    assert(flower_del(held & 1 ? &dev : &other, 100 + held) == 0);
+    assert(flower_add(&dev, 999, &fr) == -EOPNOTSUPP);
+    assert(ack.msg && !strcmp(ack.msg, want));
+    /* Pending: still used, as the pool counts it, but no port's filter
+     * holds it any more. */
+    struct net_device *owner = held & 1 ? &dev : &other;
+    unsigned before = owner == &dev ? 32 : 31;
+    assert(cdx_police_pool_used() == POOL);
+    assert(cdx_police_port_profiles(owner) == before - 1);
+    cdx_police_profile_unref(POOL);
+    assert(flower_add(&dev, 999, &fr) == -EOPNOTSUPP);
+    assert(cdx_police_pool_used() == POOL);
+    /* The last flow goes, and the profile with it, back to the pool. */
+    cdx_police_profile_unref(POOL);
+    assert(cdx_police_pool_used() == POOL - 1);
+    assert(flower_add(&dev, 999, &fr) == 0 && last_profile() == POOL);
+    assert(cdx_police_pool_used() == POOL);
+    assert(cdx_police_port_profiles(&dev) == (owner == &dev ? before : 33));
+    assert(flower_del(&dev, 999) == 0);
+    /* A ref outside the pool is no ref: the default profile, and anything
+     * past the pool's end, which no filter can hold. */
+    cdx_police_profile_ref(0);
+    cdx_police_profile_ref(POOL + 1);
+    cdx_police_profile_unref(POOL + 1);
+    for (unsigned i = 1; i <= POOL; i++)
+        if (i != held)
+            assert(flower_del(i & 1 ? &dev : &other, 100 + i) == 0);
+    assert(cdx_police_pool_used() == 0);
+    assert(cdx_police_port_profiles(&dev) == 0 && cdx_police_port_profiles(&other) == 0);
+    /* All of them back: the pool fills again from the bottom. */
+    fr = flower_rule();
+    assert(flower_add(&dev, 1, &fr) == 0 && last_profile() == 1);
+    assert(cdx_police_pool_used() == 1 && cdx_police_port_profiles(&dev) == 1);
+    assert(flower_del(&dev, 1) == 0);
+    /* And the pool is the one the class layout can address: a six-bit
+     * policer field, profile 0 the default. */
+    assert(POOL == 63);
+}
+
 int main(int argc, char **argv)
 {
     static const struct { const char *name; void (*run)(void); } cases[] = {
@@ -1020,6 +1160,7 @@ int main(int argc, char **argv)
         { "matchall_destroy_deferred", matchall_destroy_deferred },
         { "matchall_refused_destroy", matchall_refused_destroy },
         { "flower_destroy_deferred", flower_destroy_deferred },
+        { "pool", pool },
         { "counters_unread", counters_unread },
         { "channel_shut", channel_shut },
         { "locking", locking },

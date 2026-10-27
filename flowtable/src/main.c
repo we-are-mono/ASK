@@ -510,7 +510,7 @@ static int cmd_status(struct ft_ctx *ctx)
 	struct ft_backend st;
 	struct ft_devices installed;
 	bool present, owned, paused;
-	char inhash[65], devices[FT_MAX_DEVICES * (FT_IFNAME_MAX + 4) + 8];
+	char inhash[65], devices[FT_MAX_DEVICES * (FT_IFNAME_MAX + 4) + 8], *qos;
 	size_t o;
 	int i, lock = ft_lock(ctx, 30000);
 	if (lock < 0)
@@ -522,6 +522,10 @@ static int cmd_status(struct ft_ctx *ctx)
 		return -1;
 	}
 	close(lock);
+	/* The hardware QoS budget, by a reader of its own: nothing else the
+	 * controller decides depends on it, so it needs no lease. */
+	if (ft_qos_json(ctx, &st, &qos))
+		return -1;
 	/* The ports the installed flowtable is bound to. Under "devices auto"
 	 * the policy hash no longer says, so status does. */
 	o = (size_t)snprintf(devices, sizeof(devices), "%s", installed.n < 0 ? "null" : "[");
@@ -538,7 +542,8 @@ static int cmd_status(struct ft_ctx *ctx)
 	       "\"bindings\": %ld, \"entries\": %ld, \"handle_refs\": %ld, \"neighbour_refs\": %ld, "
 	       "\"quarantine\": %ld, \"fatal\": %ld, \"bypassed\": %ld, \"restarts\": %ld, "
 	       "\"resume_failures\": %ld, \"invalidated\": %ld, \"observe\": %ld, "
-	       "\"mcast_enabled\": %ld, \"mcast_installed\": %ld, \"mroute_installed\": %ld}}\n",
+	       "\"mcast_enabled\": %ld, \"mcast_installed\": %ld, \"mroute_installed\": %ld}, "
+	       "\"qos\": %s}\n",
 	       owned ? "true" : "false",
 	       owned ? "\"" : "null", owned ? inhash : "", owned ? "\"" : "",
 	       devices,
@@ -548,7 +553,8 @@ static int cmd_status(struct ft_ctx *ctx)
 	       st.bindings, st.entries, st.handle_refs, st.neighbour_refs, st.quarantine,
 	       st.fatal, st.bypassed, st.restarts, st.resume_failures,
 	       st.invalidated, st.observe,
-	       st.mcast_enabled, st.mcast_installed, st.mroute_installed);
+	       st.mcast_enabled, st.mcast_installed, st.mroute_installed, qos);
+	free(qos);
 	return 0;
 }
 

@@ -39,6 +39,29 @@ def test_state_carries_the_module_parameters(tmp_path):
         read_state(summary=True, proc=proc, parameters={})
 
 
+def test_state_carries_the_qos_rows(tmp_path):
+    """A state reads the hardware QoS rows -- one per port of cdx's, one per
+    class of each tree -- into lists of their own, read before the flows; a
+    summary reads neither."""
+    proc = proc_dir(tmp_path, qos_channels=32, qos_mark_bits=16)
+    (proc / "qos_ports").write_text(
+        "port dev=eth3 tree=1 channels=0,1 spare=0 held=- leaves=2 leaves_free=62 policers=1\n")
+    (proc / "qos_classes").write_text(
+        "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- qos=- mark=-\n"
+        "class dev=eth3 classid=1:23 parent=1:1 kind=leaf channel=0 queue=7 slot=0 qos=000017 "
+        "mark=0x170000\n")
+    assert STATE.index("qos_ports") < STATE.index("flows")
+    assert STATE.index("qos_classes") < STATE.index("flows")
+    state = read_state(proc=proc, parameters={})
+    assert state["qos_channels"] == 32 and state["qos_mark_bits"] == 16
+    assert state["qos_ports"] == [{"dev": "eth3", "tree": "1", "channels": "0,1", "spare": "0",
+                                   "held": "-", "leaves": "2", "leaves_free": "62",
+                                   "policers": "1"}]
+    assert [c["classid"] for c in state["qos_classes"]] == ["1:1", "1:23"]
+    assert state["qos_classes"][1]["mark"] == "0x170000"
+    assert read_state(summary=True, proc=proc, parameters={})["qos_classes"] == []
+
+
 def test_full_table_comparison_detects_hidden_identity_changes(tmp_path):
     count = 16384
     proc = proc_dir(tmp_path, entries=count * 2, handle_refs=count * 2, neighbour_refs=count * 2)

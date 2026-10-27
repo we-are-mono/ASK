@@ -41,6 +41,15 @@ def test_htb_offload(tmp_path):
          "ipv6_change_dsfield")))
     source = (ROOT / "cdx/cdx_htb.c").read_text()
     backend = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
+    exports = (ROOT / "cdx/cdx_flowtable.h").read_text()
+    # The ceilings the tables are sized by: one CEETM instance's channels, and
+    # the direct and leaf-class Tx queues patch 150 gives the netdev.
+    patch = (ROOT / "patches/kernel/150-sdk_dpaa-hardware-qdisc.patch").read_text()
+    (tmp_path / "htb_limits.inc").write_text(
+        re.search(r"^#define\s+CDX_CEETM_MAX_CHANNELS\s.*$",
+                  (ROOT / "cdx/cdx_ceetm_app.h").read_text(), re.M).group() + "\n"
+        + "".join(re.search(rf"^\+(#define {name}\s.*)$", patch, re.M).group(1) + "\n"
+                  for name in ("DPAA_ETH_TX_QUEUES", "DPAA_ETH_CEETM_LEAF_QUEUES")))
     # The pools a tree's class queues are budgeted against, as the headers
     # define them, and the hardware layer's own reading of how narrow a WRED
     # band it can draw, which the curve's conversion to frames widens to.
@@ -61,6 +70,9 @@ def test_htb_offload(tmp_path):
         # Tx path masks a decoded class with it before indexing.
         backend[backend.index("/* Layout of cdx_ft_rule.qos"):
                 backend.index("struct cdx_ft_counters")]
+        # What the report hands the adapter.
+        + exports[exports.index("/* What the hardware qdisc has to give"):
+                  exports.index("/* A port's egress changed")]
         # The queue budget and both structures, stopping where the file's own
         # storage begins: the harness declares that itself so it can inspect it.
         + source[source.index("/* Leaf classes are handed netdev"):
@@ -92,13 +104,18 @@ def test_htb_offload(tmp_path):
         "cdx_htb_find_qid", "cdx_htb_channel_owned",
         "cdx_htb_live_trees", "cdx_htb_budget", "cdx_htb_red_frame",
         "cdx_htb_red_want", "cdx_htb_red_frames", "cdx_htb_cap_queues",
-        "cdx_htb_tree_mask", "cdx_htb_channel_port",
+        "cdx_htb_tree_mask", "cdx_htb_given", "cdx_htb_channel_port",
         "cdx_htb_cap_share", "cdx_htb_cap_write", "cdx_htb_cap_charge",
-        "cdx_htb_cap_room", "cdx_htb_cap_apply", "cdx_htb_cap",
+        "cdx_htb_cap_room", "cdx_htb_cap_shares", "cdx_htb_cap_apply",
+        "cdx_htb_release_hold",
+        "cdx_htb_given_back", "cdx_htb_cap",
         "cdx_htb_cap_trees",
         "cdx_htb_regrow_work", "cdx_htb_implicit_sync",
         "cdx_htb_control_budget", "cdx_htb_publish", "cdx_htb_resize",
-        "cdx_htb_channel_get", "cdx_htb_cq_get", "cdx_htb_implicit_forget",
+        "cdx_htb_channel_census", "cdx_htb_levels_update", "cdx_htb_claim_pick",
+        "cdx_htb_channel_spare", "cdx_htb_channel_get",
+        "cdx_htb_cq_get", "cdx_htb_start_charge", "cdx_htb_admit",
+        "cdx_htb_implicit_forget",
         "cdx_htb_cq_configure", "cdx_htb_cq_release", "cdx_htb_cq_restore",
         "cdx_htb_shape", "cdx_htb_unshape", "cdx_htb_class_free", "cdx_htb_qid_free",
         "cdx_htb_create", "cdx_htb_release_due", "cdx_htb_destroy", "cdx_htb_leaf_alloc",
@@ -109,7 +126,9 @@ def test_htb_offload(tmp_path):
         "cdx_htb_setup_tc",
         "cdx_register_ft_egress", "cdx_unregister_ft_egress",
         "cdx_htb_class_queue",
-        "cdx_htb_port_gone", "cdx_htb_port_released", "cdx_htb_mtu_changed",
+        "cdx_qos_port_fill", "cdx_qos_class_fill",
+        "cdx_qos_budget", "cdx_qos_port_next",
+        "cdx_htb_port_added", "cdx_htb_port_gone", "cdx_htb_port_released", "cdx_htb_mtu_changed",
         "cdx_register_ft_qos_class",
         "cdx_unregister_ft_qos_class", "cdx_htb_l4", "cdx_htb_ip_family",
         "cdx_htb_parse", "cdx_htb_control", "cdx_htb_control_admit",
@@ -122,10 +141,12 @@ def test_htb_offload(tmp_path):
         "cdx_unregister_ft_setup_tc", "cdx_setup_tc", "cdx_htb_init",
         "cdx_htb_exit",
     ]
-    # The cap's view of one class queue is a structure among the functions.
+    # The cap's view of one class queue is a structure among the functions,
+    # and the list of them it keeps for one tree at a time follows it.
     cap_queue = source.index("struct cdx_htb_cap_queue {")
+    cap_list = source.index("static struct cdx_htb_cap_queue cdx_htb_cap_list[")
     (tmp_path / "htb_production.inc").write_text(
-        source[cap_queue:source.index("};", cap_queue) + 3]
+        source[cap_queue:source.index("\n", cap_list) + 1]
         + "\n".join(function(source, name) for name in names))
     binary = tmp_path / "htb_offload"
     run_process([
@@ -152,7 +173,7 @@ def test_htb_queue_budget_matches_the_driver(tmp_path):
     to agree.
     """
     patch = (ROOT / "patches/kernel/150-sdk_dpaa-hardware-qdisc.patch").read_text()
-    assert "+#define DPAA_ETH_CEETM_LEAF_QUEUES\t16" in patch
+    assert "+#define DPAA_ETH_CEETM_LEAF_QUEUES\t64" in patch
     assert "+#define DPAA_ETH_TX_QUEUES\t16" in patch
     source = (ROOT / "cdx/cdx_htb.c").read_text()
     assert "#define CDX_HTB_QID_BASE\tDPAA_ETH_TX_QUEUES" in source

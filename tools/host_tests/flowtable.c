@@ -1749,7 +1749,7 @@ static bool registration_fails(void) { return ++registration_step == registratio
  * each root-only; any of them can fail, and the directory's removal takes
  * whatever was made in it. */
 static const char *const proc_files[] = {
-    "status", "stats", "devices", "flows", "l2", "mcast", "mroute",
+    "status", "stats", "devices", "flows", "l2", "mcast", "mroute", "qos_ports", "qos_classes",
 };
 static struct proc_dir_entry proc_dir, proc_file[ARRAY_SIZE(proc_files)];
 static unsigned proc_made;
@@ -1773,6 +1773,8 @@ static struct proc_dir_entry *proc_child(const char *name, int mode, struct proc
 static int ft_status_show(struct seq_file *seq, void *v) { return 0; }
 static int ft_stats_show(struct seq_file *seq, void *v) { return 0; }
 static int ft_devices_show(struct seq_file *seq, void *v) { return 0; }
+static int ft_qos_ports_show(struct seq_file *seq, void *v) { return 0; }
+static int ft_qos_classes_show(struct seq_file *seq, void *v) { return 0; }
 struct seq_operations { int unused; };
 struct proc_ops { int unused; };
 static const struct seq_operations ft_flows_ops, ft_l2_ops;
@@ -1780,7 +1782,12 @@ static const struct proc_ops ft_mcast_proc_ops, ft_mroute_proc_ops;
 static struct proc_dir_entry *proc_create_single(const char *name, int mode, struct proc_dir_entry *parent,
                                                  int (*show)(struct seq_file *, void *))
 {
-    assert(show == (proc_made == 0 ? ft_status_show : proc_made == 1 ? ft_stats_show : ft_devices_show));
+    static int (*const shows[])(struct seq_file *, void *) = {
+        [0] = ft_status_show, [1] = ft_stats_show, [2] = ft_devices_show,
+        [7] = ft_qos_ports_show, [8] = ft_qos_classes_show,
+    };
+
+    assert(proc_made < ARRAY_SIZE(shows) && shows[proc_made] && show == shows[proc_made]);
     return proc_child(name, mode, parent);
 }
 static struct proc_dir_entry *proc_create_seq(const char *name, int mode, struct proc_dir_entry *parent,
@@ -9431,43 +9438,72 @@ static void test_qos_decode(void)
     assert(!ft_qos_remarks());
     ft_qos_default_class = CDX_FT_QOS_REMARK_MASK | 46u << CDX_FT_QOS_DSCP_SHIFT;
     assert(ft_qos_remarks());
-    ft_qos_mark_mask = 0x7ffff0; ft_qos_default_class = 0;
+    /* A mask exactly as wide as the fields up to the flag reaches it; one
+     * bit narrower stops at the policer. */
+    ft_qos_mark_mask = (CDX_FT_QOS_QUEUE_MASK | CDX_FT_QOS_CHANNEL_MASK |
+                        CDX_FT_QOS_POLICER_MASK | CDX_FT_QOS_REMARK_MASK) << 4;
+    ft_qos_default_class = 0;
     assert(ft_qos_remarks());
-    ft_qos_mark_mask = 0xfff0;
+    ft_qos_mark_mask = (CDX_FT_QOS_QUEUE_MASK | CDX_FT_QOS_CHANNEL_MASK |
+                        CDX_FT_QOS_POLICER_MASK) << 4;
     assert(!ft_qos_remarks());
 
     ft_qos_mark_mask = saved_mask; ft_qos_default_class = saved_default;
 
-    /* Validity. Each nibble is bounded at its own maximum, inclusive. The
-     * channel nibble admits 8 because value n names channel n-1 and zero is a
-     * sentinel; the policer nibble admits 7 because it is a plain profile
+    /* The layout, field by field from the mask's lowest bit: four bits of
+     * class queue, six of channel, six of ingress policer -- sixteen, which a
+     * mask beside mwan3's or pbr's alone has room for -- then the remark's
+     * flag and six bits of codepoint. Each field's width is stated once and
+     * its mask follows from it. */
+    assert(CDX_FT_QOS_QUEUE_SHIFT == 0 && CDX_FT_QOS_QUEUE_BITS == 4);
+    assert(CDX_FT_QOS_CHANNEL_SHIFT == 4 && CDX_FT_QOS_CHANNEL_BITS == 6);
+    assert(CDX_FT_QOS_POLICER_SHIFT == 10 && CDX_FT_QOS_POLICER_BITS == 6);
+    assert(CDX_FT_QOS_REMARK_SHIFT == 16 && CDX_FT_QOS_REMARK_BITS == 1);
+    assert(CDX_FT_QOS_DSCP_SHIFT == 17 && CDX_FT_QOS_DSCP_BITS == 6);
+    assert(CDX_FT_QOS_QUEUE_MASK == 0x00000fu && CDX_FT_QOS_CHANNEL_MASK == 0x0003f0u &&
+           CDX_FT_QOS_POLICER_MASK == 0x00fc00u && CDX_FT_QOS_REMARK_MASK == 0x010000u &&
+           CDX_FT_QOS_DSCP_MASK == 0x7e0000u);
+    assert(CDX_FT_QOS_MAX_CHANNEL == 32 && CDX_FT_QOS_MAX_POLICER == 63);
+
+    /* Validity. Each field is bounded at its own maximum, inclusive. The
+     * channel field admits 32 because value n names channel n-1 and zero is a
+     * sentinel; the policer field admits 63 because it is a plain profile
      * number with no sentinel to make room for. */
     assert(ft_qos_class_valid(0x000));
     assert(ft_qos_class_valid(0x00f));                       /* class queue 15 */
     assert(ft_qos_class_valid(CDX_FT_QOS_MAX_CHANNEL << CDX_FT_QOS_CHANNEL_SHIFT));
     assert(ft_qos_class_valid(CDX_FT_QOS_MAX_POLICER << CDX_FT_QOS_POLICER_SHIFT));
-    assert(ft_qos_class_valid(0x78f));                       /* all three, full */
-    /* One past either bound names an object the hardware does not have. A flow
-     * asking for it is declined to software, never truncated onto a queue or a
-     * meter nobody asked for. */
-    assert(!ft_qos_class_valid((CDX_FT_QOS_MAX_CHANNEL + 1) << CDX_FT_QOS_CHANNEL_SHIFT));
-    assert(!ft_qos_class_valid((CDX_FT_QOS_MAX_POLICER + 1) << CDX_FT_QOS_POLICER_SHIFT));
+    assert(ft_qos_class_valid(0xfe0fu));                     /* all three, full */
+    /* One past the channel bound names a channel the hardware does not have.
+     * A flow asking for it is declined to software, never truncated onto a
+     * queue nobody asked for -- every value up to what six bits hold. */
+    for (unsigned channel = CDX_FT_QOS_MAX_CHANNEL + 1;
+         channel <= CDX_FT_QOS_CHANNEL_MASK >> CDX_FT_QOS_CHANNEL_SHIFT; channel++)
+        assert(!ft_qos_class_valid(channel << CDX_FT_QOS_CHANNEL_SHIFT));
+    /* The policer field is exactly as wide as the pool: every value it can
+     * hold is a profile, and a 64th cannot be named at all -- shifted into
+     * place it is the remark's flag, not a profile. */
+    assert(CDX_FT_QOS_POLICER_MASK >> CDX_FT_QOS_POLICER_SHIFT == CDX_FT_QOS_MAX_POLICER);
+    assert(!(((CDX_FT_QOS_MAX_POLICER + 1u) << CDX_FT_QOS_POLICER_SHIFT) &
+             CDX_FT_QOS_POLICER_MASK));
 
     /* The remark: a flag and six bits of codepoint. Every codepoint is valid --
      * six bits is exactly the field -- so the only thing out of range above the
-     * policer nibble is a bit the encoding does not define at all. */
+     * policer field is a bit the encoding does not define at all. */
     assert(ft_qos_class_valid(CDX_FT_QOS_REMARK_MASK));            /* remark to CS0 */
     assert(ft_qos_class_valid(CDX_FT_QOS_REMARK_MASK |
                               (CDX_FT_QOS_MAX_DSCP << CDX_FT_QOS_DSCP_SHIFT)));
     /* Every field at its own maximum. Not CDX_FT_QOS_MASK itself: that has all
-     * four channel bits set, and channel 15 is three past the eight CEETM has. */
+     * six channel bits set, and channel 63 is thirty-one past the thirty-two
+     * CEETM has. */
     assert(ft_qos_class_valid(CDX_FT_QOS_QUEUE_MASK |
                               (CDX_FT_QOS_MAX_CHANNEL << CDX_FT_QOS_CHANNEL_SHIFT) |
                               (CDX_FT_QOS_MAX_POLICER << CDX_FT_QOS_POLICER_SHIFT) |
                               CDX_FT_QOS_REMARK_MASK |
                               (CDX_FT_QOS_MAX_DSCP << CDX_FT_QOS_DSCP_SHIFT)));
+    assert(!ft_qos_class_valid(CDX_FT_QOS_MASK));
     assert(!ft_qos_class_valid(CDX_FT_QOS_MASK + 1));
-    assert(!ft_qos_class_valid(~CDX_FT_QOS_MASK & 0xffffffu));
+    assert(!ft_qos_class_valid(~CDX_FT_QOS_MASK));
 
     /* The flag is why the codepoint needs one. Every other field spells
      * "unspecified" as zero, but DSCP zero is CS0 -- a real codepoint, and the
@@ -9481,16 +9517,18 @@ static void test_qos_decode(void)
     assert(CDX_FT_QOS_DSCP_MASK >> CDX_FT_QOS_DSCP_SHIFT == CDX_FT_QOS_MAX_DSCP);
     assert(!(CDX_FT_QOS_DSCP_MASK & CDX_FT_QOS_REMARK_MASK));
 
-    /* Nineteen bits spoken for, thirteen left to the operator. */
-    assert(CDX_FT_QOS_MASK == 0x07ffffu);        /* 19 contiguous bits from zero */
+    /* Twenty-three bits spoken for, nine left to the operator. */
+    assert(CDX_FT_QOS_MASK == 0x7fffffu);        /* 23 contiguous bits from zero */
     assert((CDX_FT_QOS_MASK & (CDX_FT_QOS_MASK + 1)) == 0);
+    assert(CDX_FT_QOS_QUEUE_BITS + CDX_FT_QOS_CHANNEL_BITS + CDX_FT_QOS_POLICER_BITS +
+           CDX_FT_QOS_REMARK_BITS + CDX_FT_QOS_DSCP_BITS == 23);
 
     /* The egress mask is what the Tx path may index its class table with, so it
-     * has to exclude the policer nibble and the remark -- neither says anything
-     * about where a frame leaves -- and stay inside a 256-entry table. Widening
-     * the class made this load-bearing: unmasked, a remark of CS7 indexes 508
-     * entries past the table. */
-    assert(CDX_FT_QOS_EGRESS_MASK == 0xff);
+     * has to exclude the policer field and the remark -- neither says anything
+     * about where a frame leaves -- and stay inside a table sized for the
+     * class queue and the channel alone. Unmasked, a remark of CS7 would index
+     * far past it. */
+    assert(CDX_FT_QOS_EGRESS_MASK == 0x3ff);
     assert(!(CDX_FT_QOS_EGRESS_MASK & CDX_FT_QOS_POLICER_MASK));
     assert(!(CDX_FT_QOS_EGRESS_MASK & CDX_FT_QOS_REMARK_MASK));
     assert(!(CDX_FT_QOS_EGRESS_MASK & CDX_FT_QOS_DSCP_MASK));
@@ -9517,12 +9555,60 @@ static void test_qos_decode(void)
     ft_qos_mark_mask = (CDX_FT_QOS_MASK << 1) | 1;   /* one bit too wide */
     assert(ask_flowtable_init() == -EINVAL);
     /* The same width placed anywhere in the word is still a class: the field is
-     * shifted down to its own base before it is measured. */
+     * shifted down to its own base before it is measured. Twenty-three bits
+     * fit at the top of the word, and no higher. */
     ft_ready=ft_stopping=false; registration_step=canceled=0;
     fixture();
-    ft_qos_mark_mask = CDX_FT_QOS_MASK << 16;
+    ft_qos_mark_mask = CDX_FT_QOS_MASK << 9;
+    assert(ft_qos_mark_mask == 0xfffffe00u && (ft_qos_mark_mask >> 9) == CDX_FT_QOS_MASK);
     assert(ask_flowtable_init() == 0);
     ask_flowtable_exit();
+    /* Sixteen bits beside mwan3's (the low half of the word taken) or pbr's
+     * (the high half): the queue, channel and policer fields whole, with the
+     * route-only bits disjoint. */
+    ft_ready=ft_stopping=false; registration_step=canceled=0;
+    fixture();
+    ft_qos_mark_mask = 0xffff0000u; ft_route_mark_mask = 0x0000ffffu;
+    assert(ask_flowtable_init() == 0);
+    ask_flowtable_exit();
+    ft_ready=ft_stopping=false; registration_step=canceled=0;
+    fixture();
+    ft_qos_mark_mask = 0x0000ffffu; ft_route_mark_mask = 0xffff0000u;
+    assert(ask_flowtable_init() == 0);
+    ask_flowtable_exit();
+    ft_route_mark_mask = 0;
+    /* A mask with a hole in it is refused. The decode shifts the masked bits
+     * down by the lowest one and reads the hole as a field's bits, so a mark
+     * would be read as a class the operator never wrote -- whatever bits of
+     * someone else's mark sit in the hole. Refused even narrow enough to fit,
+     * and even when the hole is a single bit. */
+    unsigned int holed[] = { 0x0f0fu, 0xf0f0u, 0x101u, 0xff00ffu, 0x80000001u,
+                             0xffff0000u ^ (1u << 20) };
+    for (unsigned i = 0; i < sizeof(holed) / sizeof(holed[0]); i++) {
+        ft_ready=ft_stopping=false; registration_step=canceled=0;
+        fixture();
+        ft_qos_mark_mask = holed[i];
+        assert(ask_flowtable_init() == -EINVAL);
+    }
+    /* And the check names the parameters, not a load: the same verdicts,
+     * asked directly, for the in-tree masks and both edges. */
+    ft_route_mark_mask = 0;
+    ft_qos_default_class = 0;
+    ft_qos_mark_mask = 0;                          assert(ft_qos_params_check() == 0);
+    ft_qos_mark_mask = 0xf0;                       assert(ft_qos_params_check() == 0);
+    ft_qos_mark_mask = CDX_FT_QOS_MASK;            assert(ft_qos_params_check() == 0);
+    ft_qos_mark_mask = CDX_FT_QOS_MASK << 1;       assert(ft_qos_params_check() == 0);
+    ft_qos_mark_mask = (CDX_FT_QOS_MASK << 1) | 1; assert(ft_qos_params_check() == -EINVAL);
+    ft_qos_mark_mask = 0xf0f0u;                    assert(ft_qos_params_check() == -EINVAL);
+    ft_qos_mark_mask = 0xffffffffu;                assert(ft_qos_params_check() == -EINVAL);
+    ft_qos_mark_mask = 0xffff0000u;                assert(ft_qos_params_check() == 0);
+    ft_route_mark_mask = 0x00010000u;              assert(ft_qos_params_check() == -EINVAL);
+    ft_route_mark_mask = 0;
+    ft_qos_default_class = (CDX_FT_QOS_MAX_CHANNEL + 1) << CDX_FT_QOS_CHANNEL_SHIFT;
+    assert(ft_qos_params_check() == -EINVAL);
+    ft_qos_default_class = CDX_FT_QOS_MAX_CHANNEL << CDX_FT_QOS_CHANNEL_SHIFT;
+    assert(ft_qos_params_check() == 0);
+    ft_qos_default_class = 0;
     /* Route-only bits inside the class's would decode as a class: refused at
      * load, and a disjoint pair loads. */
     ft_ready=ft_stopping=false; registration_step=canceled=0;
@@ -9657,9 +9743,9 @@ static void test_registration(void)
 {
     list_init(&block.cb_list);
     list_init(&table.flow_block.cb_list);
-    /* The claim, the proc directory and its seven files, then the egress
-     * hook and the six notifier chains: sixteen acquisitions. */
-    for (registration_failure = 0; registration_failure <= 16; registration_failure++) {
+    /* The claim, the proc directory and its nine files, then the egress
+     * hook and the six notifier chains: eighteen acquisitions. */
+    for (registration_failure = 0; registration_failure <= 18; registration_failure++) {
         /* A fresh adapter instance, backed by an independently owned CDX. */
         ft_ready=ft_stopping=false; registration_step=canceled=0;
         work_queued_invalidate = work_queued_retire = work_queued_rearm = false;

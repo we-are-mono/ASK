@@ -60,6 +60,17 @@
 static_assert(CDX_FT_QOS_MAX_POLICER == INGRESS_FLOW_POLICER_QUEUES - 1,
 	      "cdx_ft_rule.qos policer bound must track the ingress profile count");
 
+/* Every profile cdx creates as shared -- the exception path's, then the
+ * per-flow ones, then SEC's, relative ids 0..CDX_INGRESS_ALL_PROFILES -- has
+ * to be inside the shared pool the FMan wrapper configures the FMD with at
+ * PCD init, LNXWRP_FM_NUM_OF_SHARED_PROFILES (lnxwrp_fm.h, set to 144 by
+ * patch 010; the hardware has 256 profiles, shared and per-port together).
+ * Past it the FMD refuses the profile at module load
+ * (FmPcdPlcrGetAbsoluteIdByProfileParams()), which this says at build time
+ * instead. */
+static_assert(CDX_INGRESS_ALL_PROFILES < LNXWRP_FM_NUM_OF_SHARED_PROFILES,
+	      "cdx's shared policer profiles must fit the pool the FMan wrapper configures");
+
 //#define QOS_DEBUG	1
 
 /* A port's fast-forward profile, and its record: what the profile's owner --
@@ -125,7 +136,7 @@ struct port_ff_rate_lim_info port_rate_lim_mode[MAX_PHYS_PORTS];
 /* ---- keeping each profile to its record ---------------------------------
  *
  * After boot the only policer writes are the runtime ones: a port's
- * fast-forward profile (tc matchall), the seven per-flow profiles (tc flower),
+ * fast-forward profile (tc matchall), the sixty-three per-flow profiles (tc flower),
  * and the SEC and punt profiles (devlink). Each is one host command carrying
  * the whole profile, and it can fail: refused unsent while the host command
  * channel is shut after a timeout, or timed out itself, FMan having applied

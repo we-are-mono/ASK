@@ -186,16 +186,15 @@ struct cdx_ft_rule {
 	/* Adapter state: an IPv6 direction whose path MTU is its egress
 	 * device's IPv6 MTU, the route's own not being locked. */
 	bool mtu_follows_dev;
-	/* Class, already decoded from the conntrack mark: low nibble is the
-	 * CEETM class queue, second nibble the channel (zero means the port's
-	 * own least-priority channel), third nibble the ingress policer
-	 * profile, then a flag and six bits of DSCP to remark egress frames
-	 * with. Deliberately absent from ft_same_key(), because two marks
-	 * describe one flow rather than two; present in the whole-rule
-	 * comparison, so a reclassified flow is reinstalled rather than left on
-	 * its old queue.
+	/* Class, already decoded from the conntrack mark (CDX_FT_QOS_* below):
+	 * the CEETM class queue, the channel (zero means the port's own
+	 * least-priority channel), the ingress policer profile, then a flag
+	 * and six bits of DSCP to remark egress frames with. Deliberately
+	 * absent from ft_same_key(), because two marks describe one flow
+	 * rather than two; present in the whole-rule comparison, so a
+	 * reclassified flow is reinstalled rather than left on its old queue.
 	 *
-	 * Nineteen bits wide, so u32: a u16 would silently drop the codepoint.
+	 * Twenty-three bits wide, so u32: a u16 would silently drop the remark.
 	 */
 	u32 qos;
 	/* The offloaded SA this direction's frames are encrypted by, or zero.
@@ -245,24 +244,38 @@ struct cdx_ft_rule {
  * this header is where the rule's meaning is agreed, and the adapter must not
  * reach into CEETM headers to learn it.
  *
- * The channel nibble is valid over 0..CDX_FT_QOS_MAX_CHANNEL inclusive: zero
- * selects the egress port's least-priority channel rather than naming channel
- * zero, and 1..8 name a channel directly, which is the numbering
- * ceetm_get_egressfq() expects. CDX_FT_QOS_MAX_CHANNEL therefore equals
- * CDX_CEETM_MAX_CHANNELS, and a static assertion in cdx_ceetm_app.c — where
- * that count is owned — fails the build if the two ever drift.
+ * Five fields, from bit 0: four bits of class queue, six of channel, six of
+ * ingress policer profile, then the remark's flag and six bits of DSCP. Each
+ * is stated once, by its position and width, and its mask follows from them,
+ * as does anything that reports the layout -- so a field that grows grows
+ * everywhere at once. The first three are sixteen bits between them, which
+ * is what lets a class that does not remark share a 32-bit conntrack mark
+ * with mwan3's half of it, or pbr's.
  *
- * The policer nibble does NOT number that way, and the difference is worth
+ * The channel field is valid over 0..CDX_FT_QOS_MAX_CHANNEL inclusive: zero
+ * selects the egress port's least-priority channel rather than naming channel
+ * zero, and 1..32 name a channel directly, which is the numbering
+ * ceetm_get_egressfq() expects. CDX_FT_QOS_MAX_CHANNEL therefore equals
+ * CDX_CEETM_MAX_CHANNELS -- one CEETM instance's thirty-two -- and a static
+ * assertion in cdx_ceetm_app.c, where that count is owned, fails the build if
+ * the two ever drift. Six bits hold more than that; a mark naming 33..63 is
+ * refused, never truncated onto a channel nobody named. How many of the
+ * thirty-two a board has is its device tree's (ceetm_channel_count()), and a
+ * mark naming one past them resolves to no queue, as one naming a channel no
+ * tree on its port holds always has.
+ *
+ * The policer field does NOT number that way, and the difference is worth
  * stating because the symmetry is tempting. It is the RFC-2698 profile number
- * directly, 0..CDX_FT_QOS_MAX_POLICER.
+ * directly, 0..CDX_FT_QOS_MAX_POLICER: profile 0 the default, 1..63 the pool
+ * a tc flower filter on any port draws from. Six bits hold exactly that, so
+ * every value the field can carry is a profile.
  *
  * There is no sentinel because there is no absence to express. The hardware
  * encoder starts from profile 0 and only an iqid-carrying mark moves it
  * (`quenum` in create_entry_in_classif_table_hm), so profile 0 is what every
  * flow that says nothing has always metered against — it is the default
- * profile. A nibble reserved
- * to mean "no policer" would therefore select profile 0 anyway, and collide
- * with the nibble that names it.
+ * profile. A value reserved to mean "no policer" would therefore select
+ * profile 0 anyway, and collide with the value that names it.
  *
  * Naming a profile no control plane has configured is inert rather than a
  * silent drop: cdx_get_policer_profile_id() answers zero unless that profile
@@ -277,17 +290,30 @@ struct cdx_ft_rule {
  * which is also exactly how the hardware carries it: dscp_mark_flag beside
  * dscp_mark_value in union ctentry_qosmark.
  */
-#define CDX_FT_QOS_QUEUE_MASK	0x00000fu
-#define CDX_FT_QOS_CHANNEL_MASK	0x0000f0u
-#define CDX_FT_QOS_CHANNEL_SHIFT 4
-#define CDX_FT_QOS_MAX_CHANNEL	8
-#define CDX_FT_QOS_POLICER_MASK	0x000f00u
-#define CDX_FT_QOS_POLICER_SHIFT 8
-#define CDX_FT_QOS_MAX_POLICER	7	/* highest profile number, inclusive */
-#define CDX_FT_QOS_REMARK_MASK	0x001000u
-#define CDX_FT_QOS_REMARK_SHIFT	12
-#define CDX_FT_QOS_DSCP_MASK	0x07e000u
-#define CDX_FT_QOS_DSCP_SHIFT	13
+#define CDX_FT_QOS_QUEUE_SHIFT	0
+#define CDX_FT_QOS_QUEUE_BITS	4
+#define CDX_FT_QOS_CHANNEL_SHIFT (CDX_FT_QOS_QUEUE_SHIFT + CDX_FT_QOS_QUEUE_BITS)
+#define CDX_FT_QOS_CHANNEL_BITS	6
+#define CDX_FT_QOS_POLICER_SHIFT (CDX_FT_QOS_CHANNEL_SHIFT + CDX_FT_QOS_CHANNEL_BITS)
+#define CDX_FT_QOS_POLICER_BITS	6
+#define CDX_FT_QOS_REMARK_SHIFT	(CDX_FT_QOS_POLICER_SHIFT + CDX_FT_QOS_POLICER_BITS)
+#define CDX_FT_QOS_REMARK_BITS	1
+#define CDX_FT_QOS_DSCP_SHIFT	(CDX_FT_QOS_REMARK_SHIFT + CDX_FT_QOS_REMARK_BITS)
+#define CDX_FT_QOS_DSCP_BITS	6
+/* A field's bits in place, from its width and position. */
+#define CDX_FT_QOS_FIELD_MASK(bits, shift) (((1u << (bits)) - 1) << (shift))
+#define CDX_FT_QOS_QUEUE_MASK	CDX_FT_QOS_FIELD_MASK(CDX_FT_QOS_QUEUE_BITS, \
+						      CDX_FT_QOS_QUEUE_SHIFT)
+#define CDX_FT_QOS_CHANNEL_MASK	CDX_FT_QOS_FIELD_MASK(CDX_FT_QOS_CHANNEL_BITS, \
+						      CDX_FT_QOS_CHANNEL_SHIFT)
+#define CDX_FT_QOS_POLICER_MASK	CDX_FT_QOS_FIELD_MASK(CDX_FT_QOS_POLICER_BITS, \
+						      CDX_FT_QOS_POLICER_SHIFT)
+#define CDX_FT_QOS_REMARK_MASK	CDX_FT_QOS_FIELD_MASK(CDX_FT_QOS_REMARK_BITS, \
+						      CDX_FT_QOS_REMARK_SHIFT)
+#define CDX_FT_QOS_DSCP_MASK	CDX_FT_QOS_FIELD_MASK(CDX_FT_QOS_DSCP_BITS, \
+						      CDX_FT_QOS_DSCP_SHIFT)
+#define CDX_FT_QOS_MAX_CHANNEL	32	/* highest channel number, inclusive */
+#define CDX_FT_QOS_MAX_POLICER	63	/* highest profile number, inclusive */
 #define CDX_FT_QOS_MAX_DSCP	63	/* six bits, every codepoint */
 /* Every bit the encoding defines, so the adapter can reject a mark that names
  * anything outside it rather than truncating it into a different class. */
@@ -297,13 +323,12 @@ struct cdx_ft_rule {
 				 CDX_FT_QOS_REMARK_MASK | \
 				 CDX_FT_QOS_DSCP_MASK)
 /* The part that names an egress destination, which is all the Tx path may use
- * to index its class table. The policer nibble selects an ingress meter and the
- * remark changes a header rather than a queue; neither says anything about
- * where a frame leaves, so a flow that names one must not land on a different
- * queue for it — and must not reach past a table sized for the egress class
- * alone. Widening the class to nineteen bits made that masking load-bearing
- * rather than merely correct: unmasked, a remark of CS7 would index 508 entries
- * past a 256-entry table. */
+ * to index its class table: (channel << CDX_FT_QOS_CHANNEL_SHIFT) | class
+ * queue, ten bits. The policer field selects an ingress meter and the remark
+ * changes a header rather than a queue; neither says anything about where a
+ * frame leaves, so a flow that names one must not land on a different queue
+ * for it -- and must not reach past a table sized for the egress class alone,
+ * which every bit above the channel's would. */
 #define CDX_FT_QOS_EGRESS_MASK	(CDX_FT_QOS_QUEUE_MASK | \
 				 CDX_FT_QOS_CHANNEL_MASK)
 
@@ -378,8 +403,11 @@ struct cdx_ft_l2_rule {
 	u8 out_vlans;
 	struct cdx_ft_vlan in_vlan[CDX_FT_VLAN_MAX];
 	struct cdx_ft_vlan out_vlan[CDX_FT_VLAN_MAX];
-	/* The class the pair's frames are queued in, decoded as a flow's is. */
-	u16 qos;
+	/* The class the pair's frames are queued in, decoded and validated
+	 * whole as a flow's is (cdx_ft_rule.qos). The entry queues by its
+	 * channel and class queue alone: a bridged pair gets the default ingress
+	 * profile whatever the policer field names, and nothing remarks it. */
+	u32 qos;
 };
 
 /* The protocols with no ports a transit flow is carried for, keyed on its

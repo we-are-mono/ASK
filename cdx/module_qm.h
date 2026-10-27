@@ -23,7 +23,6 @@ struct ceetm_fq {
 
 #define NUM_PQS			8
 #define NUM_WBFQS		8
-#define NUM_CHANNEL_SHAPERS	8
 #define MAX_SCHEDULER_QUEUES	(NUM_PQS + NUM_WBFQS)
 #define GET_CEETM_PRIORITY(x)	((x) < NUM_PQS) ? ((x) ^ (NUM_PQS - 1)) : (x)
 

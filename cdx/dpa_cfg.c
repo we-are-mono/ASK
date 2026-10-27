@@ -1943,20 +1943,15 @@ EXPORT_SYMBOL(dpa_get_fm_MURAM_handle);
 int cdx_get_policer_profile_id(uint32_t fm_index, uint32_t queue_no)
 {
 	struct cdx_fman_info *finfo;
-	uint32_t ii;
 
-	if (queue_no >= INGRESS_ALL_POLICER_QUEUES)
+	/* Indexed as its siblings below index the FMans. The walk this replaced
+	 * never moved past the first, which only one FMan hid. */
+	if (fm_index >= num_fmans || queue_no >= INGRESS_ALL_POLICER_QUEUES)
 		return 0;
 
-	finfo =  fman_info;
-	for (ii = 0; ii < num_fmans; ii++) {
-		if (finfo->index == fm_index) {
-			if(finfo->ingress_policer_info[queue_no].policer_on == ENABLE_INGRESS_POLICER)
-				return finfo->ingress_policer_info[queue_no].profile_id;
-			else
-				break;
-		}
-	}
+	finfo = fman_info + fm_index;
+	if (finfo->ingress_policer_info[queue_no].policer_on == ENABLE_INGRESS_POLICER)
+		return finfo->ingress_policer_info[queue_no].profile_id;
 	return 0;
 }
 int cdx_ingress_enable_or_disable_qos(uint32_t fm_index,uint32_t queue_no,uint32_t oper)

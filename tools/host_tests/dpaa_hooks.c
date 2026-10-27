@@ -40,7 +40,9 @@ typedef uint64_t u64;
 #define pr_err(...)		((void)0)
 #define NETDEV_TX_OK		0
 #define DPAA_ETH_TX_QUEUES		16
-#define DPAA_ETH_CEETM_LEAF_QUEUES	16
+/* DPAA_ETH_CEETM_LEAF_QUEUES is the driver's own (dpaa_hooks_types.inc), so
+ * the statistics the driver zeroes and the hook fills are the count it
+ * reserves. */
 
 struct net_device { int ifindex; };
 struct sk_buff { u16 queue_mapping; };

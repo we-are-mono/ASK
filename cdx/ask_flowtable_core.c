@@ -2314,7 +2314,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		return ask_refuse(-EOPNOTSUPP);
 	/* Each direction is admitted as its own rule, so this is already a
 	 * per-direction class even though both directions read one mark. The
-	 * channel nibble is normally zero, which resolves to whichever channel
+	 * channel field is normally zero, which resolves to whichever channel
 	 * the egress port owns, so one class index means "this priority, on
 	 * whatever port this direction leaves by". A class the hardware cannot
 	 * express declines the flow to software rather than guessing a queue. */
@@ -2495,7 +2495,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	/* Last, because a tc police filter is matched against the finished
 	 * tuple. A filter is the more specific statement of the same intent as
 	 * the mark, so where one claims this flow its profile replaces the
-	 * mark's nibble; with none, the mark's stands.
+	 * mark's policer field; with none, the mark's stands.
 	 *
 	 * Resolved into the rule rather than further down, so that the rule is
 	 * what the hardware is given *and* what /proc reports. Doing it below

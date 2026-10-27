@@ -270,6 +270,9 @@ static unsigned warnings;
 #define __must_hold(x)
 static const char *netdev_name(const struct net_device *dev) { (void)dev; return "eth"; }
 
+/* The class layout a published class is encoded in, as the rule's header
+ * states it. */
+#include "dscp_layout.inc"
 #include "dscp_production.inc"
 
 static struct netlink_ext_ack ack;
@@ -530,6 +533,20 @@ int main(void)
     assert(hw.fq[10] == ((1 << 8) | 3));
     assert(hw.enabled == 1);                            /* enabled once */
     assert(cdx_dscp_class(&gQMCtx[3], 10) == ((1 << 4) | 3));
+
+    /* A class on the last channel there is, its last class queue: the class
+     * is the class layout's egress index, channel above queue, so it reaches
+     * past a byte and stays inside the egress mask. */
+    tree[3] = (typeof(tree[3])){ .classid = 0x00010030, .channel = 31, .cq = 15, .live = true };
+    r = dscp_rule(12, 0x00010030);                      /* AF12 */
+    assert(add(90, &r) == 0);
+    assert(hw.fq[12] == ((32 << 8) | 15));
+    assert(cdx_dscp_class(&gQMCtx[3], 12) ==
+           ((32 << CDX_FT_QOS_CHANNEL_SHIFT) | (15 << CDX_FT_QOS_QUEUE_SHIFT)));
+    assert(cdx_dscp_class(&gQMCtx[3], 12) == 0x20f &&
+           !(cdx_dscp_class(&gQMCtx[3], 12) & ~CDX_FT_QOS_EGRESS_MASK));
+    assert(del(90) == 0 && cdx_dscp_class(&gQMCtx[3], 12) == 0);
+    tree[3].live = false;
 
     /* ---- what the hardware applies as it is ----
      *

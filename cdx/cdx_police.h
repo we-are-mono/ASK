@@ -18,7 +18,7 @@ struct cdx_ft_rule;
 int cdx_police_setup_block(struct net_device *dev, struct flow_block_offload *f);
 
 /* The ingress policer profile an admitted flow should meter against, as a
- * cdx_ft_rule.qos policer nibble, or zero for the default profile. Called once
+ * cdx_ft_rule.qos policer field, or zero for the default profile. Called once
  * per admitted flow while its hardware entry is being built. */
 u8 cdx_police_lookup(const struct cdx_ft_rule *rule);
 
@@ -29,6 +29,14 @@ u8 cdx_police_lookup(const struct cdx_ft_rule *rule);
  * default) is ignored. */
 void cdx_police_profile_ref(u8 profile);
 void cdx_police_profile_unref(u8 profile);
+
+/* What the pool has given out, for the hardware QoS report
+ * (cdx_qos_budget()): the profiles spoken for, those held for a departed
+ * filter's flows among them; and those the flower filters on one port hold.
+ * Each takes the pool's spinlock, so either may be called holding a mutex --
+ * the report holds cdx_htb_mutex -- but not that lock. */
+unsigned int cdx_police_pool_used(void);
+unsigned int cdx_police_port_profiles(const struct net_device *dev);
 
 /* Which routed unicast directions arriving on a port the hardware polices by
  * the ingress filter tc knows as `cookie' there, exactly as the software

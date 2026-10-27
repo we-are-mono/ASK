@@ -14,10 +14,10 @@ PROC = Path("/proc/ask_flowtable")
 # file, the flows' last. A snapshot streams the flows into SQLite rather than
 # into memory.
 SUMMARY = ("status", "stats")
-STATE = (*SUMMARY, "devices", "mcast", "mroute", "l2", "flows")
+STATE = (*SUMMARY, "devices", "mcast", "mroute", "l2", "qos_ports", "qos_classes", "flows")
 ROW_NAMES = {"flow": "flows", "session": "sessions", "vlan": "vlans",
              "tunnel": "tunnels", "mcast": "mcast", "mroute": "mroute",
-             "l2flow": "l2flows"}
+             "l2flow": "l2flows", "port": "qos_ports", "class": "qos_classes"}
 # The module parameters the adapter runs with. procfs does not repeat them
 # (docs/flowtable/procfs.md, rule 4); a state carries them beside what the
 # files say, under these names, read here so a poll costs no extra round trip.

@@ -2,7 +2,8 @@
 
 from ask_orch.process import run_process
 
-from _host_flowtable_recovery import (AUTO, POLICY, STATS, STATUS, following, relist, statements)
+from _host_flowtable_recovery import (AUTO, POLICY, QOS_ROWS, QOS_STATUS, STATS, STATUS, following,
+                                      relist, statements)
 import json
 import os
 import subprocess
@@ -47,6 +48,141 @@ def test_every_backend_key_is_required(controller):
     (c.root / "qos_mark_mask").write_text("all\n")
     garbled = c.run("status", check=False)
     assert garbled.returncode != 0 and "qos_mark_mask" in garbled.stderr, garbled
+
+
+# What the adapter reports of the hardware QoS on a LAN port with three
+# channels and two policed hosts, beside mwan3's half of the mark.
+QOS_LEVELS = dict(
+    qos_channels=32, qos_channels_used=3, qos_channels_held=2, qos_channels_free=27,
+    qos_policers=63, qos_policers_used=2, qos_policers_free=61, qos_leaves_per_port=64,
+    qos_mark_shift=16, qos_mark_bits=16,
+    qos_class_queue_shift=0, qos_class_queue_bits=4, qos_class_channel_shift=4,
+    qos_class_channel_bits=6, qos_class_policer_shift=10, qos_class_policer_bits=6,
+    qos_class_remark_shift=16, qos_class_remark_bits=1, qos_class_dscp_shift=17,
+    qos_class_dscp_bits=6)
+QOS_PORTS = (
+    "port dev=eth3 tree=1 channels=0,1,2 spare=0 held=- leaves=30 leaves_free=34 policers=2\n"
+    'port dev=wan"0 tree=0 channels=- spare=0 held=5,6 leaves=0 leaves_free=64 policers=0\n')
+QOS_CLASSES = (
+    "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- qos=- mark=-\n"
+    "class dev=eth3 classid=1:a parent=1:1 kind=leaf channel=0 queue=5 slot=0 qos=000015 mark=0x150000\n"
+    "class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 qos=000057 mark=0x570000\n"
+    "class dev=eth3 classid=1:24 parent=1: kind=leaf channel=20 queue=2 slot=1 qos=000152 mark=-\n"
+    # A port made after the ports were read: not reported until it is listed.
+    "class dev=eth9 classid=2:1 parent=2: kind=leaf channel=9 queue=0 slot=0 qos=0000a0 mark=0xa00000\n")
+
+
+def qos_world(c):
+    c.backend(qos_mark_mask=0xffff0000, **QOS_LEVELS)
+    (c.root / "qos_ports").write_text(QOS_PORTS)
+    (c.root / "qos_classes").write_text(QOS_CLASSES)
+
+
+def test_status_reports_the_hardware_qos(controller):
+    """`status` carries what the hardware QoS has to give and what holds it:
+    the class's place in ct->mark and the class layout, the SoC's channels,
+    the policer pool, and each port's tree with every class and the mark that
+    selects it -- a port's name escaped as any JSON string."""
+    c = controller
+    qos_world(c)
+    status = c.status()
+    qos = status["qos"]
+    assert list(status)[-1] == "qos"
+    assert list(qos) == ["mark_mask", "mark_shift", "mark_bits", "class", "channels",
+                         "policers", "ports"], list(qos)
+    leaves = lambda used: {"total": 64, "used": used, "free": 64 - used}  # noqa: E731
+    assert qos == {
+        "mark_mask": 0xffff0000, "mark_shift": 16, "mark_bits": 16,
+        "class": {"queue": {"shift": 0, "bits": 4}, "channel": {"shift": 4, "bits": 6},
+                  "policer": {"shift": 10, "bits": 6}, "remark": {"shift": 16, "bits": 1},
+                  "dscp": {"shift": 17, "bits": 6}},
+        "channels": {"total": 32, "used": 3, "held": 2, "free": 27},
+        "policers": {"total": 63, "used": 2, "free": 61},
+        "ports": {
+            "eth3": {"tree": True, "channels": [0, 1, 2], "spare": 0, "held": [],
+                     "leaves": leaves(30), "policers": {"total": 63, "used": 2, "free": 61},
+                     "classes": [
+                         {"classid": "1:1", "parent": "1:", "kind": "inner", "channel": 0,
+                          "queue": None, "slot": None, "qos": None, "mark": None},
+                         {"classid": "1:a", "parent": "1:1", "kind": "leaf", "channel": 0,
+                          "queue": 5, "slot": 0, "qos": 0x15, "mark": 0x150000},
+                         {"classid": "1:23", "parent": "1:", "kind": "leaf", "channel": 4,
+                          "queue": 7, "slot": 3, "qos": 0x57, "mark": 0x570000},
+                         {"classid": "1:24", "parent": "1:", "kind": "leaf", "channel": 20,
+                          "queue": 2, "slot": 1, "qos": 0x152, "mark": None}]},
+            'wan"0': {"tree": False, "channels": [], "spare": 0, "held": [5, 6],
+                      "leaves": leaves(0), "policers": {"total": 63, "used": 0, "free": 61},
+                      "classes": []}}}
+    # At the most a board can have: every channel listed on eight ports, each
+    # with a full tree.
+    names = [f"eth{i}" for i in range(8)]
+    every = ",".join(map(str, range(32)))
+    (c.root / "qos_ports").write_text("".join(
+        f"port dev={n} tree=1 channels={every} spare=0 held={every} leaves=64 leaves_free=0 "
+        "policers=63\n" for n in names))
+    (c.root / "qos_classes").write_text("".join(
+        f"class dev={n} classid=ffff:{m:x} parent=ffff:{m + 1:x} kind=leaf channel=31 queue=15 "
+        f"slot={m} qos=00020f mark=0x20f0000\n" for n in names for m in range(64))
+        + "".join(f"class dev={n} classid=ffff:{0x100 + m:x} parent=ffff: kind=inner channel={m} "
+                  "queue=- slot=- qos=- mark=-\n" for n in names for m in range(32)))
+    big = c.status()["qos"]["ports"]
+    assert list(big) == names
+    assert all(len(p["classes"]) == 96 and p["held"] == list(range(32)) for p in big.values())
+
+
+def test_status_needs_every_qos_field(controller):
+    """Every QoS key and field `status` prints is the adapter's: one missing or
+    garbled fails the read rather than reading as zero or none. The health
+    probe and the drain never read any of it, so neither notices."""
+    c = controller
+    qos_world(c)
+    path = c.root / "backend"
+    full = path.read_text()
+    for key in QOS_STATUS:
+        path.write_text("".join(line for line in full.splitlines(True)
+                                if not line.startswith(key + ":")))
+        short = c.run("status", check=False)
+        assert short.returncode != 0 and "incomplete backend" in short.stderr, (key, short)
+        assert c.run("health", check=False).returncode == 0
+    path.write_text(full)
+    for name, text in (("qos_ports", QOS_PORTS), ("qos_classes", QOS_CLASSES)):
+        row = text.splitlines()[0]
+        tag, *fields = row.split()
+        bad = [" ".join([tag] + fields[:i] + fields[i + 1:]) for i in range(len(fields))]
+        bad += [row.replace("dev=eth3", "dev="), row + " " + "x" * 600,
+                " ".join([tag, fields[0], "", *fields[1:]])]
+        if tag == "port":
+            bad += [row.replace("spare=0", "spare=x"), row.replace("spare=0", "spare=-1"),
+                    row.replace("channels=0,1,2", "channels=0,,2"),
+                    row.replace("channels=0,1,2", "channels=0,32"),
+                    row.replace("tree=1", "tree=2")]
+        else:
+            bad += [row.replace("channel=0", "channel=x"), row.replace("kind=inner", "kind=root"),
+                    row.replace("classid=1:1", "classid=1"), row.replace("queue=-", "queue=3")]
+        assert row not in bad
+        for line in bad:
+            (c.root / name).write_text(line + "\n")
+            broken = c.run("status", check=False)
+            assert broken.returncode != 0 and "QoS" in broken.stderr, (line, broken)
+            assert c.run("health", check=False).returncode == 0
+        (c.root / name).write_text(text)
+    assert c.status()["qos"]["ports"]["eth3"]["tree"]
+
+
+def test_status_without_the_adapter_has_no_qos(controller):
+    """No adapter, no QoS to report: `"qos": null`, as `devices` is null with
+    no table to read it from. That includes an adapter unloading between the
+    reads, whichever file it took with it first."""
+    c = controller
+    qos_world(c)
+    for name in ("backend", *QOS_ROWS):
+        saved = (c.root / name).read_text()
+        (c.root / name).unlink()
+        status = c.status()
+        assert status["qos"] is None, (name, status)
+        assert status["backend"]["present"] == (name != "backend"), name
+        (c.root / name).write_text(saved)
+    assert c.status()["qos"]["mark_bits"] == 16
 
 
 def test_quiet_network_retries_failed_apply(controller):

@@ -24,9 +24,10 @@ typedef uint16_t U16;
 #define CEETM_FAILURE			-1
 #define QOS_ENERR_NOT_CONFIGURED	1
 #define QOS_ENERR_IO			2
-#define CDX_CEETM_MAX_CHANNELS		8
-#define NUM_CHANNEL_SHAPERS		8
+/* The channel ceiling, as the production header states it. */
+#include "qos_enable_constants.inc"
 #define MAX_SCHEDULER_QUEUES		16
+#define BIT(n)				(1UL << (n))
 #define CEETM_TOKEN_WHOLE_MAXVAL	0x7ff
 #define CEETM_TOKEN_FRAC_MAXVAL		0x1fff
 #define CEETM_DEFA_BSIZE		0x2000
@@ -68,6 +69,9 @@ struct ceetm_chnl_info {
 };
 
 static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];
+/* How many of them the device tree gave, as ceetm_init_channels() read it. */
+static uint32_t channel_count = CDX_CEETM_MAX_CHANNELS;
+uint32_t ceetm_channel_count(void) { return channel_count; }
 
 /* What the hardware was last told, so the test can read it back. */
 static struct qm_ceetm_rate lni_cr, lni_er, chnl_cr[CDX_CEETM_MAX_CHANNELS],
@@ -173,6 +177,38 @@ int main(void)
 		assert(ceetm_enable_or_disable_qos(&ctx, 0) == CEETM_SUCCESS);
 		assert(!lni.shaper_enable);
 	}
+
+	/* A port's channel can be any the SoC has, the last of the thirty-two
+	 * included: both directions program its shaper, as they do channel
+	 * zero's. The walk was once bounded by the eight channel shapers NXP's
+	 * tree had, so a channel past them kept the shaper the last tree left
+	 * on it. */
+	assert(CDX_CEETM_MAX_CHANNELS == 32);
+	struct qm_ceetm_channel last = { .idx = CDX_CEETM_MAX_CHANNELS - 1 },
+				middle = { .idx = 20 };
+	qm_chnl_info[CDX_CEETM_MAX_CHANNELS - 1].channel = &last;
+	qm_chnl_info[CDX_CEETM_MAX_CHANNELS - 1].idx = CDX_CEETM_MAX_CHANNELS - 1;
+	qm_chnl_info[CDX_CEETM_MAX_CHANNELS - 1].shaper_info = qm_chnl_info[0].shaper_info;
+	qm_chnl_info[20].channel = &middle;
+	qm_chnl_info[20].idx = 20;
+	qm_chnl_info[20].shaper_info = qm_chnl_info[0].shaper_info;
+	ctx.chnl_map = 1u << 20 | 1u << (CDX_CEETM_MAX_CHANNELS - 1);
+	assert(ceetm_enable_or_disable_qos(&ctx, 1) == CEETM_SUCCESS);
+	assert(chnl_cr[20].whole == rate.whole && chnl_er[20].whole == 50);
+	assert(chnl_cr[CDX_CEETM_MAX_CHANNELS - 1].whole == rate.whole &&
+	       chnl_er[CDX_CEETM_MAX_CHANNELS - 1].whole == 50);
+	assert(ceetm_enable_or_disable_qos(&ctx, 0) == CEETM_SUCCESS);
+	assert(is_max(chnl_cr[20]) && is_max(chnl_er[20]));
+	assert(is_max(chnl_cr[CDX_CEETM_MAX_CHANNELS - 1]) &&
+	       is_max(chnl_er[CDX_CEETM_MAX_CHANNELS - 1]));
+	/* Only the channels the device tree gave: one past them is not walked
+	 * at all, whatever the map says. */
+	channel_count = 20;
+	chnl_cr[20] = (struct qm_ceetm_rate){ 0 };
+	assert(ceetm_enable_or_disable_qos(&ctx, 1) == CEETM_SUCCESS);
+	assert(!chnl_cr[20].whole && !chnl_cr[20].fraction);
+	assert(ceetm_enable_or_disable_qos(&ctx, 0) == CEETM_SUCCESS);
+	channel_count = CDX_CEETM_MAX_CHANNELS;
 
 	printf("CEETM enable/disable: %u on-off cycles, shaper symmetric, excess rate preserved\n",
 	       cycle);

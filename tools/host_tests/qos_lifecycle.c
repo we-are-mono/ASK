@@ -31,6 +31,8 @@ static int atomic_read(atomic_t *p) { return p->value; }
 #define ceetm_dbg(...) ((void)0)
 #define pr_warn_ratelimited(...) ((void)0)
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define BIT(n) (1UL << (n))
+#define READ_ONCE(x) (x)
 #define cpu_to_be16(x) (x)
 #define CEETM_COMMAND_CHANNEL_MAPPING 0x1000
 #define QM_CCGR_WE_TD_EN 1
@@ -253,10 +255,11 @@ static int qman_ceetm_tokenrate2bps(struct qm_ceetm_rate *rate, uint64_t *bps, i
 static unsigned fls(unsigned bits) { return bits ? 32 - __builtin_clz(bits) : 0; }
 static int ceetm_get_dscp_fq(void) { return 0; }
 static void egress_ern_handler(void) {}
+static uint32_t ceetm_channel_count(void);
 static int dpa_register_ceetm_get_egress_fq(void *a, void *b)
 {
     if (hw_step()) return -EIO;
-    assert(channels == CDX_CEETM_MAX_CHANNELS && fqs == channels * MAX_SCHEDULER_QUEUES);
+    assert(channels == ceetm_channel_count() && fqs == channels * MAX_SCHEDULER_QUEUES);
     assert(!callbacks); callbacks = true; return 0;
 }
 static void dpa_unregister_ceetm_get_egress_fq(void) { assert(callbacks); callbacks = false; }
@@ -289,7 +292,7 @@ static int qman_ceetm_configure_mapping_shaper_tcfc(struct qm_mcc_ceetm_mapping_
 static void dpa_disable_ceetm(struct net_device *dev) { dev->priv.ceetm_en = false; }
 /* Bookkeeping only, and covered by htb_offload.c; here it just has to be
  * called before the context it names is released. */
-static unsigned htb_ports_dropped, dscp_ports_dropped;
+static unsigned htb_ports_dropped, dscp_ports_dropped, htb_ports_added;
 static void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
 {
     assert(qm_ctx);
@@ -297,6 +300,18 @@ static void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
      * have happened by the time the tree itself is dropped. */
     assert(dscp_ports_dropped > htb_ports_dropped);
     htb_ports_dropped++;
+}
+/* A port becomes one of the qdisc layer's only once its context is whole --
+ * its LNI made and the netdev pointing at it -- so its report never reads a
+ * netdev a context being made, or failing to be, names. */
+static void cdx_htb_port_added(struct tQM_context_ctl *qm_ctx)
+{
+    struct dpa_priv_s *priv;
+
+    assert(qm_ctx && qm_ctx->net_dev && qm_ctx->iface_info && lni.claimed);
+    priv = netdev_priv(qm_ctx->net_dev);
+    assert(priv->qm_ctx == qm_ctx);
+    htb_ports_added++;
 }
 static void cdx_dscp_port_gone(struct tQM_context_ctl *qm_ctx)
 {
@@ -382,6 +397,65 @@ static int qman_ceetm_channel_set_group(struct qm_ceetm_channel *channel, int gr
     return 0;
 }
 #define qman_ceetm_ccg_set(...) hw_step()
+
+/* The device tree, as far as the CEETM nodes go: each with the two ranges
+ * fsl_ceetm_init() reads, by cell, and a count of the references the OF
+ * iterator takes so a walk that leaves one behind is caught. */
+enum qm_dc_portal { qm_dc_portal_fman0 = 0, qm_dc_portal_fman1 = 1 };
+struct device_node {
+    const char *compatible;
+    const uint32_t *lfqid, *channel;
+    unsigned lfqid_cells, channel_cells;
+    int refs;
+};
+static struct device_node *dt[4];
+static unsigned dt_nodes, warnings;
+#define pr_warn(...) ((void)warnings++)
+static struct device_node *of_find_compatible_node(struct device_node *from,
+                                                   const char *type, const char *compatible)
+{
+    unsigned i = 0;
+
+    assert(!type);
+    if (from) {
+        while (i < dt_nodes && dt[i] != from) i++;
+        assert(i < dt_nodes && from->refs > 0);
+        from->refs--; i++;
+    }
+    for (; i < dt_nodes; i++)
+        if (!strcmp(dt[i]->compatible, compatible)) { dt[i]->refs++; return dt[i]; }
+    return NULL;
+}
+#define for_each_compatible_node(dn, type, compatible) \
+    for (dn = of_find_compatible_node(NULL, type, compatible); dn; \
+         dn = of_find_compatible_node(dn, type, compatible))
+static void of_node_put(struct device_node *np) { if (np) { assert(np->refs > 0); np->refs--; } }
+/* As the kernel's: the number of cells read, or an error for a property that
+ * is missing or holds fewer than sz_min or more than sz_max of them. */
+static int of_property_read_variable_u32_array(const struct device_node *np, const char *name,
+                                               u32 *out, size_t sz_min, size_t sz_max)
+{
+    const uint32_t *v = NULL;
+    unsigned n = 0;
+
+    if (!strcmp(name, "fsl,ceetm-lfqid-range")) { v = np->lfqid; n = np->lfqid_cells; }
+    else if (!strcmp(name, "fsl,ceetm-channel-range")) { v = np->channel; n = np->channel_cells; }
+    if (!v) return -EINVAL;
+    if (n < sz_min || (sz_max && n > sz_max)) return -EOVERFLOW;
+    memcpy(out, v, n * sizeof(*out));
+    return n;
+}
+/* fman0's node with this many channels, the board's own shape otherwise. */
+static const uint32_t lfqid_fman0[] = { 0xf00000, 0x1000 }, lfqid_fman1[] = { 0xf10000, 0x1000 };
+static uint32_t channel_range[] = { 0, 32 };
+static struct device_node ceetm0 = { "fsl,qman-ceetm", lfqid_fman0, channel_range, 2, 2 };
+static void dt_channels(uint32_t count)
+{
+    channel_range[1] = count;
+    ceetm0.lfqid = lfqid_fman0; ceetm0.channel = channel_range;
+    ceetm0.lfqid_cells = ceetm0.channel_cells = 2;
+    dt[0] = &ceetm0; dt_nodes = 1;
+}
 #define EVENT_QM 1
 static void M_qm_cmdproc(void) {}
 static void set_cmd_handler(unsigned event, void *handler)
@@ -421,13 +495,80 @@ static unsigned cycle(unsigned failure)
     shutdown_qos(); shutdown_qos(); empty();
     return total;
 }
+/* How many channels the device tree gives fman0's CEETM instance, read the
+ * way fsl_ceetm_init() reads it, and the walk leaving no node referenced. */
+static uint32_t dt_count(void)
+{
+    uint32_t n = ceetm_dt_channel_count();
+
+    for (unsigned i = 0; i < dt_nodes; i++)
+        assert(!dt[i]->refs);
+    return n;
+}
+
+static void device_tree(void)
+{
+    static const uint32_t few[] = { 0, 8 }, many[] = { 0, 48 }, offset[] = { 8, 24 },
+                          three[] = { 0, 32, 1 }, one[] = { 0 };
+    struct device_node ceetm1 = { "fsl,qman-ceetm", lfqid_fman1, few, 2, 2 };
+    struct device_node other = { "fsl,qman-portal", lfqid_fman0, few, 2, 2 };
+
+    /* The board's: every channel of the instance. */
+    dt_channels(32);
+    assert(dt_count() == 32 && !warnings);
+    /* Fewer, from wherever the range starts: the count cell is the count. */
+    ceetm0.channel = few;
+    assert(dt_count() == 8);
+    ceetm0.channel = offset;
+    assert(dt_count() == 24);
+    /* More than the tables hold: as many as they do, and said so. */
+    ceetm0.channel = many;
+    assert(dt_count() == CDX_CEETM_MAX_CHANNELS && warnings == 1);
+    warnings = 0;
+    /* No range, or not a two-cell one, as fsl_ceetm_init() refuses it: no
+     * channels, so none could be allocated. */
+    ceetm0.channel = NULL;
+    assert(dt_count() == 0);
+    ceetm0.channel = three; ceetm0.channel_cells = 3;
+    assert(dt_count() == 0);
+    ceetm0.channel = one; ceetm0.channel_cells = 1;
+    assert(dt_count() == 0);
+    /* Nor without an LFQID range to say which instance the node is. */
+    dt_channels(32);
+    ceetm0.lfqid = NULL;
+    assert(dt_count() == 0);
+    /* No node at all. */
+    dt_nodes = 0;
+    assert(dt_count() == 0);
+    /* fman1's instance is another FMan's channels: passed over, before
+     * fman0's or alone, and a node of another kind is no CEETM. */
+    dt_channels(32);
+    dt[0] = &ceetm1; dt[1] = &ceetm0; dt_nodes = 2;
+    assert(dt_count() == 32);
+    dt_nodes = 1;
+    assert(dt_count() == 0);
+    dt[0] = &other;
+    assert(dt_count() == 0);
+    assert(!warnings);
+}
+
 int main(void)
 {
     pending_enqueues = 1001;
     assert(ceetm_sync_portals() == -ETIMEDOUT);
     pending_enqueues = 0;
     assert(ceetm_sync_portals() == 0);
+    device_tree();
+    /* No channels: nothing is built and the load fails, as it did when the
+     * first channel could not be allocated. */
+    dt_nodes = 0;
+    step = 0; fail_at = 0; next_channel = 32;
+    assert(start() < 0 && !ceetm_channel_count() && !step);
+    /* Eight, where the fault points are walked: every channel is built the
+     * same way, and thirty-two would walk the same points four times over. */
+    dt_channels(8);
     unsigned count = cycle(0);
+    assert(ceetm_channel_count() == 8);
     for (unsigned i = 1; i <= count; i++) { cycle(i); cycle(0); }
     fail_at = 0;
     assert(start() == 0);
@@ -435,26 +576,34 @@ int main(void)
      * 0: where unclassified traffic goes, and eligible for committed tokens,
      * so below it a backlogged unclassified flow would pre-empt every
      * weighted leaf on the channel. */
-    assert(group_a_placed >= CDX_CEETM_MAX_CHANNELS && !group_a_misplaced);
+    assert(group_a_placed >= ceetm_channel_count() && !group_a_misplaced);
     /* Every class queue starts at the module-load default. Only one a
      * class gave back is parked lower (CEETM_PARKED_CQ_DEPTH): nothing names
      * a queue no class has used. */
-    for (unsigned ch = 0; ch < CDX_CEETM_MAX_CHANNELS; ch++)
+    for (unsigned ch = 0; ch < ceetm_channel_count(); ch++)
         for (unsigned cq = 0; cq < MAX_SCHEDULER_QUEUES; cq++)
             assert(qm_chnl_info[ch].cq_info[cq].qdepth == DEFAULT_CQ_DEPTH);
+    /* And none past them: the rest of the table is the ceiling's, not the
+     * hardware's. */
+    for (unsigned ch = ceetm_channel_count(); ch < CDX_CEETM_MAX_CHANNELS; ch++)
+        assert(!qm_chnl_info[ch].channel && !qm_chnl_info[ch].cq_info[0].cq);
     assert(CEETM_PARKED_CQ_DEPTH == 1 && DEFAULT_CQ_DEPTH == 8);
     struct net_device dev = {0};
     struct dpa_iface_info iface = {.name = "eth0", .eth_info = {&dev, 1}};
     port.portid = MAX_PHY_PORTS - 1;
+    unsigned added = htb_ports_added;
     for (unsigned failure = 1; failure <= 2; failure++) {
         fail_at = step + failure;
         assert(cdx_enable_ceetm_on_iface(&iface) < 0);
         assert(!lni.claimed && !sp.claimed && !dev.priv.qm_ctx);
         assert(!gQMCtx[port.portid].iface_info && !gQMCtx[port.portid].net_dev);
+        assert(htb_ports_added == added);
     }
     fail_at = 0;
     assert(cdx_enable_ceetm_on_iface(&iface) == 0);
+    assert(htb_ports_added == added + 1);
     assert(cdx_enable_ceetm_on_iface(&iface) < 0);
+    assert(htb_ports_added == added + 1);
     QM_context_ctl *ctx = &gQMCtx[port.portid];
     assert(!ceetm_get_egressfq(ctx, 0, 0));
     assert(!ceetm_get_egressfq(NULL, 1, 0));
@@ -484,6 +633,13 @@ int main(void)
     assert(ceetm_class_queue_backlog(0, 3, &held) == -EIO);
     assert(ceetm_class_queue_backlog(CDX_CEETM_MAX_CHANNELS, 0, &held) == -EINVAL);
     assert(ceetm_class_queue_backlog(0, MAX_SCHEDULER_QUEUES, &held) == -EINVAL);
+    /* A channel the device tree did not give is none, though the table has a
+     * row for it: refused by its number, and never mapped, which with no
+     * channel built into the row would be a NULL dereference. */
+    assert(ceetm_channel_count() < CDX_CEETM_MAX_CHANNELS);
+    assert(ceetm_class_queue_backlog(ceetm_channel_count(), 0, &held) == -EINVAL);
+    assert(ceetm_assign_chnl(ctx, ceetm_channel_count()) < 0 && ctx->chnl_map == 1);
+    assert(!ceetm_class_fq(ctx, ceetm_channel_count(), 0));
     hold_frames = false; pending_frames = 0;
     /* A DSCP map claimed and published: the context release gives both
      * back, whichever stage it had reached. */
@@ -691,8 +847,13 @@ int main(void)
      * port's entries are gone, so the operator is told to try again rather
      * than that the SoC has none (-ENOSPC), which is what a claim finding
      * none held says -- and what one finding only a held channel whose
-     * drain failed says too, as that one is out of service for good. */
-    assert(start() == 0);
+     * drain failed says too, as that one is out of service for good.
+     *
+     * Over every channel the board's device tree gives, all thirty-two: the
+     * last is bit 31 of a port's map. */
+    dt_channels(32);
+    assert(start() == 0 && ceetm_channel_count() == CDX_CEETM_MAX_CHANNELS);
+    assert(channels == CDX_CEETM_MAX_CHANNELS);
     assert(cdx_enable_ceetm_on_iface(&iface) == 0);
     static struct qm_ceetm_lni lni_c;
     INIT_LIST_HEAD(&lni_c.channels);
@@ -700,8 +861,9 @@ int main(void)
     struct dpa_iface_info iface_c = {.name = "eth2"};
     QM_context_ctl third = {.iface_info = &iface_c, .net_dev = &dev_c, .lni = &lni_c};
     uint32_t claimed;
-    for (unsigned ch = 1; ch < CDX_CEETM_MAX_CHANNELS; ch++)
+    for (unsigned ch = 1; ch < ceetm_channel_count(); ch++)
         assert(ceetm_assign_chnl(&third, ch) == 0);
+    assert(third.chnl_map == 0xfffffffeu && dev_c.refs == 31 * MAX_SCHEDULER_QUEUES);
     assert(ceetm_claim_channel(ctx, &claimed) == 0 && claimed == 0);
     assert(ceetm_quiesce_port(ctx, &detached, true) == 0 && detached == 1);
     ceetm_put_channel_devices(detached);
@@ -710,12 +872,32 @@ int main(void)
     assert(claimed == CDX_CEETM_MAX_CHANNELS && !other.chnl_map);
     assert(!qm_chnl_info[0].qm_ctx);
     assert(qm_chnl_info[0].quarantine == ctx && !dev_b.refs);
+    /* Who each channel is with, as a refusal and the report read it: the
+     * quarantined one held for its port and mapped to none, the rest
+     * mapped, and nothing past the channels the tree gave. */
+    {
+        QM_context_ctl *mapped, *quarantine;
+        bool failed;
+
+        assert(ceetm_channel_holder(0, &mapped, &quarantine, &failed) == 0);
+        assert(!mapped && quarantine == ctx && !failed);
+        assert(ceetm_channel_holder(31, &mapped, &quarantine, &failed) == 0);
+        assert(mapped == &third && !quarantine && !failed);
+        assert(ceetm_channel_holder(32, &mapped, &quarantine, &failed) == -EINVAL);
+    }
     assert(ceetm_claim_channel(ctx, &claimed) == 0 && claimed == 0);
     assert(ceetm_claim_channel(&other, &claimed) == -ENOSPC && !other.chnl_map);
     assert(ceetm_quiesce_port(ctx, &detached, true) == 0 && detached == 1);
     ceetm_put_channel_devices(detached);
     qm_chnl_info[0].cq_info[0].drain_failed = true;
     assert(ceetm_claim_channel(&other, &claimed) == -ENOSPC && !other.chnl_map);
+    {
+        QM_context_ctl *mapped, *quarantine;
+        bool failed;
+
+        assert(ceetm_channel_holder(0, &mapped, &quarantine, &failed) == 0);
+        assert(!mapped && quarantine == ctx && failed);
+    }
     qm_chnl_info[0].cq_info[0].drain_failed = false;
     assert(ceetm_end_quarantine(ctx) == 0);
     assert(ceetm_claim_channel(&other, &claimed) == 0 && claimed == 0);

@@ -17,8 +17,8 @@ from _host_policer import ROOT, after_includes, policer_layer
 # failure of the hardware, run in a process of its own so that one assertion
 # failing does not hide the next case.
 CASES = ["verbs", "matchall_deferred", "matchall_destroy_deferred",
-         "matchall_refused_destroy", "flower_destroy_deferred", "counters_unread",
-         "channel_shut", "locking"]
+         "matchall_refused_destroy", "flower_destroy_deferred", "pool",
+         "counters_unread", "channel_shut", "locking"]
 
 
 @pytest.fixture(scope="module")

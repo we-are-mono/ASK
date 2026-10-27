@@ -20,11 +20,18 @@
 #define DPA_ERROR(...) do {} while (0)
 struct _itf { unsigned index, type; };
 struct route { struct _itf *input_itf, *underlying_input_itf, *itf; };
+/* As production builds it: cdx_ioctl.h defines ENABLE_INGRESS_QOS for every
+ * build, so the selector always reads the mark's ingress profile. The mark's
+ * layout and the pool it is bounded by are production's own. */
+#define ENABLE_INGRESS_QOS
+typedef uint32_t U32;
+#include "mcast_qos.inc"
 struct ct {
     struct route *pRtEntry;
     unsigned family, proto, status, Sport, Dport;
     uint32_t Saddr_v4, Daddr_v4, twin_Daddr, twin_Saddr;
     uint32_t Saddr_v6[4], Daddr_v6[4];
+    union ctentry_qosmark qosmark;
 };
 typedef struct ct *PCtEntry;
 #define CT_TWIN(e) (e)
@@ -49,7 +56,10 @@ enum { CHECK = 1, RX_STATS, STRIP_ETH, VLAN_CHECK, PPPOE_REMOVE, TUNNEL_REMOVE,
 static unsigned trace[32], count, fail_at;
 static int emit(unsigned op) { trace[count++] = op; return count == fail_at; }
 #define dpa_get_ifinfo_by_itfid(index) ((void)(index), (struct dpa_iface_info *)0)
-#define create_preemptive_checks_hm(i) emit(CHECK)
+/* The ingress profile the checks are told to meter by, as an index into the
+ * per-flow profiles. */
+static unsigned checked_queue;
+#define create_preemptive_checks_hm(i, q) (checked_queue = (q), emit(CHECK))
 #define create_eth_rx_stats_hm(i,a,b) ((void)(a), (void)(b), emit(RX_STATS))
 #define create_strip_eth_hm(i) emit(STRIP_ETH)
 #define insert_remove_vlan_hm(i,a,b) ((void)(a), (void)(b), emit(VLAN_CHECK))
@@ -93,5 +103,33 @@ int main(void)
         assert(fill_actions(&entry, &info, true) == SUCCESS);
         unsigned expected[] = { CHECK, RX_STATS, VLAN_CHECK, v6 ? HOPLIMIT : TTL, ETHERNET, ENQUEUE };
         assert(count == 6 && !memcmp(trace, expected, sizeof(expected)));
+    }
+
+    /* The ingress profile a mark names reaches the checks whole, every one
+     * the pool has: the eighth and the last too, which a mask of the old
+     * eight-profile pool folded onto others' meters. A mark that names none
+     * meters by the default. */
+    struct ct entry = { .family = AF_INET, .pRtEntry = &route };
+    for (unsigned queue = 0; queue < INGRESS_FLOW_POLICER_QUEUES; queue++) {
+        struct ins_entry_info info = {0};
+        entry.qosmark.markval = 0;
+        entry.qosmark.iqid = queue;
+        entry.qosmark.iqid_valid = 1;
+        assert(entry.qosmark.iqid == queue);
+        count = fail_at = 0; checked_queue = ~0u;
+        assert(fill_actions(&entry, &info, true) == SUCCESS && checked_queue == queue);
+        entry.qosmark.iqid_valid = 0;
+        count = 0; checked_queue = ~0u;
+        assert(fill_actions(&entry, &info, true) == SUCCESS && checked_queue == 0);
+    }
+    const unsigned named[] = { 7, 8, 63 };
+    for (unsigned i = 0; i < sizeof(named) / sizeof(named[0]); i++) {
+        struct ins_entry_info info = {0};
+        unsigned queue = named[i];
+        entry.qosmark.markval = 0;
+        entry.qosmark.iqid = queue;
+        entry.qosmark.iqid_valid = 1;
+        count = fail_at = 0; checked_queue = ~0u;
+        assert(fill_actions(&entry, &info, true) == SUCCESS && checked_queue == queue);
     }
 }

@@ -22,16 +22,35 @@ typedef uint64_t u64;
 typedef int64_t s64;
 
 #define MAX_PHY_PORTS			40
-#define CDX_CEETM_MAX_CHANNELS		8
 #define NUM_PQS				8
 #define NUM_WBFQS			8
 #define MAX_SCHEDULER_QUEUES		(NUM_PQS + NUM_WBFQS)
-#define DPAA_ETH_TX_QUEUES		16
-#define DPAA_ETH_CEETM_LEAF_QUEUES	16
 #define GFP_KERNEL			0
+/* The ceilings as production states them: the channels one CEETM instance
+ * has, from cdx_ceetm_app.h, and the direct and leaf-class Tx queues patch 150
+ * gives the netdev (htb_limits.inc). A copy kept here would let the file
+ * that sizes a table and the test that fills it disagree. */
+#include "htb_limits.inc"
 
 #define BIT(n)			(1U << (n))
 #define ARRAY_SIZE(a)		(sizeof(a) / sizeof((a)[0]))
+#define hweight16(w)		__builtin_popcount((u16)(w))
+#define hweight32(w)		__builtin_popcount((u32)(w))
+#define BITS_PER_LONG		(8 * (int)sizeof(long))
+#define BITS_TO_LONGS(n)	(((n) + BITS_PER_LONG - 1) / BITS_PER_LONG)
+#define DECLARE_BITMAP(name, bits)	unsigned long name[BITS_TO_LONGS(bits)]
+static void bitmap_zero(unsigned long *map, unsigned int bits)
+{
+	memset(map, 0, BITS_TO_LONGS(bits) * sizeof(long));
+}
+static bool test_bit(unsigned int nr, const unsigned long *map)
+{
+	return map[nr / BITS_PER_LONG] >> (nr % BITS_PER_LONG) & 1;
+}
+static void __set_bit(unsigned int nr, unsigned long *map)
+{
+	map[nr / BITS_PER_LONG] |= 1UL << (nr % BITS_PER_LONG);
+}
 #define READ_ONCE(x)		(x)
 #define WRITE_ONCE(x, v)	((x) = (v))
 #define cmpxchg(p, old, new)	({					\
@@ -53,6 +72,21 @@ static bool rtnl = true;
 
 static const char *last_extack;
 #define NL_SET_ERR_MSG_MOD(extack, msg)	do { (void)(extack); last_extack = (msg); } while (0)
+/* A formatted message lands in the extack's own buffer, NETLINK_MAX_FMTMSG_LEN
+ * bytes with the module's name in front, and one that does not fit is cut
+ * short: each has to fit with its counts at their widest. */
+static char extack_buf[80];
+#define NL_SET_ERR_MSG_FMT_MOD(extack, fmt, ...) do {				\
+		(void)(extack);							\
+		assert(snprintf(extack_buf, sizeof(extack_buf), "cdx: " fmt,	\
+				##__VA_ARGS__) < (int)sizeof(extack_buf));	\
+		last_extack = extack_buf + strlen("cdx: ");			\
+	} while (0)
+/* Every extack a test checks names its resource and its count exactly. */
+static bool extack_is(const char *msg)
+{
+	return last_extack && !strcmp(last_extack, msg);
+}
 
 struct list_head { struct list_head *next, *prev; };
 #define INIT_LIST_HEAD(h)	((h)->next = (h)->prev = (h))
@@ -146,10 +180,20 @@ struct dpa_priv_s { void *qm_ctx; };
 struct net_device {
 	struct dpa_priv_s priv;
 	char name[16];
+	int ifindex;
 	unsigned real_num_tx_queues;
 	unsigned int mtu;
 	int refs;
 };
+#define IFNAMSIZ	16
+static long strscpy(char *dst, const char *src, size_t size)
+{
+	size_t n = strnlen(src, size);
+
+	assert(n < size);
+	memcpy(dst, src, n + 1);
+	return (long)n;
+}
 static struct dpa_priv_s *netdev_priv(struct net_device *dev) { return &dev->priv; }
 static void dev_hold(struct net_device *dev) { assert(dev); dev->refs++; }
 static void dev_put(struct net_device *dev) { assert(dev && dev->refs > 0); dev->refs--; }
@@ -353,6 +397,17 @@ static int netif_set_real_num_tx_queues(struct net_device *dev, unsigned int txq
 	return 0;
 }
 
+/* How many channels the device tree gave the hardware layer, which built that
+ * many and no more: every one of the CEETM instance's unless a test says the
+ * board has fewer. The hardware layer refuses a channel past them, as it does
+ * here; the calls the tree makes only on channels it holds assert it never
+ * names one. */
+static u32 channels_built;
+static uint32_t ceetm_channel_count(void)
+{
+	return channels_built;
+}
+
 /* One frame queue per (channel, class queue), so a test can name the pair a
  * Tx queue resolved to rather than just that it resolved to something. */
 static struct qman_fq class_fqs[CDX_CEETM_MAX_CHANNELS][MAX_SCHEDULER_QUEUES];
@@ -360,7 +415,7 @@ static struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx,
 				      u32 channel, u32 quenum)
 {
 	assert(qm_ctx);
-	if (channel >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+	if (channel >= ceetm_channel_count() || quenum >= MAX_SCHEDULER_QUEUES)
 		return NULL;
 	return &class_fqs[channel][quenum];
 }
@@ -372,7 +427,7 @@ static bool class_counters_fail;
 static int ceetm_class_counters(u32 channel, u32 quenum, u64 *deq_frames,
 				u64 *deq_bytes, u64 *rej_frames)
 {
-	if (channel >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+	if (channel >= ceetm_channel_count() || quenum >= MAX_SCHEDULER_QUEUES)
 		return -EINVAL;
 	if (class_counters_fail)
 		return -EIO;
@@ -412,7 +467,7 @@ static void depth_written(u32 channel, u32 quenum, u32 depth);
 static int ceetm_set_class_wred(u32 channel, u32 quenum, u32 min, u32 max,
 				u32 probability, u32 limit)
 {
-	assert(channel < CDX_CEETM_MAX_CHANNELS && quenum < MAX_SCHEDULER_QUEUES);
+	assert(channel < ceetm_channel_count() && quenum < MAX_SCHEDULER_QUEUES);
 	/* In frames, with the band the encoding can draw and the curve
 	 * starting below the tail drop, so the hardware layer never refuses
 	 * it for a band that rounded to nothing. */
@@ -428,7 +483,7 @@ static int ceetm_set_class_wred(u32 channel, u32 quenum, u32 min, u32 max,
 }
 static int ceetm_clear_class_wred(u32 channel, u32 quenum, u32 depth)
 {
-	assert(channel < CDX_CEETM_MAX_CHANNELS && quenum < MAX_SCHEDULER_QUEUES);
+	assert(channel < ceetm_channel_count() && quenum < MAX_SCHEDULER_QUEUES);
 	wred_clears++;
 	memset(&wred[channel][quenum], 0, sizeof(wred[0][0]));
 	depth_written(channel, quenum, depth);
@@ -436,7 +491,7 @@ static int ceetm_clear_class_wred(u32 channel, u32 quenum, u32 depth)
 }
 static int ceetm_set_class_depth(u32 channel, u32 quenum, u32 depth)
 {
-	assert(channel < CDX_CEETM_MAX_CHANNELS && quenum < MAX_SCHEDULER_QUEUES);
+	assert(channel < ceetm_channel_count() && quenum < MAX_SCHEDULER_QUEUES);
 	if (depth_fail)
 		return -EIO;
 	depth_written(channel, quenum, depth);
@@ -444,7 +499,7 @@ static int ceetm_set_class_depth(u32 channel, u32 quenum, u32 depth)
 }
 static int ceetm_class_queue_state(u32 channel, u32 quenum, u32 *depth, bool *curve)
 {
-	assert(channel < CDX_CEETM_MAX_CHANNELS && quenum < MAX_SCHEDULER_QUEUES);
+	assert(channel < ceetm_channel_count() && quenum < MAX_SCHEDULER_QUEUES);
 	*depth = cq_depth[channel][quenum];
 	*curve = wred[channel][quenum].set;
 	return 0;
@@ -454,7 +509,8 @@ static bool backlog_fail;
 static unsigned backlog_reads;
 static int ceetm_class_queue_backlog(u32 channel, u32 quenum, u32 *frames)
 {
-	assert(channel < CDX_CEETM_MAX_CHANNELS && quenum < MAX_SCHEDULER_QUEUES);
+	if (channel >= ceetm_channel_count() || quenum >= MAX_SCHEDULER_QUEUES)
+		return -EINVAL;
 	backlog_reads++;
 	if (backlog_fail)
 		return -EIO;
@@ -493,7 +549,24 @@ static unsigned stop_calls;
  * until the quarantine ends, and what the port's entries put on its queues
  * meanwhile is popped then, or when the port takes it back. */
 static struct tQM_context_ctl *chan_quarantine[CDX_CEETM_MAX_CHANNELS];
+/* A channel whose drain failed, out of service for good: no claim gets it. */
+static bool chan_failed[CDX_CEETM_MAX_CHANNELS];
 static unsigned leftovers_popped, quarantine_ends;
+
+/* Who a channel is with, as the hardware layer answers for a report: the port
+ * it is mapped to, the port it is quarantined for, and whether a failed drain
+ * keeps it out of service; refused past the channels there are. */
+static int ceetm_channel_holder(u32 channel_num, struct tQM_context_ctl **mapped,
+				struct tQM_context_ctl **quarantine, bool *failed)
+{
+	if (channel_num >= ceetm_channel_count())
+		return -EINVAL;
+	assert(chan_owner_set[channel_num] == !!chan_owner[channel_num]);
+	*mapped = chan_owner[channel_num];
+	*quarantine = chan_quarantine[channel_num];
+	*failed = chan_failed[channel_num];
+	return 0;
+}
 static void pop_channel(u32 channel)
 {
 	unsigned jj;
@@ -522,8 +595,8 @@ static int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, u32 *channel_num)
 
 	if (fault())
 		return -ENOSPC;
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
-		if (chan_owner_set[ii])
+	for (ii = 0; ii < ceetm_channel_count(); ii++) {
+		if (chan_owner_set[ii] || chan_failed[ii])
 			continue;
 		if (chan_quarantine[ii] && chan_quarantine[ii] != qm_ctx) {
 			held = true;
@@ -543,7 +616,7 @@ static int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, u32 *channel_num)
 
 static int ceetm_set_channel_rates(u32 channel_num, u64 cir_bps, u64 eir_bps)
 {
-	assert(channel_num < CDX_CEETM_MAX_CHANNELS);
+	assert(channel_num < ceetm_channel_count());
 	if (fault())
 		return -EINVAL;
 	chan_cir[channel_num] = cir_bps;
@@ -551,9 +624,12 @@ static int ceetm_set_channel_rates(u32 channel_num, u64 cir_bps, u64 eir_bps)
 	return 0;
 }
 
+/* Class queues configured at their starting frame, so a command that did so
+ * can be held to the budget for it (cmd()). */
+static unsigned queue_starts;
 static int ceetm_set_class_queue(u32 channel_num, u32 quenum, u32 weight, u32 depth)
 {
-	assert(channel_num < CDX_CEETM_MAX_CHANNELS);
+	assert(channel_num < ceetm_channel_count());
 	assert(quenum < MAX_SCHEDULER_QUEUES);
 	/* Every queue starts at one frame (CDX_HTB_CQ_START), and the cap
 	 * gives it its depth: nothing configures a queue past its share. */
@@ -562,6 +638,7 @@ static int ceetm_set_class_queue(u32 channel_num, u32 quenum, u32 weight, u32 de
 	assert((weight != 0) == (quenum >= NUM_PQS));
 	if (fault())
 		return -EIO;
+	queue_starts++;
 	cq_live[channel_num][quenum] = true;
 	cq_named[channel_num][quenum] = true;
 	cq_weight[channel_num][quenum] = weight;
@@ -576,7 +653,7 @@ static int ceetm_set_class_queue(u32 channel_num, u32 quenum, u32 weight, u32 de
  * the queue go on sending to it until they are installed again. */
 static int ceetm_reset_class_queue(u32 channel_num, u32 quenum)
 {
-	assert(channel_num < CDX_CEETM_MAX_CHANNELS);
+	assert(channel_num < ceetm_channel_count());
 	assert(quenum < MAX_SCHEDULER_QUEUES);
 	cq_live[channel_num][quenum] = false;
 	cq_weight[channel_num][quenum] = 0;
@@ -598,14 +675,19 @@ static int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, u32 oper)
 	return 0;
 }
 
+/* Channels whose drain fails at the next teardown, as on a paused port: their
+ * queues keep what they hold, and the channel is out of service for good. */
+static u32 drain_fails;
 static int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
 {
 	u32 ii, jj;
 
 	stop_calls++;
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+	for (ii = 0; ii < ceetm_channel_count(); ii++) {
 		if (chan_owner[ii] != qm_ctx)
 			continue;
+		if (drain_fails & BIT(ii))
+			chan_failed[ii] = true;
 		for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++) {
 			cq_live[ii][jj] = false;
 			cq_weight[ii][jj] = 0;
@@ -613,7 +695,8 @@ static int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
 			memset(&wred[ii][jj], 0, sizeof(wred[0][0]));
 			/* Drained: sent, or popped and freed. Entries not yet
 			 * installed again can still put a frame on it. */
-			cq_backlog[ii][jj] = 0;
+			if (!(drain_fails & BIT(ii)))
+				cq_backlog[ii][jj] = 0;
 		}
 		chan_cir[ii] = chan_eir[ii] = 0;
 		chan_owner_set[ii] = false;
@@ -629,16 +712,18 @@ static int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
 
 /* The quarantine's end: what the port's entries put on its channels' queues is
  * popped, the entries are known to be installed again -- so they name none of
- * the queues any more -- and the channels are any port's. */
+ * the queues any more -- and the channels are any port's. A channel whose
+ * drain failed keeps what it holds, and stays out of service. */
 static int ceetm_end_quarantine(struct tQM_context_ctl *qm_ctx)
 {
 	unsigned ii, jj;
 
 	quarantine_ends++;
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+	for (ii = 0; ii < ceetm_channel_count(); ii++) {
 		if (!qm_ctx || chan_quarantine[ii] != qm_ctx)
 			continue;
-		pop_channel(ii);
+		if (!chan_failed[ii])
+			pop_channel(ii);
 		for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++)
 			if (!cq_live[ii][jj])
 				cq_named[ii][jj] = false;
@@ -697,9 +782,16 @@ struct cdx_ft_egress_ops {
 #define rcu_assign_pointer(p, v)	((p) = (v))
 #define RCU_INIT_POINTER(p, v)	((p) = (v))
 #define might_sleep()		do { } while (0)
-/* Whether the backend holds any direction, for a drain with no adapter. */
+/* Whether the backend holds any direction, for a drain with no adapter. With
+ * none, no entry names any queue. */
 static bool backend_idle = true;
-static bool cdx_ft_idle(void) { return backend_idle; }
+static void reinstalled(void);
+static bool cdx_ft_idle(void)
+{
+	if (backend_idle)
+		reinstalled();
+	return backend_idle;
+}
 static struct net_device *egress_changed_dev;
 static unsigned egress_changes, egress_drains;
 static int egress_drain_rc;
@@ -717,11 +809,18 @@ static void egress_hook(struct net_device *dev)
  * has happen while it waits, as another thread would. */
 static bool htb_mutex_held(void);
 static void (*drain_meanwhile)(void);
+static void reinstalled_on(struct tQM_context_ctl *qm_ctx);
 static int egress_drain(struct net_device *dev)
 {
 	assert(dev);
 	assert(!htb_mutex_held());
 	egress_drains++;
+	/* A drain that says so has seen every entry on the port marked before
+	 * it was asked retired or rebuilt: none of them names a queue the
+	 * port's trees gave back any more. What changes while it waits is
+	 * marked after it. */
+	if (!egress_drain_rc)
+		reinstalled_on(netdev_priv(dev)->qm_ctx);
 	if (drain_meanwhile)
 		drain_meanwhile();
 	return egress_drain_rc;
@@ -769,11 +868,50 @@ static void cdx_dscp_port_gone(struct tQM_context_ctl *qm_ctx) { (void)qm_ctx; }
 
 /* One lock over the class lists. The production file takes it around every
  * command so a filter resolving a classid cannot walk a list mid-edit; here it
- * only has to assert it is never taken twice. */
+ * only has to assert it is never taken twice -- and a reader that must not
+ * wait for it, asked while a test holds it as another thread would, fails
+ * here rather than hanging. */
 typedef int mutex_t;
 #define DEFINE_MUTEX(x) mutex_t x
 static void mutex_lock(mutex_t *m) { assert(!*m); *m = 1; }
 static void mutex_unlock(mutex_t *m) { assert(*m); *m = 0; }
+#define lockdep_assert_held(m)	assert(*(m))
+
+/* A sequence count, which a writer moves to odd and back with preemption off
+ * and a reader retries across. One thread here, so a reader never meets an
+ * odd count; a test can have the next read retried once, as a writer between
+ * its begin and its check would, and counts the reads. */
+typedef struct { unsigned sequence; } seqcount_t;
+#define SEQCNT_ZERO(name)	{ 0 }
+static int preempt_depth;
+static inline void preempt_disable(void) { preempt_depth++; }
+static inline void preempt_enable(void) { assert(preempt_depth > 0); preempt_depth--; }
+static bool seq_retry_once;
+static unsigned seq_reads;
+static inline unsigned read_seqcount_begin(const seqcount_t *s)
+{
+	assert(!(s->sequence & 1));
+	seq_reads++;
+	return s->sequence;
+}
+static inline bool read_seqcount_retry(const seqcount_t *s, unsigned start)
+{
+	if (seq_retry_once) {
+		seq_retry_once = false;
+		return true;
+	}
+	return s->sequence != start;
+}
+static inline void write_seqcount_begin(seqcount_t *s)
+{
+	assert(preempt_depth > 0 && !(s->sequence & 1));
+	s->sequence++;
+}
+static inline void write_seqcount_end(seqcount_t *s)
+{
+	assert(preempt_depth > 0 && (s->sequence & 1));
+	s->sequence++;
+}
 
 /* The ops table is file-scope data rather than a function, so the harness
  * builds its own from the production callbacks it does compile. */
@@ -865,7 +1003,27 @@ static struct cdx_htb_release cdx_htb_releases[MAX_PHY_PORTS];
 static void cdx_htb_release_work(struct work_struct *work);
 static DECLARE_DELAYED_WORK(cdx_htb_release, cdx_htb_release_work);
 static unsigned int cdx_htb_release_ms;
+static struct net_device *cdx_htb_netdevs[MAX_PHY_PORTS];
+static struct cdx_qos_budget cdx_htb_levels;
+static seqcount_t cdx_htb_levels_seq = SEQCNT_ZERO(cdx_htb_levels_seq);
 static bool htb_mutex_held(void) { return cdx_htb_mutex; }
+
+/* The ingress policer pool, which police.c covers whole: here only that the
+ * report asks it. The pool's count is read under its own spinlock alone, from
+ * the status read, which holds no other lock; a port's profiles are asked
+ * holding this file's mutex -- the one order the two locks are ever taken
+ * in. */
+static unsigned police_pool_used, police_port_used;
+static const struct net_device *police_port_dev;
+static unsigned int cdx_police_pool_used(void)
+{
+	return police_pool_used;
+}
+static unsigned int cdx_police_port_profiles(const struct net_device *dev)
+{
+	assert(cdx_htb_mutex && dev);
+	return dev == police_port_dev ? police_port_used : 0;
+}
 
 DEFINE_STATIC_SRCU(cdx_ft_egress_srcu);
 static const struct cdx_ft_egress_ops __rcu *cdx_ft_egress_ops;
@@ -925,10 +1083,9 @@ static u32 charge(u32 channel, u32 quenum)
 	return max(cq_depth[channel][quenum], held);
 }
 
-/* Of that, what the cap cannot count, as it counts a queue given back only by
- * what it holds: the frames the entries still naming such a queue can add, up
- * to its parked depth, so never more than one -- for the channels of the tree
- * `owner', or every channel with none. The exception the cap's bound has. */
+/* Of that, the frames the entries still naming a queue given back can add, up
+ * to its parked depth, so never more than one a queue -- for the channels of
+ * the tree `owner', or every channel with none. */
 static u32 window(struct tQM_context_ctl *owner)
 {
 	u32 sum = 0;
@@ -960,6 +1117,22 @@ static void reinstalled(void)
 				cq_named[ii][jj] = false;
 }
 
+/* The same for one port's entries, which name only queues of the channels its
+ * tree holds or that are quarantined for it. */
+static void reinstalled_on(struct tQM_context_ctl *qm_ctx)
+{
+	unsigned ii, jj;
+
+	assert(qm_ctx);
+	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+		if (chan_owner[ii] != qm_ctx && chan_quarantine[ii] != qm_ctx)
+			continue;
+		for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++)
+			if (!cq_live[ii][jj])
+				cq_named[ii][jj] = false;
+	}
+}
+
 /* Every class queue of the channels of the tree owning `channel'. */
 static u32 tree_charge(u32 channel)
 {
@@ -968,6 +1141,20 @@ static u32 tree_charge(u32 channel)
 	unsigned ii, jj;
 
 	assert(owner);
+	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++)
+		if (chan_owner[ii] == owner)
+			for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++)
+				sum += charge(ii, jj);
+	return sum;
+}
+
+/* Every class queue of the channels mapped to the port `owner': its tree's
+ * charge, which the tree's budget has to cover. */
+static u32 port_charge(struct tQM_context_ctl *owner)
+{
+	u32 sum = 0;
+	unsigned ii, jj;
+
 	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++)
 		if (chan_owner[ii] == owner)
 			for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++)
@@ -995,11 +1182,13 @@ static unsigned depth_writes, last_shrink, first_grow;
 /* A class queue's depth was written. Growing one never takes its tree past
  * its budget, nor every tree together past SEC's share, counting each queue at
  * what it may hold rather than at its depth alone -- a queue holding more than
- * the depth it was shrunk to keeps it, and so does one a leaf gave back -- but
- * for the frame each queue given back can still take (window()). Shrinking
- * first is what keeps the depths inside the budget, growing first would show
- * here as the frames the others were still to give up, and growing past what
- * the queues hold would show as the frames nothing evicted.
+ * the depth it was shrunk to keeps it, and so does one a leaf gave back, which
+ * also takes the frame the entries still naming it can put there -- with no
+ * slack for any of it, however many queues the changes so far gave back.
+ * Shrinking first is what keeps the depths inside the budget, growing first
+ * would show here as the frames the others were still to give up, growing
+ * past what the queues hold would show as the frames nothing evicted, and
+ * growing into a given-back queue's frame would show as that frame.
  *
  * A queue growing no further than what it holds adds nothing it may hold, and
  * is not held to the budget: the tree can be past it by the starting frame of
@@ -1020,9 +1209,8 @@ static void depth_written(u32 channel, u32 quenum, u32 depth)
 			first_grow = depth_writes;
 		if (depth <= cq_backlog[channel][quenum])
 			return;
-		assert(tree_charge(channel) <=
-		       tree_budget() + window(chan_owner[channel]));
-		assert(all_charge() <= IPSEC_QDISC_FRAMES + window(NULL));
+		assert(tree_charge(channel) <= tree_budget());
+		assert(all_charge() <= IPSEC_QDISC_FRAMES);
 	}
 }
 
@@ -1036,6 +1224,10 @@ static void reset_world(void)
 {
 	unsigned ii;
 
+	channels_built = CDX_CEETM_MAX_CHANNELS;
+	memset(chan_failed, 0, sizeof(chan_failed));
+	drain_fails = 0;
+	seq_retry_once = false;
 	memset(chan_owner_set, 0, sizeof(chan_owner_set));
 	memset(chan_owner, 0, sizeof(chan_owner));
 	memset(cq_live, 0, sizeof(cq_live));
@@ -1046,14 +1238,20 @@ static void reset_world(void)
 	memset(cdx_htb_ports, 0, sizeof(cdx_htb_ports));
 	/* As cdx_htb_init() leaves them: zero is a channel and a leaf slot, so
 	 * the maps have to be published as saying none. */
+	mutex_lock(&cdx_htb_mutex);
 	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_ports); ii++) {
 		INIT_LIST_HEAD(&cdx_htb_ports[ii].classes);
 		cdx_htb_publish(&cdx_htb_ports[ii]);
 	}
+	mutex_unlock(&cdx_htb_mutex);
 	devices[0].priv.qm_ctx = &gQMCtx[3];
 	devices[1].priv.qm_ctx = &gQMCtx[4];
 	gQMCtx[3].net_dev = &devices[0];
 	gQMCtx[4].net_dev = &devices[1];
+	/* Both are ports of cdx's, as a CEETM context made whole leaves them. */
+	memset(cdx_htb_netdevs, 0, sizeof(cdx_htb_netdevs));
+	cdx_htb_port_added(&gQMCtx[3]);
+	cdx_htb_port_added(&gQMCtx[4]);
 	devices[0].real_num_tx_queues = DPAA_ETH_TX_QUEUES;
 	devices[1].real_num_tx_queues = DPAA_ETH_TX_QUEUES;
 	devices[0].mtu = devices[1].mtu = ETH_DATA_LEN;
@@ -1100,6 +1298,10 @@ static void reset_world(void)
 	fault_point = -1;
 	fault_seen = 0;
 	last_extack = NULL;
+	/* The status read's snapshot, as module load takes it. */
+	mutex_lock(&cdx_htb_mutex);
+	cdx_htb_levels_update();
+	mutex_unlock(&cdx_htb_mutex);
 }
 
 /* Every live tree inside its budget, every queue counted -- unless a test has
@@ -1115,11 +1317,29 @@ static void assert_capped(void)
 			assert(tree_frames(ii) <= tree_budget());
 }
 
+/* A command that configured a class queue at its starting frame left its
+ * tree, and every tree together, no further past their budgets than it found
+ * them -- and inside them, it found them so: the frame was there to be had,
+ * counting every queue at what it may hold once the cap has shrunk what it
+ * shrinks. But for the one exception a command cannot be refused for: the top
+ * channel moving takes queues 0 and 7 with it, each starting at a frame on the
+ * new top channel, two frames at most. A refusal of the hardware's to shrink
+ * a queue leaves the cap nothing to work with. */
 static int cmd(struct net_device *dev, struct tc_htb_qopt_offload *opt)
 {
+	struct cdx_htb_port *port = cdx_htb_port_of(dev);
+	struct tQM_context_ctl *ctx = port ? port->qm_ctx : NULL;
+	u32 tree = ctx ? port_charge(ctx) : 0, all = all_charge(), slack;
+	unsigned starts = queue_starts;
+	u8 top = port ? port->top : CDX_HTB_NONE;
 	int rc = cdx_htb_setup_tc(dev, opt);
 
 	assert_capped();
+	if (port && queue_starts != starts && !depth_fail) {
+		slack = port->top != top ? 2 : 0;
+		assert(port_charge(ctx) <= max(tree_budget(), tree) + slack);
+		assert(all_charge() <= max((u32)IPSEC_QDISC_FRAMES, all) + slack);
+	}
 	return rc;
 }
 
@@ -1226,11 +1446,32 @@ static int destroy(struct net_device *dev)
 	return cmd(dev, &opt);
 }
 
+/* Nothing a tree held is left once what its commands armed has run: the
+ * release that follows them -- run here if it is still due, as it would be --
+ * holds no netdev, owes no quarantine's end and charges no queue given back,
+ * on any port, and every device's references are its own again. */
+static void run_release(void);
+static void assert_settled(void)
+{
+	static const u16 none[CDX_CEETM_MAX_CHANNELS];
+	unsigned ii;
+
+	if (cdx_htb_release.pending)
+		run_release();
+	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_releases); ii++) {
+		assert(!cdx_htb_releases[ii].dev && !cdx_htb_releases[ii].due);
+		assert(!memcmp(cdx_htb_releases[ii].given, none, sizeof(none)));
+	}
+	for (ii = 0; ii < ARRAY_SIZE(devices); ii++)
+		assert(!devices[ii].refs);
+}
+
 static void assert_balanced(struct net_device *dev)
 {
 	struct cdx_htb_port *port = cdx_htb_port_of(dev);
 	unsigned ii, jj;
 
+	assert_settled();
 	assert(!port->live);
 	assert(!port->leaves);
 	assert(!port->channels);
@@ -1378,17 +1619,22 @@ static void test_depth_and_limits(void)
 	assert(!to_inner(dev, 10, 1, 0, 1));
 	for (ii = 1; ii < NUM_WBFQS; ii++)
 		assert(!add_leaf(dev, 10 + ii, 1, 0, 1, 0, 0, &qid));
+	last_extack = NULL;
 	assert(add_leaf(dev, 90, 1, 0, 1, 0, 0, &qid) == -ENOSPC);
+	assert(extack_is("no weighted class queue free on this channel (8 of 8 held)"));
 	assert(!destroy(dev));
 	assert_balanced(dev);
 
-	/* Eight channels for the whole SoC, shared by every port. */
+	/* The SoC's channels, shared by every port: each class under a root
+	 * takes one, and the next is told how many are held. */
 	reset_world();
 	assert(!create(&devices[0], 1, 0));
 	assert(!create(&devices[1], 1, 0));
 	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++)
 		assert(!add_leaf(&devices[ii & 1], 1 + ii, 0, 0, 0, 1000, 1000, &qid));
+	last_extack = NULL;
 	assert(add_leaf(&devices[0], 99, 0, 0, 0, 1000, 1000, &qid) == -ENOSPC);
+	assert(extack_is("no CEETM channel free (32 of 32 held)"));
 	assert(!destroy(&devices[0]));
 	assert(!destroy(&devices[1]));
 	assert_balanced(&devices[0]);
@@ -3002,6 +3248,23 @@ static bool regrow_armed(unsigned long ms)
 	return cdx_htb_regrow.pending && cdx_htb_regrow.delay == ms;
 }
 
+/* The release work's timer firing, the same way: what waits on a port's
+ * entries -- a torn-down tree's channels, the queues a change gave back. */
+static void run_release(void)
+{
+	assert(cdx_htb_release.pending);
+	cdx_htb_release.pending = false;
+	rtnl = false;
+	cdx_htb_release.func(&cdx_htb_release.work);
+	rtnl = true;
+	assert(!cdx_htb_mutex);
+}
+
+static bool release_armed(unsigned long ms)
+{
+	return cdx_htb_release.pending && cdx_htb_release.delay == ms;
+}
+
 /* Every class queue of a tree counts frames, and together they hold no more
  * than the tree's budget: the 1,024 of SEC's pool kept for the trees divided
  * between the live trees, within the port's share of the Ethernet pool. Shared
@@ -3058,7 +3321,7 @@ static void test_cap(void)
 		for (jj = 1; jj < NUM_WBFQS; jj++)
 			assert(!add_leaf(dev, 10 * (ii + 1) + jj, 1 + ii, 0, 1, 0, 0, NULL));
 	}
-	assert(cdx_htb_port_of(dev)->leaves == CDX_HTB_MAX_LEAVES);
+	assert(cdx_htb_port_of(dev)->leaves == 2 * NUM_WBFQS);
 	/* Channel 1 is the top, and its queues 0 and 7 make eighteen: 1,024
 	 * frames between them is 56 each, where 128 each would be 2,304, past
 	 * the Ethernet share as well. */
@@ -3156,8 +3419,13 @@ static void test_cap(void)
 	assert(cq_depth[0][0] == 1 && cq_depth[0][NUM_PQS - 3] == 128);
 	assert(!red(dev, on10, TC_RED_REPLACE, 1000000, 3000000, 1u << 26, 4000000, false));
 	assert(cq_depth[0][NUM_PQS - 1] == 1024 - 128 - 1);
-	/* Without it queue 0 asks for a plain depth again. */
+	/* Without it queue 0 asks for a plain depth again. The deleted leaf's
+	 * queue is charged the frame its entries can still put there, and the
+	 * shares are drawn from the 1,023 that leaves: the RED leaf is a frame
+	 * short of its 896 until they are shown retired or rebuilt. */
 	assert(!del_leaf(dev, 20, NULL));
+	assert(cq_depth[0][0] == 128 && cq_depth[0][NUM_PQS - 1] == 1024 - 128 - 1);
+	run_release();
 	assert(cq_depth[0][0] == 128 && cq_depth[0][NUM_PQS - 1] == 1024 - 128);
 	assert(!destroy(dev));
 	assert_balanced(dev);
@@ -3202,10 +3470,14 @@ static void test_cap(void)
 	assert(cq_depth[0][NUM_PQS - 2] == 512 - 2 * 128 && last_shrink && !first_grow);
 	assert(!add_leaf(other, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 1 */
 	assert(cq_depth[1][NUM_PQS - 2] == 128 && tree_frames(1) == 3 * 128);
-	/* Destroying it gives the first its share back. */
+	/* Destroying it gives the first its share back, but for the frame its
+	 * entries can still put on each of its three queues until they are
+	 * shown retired or rebuilt. */
 	assert(!destroy(other));
 	assert(!cdx_htb_port_of(other)->live && !gQMCtx[4].chnl_map && !cq_live[1][NUM_PQS - 2]);
-	assert(tree_budget() == 1024 && cq_depth[0][NUM_PQS - 2] == 1024 - 2 * 128);
+	assert(tree_budget() == 1024 && cq_depth[0][NUM_PQS - 2] == 1024 - 2 * 128 - 3);
+	run_release();
+	assert(cq_depth[0][NUM_PQS - 2] == 1024 - 2 * 128);
 	/* And so does a port whose CEETM context goes from under its tree, but
 	 * only once its hardware is released: until then its queues still hold
 	 * what they had of the share. */
@@ -3339,12 +3611,12 @@ static void test_backlog(void)
 	ii = regrow_cancels;
 	assert(!destroy(dev));
 	assert(regrow_cancels == ii + 1 && !cdx_htb_regrow.pending);
-	assert_balanced(dev);
 	/* Drained on the way, and parked: until the entries are installed
 	 * again they can put no more than a frame on each queue the tree
-	 * used, and then nothing is left holding a buffer. */
+	 * used, and once the release has seen them so, nothing is left
+	 * holding a buffer. */
 	assert(all_charge() == window(NULL) && window(NULL) == 5);
-	reinstalled();
+	assert_balanced(dev);
 	assert(!all_charge());
 	dev->mtu = ETH_DATA_LEN;
 
@@ -3364,6 +3636,9 @@ static void test_backlog(void)
 	cq_backlog[0][6] = 760;
 	assert(!del_leaf(dev, 11, NULL));
 	assert(!cq_live[0][6] && cq_depth[0][6] == CEETM_PARKED_CQ_DEPTH);
+	/* Once its entries are shown retired, as the release that follows the
+	 * command finds, what is left charged is what it holds. */
+	run_release();
 	assert(!red_in_frames(dev, onA, 648, 1945, 2594));
 	assert(cq_depth[0][7] == 128 + 1024 - (760 + 128 + 128) && regrow_armed(100));
 	cq_backlog[0][6] = 0;
@@ -3372,14 +3647,19 @@ static void test_backlog(void)
 
 	/* ---- so do the frames of a queue a leaf moved off ---- */
 	/* Class 11 again, on queue 6 with a RED qdisc, filled; moved to prio 3,
-	 * it takes queue 4 and leaves queue 6 reset with what it held. */
+	 * it takes queue 4 and leaves queue 6 reset with what it held. Those
+	 * 890 frames are no queue of the tree's, so its queues share what they
+	 * leave: class 10 its single frame, and class 11 and queue 0 the 133
+	 * left, 66 each. */
 	assert(!add_leaf(dev, 11, 1, 1, 0, 0, 0, NULL));
 	assert(!red_in_frames(dev, onA, 0, 1, 1));
 	assert(!red_in_frames(dev, onB, 648, 1945, 2594) && cq_depth[0][6] == 1024 - 128 - 1);
 	cq_backlog[0][6] = 890;
 	assert(!modify(dev, 11, 3, 0, 0, 0));
+	run_release();
 	assert(!cq_live[0][6] && cq_live[0][4] && wred[0][4].set);
-	assert(cq_depth[0][4] == 1 + 1024 - (890 + 128 + 1 + 1) && regrow_armed(100));
+	assert(cq_depth[0][4] == (1024 - 890 - 1) / 2 && cq_depth[0][0] == (1024 - 890 - 1) / 2);
+	assert(regrow_armed(100));
 	cq_backlog[0][6] = 0;
 	run_regrow();
 	assert(cq_depth[0][4] == 1024 - 128 - 1 && !cdx_htb_regrow.pending);
@@ -3390,7 +3670,8 @@ static void test_backlog(void)
 	/* Class 1 holds channel 0 and its queue 6 itself, a RED leaf taking the
 	 * 768 frames queues 0 and 7 leave, and fills. Its first child, at prio
 	 * 2, takes queue 5; queue 6 is given back, parked with the 760 frames on
-	 * it, and the child grows only into the seven they leave. */
+	 * it, and the child and queues 0 and 7 share the 264 they leave, 88
+	 * each. */
 	reset_world();
 	assert(!create(dev, 1, 0));
 	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
@@ -3398,7 +3679,8 @@ static void test_backlog(void)
 	cq_backlog[0][6] = 760;
 	assert(!to_inner(dev, 10, 1, 2, 0));
 	assert(!cq_live[0][6] && cq_depth[0][6] == CEETM_PARKED_CQ_DEPTH && cq_live[0][5]);
-	assert(cq_depth[0][5] == 1 + 1024 - (760 + 2 * 128 + 1) && regrow_armed(100));
+	assert(cq_depth[0][5] == (1024 - 760) / 3 && cq_depth[0][0] == (1024 - 760) / 3);
+	assert(cq_depth[0][7] == (1024 - 760) / 3 && regrow_armed(100));
 	cq_backlog[0][6] = 0;
 	run_regrow();
 	assert(cq_depth[0][5] == 128 && !cdx_htb_regrow.pending);
@@ -3409,9 +3691,10 @@ static void test_backlog(void)
 	/* Class 1 on channel 0's queue 6, a RED leaf taking 768 and filling, and
 	 * 120 frames that name no class on the top channel's queue 0. A second
 	 * class under the root takes channel 1, the top from then on: channel
-	 * 0's queues 0 and 7 are given back, parked with what they hold, class 1
-	 * shrinks to 640 under its 760, and channel 1's three queues grow only
-	 * into the 144 frames the 760 and the 120 leave. */
+	 * 0's queues 0 and 7 are given back, parked with what they hold. The
+	 * tree's queues share the 904 the 120 leave, class 1 shrinking to 520
+	 * under its 760, and channel 1's three queues grow only into the 144
+	 * frames the 760 and the 120 leave. */
 	reset_world();
 	assert(!create(dev, 1, 0));
 	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
@@ -3419,10 +3702,11 @@ static void test_backlog(void)
 	cq_backlog[0][6] = 760;
 	cq_backlog[0][0] = 120;
 	assert(!add_leaf(dev, 2, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 1 */
+	run_release();
 	assert(cdx_htb_port_of(dev)->top == 1);
 	assert(!cq_live[0][0] && !cq_live[0][7]);
 	assert(cq_depth[0][0] == CEETM_PARKED_CQ_DEPTH && cq_depth[0][7] == CEETM_PARKED_CQ_DEPTH);
-	assert(cq_depth[0][6] == 1024 - 3 * 128);
+	assert(cq_depth[0][6] == 1024 - 120 - 3 * 128);
 	assert(cq_depth[1][6] + cq_depth[1][0] + cq_depth[1][7] == 1024 - 760 - 120);
 	assert(regrow_armed(100));
 	cq_backlog[0][6] = 0;
@@ -3436,8 +3720,8 @@ static void test_backlog(void)
 	/* ---- a second tree arriving while the first holds frames ---- */
 	/* One tree's RED leaf on queue 6 takes the 768 its two neighbours
 	 * leave, and fills. A second tree halves the share: the first shrinks
-	 * to 256 but keeps its 760 frames, so the second's three queues grow
-	 * only into the 1,024 of SEC's pool those leave. */
+	 * to 256 but keeps its 760 frames, so the second's three queues share
+	 * the 8 frames of SEC's 1,024 that tree leaves, 2 each. */
 	reset_world();
 	assert(!create(dev, 1, 0));
 	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
@@ -3446,8 +3730,9 @@ static void test_backlog(void)
 	assert(!create(other, 1, 0));
 	assert(cq_depth[0][6] == 512 - 2 * 128 && !cdx_htb_regrow.pending);
 	assert(!add_leaf(other, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 1 */
-	assert(all_charge() == 1024 && regrow_armed(100));
-	assert(cq_depth[1][6] + cq_depth[1][0] + cq_depth[1][7] == 1024 - 760 - 2 * 128);
+	assert(regrow_armed(100));
+	assert(cq_depth[1][6] == 2 && cq_depth[1][0] == 2 && cq_depth[1][7] == 2);
+	assert(all_charge() == 760 + 2 * 128 + 3 * 2);
 	cq_backlog[0][6] = 0;
 	run_regrow();
 	assert(cq_depth[1][6] == 128 && cq_depth[1][0] == 128 && cq_depth[1][7] == 128);
@@ -3507,12 +3792,12 @@ static void test_backlog(void)
 	assert(!destroy(dev));
 	reinstalled();
 
-	/* ---- even with a starting frame past the budget ---- */
+	/* ---- and no starting frame past the budget ---- */
 	/* Class 10 on queue 6, a RED leaf of 768 holding 760, shrunk to a
-	 * frame: 1,016 frames charged. Class 11 gets the eight that leaves, and
-	 * class 12, configured with the budget full, starts a frame past it,
-	 * which the cap grows nothing into. Class 10 asking for 500 frames
-	 * again still takes them at once: it holds 760. */
+	 * frame: 1,016 frames charged. Class 11 gets the eight that leaves.
+	 * Class 12 would start a frame past the budget, which the cap could
+	 * grow nothing into, and is refused until the port has sent. Class 10
+	 * asking for 500 frames again still takes them at once: it holds 760. */
 	reset_world();
 	assert(!create(dev, 1, 0));
 	assert(!add_leaf(dev, 1, 0, 0, 0, 1000000, 1000000, NULL));
@@ -3521,12 +3806,16 @@ static void test_backlog(void)
 	cq_backlog[0][6] = 760;
 	assert(!red_in_frames(dev, onA, 0, 1, 1) && cq_depth[0][6] == 1);
 	assert(!add_leaf(dev, 11, 1, 2, 0, 0, 0, NULL) && cq_depth[0][5] == 8);
-	assert(!add_leaf(dev, 12, 1, 3, 0, 0, 0, NULL) && cq_depth[0][4] == 1);
-	assert(all_charge() == 1024 + 1 && regrow_armed(100));
+	assert(all_charge() == 1024 && regrow_armed(100));
+	last_extack = NULL;
+	assert(add_leaf(dev, 12, 1, 3, 0, 0, 0, NULL) == -ENOBUFS);
+	assert(extack_is("no tail-drop room (1024 of 1024 frames held); retry shortly"));
+	assert(!cq_live[0][4] && cdx_htb_port_of(dev)->leaves == 2);
 	assert(!red_in_frames(dev, onA, 100, 400, 500));
 	assert(cq_depth[0][6] == 500 && wred[0][6].limit == 500);
-	assert(cq_depth[0][5] == 8 && cq_depth[0][4] == 1 && all_charge() == 1024 + 1);
+	assert(cq_depth[0][5] == 8 && all_charge() == 1024);
 	cq_backlog[0][6] = 0;
+	assert(!add_leaf(dev, 12, 1, 3, 0, 0, 0, NULL));
 	run_regrow();
 	assert(cq_depth[0][5] == 128 && cq_depth[0][4] == 128 && !cdx_htb_regrow.pending);
 	assert(!destroy(dev));
@@ -3536,34 +3825,19 @@ static void test_backlog(void)
 	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
 
 	/* ---- unloading leaves nothing armed ---- */
-	/* Frames on queue 5, which no leaf holds, keep the leaf short. */
+	/* Frames on queue 5, which no leaf holds, keep the tree short: the leaf
+	 * and queues 0 and 7 share the 324 they leave. */
 	assert(!red_in_frames(dev, on1, 0, 1, 1));
 	cq_backlog[0][6] = 0;
 	cq_backlog[0][5] = 700;
 	assert(!red_in_frames(dev, on1, 648, 1945, 2594));
-	assert(cq_depth[0][6] == 1 + 1024 - (700 + 2 * 128 + 1) && regrow_armed(100));
+	assert(cq_depth[0][6] == (1024 - 700) / 3 && regrow_armed(100));
 	cdx_htb_exit();
 	assert(!cdx_htb_regrow.pending && !cdx_htb_ports[3].live);
 	assert(allocations == 0);
 }
 
 /* ---- a torn-down tree's channels, given back ------------------------- */
-
-/* The release work's timer firing, like run_regrow(). */
-static void run_release(void)
-{
-	assert(cdx_htb_release.pending);
-	cdx_htb_release.pending = false;
-	rtnl = false;
-	cdx_htb_release.func(&cdx_htb_release.work);
-	rtnl = true;
-	assert(!cdx_htb_mutex);
-}
-
-static bool release_armed(unsigned long ms)
-{
-	return cdx_htb_release.pending && cdx_htb_release.delay == ms;
-}
 
 /* What happens while the release waits for the flowtable, as on other
  * threads: the release holds the netdev itself; the tree is taken down again,
@@ -3630,13 +3904,15 @@ static void test_release(void)
 	/* An entry not yet installed again puts a frame on a parked queue. */
 	cq_backlog[0][6] = 1;
 	/* Another port's tree, at once, gets channel 1 rather than 0. Its RED
-	 * leaf, asking for the 768 frames the two queues beside it leave, is a
-	 * frame short of them: the one on channel 0 is charged. */
+	 * leaf, asking for the 768 frames the two queues beside it leave, is
+	 * three frames short of them: the one on channel 0's queue 6 is
+	 * charged, and so is the frame the entries can still put on each of
+	 * the torn-down tree's other two queues. */
 	assert(!create(other, 1, 0));
 	assert(!add_leaf(other, 1, 0, 1, 0, 1000000, 1000000, NULL));
 	assert(chan_owner[1] == &gQMCtx[4] && !chan_owner_set[0]);
 	assert(!red_in_frames(other, on1, 648, 1945, 2594));
-	assert(cq_depth[1][6] == 767 && regrow_armed(100));
+	assert(cq_depth[1][6] == 765 && regrow_armed(100));
 	/* The release: the flowtable asked, without the mutex and holding the
 	 * netdev, then the frame popped and the channel given back -- and the
 	 * leaf grows into the frame it left. */
@@ -3679,15 +3955,19 @@ static void test_release(void)
 	/* And with every other channel taken, its next is refused as busy
 	 * rather than as the SoC out of channels, in tc and in the log: the
 	 * channel left comes free once the first port's entries are gone. */
-	for (ii = 2; ii < CDX_CEETM_MAX_CHANNELS; ii++)
+	for (ii = 2; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
 		chan_owner_set[ii] = true;
+		chan_owner[ii] = &gQMCtx[0];
+	}
 	last_extack = NULL;
 	warns = pr_warns;
 	assert(add_leaf(other, 2, 0, 2, 0, 1000000, 1000000, NULL) == -EBUSY);
-	assert(last_extack && strstr(last_extack, "held until another port"));
+	assert(extack_is("no CEETM channel free yet (32 of 32 held, 1 retiring)"));
 	assert(pr_warns == warns + 1 && !chan_owner_set[0]);
-	for (ii = 2; ii < CDX_CEETM_MAX_CHANNELS; ii++)
+	for (ii = 2; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
 		chan_owner_set[ii] = false;
+		chan_owner[ii] = NULL;
+	}
 	egress_drain_rc = 0;
 	run_release();
 	assert(!chan_quarantine[0] && dev->refs == 0 && !cdx_htb_release.pending);
@@ -3757,6 +4037,635 @@ static void test_release(void)
 	assert(!cdx_htb_release.pending && !dev->refs && !other->refs);
 	egress_drain_rc = 0;
 	cdx_unregister_ft_egress();
+	assert(allocations == 0);
+}
+
+/* ---- what a change gives back, charged until its entries are gone ----- */
+
+/* Every class queue no tree uses that entries still name, filled to its
+ * parked frame as they would fill it: the frames then on such queues. */
+static u32 fill_given_back(void)
+{
+	u32 frames = 0;
+	unsigned ii, jj;
+
+	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++)
+		for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++) {
+			if (cq_live[ii][jj] || !cq_named[ii][jj])
+				continue;
+			assert(cq_depth[ii][jj] == CEETM_PARKED_CQ_DEPTH);
+			cq_backlog[ii][jj] = max(cq_backlog[ii][jj], cq_depth[ii][jj]);
+			frames += cq_backlog[ii][jj];
+		}
+	return frames;
+}
+
+/* A leaf moved to another priority while the release waits on the flowtable,
+ * as on another thread: the queue it leaves is given back after the marking
+ * the drain is proving. */
+static void priority_moved(void)
+{
+	rtnl = true;
+	assert(!modify(&devices[0], 100, NUM_PQS - 2, 0, 0, 0));
+	rtnl = false;
+}
+
+/* A queue a change gives back -- a leaf deleted or moved to another priority,
+ * a leaf turned into a channel, queues 0 and 7 when the top channel moves,
+ * every queue of a tree taken down -- is parked at a frame, which the entries
+ * installed while it was a class's can put on it until they are retired or
+ * rebuilt. With thirty-two channels there are 512 class queues: two large
+ * trees changed in one retirement window, or one tree churned through many
+ * queues, give back more than the 128 frames of SEC's pool left over for its
+ * own jobs. So each is charged that frame, against its tree's budget and the
+ * 1,024 across trees, from the change until the flowtable shows the port's
+ * entries retired or rebuilt since -- for any number of changes and trees, at
+ * the cost of a frame of budget a queue for the moments that takes.
+ * depth_written() counts every such queue with no slack. */
+static void test_given_back_trees(void)
+{
+	struct net_device *dev = &devices[0], *other = &devices[1];
+	struct net_device *ports[] = { dev, other };
+	const u32 on1 = TC_H_MAKE(1 << 16, 1);
+	unsigned ii, ch, warns;
+	u32 frames;
+
+	red_qdisc = RED_QDISC;
+
+	/* ---- two trees churned and taken down inside one window ---- */
+	/* Each tree sixteen channels, each a class with children at prio 0 and
+	 * 1 on queues 7 and 6: thirty-two leaves, and the top channel's queue 0
+	 * beside them, sharing 512 frames -- 15 each once the queues 0 the top
+	 * channel left on its way up are shown unused. */
+	reset_world();
+	assert(!cdx_register_ft_egress(&egress_ops));
+	for (ii = 0; ii < ARRAY_SIZE(ports); ii++) {
+		assert(!create(ports[ii], 1, 0));
+		for (ch = 0; ch < 16; ch++) {
+			assert(!add_leaf(ports[ii], 1 + ch, 0, 0, 0, 1000000, 1000000, NULL));
+			assert(!to_inner(ports[ii], 100 + 2 * ch, 1 + ch, 0, 0));
+			assert(!add_leaf(ports[ii], 101 + 2 * ch, 1 + ch, 1, 0, 0, 0, NULL));
+		}
+	}
+	run_release();
+	for (ch = 0; ch < 32; ch++)
+		assert(cq_depth[ch][NUM_PQS - 1] == 15 && cq_depth[ch][NUM_PQS - 2] == 15);
+	assert(cq_depth[15][0] == 15 && cq_depth[31][0] == 15);
+	/* No drain confirms from here. Every leaf moves to another priority,
+	 * and both trees go: 65 queues each given back, 130 frames once their
+	 * entries have filled them. */
+	egress_drain_rc = -EAGAIN;
+	for (ii = 0; ii < ARRAY_SIZE(ports); ii++)
+		for (ch = 0; ch < 16; ch++) {
+			assert(!modify(ports[ii], 100 + 2 * ch, 2, 0, 0, 0));
+			assert(!modify(ports[ii], 101 + 2 * ch, 3, 0, 0, 0));
+		}
+	assert(!destroy(dev));
+	assert(!destroy(other));
+	frames = fill_given_back();
+	assert(frames == 130 && frames > 128);
+	/* A drain that cannot say so keeps all of it charged, and is asked
+	 * again; each port's log is told once. */
+	warns = pr_warns;
+	run_release();
+	assert(release_armed(100) && pr_warns == warns + 2);
+	/* A new tree on the first port takes channel 0 back, popping what the
+	 * entries left there. Its queues 0 and 7 take their 128, and its RED
+	 * leaf asking for everything grows only into what the 128 frames still
+	 * charged on the queues given back leave of the 1,024. */
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 0 */
+	assert(!red_in_frames(dev, on1, 648, 1945, 2594));
+	assert(cq_depth[0][0] == 128 && cq_depth[0][NUM_PQS - 1] == 128);
+	assert(cq_depth[0][NUM_PQS - 2] == 1024 - 2 * 128 - 128 && regrow_armed(100));
+	assert(all_charge() == 1024);
+	/* Once the flowtable says so, the quarantines end and the charge goes:
+	 * the leaf has its 768. */
+	egress_drain_rc = 0;
+	run_release();
+	assert(!chan_quarantine[1] && !chan_quarantine[16]);
+	assert(cq_depth[0][NUM_PQS - 2] == 768 && wred[0][NUM_PQS - 2].limit == 768);
+	assert(!destroy(dev));
+	run_release();
+	assert_balanced(dev);
+	assert_balanced(other);
+
+	/* ---- a port that goes with a queue given back ---- */
+	/* The first port's tree on channel 0: a class whose child holds queue
+	 * 6, and the top channel's 0 and 7; a second child on queue 5 comes and
+	 * goes, its queue charged a frame. The second port's RED leaf takes
+	 * what is left of its 512. */
+	reset_world();
+	assert(!cdx_register_ft_egress(&egress_ops));
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000000, 1000000, NULL));
+	assert(!to_inner(dev, 10, 1, 1, 0));
+	assert(!add_leaf(dev, 11, 1, 2, 0, 0, 0, NULL));
+	assert(!del_leaf(dev, 11, NULL));
+	assert(dev->refs == 1 && release_armed(0));
+	assert(!create(other, 1, 0));
+	assert(!add_leaf(other, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 1 */
+	assert(!red_in_frames(other, on1, 648, 1945, 2594));
+	assert(cq_depth[1][NUM_PQS - 2] == 512 - 2 * 128);
+	/* The first port goes. Its release is forgotten and its netdev let
+	 * go, but until its context is released the queue given back stays
+	 * charged with its tree's own, as departing: the second tree, alone
+	 * now, grows only into what all four leave. */
+	ii = egress_drains;
+	cdx_htb_port_gone(&gQMCtx[3]);
+	assert(dev->refs == 0 && cdx_htb_departing[0] == (BIT(6) | BIT(5) | BIT(0) | BIT(7)));
+	cdx_htb_mtu_changed(other);
+	assert(cq_depth[1][NUM_PQS - 2] == 1024 - 3 * 128 - 1 - 2 * 128);
+	run_release();
+	assert(egress_drains == ii && !cdx_htb_release.pending);
+	/* The context's release parks, drains and detaches its channel with
+	 * the classifier stopped, and the second tree has its 768. */
+	for (ch = 0; ch < MAX_SCHEDULER_QUEUES; ch++) {
+		cq_live[0][ch] = false;
+		cq_named[0][ch] = false;
+		cq_depth[0][ch] = CEETM_PARKED_CQ_DEPTH;
+		cq_backlog[0][ch] = 0;
+	}
+	chan_owner[0] = NULL;
+	chan_owner_set[0] = false;
+	memset(&gQMCtx[3], 0, sizeof(gQMCtx[3]));
+	cdx_htb_port_released();
+	assert(!cdx_htb_departing[0] && cq_depth[1][NUM_PQS - 2] == 768);
+	assert(!destroy(other));
+	run_release();
+	assert_balanced(other);
+	cdx_unregister_ft_egress();
+	assert(allocations == 0);
+}
+
+/* One tree churning through many queues alone gives back as many, each
+ * costing its frame of the budget until the port's entries are shown gone --
+ * not by a drain that cannot say so yet, nor by one that saw another change
+ * arrive while it waited. The tree's own queues share what those frames leave
+ * meanwhile, so the churn goes on. */
+static void test_given_back_rotation(void)
+{
+	struct net_device *dev = &devices[0];
+	unsigned ch, prio, warns;
+	u32 frames;
+
+	/* ---- one leaf a channel, rotated through every priority ---- */
+	/* Thirty channels, each a class with one child at prio 0 on queue 7,
+	 * and the top channel's queue 0: thirty-one queues sharing 1,024, 33
+	 * each. */
+	reset_world();
+	assert(!cdx_register_ft_egress(&egress_ops));
+	assert(!create(dev, 1, 0));
+	for (ch = 0; ch < 30; ch++) {
+		assert(!add_leaf(dev, 1 + ch, 0, 0, 0, 1000000, 1000000, NULL));
+		assert(!to_inner(dev, 100 + ch, 1 + ch, 0, 0));
+	}
+	run_release();
+	for (ch = 0; ch < 30; ch++)
+		assert(cq_depth[ch][NUM_PQS - 1] == 33);
+	assert(cq_depth[29][0] == 33);
+	/* Each child through prio 1 to 7 before any drain confirms: seven
+	 * queues given back on every channel but the top one, whose queue 7
+	 * control traffic keeps -- 209 in all. Each costs its frame of the
+	 * budget, and the thirty-one queues the tree uses share the 815 left,
+	 * 26 each, until the release has run. */
+	for (prio = 1; prio < NUM_PQS; prio++)
+		for (ch = 0; ch < 30; ch++)
+			assert(!modify(dev, 100 + ch, prio, 0, 0, 0));
+	assert(regrow_armed(100) && release_armed(0));
+	for (ch = 0; ch < 30; ch++)
+		assert(cq_depth[ch][0] == (1024 - 209) / 31);
+	assert(cq_depth[29][NUM_PQS - 1] == (1024 - 209) / 31);
+	frames = fill_given_back();
+	assert(frames == 209 && tree_frames(0) + frames <= 1024);
+	/* The port sends what the entries put there; the queues stay charged
+	 * while those entries may still be there. */
+	memset(cq_backlog, 0, sizeof(cq_backlog));
+	egress_drain_rc = -EAGAIN;
+	warns = pr_warns;
+	run_release();
+	assert(release_armed(100) && pr_warns == warns + 1);
+	run_regrow();
+	assert(tree_frames(0) + frames <= 1024);
+	run_release();
+	assert(release_armed(200) && pr_warns == warns + 1);
+	/* A drain that says so, but after another child moved meanwhile, does
+	 * not cover the queue that one gave back: the charge stays -- the child
+	 * took back queue 1 of its channel and gave back queue 0 -- and its own
+	 * marking arms the release again. */
+	egress_drain_rc = 0;
+	drain_meanwhile = priority_moved;
+	run_release();
+	drain_meanwhile = NULL;
+	assert(release_armed(0) && tree_frames(0) + frames <= 1024);
+	/* The next does, and every queue has its 33. */
+	run_release();
+	assert(!cdx_htb_release.pending);
+	assert(cq_depth[0][1] == 33 && cq_depth[29][NUM_PQS - 1] == 33);
+	for (ch = 1; ch < 30; ch++)
+		assert(cq_depth[ch][0] == 33);
+	assert(tree_frames(0) == 31 * 33);
+	assert(!destroy(dev));
+	run_release();
+	assert_balanced(dev);
+	cdx_unregister_ft_egress();
+	assert(allocations == 0);
+}
+
+/* A wide tree built faster than its port's entries retire -- tc commands in a
+ * row, the release never run between them -- leaves every queue the commands
+ * gave back charged its frame meanwhile. The tree's own queues share what
+ * those frames leave of the budget, so every class still goes in, each queue
+ * that much shorter, and has its whole share again once the release has run.
+ * The depths are the max-min shares of what is left, exactly. */
+static void test_build_unconfirmed(void)
+{
+	struct net_device *dev = &devices[0], *other = &devices[1];
+	static const u8 queues[] = { 7, 5, 4, 3, 2, 1, 0, NUM_PQS };
+	unsigned ii, jj;
+
+	/* ---- thirty classes under the root, beside a second tree ---- */
+	/* The other tree's leaf takes channel 0, and this tree's classes
+	 * channels 1 to 30, each at prio 0 on queue 7. Each after the first
+	 * moves the top channel up, giving back the last one's queue 0: 29
+	 * frames charged, and the thirty leaves and the top channel's queue 0
+	 * share the 483 they leave of the 512. */
+	reset_world();
+	assert(!create(other, 1, 0));
+	assert(!add_leaf(other, 1, 0, 0, 0, 1000000, 1000000, NULL));
+	assert(!create(dev, 1, 0));
+	for (ii = 0; ii < 30; ii++)
+		assert(!add_leaf(dev, 1 + ii, 0, 0, 0, 1000000, 1000000, NULL));
+	assert(window(NULL) == 29 && release_armed(0));
+	for (ii = 0; ii < 30; ii++)
+		assert(cq_depth[1 + ii][NUM_PQS - 1] == (512 - 29) / 31);
+	assert(cq_depth[30][0] == (512 - 29) / 31);
+	/* The release runs: 16 each, as at full load beside a second tree. */
+	run_release();
+	run_regrow();
+	for (ii = 0; ii < 30; ii++)
+		assert(cq_depth[1 + ii][NUM_PQS - 1] == 512 / 31);
+	assert(cq_depth[30][0] == 512 / 31 && !cdx_htb_regrow.pending);
+	assert(!destroy(dev));
+	assert(!destroy(other));
+	run_release();
+	assert_balanced(dev);
+	assert_balanced(other);
+
+	/* ---- sixty-four leaves on one port, the same way ---- */
+	/* Eight channels, each a class at prio 1 on queue 6 whose first child
+	 * at prio 0 takes queue 7 and gives queue 6 back, then children on the
+	 * strict queues 5 to 0 and one weighted: eight leaves a channel, every
+	 * queue of the top channel a leaf's. Eight frames charged, and the
+	 * sixty-four leaves share the 504 they leave, 7 each; 8 each after. */
+	reset_world();
+	assert(!create(other, 1, 0));
+	assert(!create(dev, 1, 0));
+	for (ii = 0; ii < 8; ii++) {
+		assert(!add_leaf(dev, 1 + ii, 0, 1, 0, 1000000, 1000000, NULL));
+		assert(!to_inner(dev, 100 + 10 * ii, 1 + ii, 0, 0));
+		for (jj = 2; jj < NUM_PQS; jj++)
+			assert(!add_leaf(dev, 100 + 10 * ii + jj, 1 + ii, jj, 0, 0, 0, NULL));
+		assert(!add_leaf(dev, 100 + 10 * ii + 8, 1 + ii, 0, 1, 0, 0, NULL));
+	}
+	assert(cdx_htb_port_of(dev)->leaves == 64);
+	assert(window(NULL) == 8 && release_armed(0));
+	for (ii = 0; ii < 8; ii++)
+		for (jj = 0; jj < ARRAY_SIZE(queues); jj++)
+			assert(cq_depth[ii][queues[jj]] == (512 - 8) / 64);
+	run_release();
+	run_regrow();
+	for (ii = 0; ii < 8; ii++)
+		for (jj = 0; jj < ARRAY_SIZE(queues); jj++)
+			assert(cq_depth[ii][queues[jj]] == 512 / 64);
+	assert(!cdx_htb_regrow.pending);
+	assert(!destroy(dev));
+	assert(!destroy(other));
+	run_release();
+	assert_balanced(dev);
+	assert_balanced(other);
+	assert(allocations == 0);
+}
+
+/* ---- a queue's starting frame, refused while the budget is full -------- */
+
+/* Everything a refused command leaves as it found it: the port's tree, the
+ * maps it publishes, its claims and Tx queues, the hardware's channels and
+ * class queues, and what waits on the port's entries. */
+static struct {
+	struct cdx_htb_port port;
+	struct cdx_htb_release release;
+	struct tQM_context_ctl ctx;
+	bool owner_set[CDX_CEETM_MAX_CHANNELS];
+	struct tQM_context_ctl *owner[CDX_CEETM_MAX_CHANNELS];
+	bool live[CDX_CEETM_MAX_CHANNELS][MAX_SCHEDULER_QUEUES];
+	u32 weight[CDX_CEETM_MAX_CHANNELS][MAX_SCHEDULER_QUEUES];
+	u32 depth[CDX_CEETM_MAX_CHANNELS][MAX_SCHEDULER_QUEUES];
+	__typeof__(wred) curves;
+	u64 cir[CDX_CEETM_MAX_CHANNELS], eir[CDX_CEETM_MAX_CHANNELS];
+	unsigned txq, allocations, starts;
+} found, now;
+
+static void take_state(struct net_device *dev, __typeof__(found) *s)
+{
+	struct dpa_priv_s *priv = netdev_priv(dev);
+	struct tQM_context_ctl *ctx = priv->qm_ctx;
+
+	memset(s, 0, sizeof(*s));
+	memcpy(&s->port, &cdx_htb_ports[ctx - gQMCtx], sizeof(s->port));
+	memcpy(&s->release, &cdx_htb_releases[ctx - gQMCtx], sizeof(s->release));
+	memcpy(&s->ctx, ctx, sizeof(s->ctx));
+	memcpy(s->owner_set, chan_owner_set, sizeof(s->owner_set));
+	memcpy(s->owner, chan_owner, sizeof(s->owner));
+	memcpy(s->live, cq_live, sizeof(s->live));
+	memcpy(s->weight, cq_weight, sizeof(s->weight));
+	memcpy(s->depth, cq_depth, sizeof(s->depth));
+	memcpy(s->curves, wred, sizeof(s->curves));
+	memcpy(s->cir, chan_cir, sizeof(s->cir));
+	memcpy(s->eir, chan_eir, sizeof(s->eir));
+	s->txq = dev->real_num_tx_queues;
+	s->allocations = allocations;
+	s->starts = queue_starts;
+}
+
+/* `cmd' is refused for want of a frame of room, saying `msg', and leaves
+ * everything as it was. */
+#define REFUSED(dev, msg, cmd) do {						\
+		take_state(dev, &found);					\
+		last_extack = NULL;						\
+		assert((cmd) == -ENOBUFS && extack_is(msg));			\
+		take_state(dev, &now);						\
+		assert(!memcmp(&found, &now, sizeof(found)));			\
+	} while (0)
+
+/* A command that would configure a class queue for a class -- a leaf added
+ * under the root or under a channel, a leaf's first child taking its place, a
+ * leaf moved to another priority -- takes that queue's starting frame from
+ * the budget. Every queue counted at what it may hold once the cap has shrunk
+ * what the new shares shrink, a paused port's frames can leave no room for
+ * it: the command is refused, before anything is claimed or programmed,
+ * saying how much is held of what, and succeeds once the port has sent them. */
+static void test_start_refused(void)
+{
+	struct net_device *dev = &devices[0], *other = &devices[1];
+	const u32 on1 = TC_H_MAKE(1 << 16, 1);
+	static const char tree_full[] =
+		"no tail-drop room (512 of 512 frames held); retry shortly";
+	static const char sec_full[] =
+		"no tail-drop room (1024 of 1024 frames held); retry shortly";
+
+	red_qdisc = RED_QDISC;
+
+	/* ---- a tree's own budget full ---- */
+	/* Beside another port's empty tree, 512 frames: class 1 on channel 0
+	 * with a child on queue 6, class 2 a leaf on channel 1's queue 6, and
+	 * channel 1's queues 0 and 7 -- 128 each, every one full, the port
+	 * paused. */
+	reset_world();
+	assert(!create(other, 1, 0));
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000000, 1000000, NULL));	/* channel 0 */
+	assert(!to_inner(dev, 10, 1, 1, 0));				/* queue 6 */
+	assert(!add_leaf(dev, 2, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 1 */
+	run_release();
+	assert(cq_depth[0][6] == 128 && cq_depth[1][6] == 128);
+	assert(cq_depth[1][0] == 128 && cq_depth[1][7] == 128);
+	cq_backlog[0][6] = cq_backlog[1][6] = cq_backlog[1][0] = cq_backlog[1][7] = 128;
+	assert(port_charge(&gQMCtx[3]) == 512);
+	/* A child under class 1, on queue 5. */
+	REFUSED(dev, tree_full, add_leaf(dev, 11, 1, 2, 0, 0, 0, NULL));
+	/* A class under the root, which would claim channel 2. */
+	REFUSED(dev, tree_full, add_leaf(dev, 3, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(!chan_owner_set[2]);
+	/* Class 2's first child, on queue 5: class 2's queue would be given
+	 * back with its frames still on it. */
+	REFUSED(dev, tree_full, to_inner(dev, 20, 2, 2, 0));
+	/* Class 10 moved to prio 3, queue 4, the same way. */
+	REFUSED(dev, tree_full, modify(dev, 10, 3, 0, 0, 0));
+	/* Or into the weighted group. */
+	REFUSED(dev, tree_full, modify(dev, 10, 0, 1, 0, 0));
+	/* A change that configures no other queue adds nothing: class 10 at
+	 * the priority it has, and class 2's rate. */
+	assert(!modify(dev, 10, 1, 0, 0, 0) && cq_depth[0][6] == 128);
+	assert(!modify(dev, 2, 0, 0, 2000000, 2000000));
+	/* Once the port has sent them, each goes through. */
+	memset(cq_backlog, 0, sizeof(cq_backlog));
+	assert(!add_leaf(dev, 11, 1, 2, 0, 0, 0, NULL) && cq_live[0][5]);
+	assert(!add_leaf(dev, 3, 0, 1, 0, 1000000, 1000000, NULL) && chan_owner_set[2]);
+	assert(!to_inner(dev, 20, 2, 2, 0) && cq_live[1][5]);
+	assert(!modify(dev, 10, 3, 0, 0, 0) && cq_live[0][4]);
+	assert(!destroy(dev));
+	assert(!destroy(other));
+	run_release();
+	assert_balanced(dev);
+	assert_balanced(other);
+
+	/* ---- SEC's share full of another tree's frames ---- */
+	/* A RED leaf alone on the other port takes the 768 frames queues 0 and
+	 * 7 leave it, and fills; this port's tree halves its share, and the
+	 * 768 it holds stay. All 1,024 are held, though this tree has its
+	 * whole 512: its first leaf is refused for SEC's pool. */
+	reset_world();
+	assert(!create(other, 1, 0));
+	assert(!add_leaf(other, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 0 */
+	assert(!red_in_frames(other, on1, 648, 1945, 2594) && cq_depth[0][6] == 768);
+	cq_backlog[0][6] = 768;
+	assert(!create(dev, 1, 0));
+	assert(all_charge() == 1024 && cq_depth[0][6] == 512 - 2 * 128);
+	REFUSED(dev, sec_full, add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(!chan_owner_set[1]);
+	cq_backlog[0][6] = 0;
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL) && chan_owner[1] == &gQMCtx[3]);
+	assert(!destroy(dev));
+	assert(!destroy(other));
+	run_release();
+	assert_balanced(dev);
+	assert_balanced(other);
+
+	/* ---- the one change no command can be refused ---- */
+	/* Beside the empty tree again, class 1 on channel 0's queue 6 and
+	 * class 2 on channel 1's, the top channel, with its queues 0 and 7:
+	 * 512 frames, all held. Class 2 goes, and the top channel moves down
+	 * to channel 0, whose queues 0 and 7 start at a frame each while
+	 * channel 1's are given back with their frames on them: two frames
+	 * past the budget, and no more. */
+	reset_world();
+	assert(!create(other, 1, 0));
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 0 */
+	assert(!add_leaf(dev, 2, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 1 */
+	run_release();
+	cq_backlog[0][6] = cq_backlog[1][6] = cq_backlog[1][0] = cq_backlog[1][7] = 128;
+	assert(port_charge(&gQMCtx[3]) == 512);
+	assert(!del_leaf(dev, 2, NULL));
+	assert(cdx_htb_port_of(dev)->top == 0 && cq_live[0][0] && cq_live[0][7]);
+	assert(port_charge(&gQMCtx[3]) == 512 + 2);
+	/* The frames sent and the entries shown gone, all of it comes back. */
+	memset(cq_backlog, 0, sizeof(cq_backlog));
+	run_release();
+	run_regrow();
+	assert(port_charge(&gQMCtx[3]) <= 512);
+	assert(!destroy(dev));
+	assert(!destroy(other));
+	run_release();
+	assert_balanced(dev);
+	assert_balanced(other);
+	assert(allocations == 0);
+}
+
+/* ---- the status read's budget, with no lock it could wait on ----------- */
+
+/* What the status read reports of the SoC's channels, against the hardware
+ * layer's record of them now: mapped to a port, or kept from every claim --
+ * asked while another thread holds cdx_htb_mutex, a command or a release
+ * midway, which the controller's health probe must not wait for. One read of
+ * the snapshot, when no write overlaps it. */
+static void assert_levels(void)
+{
+	unsigned ii, used = 0, held = 0, reads = seq_reads;
+	struct cdx_qos_budget b;
+
+	for (ii = 0; ii < channels_built; ii++) {
+		if (chan_owner_set[ii])
+			used++;
+		else if (chan_failed[ii] || chan_quarantine[ii])
+			held++;
+	}
+	cdx_htb_mutex = 1;
+	cdx_qos_budget(&b);
+	cdx_htb_mutex = 0;
+	assert(b.channels == channels_built && b.channels_used == used && b.channels_held == held);
+	assert(b.leaves == CDX_HTB_MAX_LEAVES);
+	assert(b.policers == CDX_FT_QOS_MAX_POLICER && b.policers_used == police_pool_used);
+	assert(seq_reads == reads + 1);
+}
+
+/* The status read's levels -- the SoC's channels and what holds them, the
+ * leaves a port may have, the policer pool -- are a snapshot cdx keeps as
+ * each changes, read with no sleeping lock and retried across a write. */
+static void test_qos_levels(void)
+{
+	struct net_device *dev = &devices[0], *other = &devices[1];
+	struct cdx_qos_budget b;
+	unsigned reads, ii;
+
+	reset_world();
+	police_pool_used = 3;
+	assert_levels();
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 0 */
+	assert_levels();
+	assert(!add_leaf(dev, 2, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 1 */
+	assert(!create(other, 1, 0));
+	assert(!add_leaf(other, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 2 */
+	assert_levels();
+	/* Taken down with channel 1's drain failing: channel 0 quarantined
+	 * for the port, channel 1 out of service for good. */
+	drain_fails = BIT(1);
+	assert(!destroy(dev));
+	drain_fails = 0;
+	assert(chan_failed[1] && chan_quarantine[0] == &gQMCtx[3]);
+	assert_levels();
+	/* The release ends the quarantine; the failed channel stays held. */
+	run_release();
+	assert(!chan_quarantine[0]);
+	assert_levels();
+	/* The other port goes: its channel stays mapped until its context is
+	 * released, and is free once it is. */
+	cdx_htb_port_gone(&gQMCtx[4]);
+	assert_levels();
+	for (ii = 0; ii < MAX_SCHEDULER_QUEUES; ii++) {
+		cq_live[2][ii] = false;
+		cq_named[2][ii] = false;
+		cq_depth[2][ii] = CEETM_PARKED_CQ_DEPTH;
+	}
+	chan_owner[2] = NULL;
+	chan_owner_set[2] = false;
+	memset(&gQMCtx[4], 0, sizeof(gQMCtx[4]));
+	cdx_htb_port_released();
+	assert_levels();
+	/* A read a write overlapped is read again. */
+	seq_retry_once = true;
+	reads = seq_reads;
+	cdx_htb_mutex = 1;
+	cdx_qos_budget(&b);
+	cdx_htb_mutex = 0;
+	assert(seq_reads == reads + 2 && !b.channels_used && b.channels_held == 1);
+	police_pool_used = 0;
+	assert(allocations == 0);
+}
+
+/* ---- the channel a class's claim would get ------------------------------ */
+
+/* A class under the root that has to claim a channel is charged, before it
+ * claims one, what the channel the claim would pick holds for it once
+ * claimed -- the lowest one mapped to no port, in service and held for no
+ * other port -- and nothing of the others, however much they hold: not a
+ * channel a failed drain keeps out of service, which no claim hands out, nor
+ * another channel quarantined for the port. */
+static void test_claim_pick(void)
+{
+	struct net_device *dev = &devices[0], *other = &devices[1];
+	const u32 on1 = TC_H_MAKE(1 << 16, 1);
+
+	red_qdisc = RED_QDISC;
+
+	/* ---- a failed drain's frames, on a channel no claim gives ---- */
+	/* The port's tree alone, on channels 0 and 1: class 1 a RED leaf on
+	 * channel 0 taking the 640 frames channel 1's three queues leave, and
+	 * filling. A second port's tree halves the share, and the 640 stay.
+	 * Taken down with channel 0's drain failing, the port paused, they
+	 * stay still. The port's next tree's first class claims channel 1 --
+	 * channel 0 is out of service -- and goes in. */
+	reset_world();
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 0 */
+	assert(!add_leaf(dev, 2, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 1 */
+	run_release();
+	assert(!red_in_frames(dev, on1, 648, 1945, 2594) && cq_depth[0][6] == 640);
+	cq_backlog[0][6] = 640;
+	assert(!create(other, 1, 0));
+	drain_fails = BIT(0);
+	assert(!destroy(dev));
+	drain_fails = 0;
+	assert(chan_failed[0] && chan_quarantine[0] == &gQMCtx[3] && cq_backlog[0][6] == 640);
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL) && chan_owner[1] == &gQMCtx[3]);
+	assert(!destroy(dev));
+	assert(!destroy(other));
+	run_release();
+	assert_balanced(dev);
+	assert_balanced(other);
+
+	/* ---- the channel the claim would pick, and only that one ---- */
+	/* Beside another port's empty tree, 512 frames. The port's tree on
+	 * channels 0 and 1 taken down, the release not run: both quarantined
+	 * for the port, their queues given back. Channel 0's queue 0 is left
+	 * at 600 frames of depth, as a park that failed leaves a queue, which
+	 * the entries still naming it can fill: the next tree's first class
+	 * would claim channel 0, the lowest, and those frames would be the
+	 * tree's -- it is refused. Left on channel 1's instead, which the claim
+	 * would not pick, they cost the class nothing, and it goes in. */
+	reset_world();
+	assert(!create(other, 1, 0));
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 0 */
+	assert(!add_leaf(dev, 2, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 1 */
+	assert(!destroy(dev));
+	cq_depth[0][0] = 600;
+	assert(!create(dev, 1, 0));
+	REFUSED(dev, "no tail-drop room (601 of 512 frames held); retry shortly",
+		add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(!chan_owner_set[0] && !chan_owner_set[1]);
+	cq_depth[0][0] = CEETM_PARKED_CQ_DEPTH;
+	cq_depth[1][0] = 600;
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL) && chan_owner[0] == &gQMCtx[3]);
+	cq_depth[1][0] = CEETM_PARKED_CQ_DEPTH;
+	assert(!destroy(dev));
+	assert(!destroy(other));
+	run_release();
+	assert_balanced(dev);
+	assert_balanced(other);
 	assert(allocations == 0);
 }
 
@@ -3868,34 +4777,487 @@ static void test_egress_changed(void)
 	assert(!cdx_ft_egress_drain(dev) && egress_drains == 2);
 	backend_idle = false;
 	assert(cdx_ft_egress_drain(dev) == -EAGAIN);
+	/* Its entries gone, the release the teardown left due can run. */
+	backend_idle = true;
 	assert_balanced(dev);
+}
+
+/* ---- the ceilings: the SoC's channels, a port's leaves ----------------- */
+
+/* The egress class a conntrack mark spells for channel `ch' (as the hardware
+ * numbers them) and class queue `cq': the channel field is one-based, zero
+ * being the port's own top channel. */
+#define MARK(ch, cq)	((u32)((ch) + 1) << CDX_FT_QOS_CHANNEL_SHIFT | (cq))
+
+/* Every channel of the CEETM instance can serve one port's tree, not the first
+ * eight, nor the sixteen a u16 of claimed channels kept; and the mark naming
+ * the last of them reaches its class in both paths, through a class map that
+ * has an entry for every egress class the adapter decodes. */
+static void test_wide_tree(void)
+{
+	struct net_device *dev = &devices[0], *other = &devices[1];
+	struct cdx_htb_port *port;
+	struct sk_buff skb;
+	u16 qid[30], first;
+	u32 channel, cq;
+	unsigned ii;
+
+	reset_world();
+	port = cdx_htb_port_of(dev);
+	assert(CDX_HTB_CLASSES == 1024 && CDX_FT_QOS_EGRESS_MASK + 1 == 1024);
+	assert(ARRAY_SIZE(port->class_txq) == 1024);
+	assert(!cdx_register_ft_qos_class(test_classify, false));
+	/* Another port's class takes channel 0 first: the channels are the
+	 * SoC's, and this port's run from 1. */
+	assert(!create(other, 1, 0));
+	assert(!add_leaf(other, 1, 0, 0, 0, 1000000, 1000000, &first));
+	assert(chan_owner[0] == &gQMCtx[4]);
+	assert(!create(dev, 1, 0));
+	for (ii = 0; ii < 30; ii++) {
+		assert(!add_leaf(dev, 1 + ii, 0, 0, 0, 1000000, 1000000, &qid[ii]));
+		assert(qid[ii] == DPAA_ETH_TX_QUEUES + ii);
+		assert(chan_owner[1 + ii] == &gQMCtx[3] && cq_live[1 + ii][NUM_PQS - 1]);
+	}
+	/* Thirty distinct channels, 1 to 30: every one this port's in both
+	 * records, the twenty-two past the first eight among them. */
+	assert(port->channels == 0x7ffffffeu && gQMCtx[3].chnl_map == 0x7ffffffeu);
+
+	build(&skb, &(struct frame){ 0 });
+	for (ii = 0; ii < 30; ii++) {
+		/* In hardware: the class's own channel and queue, one-based. */
+		channel = ii + 2;
+		cq = NUM_PQS - 1;
+		assert(cdx_htb_resolve_class(&gQMCtx[3], &channel, &cq));
+		assert(channel == ii + 2 && cq == NUM_PQS - 1);
+		/* In software: its Tx queue, and from that its class queue. */
+		assert(pick(dev, MARK(1 + ii, NUM_PQS - 1)) == qid[ii]);
+		assert(cdx_htb_txq_fq(&gQMCtx[3], qid[ii], &skb) ==
+		       &class_fqs[1 + ii][NUM_PQS - 1]);
+	}
+	/* Channel field 31 is channel 30, the last class's, in both paths --
+	 * with every policer and the remark above it, which say nothing about
+	 * where a frame leaves and must not index past the map. */
+	channel = 31;
+	cq = NUM_PQS - 1;
+	assert(cdx_htb_resolve_class(&gQMCtx[3], &channel, &cq) &&
+	       channel == 31 && cq == NUM_PQS - 1);
+	assert(pick(dev, MARK(30, NUM_PQS - 1)) == qid[29]);
+	assert(pick(dev, (u32)CDX_FT_QOS_MAX_POLICER << CDX_FT_QOS_POLICER_SHIFT |
+		    CDX_FT_QOS_REMARK_MASK | MARK(30, NUM_PQS - 1)) == qid[29]);
+	/* It is also the top channel, which a channel field of zero names. */
+	channel = 0;
+	cq = NUM_PQS - 1;
+	assert(cdx_htb_resolve_class(&gQMCtx[3], &channel, &cq) &&
+	       channel == 31 && cq == NUM_PQS - 1);
+	assert(pick(dev, NUM_PQS - 1) == qid[29]);
+	/* Channel 31 no class holds, and field 33 names no channel at all:
+	 * both are unclassified, the top channel's queue 0 in hardware, and
+	 * no leaf in software. */
+	for (ii = 32; ii <= 33; ii++) {
+		channel = ii;
+		cq = NUM_PQS - 1;
+		assert(cdx_htb_resolve_class(&gQMCtx[3], &channel, &cq) &&
+		       channel == 31 && cq == 0);
+		assert(pick(dev, MARK(ii - 1, NUM_PQS - 1)) == DPA_SELECT_QUEUE_NONE);
+	}
+	assert(cdx_htb_txq_fq(&gQMCtx[3], 0, &skb) == &class_fqs[30][0]);
+	assert(!destroy(dev));
+	assert(!destroy(other));
+	assert_balanced(dev);
+	assert_balanced(other);
+	cdx_unregister_ft_qos_class();
+}
+
+/* A board whose device tree gives CEETM fewer channels than the instance has:
+ * the tree claims and walks only those -- the hardware layer refuses a channel
+ * past them, and a walk of what the queues hold that met the refusal kept
+ * every queue at its starting frame -- and a refusal says how many there are
+ * and how many are held. */
+static void test_channel_count(void)
+{
+	struct net_device *dev = &devices[0], *other = &devices[1];
+	unsigned ii, warns;
+
+	/* ---- eight channels, eight classes under the root ---- */
+	reset_world();
+	channels_built = 8;
+	assert(!create(dev, 1, 0));
+	for (ii = 0; ii < 8; ii++)
+		assert(!add_leaf(dev, 1 + ii, 0, 1, 0, 1000000, 1000000, NULL));
+	/* Eight leaves and the top channel's queues 0 and 7: ten asking 128
+	 * each of 1,024, and none kept short once the queues 0 and 7 the top
+	 * channel left on its way up are shown unused. */
+	run_release();
+	run_regrow();
+	for (ii = 0; ii < 8; ii++)
+		assert(cq_depth[ii][NUM_PQS - 2] == 102);
+	assert(cq_depth[7][0] == 102 && cq_depth[7][NUM_PQS - 1] == 102);
+	assert(!cdx_htb_regrow.pending);
+	/* The ninth is refused, saying so, and nothing past the eight is
+	 * touched. */
+	last_extack = NULL;
+	assert(add_leaf(dev, 9, 0, 1, 0, 1000000, 1000000, NULL) == -ENOSPC);
+	assert(extack_is("no CEETM channel free (8 of 8 held)"));
+	assert(!chan_owner_set[8] && cdx_htb_port_of(dev)->leaves == 8);
+	assert(!destroy(dev));
+	assert_balanced(dev);
+
+	/* ---- only channels held for another port left: busy, with counts ---- */
+	reset_world();
+	channels_built = 8;
+	assert(!create(other, 1, 0));
+	for (ii = 0; ii < 3; ii++)
+		assert(!add_leaf(other, 1 + ii, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(!destroy(other));
+	assert(chan_quarantine[0] == &gQMCtx[4] && chan_quarantine[2] == &gQMCtx[4]);
+	assert(!create(dev, 1, 0));
+	for (ii = 0; ii < 5; ii++)
+		assert(!add_leaf(dev, 1 + ii, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(chan_owner[3] == &gQMCtx[3] && chan_owner[7] == &gQMCtx[3]);
+	last_extack = NULL;
+	warns = pr_warns;
+	assert(add_leaf(dev, 6, 0, 1, 0, 1000000, 1000000, NULL) == -EBUSY);
+	assert(extack_is("no CEETM channel free yet (8 of 8 held, 3 retiring)"));
+	assert(pr_warns == warns + 1);
+	/* Once the other port's release has run they are this port's to
+	 * take, and past them nothing is left. */
+	run_release();
+	for (ii = 0; ii < 3; ii++)
+		assert(!add_leaf(dev, 6 + ii, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(chan_owner[0] == &gQMCtx[3] && chan_owner[2] == &gQMCtx[3]);
+	last_extack = NULL;
+	assert(add_leaf(dev, 9, 0, 1, 0, 1000000, 1000000, NULL) == -ENOSPC);
+	assert(extack_is("no CEETM channel free (8 of 8 held)"));
+	assert(!destroy(dev));
+	run_release();
+	assert_balanced(dev);
+	assert_balanced(other);
+
+	/* ---- a channel whose drain failed is held too ---- */
+	reset_world();
+	channels_built = 4;
+	chan_failed[1] = true;
+	assert(!create(dev, 1, 0));
+	for (ii = 0; ii < 3; ii++)
+		assert(!add_leaf(dev, 1 + ii, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(!chan_owner_set[1]);
+	last_extack = NULL;
+	assert(add_leaf(dev, 4, 0, 1, 0, 1000000, 1000000, NULL) == -ENOSPC);
+	assert(extack_is("no CEETM channel free (4 of 4 held)"));
+	assert(!destroy(dev));
+	run_release();
+	assert_balanced(dev);
+}
+
+/* Sixty-four leaves on a port, each with its Tx queue, and the next refused
+ * before any channel is claimed for it -- saying how many it holds. */
+static void test_leaf_ceiling(void)
+{
+	struct net_device *dev = &devices[0];
+	u16 qid, moved;
+	unsigned ii, jj;
+
+	reset_world();
+	assert(CDX_HTB_MAX_LEAVES == 64);
+	assert(!create(dev, 1, 0));
+	/* Eight channels, each a class with eight children, one per strict
+	 * priority. */
+	for (ii = 0; ii < 8; ii++) {
+		assert(!add_leaf(dev, 1 + ii, 0, 0, 0, 1000000, 1000000, NULL));
+		assert(!to_inner(dev, 100 + 10 * ii, 1 + ii, 0, 0));
+		for (jj = 1; jj < NUM_PQS; jj++)
+			assert(!add_leaf(dev, 100 + 10 * ii + jj, 1 + ii, jj, 0, 0, 0, &qid));
+	}
+	assert(qid == DPAA_ETH_TX_QUEUES + 63);
+	assert(cdx_htb_port_of(dev)->leaves == 64);
+	assert(dev->real_num_tx_queues == DPAA_ETH_TX_QUEUES + 64);
+	/* Every queue the tree uses is a leaf's, sixty-four of 1,024 each. */
+	for (ii = 0; ii < 8; ii++)
+		for (jj = 0; jj < NUM_PQS; jj++)
+			assert(cq_depth[ii][jj] == 16);
+	last_extack = NULL;
+	assert(add_leaf(dev, 9, 0, 0, 0, 1000000, 1000000, NULL) == -ENOSPC);
+	assert(extack_is("no HTB leaf free on this port (64 of 64 held)"));
+	assert(!chan_owner_set[8]);
+	/* A child of a channel the tree has is a leaf all the same. */
+	last_extack = NULL;
+	assert(add_leaf(dev, 99, 1, 0, 1, 0, 0, NULL) == -ENOSPC);
+	assert(extack_is("no HTB leaf free on this port (64 of 64 held)"));
+	/* One going makes room for one. */
+	assert(!del_leaf(dev, 177, &moved) && !moved);
+	assert(!add_leaf(dev, 9, 0, 0, 0, 1000000, 1000000, &qid));
+	assert(qid == DPAA_ETH_TX_QUEUES + 63 && chan_owner[8] == &gQMCtx[3]);
+	assert(!destroy(dev));
+	assert_balanced(dev);
+	assert(allocations == 0);
+}
+
+/* What tail drop a tree at its widest gets: thirty device leaves on one port,
+ * a channel each and prio 0, so queue 7 of every channel is a leaf's and the
+ * top channel's queue 0 is the only one unclassified traffic adds. Thirty-one
+ * queues asking 128 each share the 1,024 of SEC's pool a lone tree may hold,
+ * and half that with a second tree live; with `default' naming one of the
+ * leaves, queue 0 keeps a frame and the thirty share the rest. */
+static void test_cap_full_load(void)
+{
+	struct net_device *dev = &devices[0], *other = &devices[1];
+	const struct { u16 defcls; u32 alone, beside, unclassified_alone,
+		       unclassified_beside; } loads[] = {
+		{ 0, 33, 16, 33, 16 },
+		{ 30, 34, 17, 1, 1 },
+	};
+	unsigned ii, ch;
+
+	for (ii = 0; ii < ARRAY_SIZE(loads); ii++) {
+		reset_world();
+		assert(!create(dev, 1, loads[ii].defcls));
+		for (ch = 0; ch < 30; ch++)
+			assert(!add_leaf(dev, 1 + ch, 0, 0, 0, 1000000, 1000000, NULL));
+		/* Each class under the root moved the top channel up and gave
+		 * back the queue 0 of the one before: a frame each, charged
+		 * until the port's entries are shown retired or rebuilt. With
+		 * nothing given back unconfirmed the shares are whole, and the
+		 * work that looks again finds nothing short. */
+		assert(tree_frames(29) <= 1024 - 29 && release_armed(0));
+		run_release();
+		run_regrow();
+		for (ch = 0; ch < 30; ch++)
+			assert(cq_depth[ch][NUM_PQS - 1] == loads[ii].alone);
+		assert(cq_depth[29][0] == loads[ii].unclassified_alone);
+		assert(tree_frames(29) == 30 * loads[ii].alone + loads[ii].unclassified_alone);
+		assert(!cdx_htb_regrow.pending);
+		/* A second tree, the WAN's beside the LAN's, halves it. */
+		assert(!create(other, 2, 0));
+		for (ch = 0; ch < 30; ch++)
+			assert(cq_depth[ch][NUM_PQS - 1] == loads[ii].beside);
+		assert(cq_depth[29][0] == loads[ii].unclassified_beside);
+		/* And going gives it back. */
+		assert(!destroy(other));
+		for (ch = 0; ch < 30; ch++)
+			assert(cq_depth[ch][NUM_PQS - 1] == loads[ii].alone);
+		assert(!destroy(dev));
+		run_release();
+		assert_balanced(dev);
+		assert_balanced(other);
+	}
+}
+
+/* One class as the report gives it. */
+static void assert_class(const struct cdx_qos_class *cl, u32 classid, u16 parent,
+			 u8 channel, u8 queue, u8 slot, bool inner)
+{
+	assert(cl->classid == classid && cl->parent == parent);
+	assert(cl->channel == channel && cl->queue == queue && cl->slot == slot);
+	assert(cl->inner == inner);
+}
+
+/* The report on `dev' alone, picked out of the walk of every port the
+ * adapter's row files make (cdx_qos_port_next()): what the walk gives for it,
+ * its classes too with `classes', or -ENODEV when the walk never meets it. */
+static int qos_port(struct net_device *dev, struct cdx_qos_port *p,
+		    struct cdx_qos_class *classes, unsigned int max)
+{
+	unsigned int ii;
+	int rc;
+
+	for (ii = 0; (rc = cdx_qos_port_next(&ii, p, classes, max)) != -ENOENT; ii++)
+		if (dev && cdx_htb_netdevs[ii] == dev)
+			return rc;
+	return -ENODEV;
+}
+
+/* What the hardware QoS has and what of it is held, for the adapter's status:
+ * the SoC's channels and what holds them, a port's tree, and every class of it
+ * with the channel and class queue it got -- which is what a consumer builds a
+ * mark from. Read without RTNL, as a procfs read is. */
+static void test_qos_report(void)
+{
+	struct net_device *dev = &devices[0], *other = &devices[1];
+	struct net_device bare = { 0 };
+	struct cdx_qos_class cls[64 + 32];
+	struct cdx_qos_budget b;
+	struct cdx_qos_port p;
+	unsigned int ii;
+	u16 moved;
+
+	reset_world();
+	strscpy(dev->name, "eth3", sizeof(dev->name));
+	strscpy(other->name, "eth4", sizeof(other->name));
+	dev->ifindex = 5;
+	other->ifindex = 6;
+	police_pool_used = police_port_used = 0;
+	police_port_dev = NULL;
+	rtnl = false;
+	cdx_qos_budget(&b);
+	assert(b.channels == 32 && !b.channels_used && !b.channels_held && b.leaves == 64);
+	/* The ingress policer pool beside them: the sixty-three profiles any
+	 * port's flower filters draw from. */
+	assert(b.policers == 63 && !b.policers_used);
+	/* A netdev with no CEETM context behind it is no port of cdx's: the
+	 * walk never meets it. */
+	assert(qos_port(&bare, &p, NULL, 0) == -ENODEV);
+	assert(qos_port(&bare, &p, cls, ARRAY_SIZE(cls)) == -ENODEV);
+	assert(qos_port(NULL, &p, NULL, 0) == -ENODEV);
+	/* A port of cdx's no tc command has touched yet has nothing. */
+	assert(!qos_port(dev, &p, NULL, 0));
+	assert(!p.tree && !p.channels && !p.spare && !p.held && !p.leaves);
+	assert(qos_port(dev, &p, cls, ARRAY_SIZE(cls)) == 0);
+	rtnl = true;
+
+	/* A tree: 1:1 a channel with two leaves under it, 1:2 a leaf with a
+	 * channel of its own. */
+	assert(!create(dev, 1, 0));
+	assert(!qos_port(dev, &p, NULL, 0) && p.tree && !p.channels && !p.leaves);
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000000, 1000000, NULL));	/* channel 0, slot 0 */
+	assert(!add_leaf(dev, 2, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 1, queue 6, slot 1 */
+	assert(!to_inner(dev, 10, 1, 2, 0));				/* queue 5, slot 0 */
+	assert(!add_leaf(dev, 11, 1, 0, 3, 0, 0, NULL));		/* weighted queue 8, slot 2 */
+	rtnl = false;
+	cdx_qos_budget(&b);
+	assert(b.channels == 32 && b.channels_used == 2 && !b.channels_held);
+	assert(!qos_port(dev, &p, NULL, 0));
+	assert(p.tree && p.channels == 0x3 && !p.spare && !p.held && p.leaves == 3);
+	assert(qos_port(dev, &p, cls, ARRAY_SIZE(cls)) == 4);
+	assert_class(&cls[0], 0x10001, 0, 0, CDX_QOS_NONE, CDX_QOS_NONE, true);
+	assert_class(&cls[1], 0x10002, 0, 1, NUM_PQS - 2, 1, false);
+	assert_class(&cls[2], 0x1000a, 1, 0, NUM_PQS - 3, 0, false);
+	assert_class(&cls[3], 0x1000b, 1, 0, NUM_PQS, 2, false);
+	/* Too little room is refused rather than half-filled. */
+	assert(qos_port(dev, &p, cls, 3) == -ENOSPC);
+	rtnl = true;
+
+	/* 1:2 goes: its channel stays the port's, spare for the next class
+	 * under the root, and 1:11 moves into its slot. */
+	assert(!del_leaf(dev, 2, &moved) && moved == 11);
+	rtnl = false;
+	cdx_qos_budget(&b);
+	assert(b.channels_used == 2 && !b.channels_held);
+	assert(!qos_port(dev, &p, NULL, 0));
+	assert(p.tree && p.channels == 0x3 && p.spare == 1 && !p.held && p.leaves == 2);
+	assert(qos_port(dev, &p, cls, ARRAY_SIZE(cls)) == 3);
+	assert_class(&cls[0], 0x10001, 0, 0, CDX_QOS_NONE, CDX_QOS_NONE, true);
+	assert_class(&cls[1], 0x1000a, 1, 0, NUM_PQS - 3, 0, false);
+	assert_class(&cls[2], 0x1000b, 1, 0, NUM_PQS, 1, false);
+	rtnl = true;
+
+	/* Another port's tree takes channel 2. */
+	assert(!create(other, 7, 0));
+	assert(!add_leaf(other, 0x20, 0, 0, 0, 1000000, 1000000, NULL));
+	rtnl = false;
+	cdx_qos_budget(&b);
+	assert(b.channels_used == 3 && !b.channels_held);
+	assert(!qos_port(other, &p, NULL, 0));
+	assert(p.tree && p.channels == 0x4 && !p.spare && !p.held && p.leaves == 1);
+	assert(qos_port(other, &p, cls, ARRAY_SIZE(cls)) == 1);
+	assert_class(&cls[0], 0x70020, 0, 2, NUM_PQS - 1, 0, false);
+
+	/* Five of the pool's profiles spoken for, pending ones among them, and
+	 * two held by the first port's filters. */
+	police_pool_used = 5;
+	police_port_dev = dev;
+	police_port_used = 2;
+	cdx_qos_budget(&b);
+	assert(b.policers == 63 && b.policers_used == 5);
+	assert(!qos_port(dev, &p, NULL, 0) && p.policers == 2);
+	assert(!strcmp(p.name, "eth3") && p.ifindex == 5);
+	assert(!qos_port(other, &p, NULL, 0) && !p.policers);
+	assert(!strcmp(p.name, "eth4") && p.ifindex == 6);
+
+	/* Every port of cdx's in turn, as the adapter's row files walk them --
+	 * holding no netdev of their own: each with the name and index it has,
+	 * the same answers, and its tree's classes when asked for them. */
+	ii = 0;
+	assert(cdx_qos_port_next(&ii, &p, cls, ARRAY_SIZE(cls)) == 3 && ii == 3);
+	assert(!strcmp(p.name, "eth3") && p.ifindex == 5 && p.tree);
+	assert(p.channels == 0x3 && p.spare == 1 && !p.held && p.leaves == 2 && p.policers == 2);
+	assert_class(&cls[0], 0x10001, 0, 0, CDX_QOS_NONE, CDX_QOS_NONE, true);
+	assert_class(&cls[1], 0x1000a, 1, 0, NUM_PQS - 3, 0, false);
+	assert_class(&cls[2], 0x1000b, 1, 0, NUM_PQS, 1, false);
+	ii++;
+	assert(cdx_qos_port_next(&ii, &p, NULL, 0) == 0 && ii == 4);
+	assert(!strcmp(p.name, "eth4") && p.ifindex == 6 && p.tree);
+	assert(p.channels == 0x4 && !p.spare && !p.held && p.leaves == 1 && !p.policers);
+	ii++;
+	assert(cdx_qos_port_next(&ii, &p, cls, ARRAY_SIZE(cls)) == -ENOENT);
+	ii = MAX_PHY_PORTS;
+	assert(cdx_qos_port_next(&ii, &p, NULL, 0) == -ENOENT);
+	/* Too little room is refused rather than half-filled, here too. */
+	ii = 0;
+	assert(cdx_qos_port_next(&ii, &p, cls, 2) == -ENOSPC && ii == 3);
+	rtnl = true;
+
+	/* The first tree taken down, channel 1's drain failing: channel 0
+	 * quarantined for its port until its entries are retired, channel 1
+	 * out of service for good -- both held, neither used, and only
+	 * channel 0 coming back to the port or the pool. */
+	drain_fails = BIT(1);
+	assert(!destroy(dev));
+	drain_fails = 0;
+	rtnl = false;
+	cdx_qos_budget(&b);
+	assert(b.channels_used == 1 && b.channels_held == 2);
+	assert(!qos_port(dev, &p, NULL, 0));
+	assert(!p.tree && !p.channels && !p.spare && p.held == 0x1 && !p.leaves);
+	assert(qos_port(dev, &p, cls, ARRAY_SIZE(cls)) == 0);
+	rtnl = true;
+	/* The release gives the quarantined one back; the failed one stays
+	 * held. */
+	run_release();
+	rtnl = false;
+	cdx_qos_budget(&b);
+	assert(b.channels_used == 1 && b.channels_held == 1);
+	assert(!qos_port(dev, &p, NULL, 0) && !p.held);
+	rtnl = true;
+	/* Back in service, as only a test can put it: the next change reads
+	 * it so. */
+	chan_failed[1] = false;
+	assert(!destroy(other));
+	run_release();
+	cdx_qos_budget(&b);
+	assert(!b.channels_used && !b.channels_held);
+	assert_balanced(dev);
+	assert_balanced(other);
+
+	/* A port leaving cdx stops being one of its ports as its tree is
+	 * dropped, before its context and the netdev behind it are let go: no
+	 * report names it from then on, nor reads its netdev. */
+	cdx_htb_port_gone(&gQMCtx[4]);
+	assert(qos_port(other, &p, NULL, 0) == -ENODEV);
+	assert(qos_port(other, &p, cls, ARRAY_SIZE(cls)) == -ENODEV);
+	ii = 0;
+	assert(cdx_qos_port_next(&ii, &p, NULL, 0) == 0 && ii == 3);
+	ii++;
+	assert(cdx_qos_port_next(&ii, &p, NULL, 0) == -ENOENT);
+	/* And a context made whole again makes it one once more. */
+	cdx_htb_port_added(&gQMCtx[4]);
+	assert(!qos_port(other, &p, NULL, 0) && !p.tree && !strcmp(p.name, "eth4"));
+	assert(allocations == 0);
 }
 
 int main(void)
 {
-	test_tree();
-	test_egress_changed();
-	test_density();
-	test_depth_and_limits();
-	test_channel_reuse();
-	test_software_path();
-	test_unclassified();
-	test_control_budget();
-	test_fragments();
-	test_treeless_port();
-	test_remark();
-	test_class_statistics();
-	test_red();
-	test_cap();
-	test_backlog();
-	test_release();
-	test_queue_budget();
-	test_faults();
-	test_dispatch();
-	test_refusals();
+	static void (*const tests[])(void) = {
+		test_tree, test_egress_changed, test_density, test_depth_and_limits,
+		test_channel_reuse, test_software_path, test_unclassified,
+		test_control_budget, test_fragments, test_treeless_port, test_remark,
+		test_class_statistics, test_red, test_cap, test_backlog, test_release,
+		test_given_back_trees, test_given_back_rotation, test_build_unconfirmed,
+		test_start_refused, test_qos_levels, test_claim_pick, test_queue_budget,
+		test_faults, test_dispatch, test_refusals, test_wide_tree,
+		test_channel_count, test_leaf_ceiling, test_cap_full_load,
+		test_qos_report,
+	};
+	unsigned ii;
+
+	/* Whatever a test left armed runs, as it would, and holds nothing. */
+	for (ii = 0; ii < ARRAY_SIZE(tests); ii++) {
+		tests[ii]();
+		assert_settled();
+	}
 	assert(allocations == 0);
 	printf("htb offload: tree, density, limits, reuse, software path, "
-	       "statistics, WRED, the queues' cap and what they hold, %d fault points, "
-	       "dispatch passed\n", 24);
+	       "statistics, WRED, the queues' cap, what they hold and what a change "
+	       "gives back, %d fault points, "
+	       "dispatch, the channel and leaf ceilings, the report passed\n", 24);
 	return 0;
 }

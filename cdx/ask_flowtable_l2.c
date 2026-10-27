@@ -1175,6 +1175,9 @@ static int ft_l2_admit(const struct ft_l2_seen *s, unsigned int kinds)
 			ft_l2_unconfirmed++;
 			return 0;
 		}
+		/* The whole class, every field the mark carries, as a flow's;
+		 * the pair's entry queues by its channel and class queue alone
+		 * (cdx_ft_l2_rule.qos). */
 		p->rule.qos = ft_qos_class(conf.mark);
 		if (!ft_qos_class_valid(p->rule.qos)) {
 			kfree(p);

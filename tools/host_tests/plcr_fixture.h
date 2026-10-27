@@ -39,7 +39,7 @@ typedef uint16_t __be16; typedef uint32_t __be32;
 #define ERR_QM_INGRESS_POLICER_HANDLE_NULL 507
 #define ERR_QM_INGRESS_SET_PROFILE_FAILED 508
 #define FMAN_INDEX 0
-#define CDX_FT_QOS_MAX_POLICER 7
+#include "plcr_layout.inc"
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
 #define ENABLE_EGRESS_QOS
 #define SEC_PROFILE_SUPPORT
@@ -189,12 +189,15 @@ typedef struct t_FmPcdPlcrProfileCounterValues {
 
 /* One slot per profile: what the hardware runs, what it counted since that
  * was written, and how many writes have landed on it. */
+/* As many as the FMan has (FM_PCD_PLCR_NUM_ENTRIES), shared and per-port
+ * together. */
+#define PLCR_PROFILES 256
 static struct profile {
     bool live;
     t_FmPcdPlcrProfileParams params;
     uint32_t green, yellow, red;
     unsigned landed;
-} profiles[32];
+} profiles[PLCR_PROFILES];
 /* Every set, and every modify of a profile; the last profile a write landed
  * on; and the modifies made with no mutex held. */
 static unsigned profile_sets, fail_profile_set, plcr_attempts, plcr_unlocked;
@@ -223,8 +226,12 @@ static inline t_Handle FM_PCD_PlcrProfileSet(t_Handle pcd, t_FmPcdPlcrProfilePar
     if (fail_profile_set && profile_sets == fail_profile_set)
         return NULL;
     if (!p->modify) {
+        /* The FMD refuses a shared profile past the pool the wrapper
+         * configured it with (FmPcdPlcrGetAbsoluteIdByProfileParams()). */
+        if (p->id.newParams.profileType == e_FM_PCD_PLCR_SHARED)
+            assert(p->id.newParams.relativeProfileId < LNXWRP_FM_NUM_OF_SHARED_PROFILES);
         for (slot = profiles; slot->live; slot++)
-            assert(slot < profiles + 31);
+            assert(slot < profiles + PLCR_PROFILES - 1);
         slot->live = true;
         plcr_land(slot, p);
         return slot;

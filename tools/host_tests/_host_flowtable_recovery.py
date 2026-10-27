@@ -26,6 +26,8 @@ def controller(tmp_path):
         "/run/ask-flowtable": str(tmp_path),
         "/proc/ask_flowtable/status": str(tmp_path / "backend"),
         "/proc/ask_flowtable/stats": str(tmp_path / "stats"),
+        "/proc/ask_flowtable/qos_ports": str(tmp_path / "qos_ports"),
+        "/proc/ask_flowtable/qos_classes": str(tmp_path / "qos_classes"),
         "/proc/sys/kernel/random/boot_id": str(tmp_path / "boot_id"),
         "/sys/module/cdx": str(tmp_path / "cdx"),
         "/sys/module/ask_flowtable/parameters/multicast": str(tmp_path / "multicast"),
@@ -99,9 +101,12 @@ int ft_enumerate(struct ft_policy *p) {
     (tmp_path / "cdx/parameters").mkdir(parents=True)
     (tmp_path / "policy").write_text(POLICY)
     # The adapter as loaded: its status and stats files, in the layout the
-    # kernel writes them in, and its parameters at their defaults.
-    write_backend(tmp_path, **{key: 0 for key in STATUS + STATS},
+    # kernel writes them in, its parameters at their defaults, and no port
+    # of cdx's in its QoS rows.
+    write_backend(tmp_path, **{key: 0 for key in STATUS + QOS_STATUS + STATS},
                   observe=0, mcast_enabled=1, qos_mark_mask=0, route_mark_mask=0)
+    for name in QOS_ROWS:
+        (tmp_path / name).write_text("")
     os.mkfifo(tmp_path / "events")
     return Controller(tmp_path, binary)
 
@@ -111,6 +116,14 @@ STATUS = ("bindings", "entries", "handle_refs", "neighbour_refs", "quarantine", 
           "invalidated", "bypassed", "restarts", "resume_failures", "mcast_installed",
           "mroute_installed")
 STATS = ("installs", "deletes", "rearms", "errors")
+# The hardware QoS budget's keys in status, which only `status` reads, beside
+# the two row files that describe each port and class.
+QOS_STATUS = ("qos_channels", "qos_channels_used", "qos_channels_held", "qos_channels_free",
+              "qos_policers", "qos_policers_used", "qos_policers_free", "qos_leaves_per_port",
+              "qos_mark_shift", "qos_mark_bits",
+              *(f"qos_class_{field}_{part}" for field in
+                ("queue", "channel", "policer", "remark", "dscp") for part in ("shift", "bits")))
+QOS_ROWS = ("qos_ports", "qos_classes")
 # And where each module parameter it reads stands in this tree, as written.
 PARAMETERS = {
     "observe": ("cdx/parameters/flowtable_observe", lambda v: "Y" if v else "N"),
@@ -124,7 +137,7 @@ def write_backend(root, **changes):
     """Change what the fake adapter reports. A status or stats key is
     rewritten in its file, laid out as the kernel lays it out; a parameter in
     its own file."""
-    for name, keys in (("backend", STATUS), ("stats", STATS)):
+    for name, keys in (("backend", STATUS + QOS_STATUS), ("stats", STATS)):
         mine = {k: v for k, v in changes.items() if k in keys}
         if not mine:
             continue
@@ -142,7 +155,7 @@ def write_backend(root, **changes):
             name, render = PARAMETERS[key]
             (root / name).write_text(render(value) + "\n")
         else:
-            assert key in STATUS + STATS, key
+            assert key in STATUS + QOS_STATUS + STATS, key
 
 
 class Controller:

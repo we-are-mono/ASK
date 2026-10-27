@@ -23,8 +23,9 @@ int cdx_dscp_setup_block(struct net_device *dev, struct flow_block_offload *f);
 void cdx_dscp_tree_changed(struct net_device *dev);
 
 /* The class a DSCP names on this port, in the encoding the qdisc's own
- * published class map is indexed by -- (channel + 1) << 4 | class queue -- or
- * zero for none. For the software Tx path, which asks about a frame that named
+ * published class map is indexed by -- (channel + 1) <<
+ * CDX_FT_QOS_CHANNEL_SHIFT | class queue, the egress half of a flow's class --
+ * or zero for none. For the software Tx path, which asks about a frame that named
  * no class of its own, so that both paths answer from the same filter.
  * Lock-free: reads a plain array republished under the lock after every
  * change. */

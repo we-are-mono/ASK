@@ -35,7 +35,9 @@ def test_dpaa_hooks(tmp_path):
     eth = (kernel / SDK / "dpaa_eth.c").read_text()
     sg = (kernel / SDK / "dpaa_eth_sg.c").read_text()
     header = (kernel / SDK / "dpaa_eth_common.h").read_text()
-    types = [re.search(pattern, header, re.S).group() for pattern in (
+    driver = (kernel / SDK / "dpaa_eth.h").read_text()
+    types = [re.search(r"^#define DPAA_ETH_CEETM_LEAF_QUEUES\s[^\n]*", driver, re.M).group()]
+    types += [re.search(pattern, header, re.S).group() for pattern in (
         r"typedef struct qman_fq \*\(\*cdx_get_ipsec_fq_hook_t\)\([^;]*;",
         r"typedef struct qman_fq \*\(\*cdx_get_ceetm_egressfq\)\([^;]*;",
         r"typedef struct qman_fq \*\(\*cdx_get_ceetm_dscp_fq\)\([^;]*;",

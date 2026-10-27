@@ -2,6 +2,7 @@
 #ifndef CDX_FLOWTABLE_H
 #define CDX_FLOWTABLE_H
 
+#include <linux/if.h>
 #include <linux/types.h>
 
 /* The `transit` parameter; see cdx_flowtable_backend.c. */
@@ -61,6 +62,93 @@ u64 cdx_ft_qos_remark_failures(void);
 /* Control frames sent as unclassified traffic because their port's control
  * budget was spent, summed over every port, for the adapter's status. */
 u64 cdx_ft_qos_control_overruns(void);
+
+/* What the hardware qdisc has to give and what of it is held, for the
+ * adapter's status.
+ *
+ * cdx_qos_budget() takes no sleeping lock: it reads a snapshot cdx keeps of
+ * the channels and leaves as they change, retried should a write overlap it,
+ * and the policer pool's counts under the pool's spinlock -- so the status
+ * read, which the controller's health probe and drain wait read, never waits
+ * for a tc command or a release. From process context, holding any lock or
+ * none. Its answer is one moment's, but for the quarantine a port's context
+ * being released ends: cdx follows that in the snapshot once the release is
+ * done (cdx_htb_port_released()).
+ *
+ * cdx_qos_port_next() takes cdx_htb_mutex and, inside it, the policer pool's
+ * spinlock and nothing else, so it sleeps, and may be made holding RTNL, the
+ * control mutex -- the flowtable's transaction -- or neither: wherever one of
+ * those and that mutex are both taken, that mutex is taken last, and nothing
+ * holding it waits for either (cdx_htb.c). Never from atomic context. Each
+ * answer is one moment's, with the same exception for a context's release,
+ * which happens under the control mutex rather than cdx_htb_mutex: asked under
+ * the transaction, there is none.
+ *
+ * The SoC's CEETM channels: how many the device tree gave (`channels'), how
+ * many are mapped to a port for its tree (`channels_used'), and how many no
+ * tree may claim yet (`channels_held'): quarantined for a port whose tree
+ * went, until its flowtable entries are retired or rebuilt, or out of service
+ * for good after a drain failed. The rest are free. The FMan's pool of
+ * ingress policer profiles a flower filter on any port draws from
+ * (`policers'), and how many of them are spoken for (`policers_used'): by a
+ * filter, or held for the flows a departed filter's profile still meters. And
+ * how many leaf classes a tree may have on a port (`leaves'). */
+struct cdx_qos_budget {
+	u32 channels, channels_used, channels_held;
+	u32 policers, policers_used;
+	u32 leaves;
+};
+void cdx_qos_budget(struct cdx_qos_budget *b);
+
+/* One port's: its name and index (`name', `ifindex'), read where cdx knows
+ * its netdev to be there; whether a tree is live on it (`tree'); the channels
+ * its tree claimed, as a bitmap by channel number (`channels'), and how many
+ * of those no class holds (`spare'), which its next class under the root
+ * takes before it claims another; the channels quarantined for it after its
+ * last tree went (`held', a bitmap); its leaf classes (`leaves'); and the
+ * pool's profiles its flower filters hold (`policers'). */
+struct cdx_qos_port {
+	char name[IFNAMSIZ];
+	int ifindex;
+	u32 channels;
+	u32 spare;
+	u32 held;
+	u32 leaves;
+	u32 policers;
+	bool tree;
+};
+
+/* One class of a port's tree, with the hardware it got: what a consumer
+ * composes the mark that selects the class from, whose channel field is
+ * `channel' + 1 and whose queue field is `queue' (cdx_flowtable_backend.h). A
+ * class directly under the qdisc holds a channel; one with children is only
+ * that (`inner'), with no class queue or leaf slot of its own. A leaf's slot
+ * is its Tx queue's index above the direct queues, which its ethtool counters
+ * are named by. */
+#define CDX_QOS_NONE	0xff
+struct cdx_qos_class {
+	u32 classid;	/* the tc handle, major:minor */
+	u16 parent;	/* its parent's minor; zero under the qdisc */
+	u8 channel;	/* the CEETM channel */
+	u8 queue;	/* its class queue on that channel, or CDX_QOS_NONE */
+	u8 slot;	/* its leaf slot, or CDX_QOS_NONE */
+	bool inner;
+};
+
+/* Every port of cdx's in turn, for a reader that holds none of their netdevs
+ * -- the adapter's procfs, which takes no RTNL to look one up. The first port
+ * at or after `*index', which is set to it, and what it has in `p'. With
+ * `classes' not NULL, every class of its tree too, in the order they were
+ * made, written there: how many is returned, none for a port with no tree and
+ * never more than `leaves' + `channels' of struct cdx_qos_budget, or -ENOSPC
+ * when they do not fit in `max'. Zero without. -ENOENT when no port is left.
+ * One call is one moment's; the walk is not, so a port made or gone between
+ * two calls is listed or not. Walked as
+ *
+ *	for (ii = 0; (n = cdx_qos_port_next(&ii, &p, NULL, 0)) >= 0; ii++)
+ */
+int cdx_qos_port_next(unsigned int *index, struct cdx_qos_port *p,
+		      struct cdx_qos_class *classes, unsigned int max);
 
 /* A port's egress changed under the entries that transmit on it.
  *

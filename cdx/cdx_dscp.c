@@ -62,6 +62,7 @@
 #include "portdefs.h"
 #include "module_qm.h"
 #include "cdx_ceetm_app.h"
+#include "cdx_flowtable_backend.h"
 #include "cdx_htb.h"
 #include "cdx_dscp.h"
 
@@ -70,10 +71,12 @@
 #define CDX_DSCP_SHIFT		2
 #define CDX_DSCP_COUNT		64
 
-/* A class in the encoding the qdisc's published map is indexed by. The channel
- * is stored one higher so that zero is free to mean "no class", which is how a
+/* A class in the encoding the qdisc's published map is indexed by, which is
+ * the egress half of cdx_ft_rule.qos (CDX_FT_QOS_EGRESS_MASK). The channel is
+ * stored one higher so that zero is free to mean "no class", which is how a
  * codepoint nobody has claimed reads. */
-#define CDX_DSCP_CLASS(channel, cq)	((u16)(((channel) + 1) << 4 | (cq)))
+#define CDX_DSCP_CLASS(channel, cq)	((u16)(((channel) + 1) << CDX_FT_QOS_CHANNEL_SHIFT | \
+					       (cq) << CDX_FT_QOS_QUEUE_SHIFT))
 
 /* One filter: a DSCP, and the class an operator named for it. The class is
  * kept as the operator wrote it rather than as the (channel, class queue) it
@@ -95,8 +98,8 @@ struct cdx_dscp_filter {
 	__be16			n_proto;
 	u8			dscp;
 	/* Where the class currently sits, in the encoding the qdisc's own
-	 * published map is indexed by: (channel + 1) << 4 | class queue, so
-	 * zero is free to mean "that class does not exist just now". A filter
+	 * published map is indexed by (CDX_DSCP_CLASS()), so zero is free to
+	 * mean "that class does not exist just now". A filter
 	 * outlives a `tc class del' and selects again if the class comes back,
 	 * but while it is gone the codepoint must select nothing. */
 	u16			klass;

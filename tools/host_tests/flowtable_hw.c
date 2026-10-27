@@ -292,10 +292,10 @@ typedef struct CtEntry {
         unsigned dscp_mark_flag : 1;
         unsigned dscp_mark_value : 6;
         unsigned pad_2 : 1;
-        unsigned iqid : 4;
-        unsigned pad_3 : 3;
+        unsigned iqid : 6;
+        unsigned pad_3 : 1;
         unsigned iqid_valid : 1;
-        unsigned chnl_id : 4;
+        unsigned chnl_id : 6;
     } qosmark;
     uint8_t detour;
 } CtEntry, *PCtEntry;
@@ -368,8 +368,9 @@ static u8 expected_family = AF_INET;
 static __be16 expected_sport, expected_dport;
 static unsigned expected_proto = IPPROTO_UDP;
 /* The class the rule under test carries, so the encoder stub can require that
- * each nibble reached the field that reads it. */
-static u16 expected_qos;
+ * each field reached the one that reads it. As wide as the rule's own: the
+ * remark and its codepoint sit above sixteen bits. */
+static u32 expected_qos;
 static bool expected_hairpin;
 /* The Ethernet source the entry must carry: the rule's. */
 static u8 expected_src_mac[6] = {2};
@@ -444,25 +445,25 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
         assert(ct->status == (CONNTRACK_ORIG | (nat ? CONNTRACK_NAT : 0) |
                               ((expected_sa || expected_in_sa) ? CONNTRACK_SEC : 0)));
     }
-    /* The rule's three class nibbles reach three separate hardware fields. The
-     * policer nibble is a plain profile number and is copied straight through,
+    /* The rule's three class fields reach three separate hardware fields. The
+     * policer field is a plain profile number and is copied straight through,
      * with the valid bit always set -- profile 0 is the encoder's own default,
      * so a clear valid bit would select it anyway and a sentinel would collide
-     * with the nibble that names it.
+     * with the field that names it.
      *
-     * Spelled out in nibbles rather than through the header's masks, as the
-     * CtEntry bit positions above are: this stub is compiled before the
+     * Spelled out in bit positions rather than through the header's masks, as
+     * the CtEntry bit positions above are: this stub is compiled before the
      * encoding header is included, and the caller builds its values from the
      * macros, so a shift that moved would fail there. */
     assert(ct->qosmark.queue == (expected_qos & 0xf));
-    assert(ct->qosmark.chnl_id == ((expected_qos >> 4) & 0xf));
-    assert(ct->qosmark.iqid == ((expected_qos >> 8) & 0xf));
+    assert(ct->qosmark.chnl_id == ((expected_qos >> 4) & 0x3f));
+    assert(ct->qosmark.iqid == ((expected_qos >> 10) & 0x3f));
     assert(ct->qosmark.iqid_valid);
     /* The remark's flag is conditional where the policer's is not, because
      * DSCP zero is a real codepoint and "remark to CS0" has to differ from
      * "do not remark". */
-    assert(ct->qosmark.dscp_mark_flag == ((expected_qos >> 12) & 0x1));
-    assert(ct->qosmark.dscp_mark_value == ((expected_qos >> 13) & 0x3f));
+    assert(ct->qosmark.dscp_mark_flag == ((expected_qos >> 16) & 0x1));
+    assert(ct->qosmark.dscp_mark_value == ((expected_qos >> 17) & 0x3f));
     assert(ct->pRtEntry->itf == (expected_hairpin ? &in_itf : &out_itf) && ct->pRtEntry->input_itf == &in_itf);
     assert(ct->pRtEntry->underlying_input_itf == &in_itf);
     assert(ct->pRtEntry->mtu == expected_mtu);
@@ -482,7 +483,11 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
 }
 /* A bridged pair's insert: the key's pair and EtherType as the rule gave
  * them, and the entry's own route rewriting the frame with that same pair. */
-static struct { u8 da[6], sa[6]; u16 ethertype; bool encap_given; struct cdx_l2_encap encap; } l2_seen;
+static struct {
+    u8 da[6], sa[6]; u16 ethertype; bool encap_given; struct cdx_l2_encap encap;
+    /* The mark the entry queues by, as written into it. */
+    unsigned queue, chnl_id, iqid, dscp_mark_flag, dscp_mark_value;
+} l2_seen;
 static int insert_l2_entry_in_classif_table(PCtEntry ct, const uint8_t *da, const uint8_t *sa,
                                             uint16_t ethertype, const struct cdx_l2_encap *encap)
 {
@@ -490,6 +495,12 @@ static int insert_l2_entry_in_classif_table(PCtEntry ct, const uint8_t *da, cons
     memcpy(l2_seen.da, da, 6);
     memcpy(l2_seen.sa, sa, 6);
     l2_seen.ethertype = ethertype;
+    l2_seen.queue = ct->qosmark.queue;
+    l2_seen.chnl_id = ct->qosmark.chnl_id;
+    l2_seen.iqid = ct->qosmark.iqid;
+    l2_seen.dscp_mark_flag = ct->qosmark.dscp_mark_flag;
+    l2_seen.dscp_mark_value = ct->qosmark.dscp_mark_value;
+    assert(ct->qosmark.iqid_valid);
     l2_seen.encap_given = encap != NULL;
     memset(&l2_seen.encap, 0, sizeof(l2_seen.encap));
     if (encap) {
@@ -1486,6 +1497,19 @@ static void test_l2_pair(struct net_device *in, struct net_device *out)
     assert(cdx_ft_hw_l2_add(&rule, &hw) == 0);
     assert(l2_seen.encap.num_ingress == 1 && l2_seen.encap.num_egress == 1);
     assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+    /* The pair carries its class whole, as a flow does, every field of the
+     * twenty-three bits; but a bridged entry queues by the class's channel
+     * and class queue alone. It gets the default ingress profile whatever
+     * the policer field names, and nothing remarks it. */
+    rule.in_vlans = rule.out_vlans = 0;
+    rule.qos = 5u << CDX_FT_QOS_QUEUE_SHIFT | 31u << CDX_FT_QOS_CHANNEL_SHIFT |
+               (u32)CDX_FT_QOS_MAX_POLICER << CDX_FT_QOS_POLICER_SHIFT |
+               CDX_FT_QOS_REMARK_MASK | 46u << CDX_FT_QOS_DSCP_SHIFT;
+    assert(rule.qos >> CDX_FT_QOS_DSCP_SHIFT == 46 && (rule.qos & CDX_FT_QOS_REMARK_MASK));
+    assert(cdx_ft_hw_l2_add(&rule, &hw) == 0);
+    assert(l2_seen.queue == 5 && l2_seen.chnl_id == 31);
+    assert(!l2_seen.iqid && !l2_seen.dscp_mark_flag && !l2_seen.dscp_mark_value);
+    assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
 }
 
 static void test_backend(void)
@@ -2133,6 +2157,15 @@ int main(void)
                 assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
                 assert(!police_refs[policer]);
             }
+    /* And every field at once, each at its own maximum, the remark with them:
+     * nothing spills from one field into the next. */
+    rule.qos = expected_qos = CDX_FT_QOS_QUEUE_MASK |
+            (CDX_FT_QOS_MAX_CHANNEL << CDX_FT_QOS_CHANNEL_SHIFT) |
+            (CDX_FT_QOS_MAX_POLICER << CDX_FT_QOS_POLICER_SHIFT) |
+            CDX_FT_QOS_REMARK_MASK | (CDX_FT_QOS_MAX_DSCP << CDX_FT_QOS_DSCP_SHIFT);
+    assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+    assert(police_refs[CDX_FT_QOS_MAX_POLICER] == 1);
+    assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
     rule.qos = expected_qos = 0;
     for (unsigned i = 0; i < 16; i++) {
         unsigned variant = i % 8;

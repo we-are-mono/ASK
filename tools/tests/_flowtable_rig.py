@@ -80,11 +80,12 @@ async def upper_roundtrip(r, dev):
 
 STATUS_ROWS = {"flow": "flows", "session": "sessions", "vlan": "vlans",
                "tunnel": "tunnels", "mcast": "mcast", "mroute": "mroute",
-               "l2flow": "l2flows"}
+               "l2flow": "l2flows", "port": "qos_ports", "class": "qos_classes"}
 # The adapter's files (docs/flowtable/procfs.md): levels, counters, then the
 # row files, the flows' last because they grow with the connections.
 PROC = "/proc/ask_flowtable"
-PROC_FILES = ("status", "stats", "devices", "mcast", "mroute", "l2", "flows")
+PROC_FILES = ("status", "stats", "devices", "mcast", "mroute", "l2", "qos_ports", "qos_classes",
+              "flows")
 
 
 def proc_paths(*names):

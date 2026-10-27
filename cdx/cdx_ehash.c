@@ -1121,9 +1121,15 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info, bool routed
 		iface_info = dpa_get_ifinfo_by_itfid(entry->pRtEntry->itf->index);
 
 #ifdef ENABLE_INGRESS_QOS
-		if(qosmark->iqid_valid) {
-			quenum = (qosmark->iqid & (INGRESS_FLOW_POLICER_QUEUES - 1));
-		}
+		/* The per-flow profile the mark names, as the index into
+		 * ingress_policer_info[] the checks look it up by. Bounded
+		 * rather than masked: a number past the pool names no profile
+		 * and meters by the default, where a mask would fold it onto
+		 * another filter's meter. The field is as wide as the pool, so
+		 * no mark the flowtable builds reaches past it; the SEC
+		 * profile after the pool is chosen by the SEC path alone. */
+		if (qosmark->iqid_valid && qosmark->iqid < INGRESS_FLOW_POLICER_QUEUES)
+			quenum = qosmark->iqid;
 		if(create_preemptive_checks_hm(info,quenum))
 #else
 		if(create_preemptive_checks_hm(info))
@@ -1243,8 +1249,9 @@ static int fill_detour_actions(PCtEntry entry, struct ins_entry_info *info)
 		     entry->pRtEntry->underlying_input_itf)->index;
 	underlying_iif_index = entry->pRtEntry->underlying_input_itf->index;
 #ifdef ENABLE_INGRESS_QOS
-	if (entry->qosmark.iqid_valid)
-		quenum = (entry->qosmark.iqid & (INGRESS_FLOW_POLICER_QUEUES - 1));
+	/* Bounded, not masked, as fill_actions() bounds it. */
+	if (entry->qosmark.iqid_valid && entry->qosmark.iqid < INGRESS_FLOW_POLICER_QUEUES)
+		quenum = entry->qosmark.iqid;
 	if (create_preemptive_checks_hm(info, quenum))
 #else
 	if (create_preemptive_checks_hm(info))

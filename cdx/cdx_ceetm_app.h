@@ -50,8 +50,12 @@ Structure and Macro definitions
 /* max CEETM instances on SOC equal to number of FMAN instances */
 /* max number of logical network interfaces */
 #define CDX_CEETM_MAX_LNIS                      8
-/* max number of channels */
-#define CDX_CEETM_MAX_CHANNELS                 	8
+/* The most channels this file builds, and what its tables are sized by: one
+ * CEETM instance's architectural maximum, thirty-two. How many a board has is
+ * its device tree's fsl,ceetm-channel-range, read once at load
+ * (ceetm_channel_count()); every walk over the channels and every bound on a
+ * channel number is that count, so a row past it is never used. */
+#define CDX_CEETM_MAX_CHANNELS                 	32
 /* CEETM FQ Context A */
 /* set context_A for FQ, SET OVFQ, OVOM,A0V, B0V, A2V and EBD */
 #define VQA_DPAA_VAL_TO_RELEASE_BUFFER 0x9e00000080000000ull
@@ -114,6 +118,10 @@ Structure and Macro definitions
 
 int ceetm_create_lni(struct tQM_context_ctl *qm_ctx);
 int ceetm_init_channels(void);
+/* How many CEETM channels there are, numbered 0..count-1: the device tree's
+ * count for fman0's instance, at most CDX_CEETM_MAX_CHANNELS, as
+ * ceetm_init_channels() built them. Fixed from then until the module goes. */
+uint32_t ceetm_channel_count(void);
 int ceetm_release_lni(void *handle, void *sp_handle);
 int ceetm_release_iface(struct tQM_context_ctl *qm_ctx);
 int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info);
@@ -142,6 +150,8 @@ int ceetm_class_queue_state(uint32_t channel_num, uint32_t quenum,
 int ceetm_class_queue_backlog(uint32_t channel_num, uint32_t quenum,
 			      uint32_t *frames);
 int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, uint32_t *channel_num);
+int ceetm_channel_holder(uint32_t channel_num, struct tQM_context_ctl **mapped,
+			 struct tQM_context_ctl **quarantine, bool *failed);
 int ceetm_set_channel_rates(uint32_t channel_num, uint64_t cir_bps, uint64_t eir_bps);
 int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight,
 			  uint32_t depth);

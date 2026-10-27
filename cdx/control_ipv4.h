@@ -30,11 +30,15 @@ union ctentry_qosmark {
 		U32 dscp_mark_flag : 1;
 		U32 dscp_mark_value : 6;
 		U32 vlan_pbits_valid : 1;
-		U32 iqid : 4;		/* ingres Qos id, qualify with valid bit*/ 
-		U32 reserved_2: 3; 
+		/* As wide as cdx_ft_rule.qos's policer and channel fields
+		 * (cdx_flowtable_backend.h): the profile 0..63, and the channel
+		 * 0..32 with zero for the port's own. Each took two reserved
+		 * bits above it; nothing else moved. */
+		U32 iqid : 6;		/* ingres Qos id, qualify with valid bit*/
+		U32 reserved_2: 1;
 		U32 iqid_valid : 1;	/* if set, iqid is valid */
-		U32 chnl_id : 4;	/* egress Qos channel id */
-		U32 reserved_3: 3; 
+		U32 chnl_id : 6;	/* egress Qos channel id */
+		U32 reserved_3: 1;
 		U32 ds_info_valid: 1; 	/* bit indicates qosconmark specified values for DS direction */
 	};
 };

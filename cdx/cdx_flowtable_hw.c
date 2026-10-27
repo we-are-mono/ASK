@@ -466,13 +466,14 @@ static int ft_hw_add_one(const struct cdx_ft_rule *rule,
 			      CDX_FT_QOS_CHANNEL_SHIFT;
 	/* The ingress policer travels the same field but reaches the hardware by
 	 * a different route: create_preemptive_checks_hm() turns iqid into the
-	 * ucode's pp_no, so this selects which of the eight RFC-2698 profiles
-	 * the flow's ingress frames are metered against.
+	 * ucode's pp_no, so this selects which of the sixty-four RFC-2698
+	 * profiles -- the default and the pool's sixty-three -- the flow's
+	 * ingress frames are metered against.
 	 *
 	 * The valid bit is always set, including for profile 0. It is not a
 	 * "policer wanted" flag -- the encoder's own default is profile 0, so
 	 * leaving the bit clear selects profile 0 too. Setting it unconditionally
-	 * makes the rule say exactly which profile it means and keeps the nibble
+	 * makes the rule say exactly which profile it means and keeps the field
 	 * a plain profile number.
 	 *
 	 * Which profile that is was settled by the adapter, which resolves a tc
@@ -668,6 +669,9 @@ int cdx_ft_hw_l2_add(const struct cdx_ft_l2_rule *rule, struct cdx_ft_hw **resul
 	ct->hash = jhash(rule->dst_mac, 2 * ETH_ALEN, rule->ethertype);
 	ft_encap(rule->in_vlan, rule->in_vlans, encap.ingress, &encap.num_ingress);
 	ft_encap(rule->out_vlan, rule->out_vlans, encap.egress, &encap.num_egress);
+	/* Of the pair's class, the channel and class queue alone: the ingress
+	 * profile is the default one a class naming no policer gets, and no
+	 * remark is asked for. */
 	ct->qosmark.queue = rule->qos & CDX_FT_QOS_QUEUE_MASK;
 	ct->qosmark.chnl_id = (rule->qos & CDX_FT_QOS_CHANNEL_MASK) >>
 			      CDX_FT_QOS_CHANNEL_SHIFT;

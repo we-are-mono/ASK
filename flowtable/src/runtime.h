@@ -10,6 +10,8 @@
 /* The adapter's levels and its counters (docs/flowtable/procfs.md). */
 #define FT_STATUS      "/proc/ask_flowtable/status"
 #define FT_STATS       "/proc/ask_flowtable/stats"
+#define FT_QOS_PORTS   "/proc/ask_flowtable/qos_ports"
+#define FT_QOS_CLASSES "/proc/ask_flowtable/qos_classes"
 #define FT_CDX_MODULE  "/sys/module/cdx"
 #define FT_MULTICAST   "/sys/module/ask_flowtable/parameters/multicast"
 #define FT_QOS_MARK_MASK   "/sys/module/ask_flowtable/parameters/qos_mark_mask"
@@ -65,6 +67,15 @@ int ft_backend_json(const struct ft_backend *b, char *buf, size_t n);
  * or -1 with ctx->err on a malformed or partial read: every field is
  * required, so none can quietly read as zero. */
 int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b);
+
+/* The hardware QoS budget as the `status` JSON's `qos` object, from the
+ * adapter's QoS keys in status, its qos_ports and qos_classes rows, and the
+ * class mask `b` was read with; `null` when the adapter is not loaded, or is
+ * unloading between the reads. Read by `status` alone: the health probe and
+ * the drain never depend on it. Every field is required, as
+ * ft_backend_read()'s are. Returns 0 with *json allocated (the caller frees
+ * it), or -1 with ctx->err. */
+int ft_qos_json(struct ft_ctx *ctx, const struct ft_backend *b, char **json);
 
 /* Turn the adapter's multicast acceleration on or off. Multicast follows no
  * flowtable: the policy's global enable and the stop that overrides it are its

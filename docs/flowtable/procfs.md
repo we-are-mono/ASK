@@ -8,16 +8,18 @@ transaction on every read.
 
 ```
 /proc/ask_flowtable/
-  status    levels and latches: what the backend holds now      transaction
-  stats     events since the module loaded: only ever grows     none
-  devices   one row per VLAN, PPPoE session and tunnel device   transaction
-  flows     one row per routed unicast direction                transaction, per buffer
-  l2        one row per bridged unicast station pair            transaction, per buffer
-  mcast     one row per bridged multicast flow or membership    transaction + ft_mc_lock
-  mroute    one row per routed multicast group                  transaction + ft_mr_lock
+  status       levels and latches: what the backend holds now      transaction; qos_ keys a snapshot
+  stats        events since the module loaded: only ever grows     none
+  devices      one row per VLAN, PPPoE session and tunnel device   transaction
+  flows        one row per routed unicast direction                transaction, per buffer
+  l2           one row per bridged unicast station pair            transaction, per buffer
+  mcast        one row per bridged multicast flow or membership    transaction + ft_mc_lock
+  mroute       one row per routed multicast group                  transaction + ft_mr_lock
+  qos_ports    one row per Ethernet port of cdx's                  cdx_htb_mutex, per port
+  qos_classes  one row per class of every hardware qdisc tree      cdx_htb_mutex, per port
 ```
 
-All seven are mode 0400, created when the module loads and removed before it
+All nine are mode 0400, created when the module loads and removed before it
 unloads.
 
 ## Rules
@@ -118,7 +120,7 @@ pasted on its own.
 | IPsec ESP packet offload | SEC descriptor and classifier entry per SA | `ip -s xfrm state` (`curlft` folded); `/proc/net/xfrm_stat` on kernels with `CONFIG_XFRM_STATISTICS` | `ipsec_sas`/`ipsec_sa_cache` in `status`; `ipsec_*` refusal counts in `stats`; `sa=`/`in_sa=` on `flows` |
 | Wi-Fi VAP | VWD registration on an offline port | `/sys/class/vwd/vwd0/<ifname>` (cdx) | `wifi_vaps` in `status`; `wifi_refused` in `stats` |
 | Offline-port detour (IPv4 UDP larger than the path) | offline port | none | `detour`, `detour_flows` in `status`; `detour_*` in `stats`; `detour=` on `flows` |
-| QoS: mark to class, DSCP remark, HTB/CEETM, policers | a class field on the entry, the CEETM tree | `tc -s class show`, `tc -s filter show`, `ethtool -S` | `qos=` on `flows`; `qos_*` in `stats` |
+| QoS: mark to class, DSCP remark, HTB/CEETM, policers | a class field on the entry, the CEETM tree, the ingress policer pool | `tc -s class show`, `tc -s filter show`, `ethtool -S` | `qos=` on `flows`; `qos_*` in `status` and `stats`; `qos_ports` and `qos_classes` rows |
 
 Two candidates were considered for rows and rejected, each because a standard
 door already shows the same thing:
@@ -135,7 +137,15 @@ door already shows the same thing:
 Read under CDX's transaction, which several of these values require. The
 file is a fixed set of lines with no walk over flows or groups, so the hold
 is short. This is the file the controller's health probe and its drain wait
-read.
+read. The `qos_` keys come last and are read after the transaction is let
+go, with no lock they could wait on. The channel and leaf levels are a
+snapshot CDX takes under its QoS mutex (`cdx_htb_mutex`) whenever they can
+change, copied under a sequence count and read again if a write overlaps; the
+policer counts are read under the policer pool's spinlock. So a tc command or
+a release holding the QoS mutex never stalls the status read the controller's
+health probe and drain wait time. A quarantine that a port's context release
+ends shows once that release is done. `qos_ports` and `qos_classes` still
+read under the QoS mutex, one port at a time.
 
 | Key | Meaning |
 |---|---|
@@ -162,11 +172,37 @@ read.
 | `mroute_groups`, `mroute_installed`, `mroute_policy_rules`, `mroute_ruleset_settled` | the routed learner's groups, what is in hardware, and the policy rules and ruleset state that hold groups back |
 | `l2_enabled`, `l2_entries`, `l2_hook_kinds`, `l2_confirming` | bridged unicast switching: active, pairs in hardware, the other bridge hooks present, whether frames confirm pairs |
 | `wifi_vaps` | VAPs registered |
+| `qos_channels`, `qos_channels_used`, `qos_channels_held`, `qos_channels_free` | the SoC's CEETM channels: how many the device tree gives (`fsl,ceetm-channel-range`, at most 32), how many are mapped to a port's tree, how many no tree may claim yet -- quarantined for a port whose tree went until its flowtable entries are retired or rebuilt, or out of service after a drain failed -- and the rest |
+| `qos_policers`, `qos_policers_used`, `qos_policers_free` | the FMan-wide pool of ingress policer profiles a flower filter on any port draws from (63; profile 0 is the default and not the pool's); a profile still held for the flows of a filter that went counts as used |
+| `qos_leaves_per_port` | the leaf classes a port's tree may have (64) |
+| `qos_mark_shift`, `qos_mark_bits` | where `qos_mark_mask` puts the class in `ct mark`: its lowest bit, and its width; `0` bits is classification off |
+| `qos_class_queue_shift`, `qos_class_queue_bits`, `qos_class_channel_shift`, `qos_class_channel_bits`, `qos_class_policer_shift`, `qos_class_policer_bits`, `qos_class_remark_shift`, `qos_class_remark_bits`, `qos_class_dscp_shift`, `qos_class_dscp_bits` | the class layout, field by field (below) |
 
 `restarts`, `resume_failures` and `stats_deferred` are counts, but they are
 read through CDX accessors that require the transaction. They describe the
 latch machinery, which is what `status` is about, so they belong here and not
 in `stats`.
+
+The class layout is a constant of the build, stated once in
+`cdx_flowtable_backend.h` (`CDX_FT_QOS_*_SHIFT` and `_BITS`). It is where each
+field sits in the class, which is also what a flow row's `qos=` and a class
+row's print, whether or not the mask reaches it: a flower filter writes the
+policer field there all the same.
+
+| Field | Shift | Bits | Values |
+|---|---|---|---|
+| `queue` | 0 | 4 | the class queue, 0-15 |
+| `channel` | 4 | 6 | 0 the port's top channel; n is channel n-1, up to 32 |
+| `policer` | 10 | 6 | 0 the default profile; 1-63 a profile of the pool |
+| `remark` | 16 | 1 | remark egress frames with `dscp` |
+| `dscp` | 17 | 6 | the codepoint |
+
+`qos_mark_shift` and `qos_mark_bits` restate the `qos_mark_mask` parameter,
+which stays in sysfs (rule 4), in the form a consumer composes a mark from:
+the mask is one run of bits, which the module refuses to load without, so a
+mark is `class << qos_mark_shift`, and a class whose bits run past
+`qos_mark_bits` has no mark. Beside mwan3 (`0xffff0000`) that is shift 16 and
+16 bits: queue, channel and policer, but no remark.
 
 ## `stats`
 
@@ -190,8 +226,8 @@ the module is loaded. The reader loads each one with `READ_ONCE()` or
 
 ## Row files
 
-The fields are the ones `/proc/cdx_flowtable` carried. Only where each kind
-lives has changed.
+The fields of the first five are the ones `/proc/cdx_flowtable` carried. Only
+where each kind lives has changed. `qos_ports` and `qos_classes` are new.
 
 - **`flows`**: `flow cookie= in= out= in_vlan= out_vlan= in_br= out_br=
   in_ppp= out_ppp= in_tnl= out_tnl= family= src= dst= new_src= new_dst=
@@ -218,6 +254,46 @@ lives has changed.
   - A read folds each group's hardware count into the MFC, so `ip -s mroute`
     and this file agree. A reader who wants `ip -s mroute` exact reads this
     file first.
+- **`qos_ports`**: `port dev= tree= channels= spare= held= leaves=
+  leaves_free= policers=`.
+  - One row per Ethernet port of cdx's, with a hardware qdisc or not:
+    ```
+    port dev=eth3 tree=1 channels=0,1,2 spare=0 held=- leaves=30 leaves_free=34 policers=2
+    ```
+  - `tree` is whether an HTB tree is offloaded on the port. `channels` lists
+    the CEETM channels its tree claimed, with or without a class, and `spare`
+    counts those no class holds: its next class under the root takes one of
+    them before it claims another. `held` lists the channels quarantined for
+    the port after its tree went. A list is the channel numbers,
+    comma-separated, or `-` for none.
+  - `leaves` and `leaves_free` are the tree's leaf classes and the room for
+    more (`qos_leaves_per_port` in all). `policers` counts the pool profiles
+    the port's flower filters hold. The pool is the FMan's, so what is left
+    of it (`qos_policers_free`) is left to every port alike.
+- **`qos_classes`**: `class dev= classid= parent= kind= channel= queue= slot=
+  qos= mark=`.
+  - One row per class of every port's tree, port by port, in the order the
+    classes were made: which channel and class queue each got, and the mark
+    that selects it.
+    ```
+    class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- qos=- mark=-
+    class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 qos=000057 mark=0x570000
+    ```
+  - `classid` and `parent` are as `tc` prints them: hex, the parent `1:` for
+    a class directly under the qdisc. A class there holds a channel; one
+    with children (`kind=inner`) is only that, with no class queue, leaf slot
+    or class value of its own (`-`).
+  - `slot` is the leaf's Tx queue above the port's direct queues, which its
+    `ethtool -S` counters are named by. `qos` is the class value that selects
+    the leaf, printed as on the flow rows: the channel field is the channel
+    plus one, since zero names the port's top channel. `mark` is
+    `qos << qos_mark_shift`, the `ct mark` bits a consumer sets for the leaf,
+    or `-` when the mask cannot carry the value -- the test image's `0xf0`
+    reaches the queue field alone, and an eight-bit mask channels up to 14.
+- Both are read under CDX's QoS mutex and nothing of the adapter's, one port
+  at a time. Neither takes RTNL nor holds a port's netdev: a port is one of
+  cdx's from its CEETM context being made until its interface goes, and its
+  name is read where cdx knows the netdev to be there.
 
 `mcast` and `mroute` are each rendered as one record. Their buffer is sized
 up front from the learners' counts (`single_open_size()`), so a read at the
@@ -230,11 +306,36 @@ caps renders once rather than once per buffer doubling.
   - Every key it uses is now required. A missing one fails the read, where
     before `entries` and the two masks quietly defaulted to zero and let a
     drain pass.
-  - Its JSON is unchanged.
+  - `ask-flowtable status` adds a `qos` object, built from the `qos_` keys,
+    `qos_mark_mask`, and both QoS row files by a reader of its own: the
+    health probe and the drain read none of it. Its fields are required the
+    same way; it is `null` without the adapter. A port's classes come under
+    the port, with `qos` and `mark` as numbers, and `null` for what a row
+    prints as `-`:
+
+    ```json
+    "qos": {"mark_mask": 4294901760, "mark_shift": 16, "mark_bits": 16,
+            "class": {"queue": {"shift": 0, "bits": 4}, "channel": {"shift": 4, "bits": 6}, ...},
+            "channels": {"total": 32, "used": 3, "held": 0, "free": 29},
+            "policers": {"total": 63, "used": 2, "free": 61},
+            "ports": {"eth3": {"tree": true, "channels": [0, 1, 2], "spare": 0, "held": [],
+                               "leaves": {"total": 64, "used": 30, "free": 34},
+                               "policers": {"total": 63, "used": 2, "free": 61},
+                               "classes": [{"classid": "1:23", "parent": "1:", "kind": "leaf",
+                                            "channel": 4, "queue": 7, "slot": 3,
+                                            "qos": 87, "mark": 5701632}]}}}
+    ```
+
+    A port's `policers.free` is the pool's, since any port may take what is
+    left of it. The rest of the JSON is unchanged.
+- **`qos=` on the flow rows** is six hex digits, where it was five: the class
+  is 23 bits wide now. A reader that parses the field as a hex number, as
+  every one in this tree does, reads it the same.
 - **The test agent (`tools/askd_agent/observe.py`)**:
   - A `summary` reads `status` and `stats`, as the health probe does: one
     short hold of the transaction.
-  - A `state` adds every row file.
+  - A `state` adds every row file, `qos_ports` and `qos_classes` among them,
+    as lists of those names.
   - A snapshot streams `flows` into SQLite and parses the other files into
     its header, as before.
   - Both carry the six module parameters too, read from sysfs under their
@@ -243,7 +344,8 @@ caps renders once rather than once per buffer doubling.
 - **The rig helpers (`tools/tests/_flowtable_rig.py`)**:
   - `status_text()` parses both line forms.
   - `PROC` and `proc_paths()` name the files, so a test reads exactly what it
-    needs.
+    needs, and `status_text()` parses the QoS rows into `qos_ports` and
+    `qos_classes`.
 - **Consistency checks that compare a level with a row count** read the two
   files back to back:
   - `entries` with the flow rows;

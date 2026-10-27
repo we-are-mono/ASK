@@ -64,7 +64,13 @@ PORT_STRANDED_GROUP = PORT + 32
 PORT_SQM_UPLOAD, PORT_SQM_LIVE = PORT + 33, PORT + 34
 PORT_SQM_DOWNLOAD, PORT_SQM_DEFAULT = PORT + 35, PORT + 36
 PORT_SQM_FQ = PORT + 37
-PORTS_LAST = PORT_SQM_FQ
+# One flow per class of a LAN tree with a channel each, and per flower filter
+# of a WAN port with a profile each, past the eight channels and seven profiles
+# ASK once stopped at.
+CEILING_CLASSES = 16
+PORTS_CHANNELS = tuple(PORT + 40 + ii for ii in range(CEILING_CLASSES))
+PORTS_POLICERS = tuple(PORT + 56 + ii for ii in range(CEILING_CLASSES))
+PORTS_LAST = PORTS_POLICERS[-1]
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
 # unshaped and far above what the CPU can: see the module docstring.
@@ -117,12 +123,20 @@ PROBE_SLACK = 0.15e-3
 EF_DSCP = 46
 EF_TOS = EF_DSCP << 2
 COUNT = 256
-# A class that carries a remark: the flag at bit 12, the codepoint in the six
-# bits above it. The image's 0xf0 mask stops at the class queue, so the adapter
-# is reloaded with the field widened from the same base -- a mark of 0x70 still
+# A class that carries a remark: the flag at bit 16, the codepoint in the six
+# bits above it, as status reports the class layout (qos_class_remark_shift,
+# qos_class_dscp_shift; remarking() checks). The image's 0xf0 mask stops at
+# the class queue, so the adapter is reloaded with the field widened to the
+# whole twenty-three-bit class from the same base -- a mark of 0x70 still
 # names class queue 7 under it.
-REMARK_MASK = 0x7ffff0
-REMARK_CLASS = 1 << 12 | EF_DSCP << 13
+CLASS_BITS = 23
+REMARK_SHIFT = 16
+DSCP_SHIFT = 17
+REMARK_MASK = ((1 << CLASS_BITS) - 1) << 4
+REMARK_CLASS = 1 << REMARK_SHIFT | EF_DSCP << DSCP_SHIFT
+# The class queue, channel and policer fields from the same base, sixteen
+# bits, so a mark can name any channel the SoC has.
+WIDE_MASK = 0xffff << 4
 # What the remark cases' senders put in the byte the remark rewrites: AF11,
 # and beside it an ECN field that walks all four encodings, datagram n
 # carrying n % 4. A rewrite that clears or sets either ECN bit shows on the
@@ -343,7 +357,10 @@ def probe(destination, seconds, *, interval=0.01, timeout=0.25):
 
 LEAF_COUNTER = re.compile(
     r"^\s*ceetm (dequeued frames|dequeued bytes|rejected frames) \[leaf (\d+)\]:\s*(\d+)\s*$", re.M)
-# The two queues traffic that names no leaf takes, after the sixteen slots:
+# The leaf slots a port reports, always, whatever its tree holds; the qos
+# fixture holds it to the adapter's qos_leaves_per_port.
+LEAF_SLOTS = 64
+# The two queues traffic that names no leaf takes, after the leaf slots:
 # where unclassified traffic goes, and the top channel's control queue.
 IMPLICIT_COUNTER = re.compile(
     r"^\s*ceetm (dequeued frames|dequeued bytes|rejected frames) \[(default|control)\]:\s*(\d+)\s*$",
@@ -371,7 +388,7 @@ async def egress(r, dev):
     for name, queue, value in IMPLICIT_COUNTER.findall(text):
         leaves.setdefault(queue, {})[LEAF_FIELDS[name]] = int(value)
     software = SOFTWARE_TX.findall(text)
-    assert len(leaves) == 18 and len(software) == 1, text
+    assert len(leaves) == LEAF_SLOTS + 2 and len(software) == 1, text
     return {"at": result["at"], "span": result["span"], "leaves": leaves,
             "software_tx": int(software[0])}
 
@@ -416,6 +433,18 @@ def directions(state, *, ingress, proto, src=None, dst=None):
     match. Either endpoint may be left open."""
     return [f for f in state["flows"] if f["in"] == ingress and f["proto"] == str(proto)
             and (src is None or f["src"] == src) and (dst is None or f["dst"] == dst)]
+
+
+def class_field(state, row, field):
+    """One field of an installed direction's class (a flows row's `qos=`), at
+    the position status reports for it rather than one restated here."""
+    shift, bits = state[f"qos_class_{field}_shift"], state[f"qos_class_{field}_bits"]
+    return int(row["qos"], 16) >> shift & ((1 << bits) - 1)
+
+
+def policed(state, row):
+    """Whether a direction names one of the pool's per-flow profiles."""
+    return 1 <= class_field(state, row, "policer") <= state["qos_policers"]
 
 
 async def offload(r, *rules):
@@ -533,26 +562,35 @@ async def reload_adapter(r, *parameters, idle=True):
 
 
 @asynccontextmanager
-async def remarking(r):
-    """The adapter reloaded with REMARK_MASK for the case, yielding the mark
-    that names REMARK_CLASS under it, and reloaded with the image's own
-    options afterwards. The remark lives in bits the image's mask does not
-    cover; the two boot-immutable parameters have to read back as they did
-    before."""
+async def reloaded_mask(r, mask):
+    """The adapter reloaded with `mask` as its qos_mark_mask, yielding the
+    state it then reports, and reloaded with the image's own options
+    afterwards; the two boot-immutable parameters have to read back as they
+    did before."""
     parameters = "/sys/module/ask_flowtable/parameters/"
     original = {name: (await read(r.target, r.session, parameters + name)).strip()
                 for name in ("qos_mark_mask", "qos_default_class")}
-    await reload_adapter(r, f"qos_mark_mask={REMARK_MASK:#x}")
+    await reload_adapter(r, f"qos_mark_mask={mask:#x}")
     try:
-        mask = int((await read(r.target, r.session, parameters + "qos_mark_mask")).strip())
-        assert mask == REMARK_MASK, mask
-        shift = (REMARK_MASK & -REMARK_MASK).bit_length() - 1
-        yield REMARK_CLASS << shift
+        loaded = int((await read(r.target, r.session, parameters + "qos_mark_mask")).strip())
+        assert loaded == mask, loaded
+        yield await r.state()
     finally:
         await reload_adapter(r, idle=False)
     restored = {name: (await read(r.target, r.session, parameters + name)).strip()
                 for name in original}
     assert restored == original, (original, restored)
+
+
+@asynccontextmanager
+async def remarking(r):
+    """The adapter reloaded with REMARK_MASK for the case, yielding the mark
+    that names REMARK_CLASS under it. The remark lives in bits the image's
+    mask does not cover."""
+    async with reloaded_mask(r, REMARK_MASK) as state:
+        assert (state["qos_class_remark_shift"], state["qos_class_dscp_shift"],
+                state["qos_mark_bits"]) == (REMARK_SHIFT, DSCP_SHIFT, CLASS_BITS), state
+        yield REMARK_CLASS << state["qos_mark_shift"]
 
 
 IPV6_FLOWLABEL_MGR, IPV6_FLOWINFO_SEND, IPV6_FLOWINFO = 32, 33, 11
@@ -725,6 +763,8 @@ async def qos(rig):
                     "ask_flowtable.qos_mark_mask=0xf0, which the test image ships")
     shift = (mask & -mask).bit_length() - 1
     r.mark = lambda cq: cq << shift
+    budget = await r.state()
+    assert budget["qos_leaves_per_port"] == LEAF_SLOTS, budget["qos_leaves_per_port"]
     wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     console = Console.target(log_path=str(artifact_dir() / "qos-uart.log"))
     await asyncio.to_thread(console.login, "root", None)

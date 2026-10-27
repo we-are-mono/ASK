@@ -34,7 +34,8 @@ import pytest
 
 from _flowtable_qos import HIGH_CQ, HIGH_PRIO, LOW_CQ, LOW_PRIO, LOWER_CQ, LOWER_PRIO, PORT_BE, PORT_BULK, PORT_EF, PORT_EF_BEFORE, PORT_EF_MOVED, PORT_EF_SOFTWARE, PORT_HELD_A, PORT_HELD_B, PORT_HELD_C, PORT_HIGH, PORT_LOW, PORT_POOL, PORT_PROBE, PORT_REMARK_HW, PORT_REMARK_SW, PORT_UNCLASSIFIED_HW, PORT_UNCLASSIFIED_SW, PORT_WEIGHTED, PORT_WEIGHTED_BULK, PORT_STRANDED_GROUP, PORTS_STRANDED, TCP_FRAME, TCP_PAYLOAD
 
-from _flowtable_qos import (AF11_TOS, CAP_MBIT, COUNT, DATAGRAM, EF_TOS, FLOW_LABEL, OAL, OFFERED_MBIT, POLICE_BURST, PORT_DECLINED, PORT_DEFAULT, PORT_EF_REPLACED, PORT_EGRESS, PORT_POLICED, PORT_SATURATE, PORT_SHAPED, PROBE_SLACK, REMARK_CLASS, SETTLE, TAIL_FRAMES, UDP_HEADERS, UNSHAPED_GBPS, WEIGHTED_CQ, WINDOW, WRED_BANDS, WRED_LIMIT, WRED_MBIT, WRED_PROBABILITY, admit, assert_remarked, captured, conntrack_ids, directions, dut_ping, ef_filter, egress, handshakes, inbound, iperf, lan_start, leaf_delta, lockstep, logged, offered, offload, police_counters, probe, qdisc_shown, read_intervals, readmitted, received_bps, received_loss, remark_fields, remark_send, remarking, shaped_bps, timing_slack, tree)
+from _flowtable_qos import (CEILING_CLASSES, LEAF_SLOTS, PORTS_CHANNELS, PORTS_POLICERS, WIDE_MASK, reloaded_mask)
+from _flowtable_qos import (AF11_TOS, CAP_MBIT, COUNT, DATAGRAM, EF_TOS, FLOW_LABEL, OAL, OFFERED_MBIT, POLICE_BURST, PORT_DECLINED, PORT_DEFAULT, PORT_EF_REPLACED, PORT_EGRESS, PORT_POLICED, PORT_SATURATE, PORT_SHAPED, PROBE_SLACK, REMARK_CLASS, SETTLE, TAIL_FRAMES, UDP_HEADERS, UNSHAPED_GBPS, WEIGHTED_CQ, WINDOW, WRED_BANDS, WRED_LIMIT, WRED_MBIT, WRED_PROBABILITY, admit, assert_remarked, captured, class_field, conntrack_ids, directions, dut_ping, ef_filter, egress, handshakes, inbound, iperf, lan_start, leaf_delta, lockstep, logged, offered, offload, police_counters, policed, probe, qdisc_shown, read_intervals, readmitted, received_bps, received_loss, remark_fields, remark_send, remarking, shaped_bps, timing_slack, tree)
 
 import asyncio
 import json
@@ -558,8 +559,6 @@ async def test_shrunk_leaf_backlog_stays_charged(qos):
 STRANDED_CYCLES = 10
 # How long each flow is flooded in a cycle; the swap comes a second in.
 STRANDED_FLOOD_SECONDS = 4
-# The WAN tree's classes under its root: a channel each, as many as the SoC has.
-STRANDED_WAN_CLASSES = 8
 # After the WAN tree is taken down, for the releases of both trees' channels.
 STRANDED_SETTLE = 3
 # The routed groups streamed through the LAN tree. Each is rebuilt on its own
@@ -697,9 +696,12 @@ async def _staged_swap(r, *, rtnl_requests=0):
     was, which nothing in the flowtable adapter or CDX follows."""
     lan, wan = TARGET_LAN_IF, TARGET_WAN_IF
     queue = int((await read(r.target, r.session, "/sys/class/net/lo/tx_queue_len")).strip())
+    # A class under the root for every channel the SoC has, as status counts
+    # them, so the WAN tree asks for each one the LAN tree gave back.
+    channels = (await r.state())["qos_channels"]
     lines = [f"qdisc del dev {lan} root", f"qdisc add dev {wan} root handle 1: htb offload",
-             *(f"class add dev {wan} parent 1: classid 1:{ii} htb rate 1000mbit ceil 1000mbit"
-               for ii in range(1, STRANDED_WAN_CLASSES + 1))]
+             *(f"class add dev {wan} parent 1: classid 1:{ii:x} htb rate 1000mbit ceil 1000mbit"
+               for ii in range(1, channels + 1))]
     busy = restore = ""
     if rtnl_requests:
         busy = (f"for i in $(seq {rtnl_requests // 2}); do\n"
@@ -1762,9 +1764,8 @@ async def test_flower_police_caps_the_flow(qos):
 
     cap = CAP_MBIT * 1e6
     assert len(forward) == len(reverse) == 1, (forward, reverse)
-    profile = int(forward[0]["qos"], 16) >> 8 & 0xf
-    assert 1 <= profile <= 7, forward
-    assert int(reverse[0]["qos"], 16) >> 8 & 0xf == 0, reverse
+    assert policed(state, forward[0]), forward
+    assert class_field(state, reverse[0], "policer") == 0, reverse
     assert offered >= 2 * cap, ("the orchestrator did not offer enough to test a meter", offered)
     hits = int(forward[0]["packets"])
     assert hits in (metered, metered - dropped), (hits, metered, dropped)
@@ -1822,7 +1823,7 @@ async def test_flower_police_follows_linux_buckets(qos, case):
     assert offered >= 2 * rate * 1e6, ("the orchestrator did not offer enough to test a meter", offered)
     # skip_sw: Linux carries the first datagrams unmetered, which admits the
     # flow, and from then on the entry names the filter's profile.
-    assert len(forward) == 1 and 1 <= int(forward[0]["qos"], 16) >> 8 & 0xf <= 7, forward
+    assert len(forward) == 1 and policed(state, forward[0]), forward
     expected = through * 1e6 * DATAGRAM / (DATAGRAM + UDP_HEADERS)
     if through:
         assert 0.9 * expected <= goodput <= 1.03 * expected, (goodput, expected)
@@ -1858,7 +1859,8 @@ async def test_flower_police_mtu_boundary(qos):
     while not directions(await r.state(), ingress=dev, proto=17, dst=target):
         await asyncio.to_thread(lockstep, r.lan_ip, PORT_POLICED, 8)
         assert time.monotonic() < deadline, "the policed flow was never admitted"
-    forward = directions(await r.state(), ingress=dev, proto=17, dst=target)
+    state = await r.state()
+    forward = directions(state, ingress=dev, proto=17, dst=target)
     # Frames from a few bytes under the mtu to one over it, as Linux measures
     # them: Ethernet 14 + IPv4 20 + UDP 8 around the payload.
     crossed = {}
@@ -1870,7 +1872,7 @@ async def test_flower_police_mtu_boundary(qos):
     shown = (await r.tc("-s", "filter", "show", "dev", dev, "ingress"))["stdout"]
     r.record("qos-police-mtu-boundary", {"crossed": crossed, "forward": forward,
                                           "after": after, "filter": shown})
-    assert len(forward) == 1 and 1 <= int(forward[0]["qos"], 16) >> 8 & 0xf <= 7, forward
+    assert len(forward) == 1 and policed(state, forward[0]), forward
     assert [row["cookie"] for row in after] == [forward[0]["cookie"]], (forward, after)
     assert crossed == {length: BOUNDARY_COUNT if length <= BOUNDARY_MTU else 0
                        for length in crossed}, crossed
@@ -1906,7 +1908,7 @@ async def test_flower_police_charges_ip_bytes(qos):
     expected = SMALL_RATE_MBIT * 1e6 * SMALL_DATAGRAM / ip_bytes
     r.record("qos-police-ip-bytes", {"filter": shown, "state": state, "goodput_bps": goodput,
                                       "expected_bps": expected, "report": report})
-    assert len(forward) == 1 and 1 <= int(forward[0]["qos"], 16) >> 8 & 0xf <= 7, forward
+    assert len(forward) == 1 and policed(state, forward[0]), forward
     assert police_counters(shown)[1], shown
     # Charging the whole frame would land 16% under; the token bucket itself
     # runs a little under the rate.
@@ -2068,3 +2070,221 @@ print(json.dumps({{'rc': result.returncode, 'stderr': result.stderr[-400:]}}))
     assert (0.95 - slack) * cap <= held <= (1.03 + slack) * cap, (
         held, cap, slack, leaf_delta(first, second, 0))
     assert median_between(unshaping["readmitted"] + 1.0, ended) >= UNSHAPED_GBPS * 1e9, intervals
+
+
+def rows_on(state, kind, dev):
+    """A port's rows of one of the QoS budget files, `qos_ports` or `qos_classes`."""
+    return [row for row in state[kind] if row["dev"] == dev]
+
+
+async def shaped_class(r, dev, row, port):
+    """One offloaded flow through the class `row` names, offered three times
+    the cap, measured as test_htb_shapes_at_the_cap measures its one."""
+    slot = int(row["slot"])
+    client = asyncio.create_task(iperf(r, port, udp_mbit=OFFERED_MBIT))
+    try:
+        await asyncio.sleep(SETTLE)
+        first = await egress(r, dev)
+        await asyncio.sleep(WINDOW)
+        second = await egress(r, dev)
+        report = await client
+    finally:
+        if not client.done():
+            client.cancel()
+            await asyncio.gather(client, return_exceptions=True)
+    state = await r.state()
+    forward = directions(state, ingress=TARGET_WAN_IF, proto=17, dst=f"{r.lan_ip}:{port}")
+    return {"class": row, "port": port, "forward": forward,
+            "window": leaf_delta(first, second, slot), "shaped_bps": shaped_bps(first, second, slot),
+            "slack": timing_slack(first, second),
+            "software": second["software_tx"] - first["software_tx"],
+            "goodput_bps": received_bps(report),
+            "offered_bps": report["end"]["sum_sent"]["bits_per_second"]}
+
+
+async def test_sixteen_channels_shape_on_one_port(qos):
+    """Sixteen classes under the LAN tree's root, a channel each, and one
+    offloaded flow marked for each, offered three times the cap in turn.
+
+    Past the eight channels ASK once had: the tree takes sixteen of the SoC's,
+    as status and the port's row count them, and each flow carries the mark
+    its class's row gives -- read from the adapter, not composed here, which
+    is how a consumer learns the channel the hardware picked. Each lands on its
+    class's leaf, which holds it at the cap in hardware: the leaf dequeues at
+    the cap and rejects the excess, almost nothing went through the CPU, and the
+    receiver's goodput sits under a cap far above what the CPU forwards.
+    """
+    r = qos
+    dev = TARGET_LAN_IF
+    rate = f"{CAP_MBIT}mbit"
+    async with reloaded_mask(r, WIDE_MASK):
+        # The adapter leaves only once nothing is bound, so the table goes
+        # before the image's own mask comes back.
+        try:
+            await r.tc("qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "offload")
+            for ii in range(1, CEILING_CLASSES + 1):
+                await r.tc("class", "add", "dev", dev, "parent", "1:", "classid", f"1:{ii:x}",
+                           "htb", "rate", rate, "ceil", rate, "prio", "0")
+            built = await r.state()
+            classes = sorted(rows_on(built, "qos_classes", dev), key=lambda row: int(row["slot"]))
+            ports = rows_on(built, "qos_ports", dev)
+            await offload(r, *(inbound(r, "udp", port, int(row["mark"], 16))
+                               for row, port in zip(classes, PORTS_CHANNELS)))
+            await lan_start(r, iperf=PORTS_CHANNELS, lifetime=600)
+            results = [await shaped_class(r, dev, row, port)
+                       for row, port in zip(classes, PORTS_CHANNELS)]
+        finally:
+            await r.delete_table()
+    r.record("qos-sixteen-channels", {"built": built, "results": results})
+
+    channels = {int(row["channel"]) for row in classes}
+    assert len(classes) == CEILING_CLASSES and all(row["kind"] == "leaf" for row in classes), classes
+    assert len(channels) == CEILING_CLASSES and max(channels) >= 8, channels
+    assert len(ports) == 1 and int(ports[0]["leaves"]) == CEILING_CLASSES, ports
+    assert set(map(int, ports[0]["channels"].split(","))) == channels, (ports, channels)
+    assert built["qos_channels_used"] >= CEILING_CLASSES, built["qos_channels_used"]
+    assert built["qos_channels_free"] == (built["qos_channels"] - built["qos_channels_used"]
+                                          - built["qos_channels_held"]), built
+    cap = CAP_MBIT * 1e6
+    expected = cap * DATAGRAM / (DATAGRAM + UDP_HEADERS + OAL)
+    for result in results:
+        row, forward, window = result["class"], result["forward"], result["window"]
+        assert len(forward) == 1 and forward[0]["out"] == dev, result
+        assert int(forward[0]["qos"], 16) == int(row["qos"], 16), result
+        assert result["offered_bps"] >= 2 * cap, result
+        slack = result["slack"]
+        assert (0.95 - slack) * cap <= result["shaped_bps"] <= (1.03 + slack) * cap, result
+        assert window["rejected"] >= window["frames"], result
+        assert result["software"] <= window["frames"] // 100, result
+        assert 0.9 * expected <= result["goodput_bps"] <= 1.02 * expected, result
+
+
+async def test_sixteen_policers_meter_on_one_port(qos):
+    """Sixteen `flower` police filters on the WAN port's ingress, a profile
+    each, and one offloaded flow under each, offered three times the rate in
+    turn.
+
+    Past the seven profiles ASK once had: the port's row and the pool's levels
+    count all sixteen, each flow's entry names a profile of its own, and each
+    meter holds its flow at the rate in hardware, its red counter carrying the
+    excess.
+    """
+    r = qos
+    dev = TARGET_WAN_IF
+    await r.tc("qdisc", "add", "dev", dev, "clsact")
+    for pref, port in enumerate(PORTS_POLICERS, 1):
+        await r.tc("filter", "add", "dev", dev, "ingress", "protocol", "ip", "pref", str(pref),
+                   "flower", "skip_sw", "ip_proto", "udp", "dst_ip", r.lan_ip,
+                   "dst_port", str(port),
+                   "action", "police", "rate", f"{CAP_MBIT}mbit", "burst", POLICE_BURST,
+                   "conform-exceed", "drop")
+    built = await r.state()
+    await offload(r, *(inbound(r, "udp", port) for port in PORTS_POLICERS))
+    await lan_start(r, iperf=PORTS_POLICERS, lifetime=600)
+    results = []
+    for pref, port in enumerate(PORTS_POLICERS, 1):
+        report = await iperf(r, port, udp_mbit=OFFERED_MBIT)
+        state = await r.state()
+        shown = (await r.tc("-s", "filter", "show", "dev", dev, "ingress",
+                            "pref", str(pref)))["stdout"]
+        metered, dropped = police_counters(shown)
+        results.append({"pref": pref, "port": port, "filter": shown, "metered": metered,
+                        "dropped": dropped, "state": state,
+                        "forward": directions(state, ingress=dev, proto=17,
+                                              dst=f"{r.lan_ip}:{port}"),
+                        "goodput_bps": received_bps(report),
+                        "offered_bps": report["end"]["sum_sent"]["bits_per_second"]})
+    r.record("qos-sixteen-policers", {"built": built, "results": results})
+
+    ports = rows_on(built, "qos_ports", dev)
+    assert len(ports) == 1 and int(ports[0]["policers"]) == CEILING_CLASSES, ports
+    assert built["qos_policers_used"] >= CEILING_CLASSES, built["qos_policers_used"]
+    assert built["qos_policers_free"] == built["qos_policers"] - built["qos_policers_used"], built
+    cap = CAP_MBIT * 1e6
+    expected = cap * DATAGRAM / (DATAGRAM + UDP_HEADERS)
+    profiles = set()
+    for result in results:
+        state, forward = result["state"], result["forward"]
+        assert "in_hw" in result["filter"], result["filter"]
+        assert len(forward) == 1 and policed(state, forward[0]), result
+        profiles.add(class_field(state, forward[0], "policer"))
+        assert result["offered_bps"] >= 2 * cap, result
+        hits = int(forward[0]["packets"])
+        assert hits in (result["metered"], result["metered"] - result["dropped"]), result
+        assert result["dropped"] >= result["metered"] // 2, result
+        assert 0.9 * expected <= result["goodput_bps"] <= 1.03 * expected, result
+    assert len(profiles) == CEILING_CLASSES and max(profiles) > 7, profiles
+
+
+async def test_capacity_refusals_name_the_count(qos):
+    """What tc is told when it asks for more than the hardware has left: the
+    resource and the count, and the command refused rather than left in
+    software.
+
+    Every channel the SoC has free goes to classes under the WAN tree's root,
+    and one more is refused naming them all held; sixty-four leaves fill the LAN
+    port's leaf slots, four channels of eight strict and eight weighted class
+    queues, and a sixty-fifth is refused; the pool's free profiles go to
+    skip_sw filters, and one more is refused. Each level reads back exhausted
+    first, so the refusal is the count status gave.
+    """
+    r = qos
+    wan, lan = TARGET_WAN_IF, TARGET_LAN_IF
+    await r.wait(lambda s: s["qos_channels_held"] == 0 and s["qos_channels_used"] == 0)
+    # Channels: one class under the root per free channel, then one more.
+    await r.tc("qdisc", "add", "dev", wan, "root", "handle", "1:", "htb", "offload")
+    total = (await r.state())["qos_channels"]
+    for ii in range(1, total + 1):
+        await r.tc("class", "add", "dev", wan, "parent", "1:", "classid", f"1:{ii:x}",
+                   "htb", "rate", "100mbit", "ceil", "100mbit", "prio", "0")
+    full = await r.state()
+    refused_channel = await r.tc("class", "add", "dev", wan, "parent", "1:",
+                                 "classid", f"1:{total + 1:x}", "htb", "rate", "100mbit",
+                                 "ceil", "100mbit", "prio", "0", check=False)
+    await r.tc("qdisc", "del", "dev", wan, "root")
+    await r.wait(lambda s: s["qos_channels_held"] == 0 and s["qos_channels_used"] == 0,
+                 timeout=30)
+    # Leaves: four channels' sixteen class queues each, then a fifth class
+    # under the root, which needs a leaf slot of its own. A channel's first
+    # child takes over the slot the channel held as a leaf.
+    await r.tc("qdisc", "add", "dev", lan, "root", "handle", "1:", "htb", "offload")
+    for channel in range(1, 5):
+        await r.tc("class", "add", "dev", lan, "parent", "1:", "classid", f"1:{channel:x}",
+                   "htb", "rate", "100mbit", "ceil", "100mbit")
+    for channel in range(1, 5):
+        for cq in range(16):
+            leaf = f"1:{channel:x}{cq:02x}"
+            params = ["prio", str(cq)] if cq < 8 else ["quantum", "1"]
+            await r.tc("class", "add", "dev", lan, "parent", f"1:{channel:x}", "classid", leaf,
+                       "htb", "rate", "10mbit", "ceil", "100mbit", *params)
+    leaves = rows_on(await r.state(), "qos_ports", lan)
+    refused_leaf = await r.tc("class", "add", "dev", lan, "parent", "1:", "classid", "1:5",
+                              "htb", "rate", "100mbit", "ceil", "100mbit", check=False)
+    # Profiles: a skip_sw filter per free profile, then one more.
+    await r.tc("qdisc", "add", "dev", wan, "clsact")
+    free = (await r.state())["qos_policers_free"]
+    for pref in range(1, free + 2):
+        last = await r.tc("filter", "add", "dev", wan, "ingress", "protocol", "ip",
+                          "pref", str(pref), "flower", "skip_sw", "ip_proto", "udp",
+                          "dst_ip", r.lan_ip, "dst_port", str(PORT_POOL + pref),
+                          "action", "police", "rate", "10mbit", "burst", POLICE_BURST,
+                          "conform-exceed", "drop", check=pref <= free)
+    pool = await r.state()
+    r.record("qos-capacity-refusals", {"full": full, "channel": refused_channel,
+                                       "leaves": leaves, "leaf": refused_leaf,
+                                       "pool": pool, "policer": last})
+
+    assert full["qos_channels_free"] == 0 and full["qos_channels_used"] == total, full
+    assert refused_channel["rc"], refused_channel
+    assert f"no CEETM channel free ({total} of {total} held)" in (
+        refused_channel["stdout"] + refused_channel.get("stderr", "")), refused_channel
+    assert len(leaves) == 1 and int(leaves[0]["leaves"]) == LEAF_SLOTS, leaves
+    assert int(leaves[0]["leaves_free"]) == 0, leaves
+    assert refused_leaf["rc"], refused_leaf
+    assert f"no HTB leaf free on this port ({LEAF_SLOTS} of {LEAF_SLOTS} held)" in (
+        refused_leaf["stdout"] + refused_leaf.get("stderr", "")), refused_leaf
+    assert pool["qos_policers_free"] == 0, pool
+    total_policers = pool["qos_policers"]
+    assert last["rc"], last
+    assert (f"flower: no ingress policer profile free ({total_policers} of {total_policers} held)"
+            in last["stdout"] + last.get("stderr", "")), last

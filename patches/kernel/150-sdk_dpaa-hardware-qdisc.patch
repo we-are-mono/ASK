@@ -1,4 +1,4 @@
-From f49af29237ca660d0abaff553017e98b21e9306b Mon Sep 17 00:00:00 2001
+From 3e9ccdd8392f1d6d45bcb6e7ade984b237d56290 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 19:08:09 +0200
 Subject: [PATCH] sdk_dpaa: let this netdev host a hardware qdisc
@@ -11,14 +11,22 @@ this driver did not: DPAA_ETH_TX_QUEUES was NR_CPUS, so the same code offered
 egress_fqs[] and conf_fqs[] to match. A budget that moves with someone else's
 Kconfig cannot be part of an interface contract.
 
-Pin the direct queues at sixteen and reserve DPAA_ETH_CEETM_LEAF_QUEUES more
-above them, one per CEETM class queue on a channel. Sixteen is not a new
-number - it is what the more constrained configuration already ran, so that
-Tx path is untouched and the other moves down to a count already in service.
-It stays a power of two because the Tx paths index conf_fqs[] with & (N - 1).
-The count is not derived from the core count: these queues carry only what the
-CPU sends, an offloaded flow reaches none of them, and with no XPS maps here a
-queue is picked by flow hash rather than by CPU.
+Pin the direct queues at sixteen. Sixteen is not a new number - it is what
+the more constrained configuration already ran, so that Tx path is untouched
+and the other moves down to a count already in service. It stays a power of
+two because the Tx paths index conf_fqs[] with & (N - 1). The count is not
+derived from the core count: these queues carry only what the CPU sends, an
+offloaded flow reaches none of them, and with no XPS maps here a queue is
+picked by flow hash rather than by CPU.
+
+Reserve DPAA_ETH_CEETM_LEAF_QUEUES more above them, one per leaf class a
+tree can hold on the port. A tree's leaves spread over its CEETM channels,
+one for each class under its root, so the count is not one channel's sixteen
+class queues: sixty-four is a leaf on each of a CEETM instance's thirty-two
+channels twice over. Each slot is a netdev queue, which the default root
+qdisc also gives a child of its own until a hardware qdisc takes the port,
+and each slot's ethtool counters are named by its index, which a hundred
+would not fit.
 
 netif_set_real_num_tx_queues() then reports only the direct queues as usable -
 the first such call this driver has made - so a leaf class is invisible until
@@ -89,11 +97,11 @@ AF_PACKET's qdisc bypass calls it from plain process context, which under
 PREEMPT_RCU is no reader -- and the unregister waits for a grace period.
 ---
  .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    | 173 +++++++++++++++++-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |  33 +++-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |  41 ++++-
  .../freescale/sdk_dpaa/dpaa_eth_common.h      |  69 +++++++
  .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  30 ++-
- .../freescale/sdk_dpaa/dpaa_ethtool.c         |  65 ++++++-
- 5 files changed, 360 insertions(+), 10 deletions(-)
+ .../freescale/sdk_dpaa/dpaa_ethtool.c         |  71 ++++++-
+ 5 files changed, 374 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 index 3d56598a4bf2..e371e7755664 100644
@@ -327,10 +335,10 @@ index 3d56598a4bf2..e371e7755664 100644
  alloc_etherdev_mq_failed:
  	if (atomic_read(&dpa_bp->refs) == 0)
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
-index 2b852d0fc6f3..82a93a7c1461 100644
+index 2b852d0fc6f3..3240deb375af 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
-@@ -189,13 +189,42 @@ increased buffer size from 2048 to 2176, to accomodate them in contiguous fd */
+@@ -189,13 +189,50 @@ increased buffer size from 2048 to 2176, to accomodate them in contiguous fd */
  #define fm_l4_frame_is_tcp(parse_result_ptr) \
  	((parse_result_ptr)->l4r & FM_L4_PARSE_RESULT_TCP)
  
@@ -363,13 +371,21 @@ index 2b852d0fc6f3..82a93a7c1461 100644
 +#define DPAA_ETH_TX_QUEUES	16
  #endif
  
-+/* Headroom above the direct queues, one slot per CEETM class queue on a
-+ * channel, reserved so a hardware qdisc can hand sch_htb a real and
-+ * exclusively owned netdev_queue index for each leaf class. Nothing allocates
-+ * an egress FQ for these: a leaf's frames leave through a CEETM logical FQ
-+ * that the scheduler owns, not through egress_fqs[].
++/* Headroom above the direct queues, one slot per leaf class a hardware qdisc
++ * can hold on this port, reserved so it can hand sch_htb a real and
++ * exclusively owned netdev_queue index for each. Nothing allocates an egress
++ * FQ for these: a leaf's frames leave through a CEETM logical FQ that the
++ * scheduler owns, not through egress_fqs[].
++ *
++ * A tree's leaves spread over its CEETM channels, one for each class under
++ * its root, so the count is not one channel's sixteen class queues: sixty-four
++ * is a leaf on each of a CEETM instance's thirty-two channels twice over. Each
++ * slot is a netdev queue, which the stack's default root qdisc also gives a
++ * child qdisc of its own until a hardware qdisc takes the port. And each
++ * slot's ethtool counters are named by its index, which a hundred would not
++ * fit (dpa_get_strings()).
 + */
-+#define DPAA_ETH_CEETM_LEAF_QUEUES	16
++#define DPAA_ETH_CEETM_LEAF_QUEUES	64
 +#define DPAA_ETH_TX_QUEUES_MAX	(DPAA_ETH_TX_QUEUES + DPAA_ETH_CEETM_LEAF_QUEUES)
 +
  #define DPAA_ETH_RX_QUEUES	128
@@ -513,10 +529,10 @@ index c8af7b8ad379..1833c50014b2 100644
  }
  
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
-index 95f6db29416b..6ff76952144f 100644
+index 95f6db29416b..a68061e4ae7f 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
-@@ -93,6 +93,45 @@ static char dpa_stats_global[][ETH_GSTRING_LEN] = {
+@@ -93,6 +93,50 @@ static char dpa_stats_global[][ETH_GSTRING_LEN] = {
  #define DPA_STATS_PERCPU_LEN ARRAY_SIZE(dpa_stats_percpu)
  #define DPA_STATS_GLOBAL_LEN ARRAY_SIZE(dpa_stats_global)
  
@@ -555,6 +571,11 @@ index 95f6db29416b..6ff76952144f 100644
 +	 ARRAY_SIZE(dpa_stats_ceetm))
 +static_assert(ARRAY_SIZE(dpa_stats_ceetm) == DPA_CEETM_CLASS_STATS,
 +	      "one name per value the qdisc module reports");
++/* A slot's names carry its index in at most two digits: ethtool_sprintf()
++ * cuts a longer name at ETH_GSTRING_LEN without a word, and two slots' names
++ * would read the same (dpa_get_strings()). */
++static_assert(DPAA_ETH_CEETM_LEAF_QUEUES <= 100,
++	      "a leaf slot numbered from a hundred would not fit its ethtool names");
 +#else
 +#define DPA_STATS_CEETM_LEN 0
 +#endif
@@ -562,7 +583,7 @@ index 95f6db29416b..6ff76952144f 100644
  static int __cold dpa_get_ksettings(struct net_device *net_dev,
  		struct ethtool_link_ksettings *cmd)
  {
-@@ -359,7 +398,8 @@ static int dpa_get_sset_count(struct net_device *net_dev, int type)
+@@ -359,7 +403,8 @@ static int dpa_get_sset_count(struct net_device *net_dev, int type)
  	unsigned int total_stats, num_stats;
  
  	num_stats   = num_online_cpus() + 1;
@@ -572,7 +593,7 @@ index 95f6db29416b..6ff76952144f 100644
  
  	switch (type) {
  	case ETH_SS_STATS:
-@@ -482,6 +522,14 @@ static void dpa_get_ethtool_stats(struct net_device *net_dev,
+@@ -482,6 +527,14 @@ static void dpa_get_ethtool_stats(struct net_device *net_dev,
  	data[offset++] = cg_time;
  	data[offset++] = cg_num;
  	data[offset++] = cg_status;
@@ -587,7 +608,7 @@ index 95f6db29416b..6ff76952144f 100644
  }
  
  static void dpa_get_strings(struct net_device *net_dev, u32 stringset, u8 *data)
-@@ -505,6 +553,21 @@ static void dpa_get_strings(struct net_device *net_dev, u32 stringset, u8 *data)
+@@ -505,6 +558,22 @@ static void dpa_get_strings(struct net_device *net_dev, u32 stringset, u8 *data)
  		strings += ETH_GSTRING_LEN;
  	}
  	memcpy(strings, dpa_stats_global, size);
@@ -596,8 +617,9 @@ index 95f6db29416b..6ff76952144f 100644
 +#ifdef CONFIG_CPE_FAST_PATH
 +	/* Leaf i is Tx queue DPAA_ETH_TX_QUEUES + i, which is what
 +	 * TC_HTB_LEAF_QUERY_QUEUE answers for a classid. Every name fits
-+	 * ETH_GSTRING_LEN, the longest -- "ceetm rejected frames [leaf 15]" and
-+	 * "ceetm dequeued frames [default]" -- with no room to spare. */
++	 * ETH_GSTRING_LEN, the longest -- "ceetm rejected frames [leaf 63]" and
++	 * "ceetm dequeued frames [default]", thirty-one characters and the NUL
++	 * -- with no room to spare: a slot numbered from a hundred would not. */
 +	for (i = 0; i < DPAA_ETH_CEETM_LEAF_QUEUES; i++)
 +		for (j = 0; j < ARRAY_SIZE(dpa_stats_ceetm); j++)
 +			ethtool_sprintf(&strings, "%s [leaf %u]", dpa_stats_ceetm[j], i);

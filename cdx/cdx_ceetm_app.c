@@ -13,6 +13,7 @@
 #include <linux/cpu.h>
 #include <linux/delay.h>
 #include <linux/jiffies.h>
+#include <linux/of.h>
 #include "cdx.h"
 #include "control_ipv4.h"
 #include "lnxwrp_fm.h"
@@ -34,10 +35,22 @@ static_assert(CDX_FT_QOS_MAX_CHANNEL == CDX_CEETM_MAX_CHANNELS,
 	      "cdx_ft_rule.qos channel bound must track CEETM's channel count");
 
 static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];
+/* How many of those the hardware has, from the device tree, set once by
+ * ceetm_init_channels() before any channel is built. The rest of the table
+ * stays zeroed and is never named: every walk below stops here, and every
+ * channel number is checked against it -- a row past it has no channel built
+ * into it, so mapping it, or configuring a queue on it, would dereference
+ * nothing. */
+static uint32_t ceetm_channels;
 static bool ceetm_callbacks_registered;
 
 static int ceetm_release_channels(void);
 static int ceetm_pop_leftovers(struct classque_info *cqinfo);
+
+uint32_t ceetm_channel_count(void)
+{
+	return ceetm_channels;
+}
 
 
 /* The class queue a (channel, class queue) pair names, or NULL.
@@ -46,7 +59,8 @@ static int ceetm_pop_leftovers(struct classque_info *cqinfo);
  * conntrack mark spells a class that does not care; every other value is
  * one-based. The qman_fq is shared by every caller and never written here.
  */
-/* The channel index a mark's nibble names, or negative for none.
+/* The channel index a mark's channel field names, or negative for none: past
+ * the channels the device tree gave, none.
  *
  * Zero means "whichever channel this port owns", which is the highest one it
  * holds; every other value is one-based. One
@@ -54,7 +68,7 @@ static int ceetm_pop_leftovers(struct classque_info *cqinfo);
  * this would be a second answer to keep in step. */
 static int ceetm_resolve_channel(struct tQM_context_ctl *qm_ctx, uint32_t channel)
 {
-	if (channel > CDX_CEETM_MAX_CHANNELS)
+	if (channel > ceetm_channel_count())
 		return -1;
 	if (!qm_ctx || !qm_ctx->chnl_map)
 		return -1;
@@ -781,6 +795,45 @@ static int ceetm_create_channel(struct ceetm_chnl_info *qm_channel)
 	return CEETM_SUCCESS;
 }
 
+/* The channels the device tree gives fman0's CEETM instance: the count cell of
+ * its fsl,ceetm-channel-range, which is what fsl_ceetm_init() seeded the
+ * allocator qman_alloc_ceetm0_channel() draws from. The instance is found the
+ * way that function tells them apart, by the DCP portal its
+ * fsl,ceetm-lfqid-range names in bits 16-19 of its base; a node of fman1's is
+ * another FMan's channels and is passed over. Each range is read only as the
+ * two cells fsl_ceetm_init() accepts, so a node it refused gives nothing here
+ * either.
+ *
+ * Zero with no such node or no such range. The allocator then holds no
+ * channel either, and ceetm_init_channels() fails the load, as it did when
+ * the first allocation failed. More than CDX_CEETM_MAX_CHANNELS is more than
+ * one instance has; the tables hold that many, the rest stay the allocator's,
+ * and the board is told so. */
+static uint32_t ceetm_dt_channel_count(void)
+{
+	struct device_node *np;
+	uint32_t range[2];
+	uint32_t count = 0;
+
+	for_each_compatible_node(np, NULL, "fsl,qman-ceetm") {
+		if (of_property_read_variable_u32_array(np, "fsl,ceetm-lfqid-range",
+							range, 2, 2) != 2 ||
+		    ((range[0] & 0x0F0000) >> 16) != qm_dc_portal_fman0)
+			continue;
+		if (of_property_read_variable_u32_array(np, "fsl,ceetm-channel-range",
+							range, 2, 2) == 2)
+			count = range[1];
+		of_node_put(np);
+		break;
+	}
+	if (count > CDX_CEETM_MAX_CHANNELS) {
+		pr_warn("cdx: the device tree gives CEETM %u channels; %u are used\n",
+			count, CDX_CEETM_MAX_CHANNELS);
+		count = CDX_CEETM_MAX_CHANNELS;
+	}
+	return count;
+}
+
 int ceetm_init_channels(void)
 {
 	uint32_t ii;
@@ -791,6 +844,11 @@ int ceetm_init_channels(void)
 	uint64_t rate;
 
 	memset(&qm_chnl_info, 0, (CDX_CEETM_MAX_CHANNELS * sizeof(struct ceetm_chnl_info)));
+	ceetm_channels = ceetm_dt_channel_count();
+	if (!ceetm_channels) {
+		ceetm_err("%s::the device tree gives CEETM no channels\n", __func__);
+		return CEETM_FAILURE;
+	}
 	chinfo = &qm_chnl_info[0];
 	cr.whole = CEETM_TOKEN_WHOLE_MAXVAL;
 	cr.fraction = CEETM_TOKEN_FRAC_MAXVAL;
@@ -798,7 +856,7 @@ int ceetm_init_channels(void)
 		ceetm_err("%s::unable to deduce rate for shaper\n", __func__);
 		return CEETM_FAILURE;
 	}
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+	for (ii = 0; ii < ceetm_channels; ii++) {
 		chinfo->wbfq_priority = CEETM_DEFA_WBFQ_PRIORITY;
 		chinfo->wbfq_chshaper = 0;
 		chinfo->shaper_info.bsize = CEETM_DEFA_BSIZE;
@@ -863,14 +921,14 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 		ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
 		return CEETM_FAILURE;
 	}
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+	for (ii = 0; ii < ceetm_channel_count(); ii++) {
 		struct ceetm_chnl_info *qm_channel;
 		struct qm_ceetm_channel *channel;
 		struct classque_info *cqinfo;
 		uint32_t priority;
 
 		/* program all mapped channels */
-		if (qm_ctx->chnl_map & (1 << ii)) {
+		if (qm_ctx->chnl_map & BIT(ii)) {
 
 			qm_channel = &qm_chnl_info[ii];
 			channel = qm_channel->channel;
@@ -998,8 +1056,12 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 				ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
 				return QOS_ENERR_IO;
 			}
-			for (ii = 0; ii < NUM_CHANNEL_SHAPERS; ii++) {
-				if (qm_ctx->chnl_map & (1 << ii)) {
+			/* Every channel the port holds, whichever of the SoC's
+			 * it is. This walk used to stop at eight, the channels
+			 * NXP's tree had, so a channel past them kept whatever
+			 * shaper it was last left with. */
+			for (ii = 0; ii < ceetm_channel_count(); ii++) {
+				if (qm_ctx->chnl_map & BIT(ii)) {
 					chnl_ctx = &qm_chnl_info[ii];
 					/* Configure the channel shaper from the two
 					 * rates the context holds. This used to pass
@@ -1041,8 +1103,8 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 				return QOS_ENERR_IO;
 			}
 			/* disable channel shapers */
-			for (ii = 0; ii < NUM_CHANNEL_SHAPERS; ii++) {
-				if (qm_ctx->chnl_map & (1 << ii)) {
+			for (ii = 0; ii < ceetm_channel_count(); ii++) {
+				if (qm_ctx->chnl_map & BIT(ii)) {
 					chnl_ctx = &qm_chnl_info[ii];
 					if (ceetm_program_channel_shaper(chnl_ctx, &token, &token, CEETM_DEFA_BSIZE)) {
 						ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
@@ -1089,7 +1151,7 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 	struct qm_ceetm_lni *lni;
 	struct qm_mcc_ceetm_mapping_shaper_tcfc_config config_opts;
 
-	if (channel_num >= CDX_CEETM_MAX_CHANNELS) {
+	if (channel_num >= ceetm_channel_count()) {
 		ceetm_err("%s::invalid channel number %d\n", __func__,
 			channel_num);
 		return CEETM_FAILURE;
@@ -1141,7 +1203,7 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 	list_add_tail(&channel->node, &lni->channels);
 	chnl_ctx->qm_ctx = qm_ctx;
 	chnl_ctx->quarantine = NULL;
-	qm_ctx->chnl_map |= (1 << chnl_ctx->idx);
+	qm_ctx->chnl_map |= BIT(chnl_ctx->idx);
 	ceetm_dbg("%s::lni %d, dcp %d, chnl_map %x\n", __func__, lni->idx, lni->dcp_idx, qm_ctx->chnl_map);
 	/* if qos is enabled on port and channel shaper is on program values into shaper */
 
@@ -1175,7 +1237,7 @@ int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, uint32_t *channel_num)
 	bool held = false;
 	uint32_t ii;
 
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+	for (ii = 0; ii < ceetm_channel_count(); ii++) {
 		struct ceetm_chnl_info *chnl_ctx = &qm_chnl_info[ii];
 
 		if (chnl_ctx->qm_ctx || ceetm_chnl_failed(chnl_ctx))
@@ -1192,6 +1254,30 @@ int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, uint32_t *channel_num)
 	return held ? -EBUSY : -ENOSPC;
 }
 
+/* Who a channel is with, for a claim's refusal or a report of what is held:
+ * the port it is mapped to and the port it is quarantined for
+ * (ceetm_stop_qos()), each NULL for none, and whether a failed drain keeps it
+ * out of service for good. -EINVAL past the channels there are.
+ *
+ * Read as the claim reads them. A claim, a tree's teardown and the end of a
+ * quarantine are each made under the hardware qdisc's mutex, which the callers
+ * of this hold; a port's context release clears both words under the control
+ * mutex instead (ceetm_release_iface()), so a caller holding only the first
+ * sees each one as it was or cleared -- never another port's. */
+int ceetm_channel_holder(uint32_t channel_num, struct tQM_context_ctl **mapped,
+			 struct tQM_context_ctl **quarantine, bool *failed)
+{
+	struct ceetm_chnl_info *chnl_ctx;
+
+	if (channel_num >= ceetm_channel_count())
+		return -EINVAL;
+	chnl_ctx = &qm_chnl_info[channel_num];
+	*mapped = READ_ONCE(chnl_ctx->qm_ctx);
+	*quarantine = READ_ONCE(chnl_ctx->quarantine);
+	*failed = ceetm_chnl_failed(chnl_ctx);
+	return 0;
+}
+
 /* The frame queue a class queue on a channel sends through, by the indices
  * this file numbers them with. ceetm_get_egressfq() takes the conntrack mark's
  * numbering instead, where zero means "whichever channel this port owns"
@@ -1200,7 +1286,7 @@ int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, uint32_t *channel_num)
 struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx, uint32_t channel,
 			       uint32_t quenum)
 {
-	if (channel >= CDX_CEETM_MAX_CHANNELS)
+	if (channel >= ceetm_channel_count())
 		return NULL;
 	return ceetm_get_egressfq(qm_ctx, channel + 1, quenum);
 }
@@ -1323,7 +1409,7 @@ int ceetm_set_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t min,
 	uint32_t maxp, maxth;
 	uint16_t mask;
 
-	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+	if (channel_num >= ceetm_channel_count() || quenum >= MAX_SCHEDULER_QUEUES)
 		return -EINVAL;
 	if (!limit || !max || max <= min)
 		return -EINVAL;
@@ -1386,7 +1472,7 @@ int ceetm_clear_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t depth
 {
 	int rc;
 
-	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES ||
+	if (channel_num >= ceetm_channel_count() || quenum >= MAX_SCHEDULER_QUEUES ||
 	    !depth)
 		return -EINVAL;
 	rc = ceetm_cq_wred_off(&qm_chnl_info[channel_num].cq_info[quenum]);
@@ -1405,7 +1491,7 @@ int ceetm_clear_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t depth
  * tail drop at all. */
 int ceetm_set_class_depth(uint32_t channel_num, uint32_t quenum, uint32_t depth)
 {
-	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES ||
+	if (channel_num >= ceetm_channel_count() || quenum >= MAX_SCHEDULER_QUEUES ||
 	    !depth)
 		return -EINVAL;
 	if (!qm_chnl_info[channel_num].cq_info[quenum].ccg)
@@ -1425,7 +1511,7 @@ int ceetm_class_queue_state(uint32_t channel_num, uint32_t quenum,
 {
 	struct classque_info *cqinfo;
 
-	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+	if (channel_num >= ceetm_channel_count() || quenum >= MAX_SCHEDULER_QUEUES)
 		return -EINVAL;
 	cqinfo = &qm_chnl_info[channel_num].cq_info[quenum];
 	if (!cqinfo->ccg)
@@ -1449,7 +1535,7 @@ int ceetm_class_queue_state(uint32_t channel_num, uint32_t quenum,
 int ceetm_class_queue_backlog(uint32_t channel_num, uint32_t quenum,
 			      uint32_t *frames)
 {
-	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+	if (channel_num >= ceetm_channel_count() || quenum >= MAX_SCHEDULER_QUEUES)
 		return -EINVAL;
 	if (!qm_chnl_info[channel_num].cq_info[quenum].cq)
 		return -ENODEV;
@@ -1471,7 +1557,7 @@ int ceetm_class_counters(uint32_t channel_num, uint32_t quenum,
 	struct classque_info *cqinfo;
 	uint64_t pkts, bytes;
 
-	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+	if (channel_num >= ceetm_channel_count() || quenum >= MAX_SCHEDULER_QUEUES)
 		return -EINVAL;
 	cqinfo = &qm_chnl_info[channel_num].cq_info[quenum];
 	if (!cqinfo->cq || !cqinfo->ccg)
@@ -1501,7 +1587,7 @@ int ceetm_set_channel_rates(uint32_t channel_num, uint64_t cir_bps, uint64_t eir
 	struct qm_ceetm_rate cr, er;
 	uint64_t rate;
 
-	if (channel_num >= CDX_CEETM_MAX_CHANNELS)
+	if (channel_num >= ceetm_channel_count())
 		return -EINVAL;
 	chnl_ctx = &qm_chnl_info[channel_num];
 	shinfo = &chnl_ctx->shaper_info;
@@ -1551,7 +1637,7 @@ int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight
 	struct classque_info *cqinfo;
 	uint32_t ceetm_quenum;
 
-	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+	if (channel_num >= ceetm_channel_count() || quenum >= MAX_SCHEDULER_QUEUES)
 		return -EINVAL;
 	if ((weight != 0) != (quenum >= NUM_PQS))
 		return -EINVAL;
@@ -1595,8 +1681,9 @@ int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight
  * then names a class that no longer exists. The depth matters because the
  * classifier entries installed for the class still send to the queue until
  * they are retired or rebuilt, and a caller that bounds what its queues may
- * hold counts this one only by what it holds. What it already holds stays: a
- * lower tail drop evicts nothing. */
+ * hold charges this one that depth until then (cdx_htb.c): a frame, for as
+ * long as the retirement takes. What it already holds stays: a lower tail
+ * drop evicts nothing. */
 int ceetm_reset_class_queue(uint32_t channel_num, uint32_t quenum)
 {
 	struct qm_ceetm_weight_code weight_code;
@@ -1604,7 +1691,7 @@ int ceetm_reset_class_queue(uint32_t channel_num, uint32_t quenum)
 	struct classque_info *cqinfo;
 	int ret = 0;
 
-	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+	if (channel_num >= ceetm_channel_count() || quenum >= MAX_SCHEDULER_QUEUES)
 		return -EINVAL;
 	chnl_ctx = &qm_chnl_info[channel_num];
 	cqinfo = &chnl_ctx->cq_info[quenum];
@@ -2015,7 +2102,8 @@ static int ceetm_quiesce_port(struct tQM_context_ctl *qm_ctx,
 			      uint32_t *detached, bool quarantine)
 {
 	int ret = CEETM_SUCCESS;
-	int ii, jj;
+	uint32_t ii;
+	int jj;
 
 	*detached = 0;
 	if (qm_ctx->net_dev) {
@@ -2027,7 +2115,7 @@ static int ceetm_quiesce_port(struct tQM_context_ctl *qm_ctx,
 	}
 	if (qm_ctx->qos_enabled && ceetm_enable_or_disable_qos(qm_ctx, 0))
 		ret = CEETM_FAILURE;
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+	for (ii = 0; ii < ceetm_channel_count(); ii++) {
 		struct ceetm_chnl_info *chinfo = &qm_chnl_info[ii];
 
 		if (chinfo->qm_ctx != qm_ctx)
@@ -2049,7 +2137,7 @@ static int ceetm_quiesce_port(struct tQM_context_ctl *qm_ctx,
 		if (quarantine)
 			chinfo->quarantine = qm_ctx;
 		chinfo->qm_ctx = NULL;
-		*detached |= 1U << ii;
+		*detached |= BIT(ii);
 	}
 	qm_ctx->chnl_map &= ~*detached;
 	/* And take the sub-portal back out of CEETM mode, which is the other
@@ -2085,10 +2173,11 @@ static int ceetm_quiesce_port(struct tQM_context_ctl *qm_ctx,
 
 static void ceetm_put_channel_devices(uint32_t detached)
 {
-	int ii, jj;
+	uint32_t ii;
+	int jj;
 
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
-		if (!(detached & (1U << ii)))
+	for (ii = 0; ii < ceetm_channel_count(); ii++) {
+		if (!(detached & BIT(ii)))
 			continue;
 		for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++) {
 			struct classque_info *cqinfo = &qm_chnl_info[ii].cq_info[jj];
@@ -2152,7 +2241,7 @@ int ceetm_end_quarantine(struct tQM_context_ctl *qm_ctx)
 	int ret = CEETM_SUCCESS;
 	uint32_t ii, jj;
 
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+	for (ii = 0; ii < ceetm_channel_count(); ii++) {
 		struct ceetm_chnl_info *chinfo = &qm_chnl_info[ii];
 
 		if (!qm_ctx || chinfo->quarantine != qm_ctx)
@@ -2251,7 +2340,7 @@ static int ceetm_release_channels(void)
 	int ii, jj;
 	int ret = CEETM_SUCCESS;
 
-	for (ii = CDX_CEETM_MAX_CHANNELS - 1; ii >= 0; ii--) {
+	for (ii = (int)ceetm_channel_count() - 1; ii >= 0; ii--) {
 		struct ceetm_chnl_info *chinfo = &qm_chnl_info[ii];
 
 		if (!chinfo->channel)

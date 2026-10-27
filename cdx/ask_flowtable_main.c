@@ -26,7 +26,7 @@ static unsigned int ft_qos_default_class;
 module_param_named(qos_mark_mask, ft_qos_mark_mask, uint, 0444);
 MODULE_PARM_DESC(qos_mark_mask, "Conntrack mark bits holding the class; 0 disables classification");
 module_param_named(qos_default_class, ft_qos_default_class, uint, 0444);
-MODULE_PARM_DESC(qos_default_class, "Class for flows whose masked mark is zero: nibbles low to high are class queue, channel, ingress policer profile, then a remark flag and six bits of DSCP");
+MODULE_PARM_DESC(qos_default_class, "Class for flows whose masked mark is zero: from bit 0, four bits of class queue, six of channel (1-32; 0 is the port's own), six of ingress policer profile (0-63), then a remark flag and six bits of DSCP");
 
 /* Conntrack mark bits that select a route at a connection's creation and are
  * read by nothing after it: mwan3's, pbr's, a VPN client's policy routing.
@@ -49,27 +49,35 @@ unsigned int ft_route_mark_mask;
 module_param_named(route_mark_mask, ft_route_mark_mask, uint, 0444);
 MODULE_PARM_DESC(route_mark_mask, "Conntrack mark bits that only select a route at connection creation (mwan3, pbr); a mark within them is admitted");
 
+/* Every value the policer field can carry names a profile the pool has, so a
+ * class is never refused for its policer -- and is never truncated onto
+ * another meter either. Should the field outgrow the pool, this fails the build
+ * until ft_qos_class_valid() bounds it the way it bounds the channel. */
+static_assert(CDX_FT_QOS_POLICER_MASK >> CDX_FT_QOS_POLICER_SHIFT == CDX_FT_QOS_MAX_POLICER,
+	      "the policer field must name exactly the ingress profiles there are");
+
 /* Reject a class the hardware cannot express rather than truncating it into a
  * different queue, which would accelerate the flow onto a queue nobody asked
- * for instead of declining it. */
+ * for instead of declining it: a bit outside the encoding, or a channel past
+ * the thirty-two the field may name. */
 bool ft_qos_class_valid(unsigned int class)
 {
 	return !(class & ~CDX_FT_QOS_MASK) &&
 		((class & CDX_FT_QOS_CHANNEL_MASK) >> CDX_FT_QOS_CHANNEL_SHIFT) <=
-			CDX_FT_QOS_MAX_CHANNEL &&
-		((class & CDX_FT_QOS_POLICER_MASK) >> CDX_FT_QOS_POLICER_SHIFT) <=
-			CDX_FT_QOS_MAX_POLICER;
+			CDX_FT_QOS_MAX_CHANNEL;
 }
 
 /* Map a conntrack mark onto a class. The masked bits are shifted down to their
  * own base so an operator can place the field anywhere in the word and share
  * the rest with policy routing or a VPN's own marks.
  *
- * Nineteen bits are spoken for — four each for class queue, channel and ingress
- * policer, then a flag and six bits of DSCP to remark with — leaving thirteen
- * of a 32-bit mark to the operator. A mask narrower than the fields an operator
- * uses is not an error: the bits it does not cover read zero, which is this
- * encoding's "unspecified" in every position, including a clear remark flag. */
+ * Twenty-three bits are spoken for -- four of class queue, six each of channel
+ * and ingress policer, then a flag and six bits of DSCP to remark with --
+ * leaving nine of a 32-bit mark to the operator. The first three fields are
+ * sixteen bits, so a class that does not remark fits in half the word. A mask
+ * narrower than the fields an operator uses is not an error: the bits it does
+ * not cover read zero, which is this encoding's "unspecified" in every
+ * position, including a clear remark flag. */
 u32 ft_qos_class(u32 mark)
 {
 	if (!ft_qos_mark_mask)
@@ -408,7 +416,7 @@ static int ft_flows_show(struct seq_file *seq, void *v)
 	/* One row shape per family. Brackets keep an IPv6 address and its port
 	 * a single whitespace-free token, as the IPv4 rows already are. */
 	if (entry->rule.family == AF_INET6)
-		seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u detour=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
+		seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%06x sa=%u in_sa=%u detour=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
 			   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 			   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 			   in_tnl, out_tnl,
@@ -421,7 +429,7 @@ static int ft_flows_show(struct seq_file *seq, void *v)
 			   entry->rule.detour,
 			   nexthop, stats.packets, stats.bytes, stats.lastused);
 	else
-		seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u detour=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
+		seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%06x sa=%u in_sa=%u detour=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
 			   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 			   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 			   in_tnl, out_tnl,
@@ -458,11 +466,167 @@ void ft_kv(struct seq_file *seq, const char *key, u64 value)
 		   (unsigned long long)value);
 }
 
+/* ---- the hardware QoS: what it has to give, and what holds it ----------
+ *
+ * All of it is cdx's, read through cdx_qos_budget(), which takes no sleeping
+ * lock -- a snapshot, and the policer pool's spinlock -- and
+ * cdx_qos_port_next(), which takes cdx's QoS mutex and that spinlock inside
+ * it and nothing else; none of it needs the transaction, nor RTNL, and the
+ * walk over the ports holds no netdev of its own. */
+
+/* Where the class sits in a conntrack mark: the lowest bit of the mask the
+ * module was loaded with. The mask is one run of bits (ft_qos_params_check()),
+ * so this and its width are all of it. */
+static unsigned int ft_qos_mark_shift(void)
+{
+	return ft_qos_mark_mask ? __ffs(ft_qos_mark_mask) : 0;
+}
+
+/* The mark that selects a class value, when the mask reaches every bit of the
+ * value; a mask narrower than that cannot carry it, as the test image's 0xf0,
+ * the queue field alone, carries no channel. */
+static bool ft_qos_mark(u32 qos, u32 *mark)
+{
+	unsigned int shift = ft_qos_mark_shift();
+
+	if (!ft_qos_mark_mask || (qos & ~(ft_qos_mark_mask >> shift)))
+		return false;
+	*mark = qos << shift;
+	return true;
+}
+
+/* The budget, at the end of status. Read after the transaction is let go, and
+ * with no lock it could wait on (cdx_qos_budget()): a tc command or a release
+ * holding cdx's QoS mutex is no part of what the health probe times. The class
+ * layout is cdx_flowtable_backend.h's, and it is also what the flows rows'
+ * `qos=' and the class rows' print: a flower filter writes the policer field
+ * there whether or not the mask reaches it. */
+static void ft_qos_status(struct seq_file *seq)
+{
+	struct cdx_qos_budget b;
+
+	cdx_qos_budget(&b);
+	ft_kv(seq, "qos_channels", b.channels);
+	ft_kv(seq, "qos_channels_used", b.channels_used);
+	ft_kv(seq, "qos_channels_held", b.channels_held);
+	ft_kv(seq, "qos_channels_free", b.channels - b.channels_used - b.channels_held);
+	ft_kv(seq, "qos_policers", b.policers);
+	ft_kv(seq, "qos_policers_used", b.policers_used);
+	ft_kv(seq, "qos_policers_free", b.policers - b.policers_used);
+	ft_kv(seq, "qos_leaves_per_port", b.leaves);
+	ft_kv(seq, "qos_mark_shift", ft_qos_mark_shift());
+	ft_kv(seq, "qos_mark_bits", hweight32(ft_qos_mark_mask));
+	ft_kv(seq, "qos_class_queue_shift", CDX_FT_QOS_QUEUE_SHIFT);
+	ft_kv(seq, "qos_class_queue_bits", CDX_FT_QOS_QUEUE_BITS);
+	ft_kv(seq, "qos_class_channel_shift", CDX_FT_QOS_CHANNEL_SHIFT);
+	ft_kv(seq, "qos_class_channel_bits", CDX_FT_QOS_CHANNEL_BITS);
+	ft_kv(seq, "qos_class_policer_shift", CDX_FT_QOS_POLICER_SHIFT);
+	ft_kv(seq, "qos_class_policer_bits", CDX_FT_QOS_POLICER_BITS);
+	ft_kv(seq, "qos_class_remark_shift", CDX_FT_QOS_REMARK_SHIFT);
+	ft_kv(seq, "qos_class_remark_bits", CDX_FT_QOS_REMARK_BITS);
+	ft_kv(seq, "qos_class_dscp_shift", CDX_FT_QOS_DSCP_SHIFT);
+	ft_kv(seq, "qos_class_dscp_bits", CDX_FT_QOS_DSCP_BITS);
+}
+
+/* A bitmap of channels as their numbers, comma-separated, or "-" for none;
+ * room for every one of an instance's thirty-two. */
+#define FT_QOS_LIST sizeof("0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31")
+static void ft_qos_list(u32 bits, char *text, size_t size)
+{
+	size_t len = 0;
+	unsigned int bit;
+
+	strscpy(text, "-", size);
+	while (bits) {
+		bit = __ffs(bits);
+		bits &= bits - 1;
+		len += scnprintf(text + len, size - len, "%s%u", len ? "," : "", bit);
+	}
+}
+
+/* One row per port of cdx's, with a tree or not. */
+static int ft_qos_ports_show(struct seq_file *seq, void *v)
+{
+	char channels[FT_QOS_LIST], held[FT_QOS_LIST];
+	struct cdx_qos_budget b;
+	struct cdx_qos_port p;
+	unsigned int ii;
+
+	cdx_qos_budget(&b);
+	for (ii = 0; cdx_qos_port_next(&ii, &p, NULL, 0) >= 0; ii++) {
+		ft_qos_list(p.channels, channels, sizeof(channels));
+		ft_qos_list(p.held, held, sizeof(held));
+		seq_printf(seq, "port dev=%s tree=%u channels=%s spare=%u held=%s leaves=%u leaves_free=%u policers=%u\n",
+			   p.name, p.tree, channels, p.spare, held, p.leaves,
+			   b.leaves - p.leaves, p.policers);
+	}
+	return 0;
+}
+
+/* A class as tc names it -- the major and minor in hex, the parent `1:' for
+ * the qdisc itself -- with what the hardware gave it: its channel, and for a
+ * leaf its class queue, its leaf slot, its class value (the channel field
+ * counting the port's own top channel as zero, so channel n is n + 1) and
+ * the mark that selects it. */
+static void ft_qos_class_row(struct seq_file *seq, const char *dev,
+			     const struct cdx_qos_class *cl)
+{
+	char parent[sizeof("ffff:ffff")], queue[4] = "-", slot[4] = "-", qos[8] = "-";
+	char mark[sizeof("0xffffffff")] = "-";
+	u32 major = TC_H_MAJ(cl->classid) >> 16, value, selector;
+
+	if (cl->parent)
+		scnprintf(parent, sizeof(parent), "%x:%x", major, cl->parent);
+	else
+		scnprintf(parent, sizeof(parent), "%x:", major);
+	if (!cl->inner) {
+		value = (u32)(cl->channel + 1) << CDX_FT_QOS_CHANNEL_SHIFT |
+			(u32)cl->queue << CDX_FT_QOS_QUEUE_SHIFT;
+		scnprintf(queue, sizeof(queue), "%u", cl->queue);
+		scnprintf(slot, sizeof(slot), "%u", cl->slot);
+		scnprintf(qos, sizeof(qos), "%06x", value);
+		if (ft_qos_mark(value, &selector))
+			scnprintf(mark, sizeof(mark), "0x%x", selector);
+	}
+	seq_printf(seq, "class dev=%s classid=%x:%x parent=%s kind=%s channel=%u queue=%s slot=%s qos=%s mark=%s\n",
+		   dev, major, TC_H_MIN(cl->classid), parent, cl->inner ? "inner" : "leaf",
+		   cl->channel, queue, slot, qos, mark);
+}
+
+/* One row per class of every live tree, port by port in cdx's order and each
+ * port's in the order they were made. A port has no more classes than its
+ * leaves and the channels its root classes hold, which bounds the buffer; a
+ * port that had more would be a bug in cdx, and fails the read. */
+static int ft_qos_classes_show(struct seq_file *seq, void *v)
+{
+	struct cdx_qos_class *classes;
+	struct cdx_qos_budget b;
+	struct cdx_qos_port p;
+	unsigned int ii, max;
+	int n, jj;
+
+	cdx_qos_budget(&b);
+	max = b.leaves + b.channels;
+	classes = kmalloc_array(max, sizeof(*classes), GFP_KERNEL);
+	if (!classes)
+		return -ENOMEM;
+	for (ii = 0; (n = cdx_qos_port_next(&ii, &p, classes, max)) != -ENOENT; ii++) {
+		if (n < 0)
+			break;
+		for (jj = 0; jj < n; jj++)
+			ft_qos_class_row(seq, p.name, &classes[jj]);
+	}
+	kfree(classes);
+	return n == -ENOENT ? 0 : n;
+}
+
 /* What the backend holds now, and its latches: levels, which go down as well
  * as up. Read under the transaction, which the latch machinery's accessors
  * require and which makes the whole file one consistent reading; it walks no
  * flow or group, so the hold is short. This is what the controller's health
- * probe and its drain wait read. */
+ * probe and its drain wait read. The hardware QoS budget comes after, read
+ * once the transaction is let go: it is cdx's QoS mutex's, and needs nothing
+ * of the transaction's. */
 static int ft_status_show(struct seq_file *seq, void *v)
 {
 	unsigned int session_records = 0, session_slots = 0, vlan_records = 0, vlan_slots = 0;
@@ -576,6 +740,7 @@ static int ft_status_show(struct seq_file *seq, void *v)
 	 * /sys/class/vwd/ appears only on success. */
 	ft_kv(seq, "wifi_vaps", READ_ONCE(ft_wifi_registered));
 	cdx_ft_end();
+	ft_qos_status(seq);
 	return 0;
 }
 
@@ -804,7 +969,9 @@ static int ft_proc_init(void)
 	    !proc_create_seq("flows", 0400, dir, &ft_flows_ops) ||
 	    !proc_create_seq("l2", 0400, dir, &ft_l2_ops) ||
 	    !proc_create("mcast", 0400, dir, &ft_mcast_proc_ops) ||
-	    !proc_create("mroute", 0400, dir, &ft_mroute_proc_ops)) {
+	    !proc_create("mroute", 0400, dir, &ft_mroute_proc_ops) ||
+	    !proc_create_single("qos_ports", 0400, dir, ft_qos_ports_show) ||
+	    !proc_create_single("qos_classes", 0400, dir, ft_qos_classes_show)) {
 		proc_remove(dir);
 		return -ENOMEM;
 	}
@@ -881,19 +1048,33 @@ static bool ft_init_fault(unsigned int stage)
 #endif
 }
 
-static int __init ask_flowtable_init(void)
+/* Refuse a classification the adapter would have to truncate or misread. The
+ * three parameters are boot-immutable, so checking once at load is the only
+ * chance to say so out loud; silently narrowing them would accelerate flows
+ * onto queues the operator never named.
+ *
+ * The class mask must be one run of bits. The decode shifts the masked bits
+ * down by the lowest one and reads what it gets as the fields above, so with
+ * a hole in the mask the hole reads as zero and every bit above it lands that
+ * much higher in the class than where the operator wrote it: a flow classified
+ * by a value nobody wrote. Every mask a consumer ships is a run: 0xf0 on the
+ * test image, a half of the word beside mwan3 or pbr. */
+static int __init ft_qos_params_check(void)
 {
-	int rc;
+	unsigned int field;
 
-	/* Refuse a classification the adapter would have to truncate. Both
-	 * values are boot-immutable, so checking once here is the only chance
-	 * to say so out loud; silently narrowing them would accelerate flows
-	 * onto queues the operator never named. */
-	if (ft_qos_mark_mask &&
-	    (ft_qos_mark_mask >> __ffs(ft_qos_mark_mask)) > CDX_FT_QOS_MASK) {
-		pr_err("cdx flowtable: qos_mark_mask %#x spans more than the %u bits of a class\n",
-		       ft_qos_mark_mask, (unsigned int)fls(CDX_FT_QOS_MASK));
-		return -EINVAL;
+	if (ft_qos_mark_mask) {
+		field = ft_qos_mark_mask >> __ffs(ft_qos_mark_mask);
+		if (field & (field + 1)) {
+			pr_err("cdx flowtable: qos_mark_mask %#x is not one contiguous run of bits\n",
+			       ft_qos_mark_mask);
+			return -EINVAL;
+		}
+		if (field > CDX_FT_QOS_MASK) {
+			pr_err("cdx flowtable: qos_mark_mask %#x spans more than the %u bits of a class\n",
+			       ft_qos_mark_mask, (unsigned int)fls(CDX_FT_QOS_MASK));
+			return -EINVAL;
+		}
 	}
 	if (ft_qos_mark_mask & ft_route_mark_mask) {
 		pr_err("cdx flowtable: route_mark_mask %#x overlaps qos_mark_mask %#x\n",
@@ -905,6 +1086,16 @@ static int __init ask_flowtable_init(void)
 		       ft_qos_default_class);
 		return -EINVAL;
 	}
+	return 0;
+}
+
+static int __init ask_flowtable_init(void)
+{
+	int rc;
+
+	rc = ft_qos_params_check();
+	if (rc)
+		return rc;
 	ft_hash_seed = get_random_u32();
 	/* Exported symbol dependencies pin a fully initialized CDX throughout
 	 * this module's lifetime, including failed initialization and exit. */

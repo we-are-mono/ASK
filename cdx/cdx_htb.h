@@ -16,6 +16,12 @@ struct netlink_ext_ack;
 int cdx_htb_init(void);
 void cdx_htb_exit(void);
 
+/* A port's CEETM context is whole, its netdev pointing at it: the port is one
+ * of cdx's to the hardware QoS report (cdx_qos_port_next()) until the next
+ * call. Takes this file's mutex, under the control mutex the context is made
+ * under. */
+void cdx_htb_port_added(struct tQM_context_ctl *qm_ctx);
+
 /* Drop a port's qdisc state without touching hardware, for a caller that is
  * already tearing the interface's CEETM context down. Its class queues stay
  * charged at their depth to the other ports' trees until the next call. May
@@ -23,7 +29,8 @@ void cdx_htb_exit(void);
  * which takes this file's mutex and nothing else. A release of an earlier
  * tree's channels still due is forgotten rather than waited for, since it
  * waits on work that takes the control mutex this is called under; the
- * context's release ends their quarantine. */
+ * context's release ends their quarantine. The port stops being one of cdx's
+ * to the report here, before the caller lets its netdev go. */
 void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx);
 /* That caller has released the context, its queues drained, and the other
  * ports' trees take the share of SEC's pool the departed one had. */

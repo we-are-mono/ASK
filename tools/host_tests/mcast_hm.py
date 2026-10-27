@@ -18,6 +18,14 @@ def test_mcast_root_hop_semantics(tmp_path):
     source = (ROOT / "cdx/cdx_ehash.c").read_text()
     definitions = source[source.index("#define TTL_HM_VALID"):source.index("#define MURAM_VIRT_TO_PHYS_ADDR")]
     (tmp_path / "mcast_root.inc").write_text(definitions + function(source, "fill_actions"))
+    # The mark the selector reads its ingress profile from, and the pool that
+    # profile is bounded by, as production defines them.
+    union = re.search(r"union ctentry_qosmark \{.*?\n\};\n",
+                      (ROOT / "cdx/control_ipv4.h").read_text(), re.S)
+    pool = re.search(r"^#define INGRESS_FLOW_POLICER_QUEUES\s.*$",
+                     (ROOT / "cdx/cdx_ioctl.h").read_text(), re.M)
+    assert union and pool
+    (tmp_path / "mcast_qos.inc").write_text(union.group() + pool.group() + "\n")
     binary = tmp_path / "mcast_root"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",

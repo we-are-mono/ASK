@@ -27,14 +27,17 @@ def test_qos_lifecycle(tmp_path):
         + header[header.index("struct ceetm_fq {"):header.index("/* return values */")]
     )
     names = [
+        "ceetm_channel_count",
         "ceetm_resolve_channel", "ceetm_get_egressfq", "ceetm_egressfq_hook",
         "ceetm_release_lni", "ceetm_program_channel_shaper",
         "ceetm_create_lni", "ceetm_get_fqcount", "ceetm_class_queue_backlog",
         "ceetm_create_ccg_for_class_queue", "ceetm_num_to_2powN_multiple",
         "ceetm_cfg_td_on_class_queue", "ceetm_cq_wred_off", "ceetm_park_class_queue",
         "ceetm_create_cq",
-        "ceetm_create_queues", "ceetm_create_channel", "ceetm_init_channels",
+        "ceetm_create_queues", "ceetm_create_channel", "ceetm_dt_channel_count",
+        "ceetm_init_channels",
         "ceetm_chnl_failed", "ceetm_assign_chnl", "ceetm_claim_channel",
+        "ceetm_channel_holder", "ceetm_class_fq",
         "ceetm_release_fd", "ceetm_sync_portal", "ceetm_sync_portals",
         "ceetm_drain_queue", "ceetm_drain_channel", "ceetm_pop_leftovers",
         "ceetm_quiesce_port", "ceetm_put_channel_devices", "ceetm_end_quarantine",
@@ -43,6 +46,7 @@ def test_qos_lifecycle(tmp_path):
     ]
     (tmp_path / "qos_production.inc").write_text(
         "static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];\n"
+        "static uint32_t ceetm_channels;\n"
         "static bool ceetm_callbacks_registered;\n"
         "static int ceetm_release_channels(void);\n"
         "static int ceetm_pop_leftovers(struct classque_info *cqinfo);\n"

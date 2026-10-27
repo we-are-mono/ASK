@@ -18,9 +18,10 @@
  *
  * Two halves. `matchall` is the port-wide one and needs no correlation with
  * anything: the filter's scope and the port profile's scope are the same set
- * of frames. `flower` matches a subset, so it reaches the seven per-flow
- * profiles instead and has to bind them to flows the flowtable admitted --
- * which is the whole of the second half below.
+ * of frames. `flower` matches a subset, so it reaches the sixty-three per-flow
+ * profiles instead -- one pool, shared by every port's filters -- and has to
+ * bind them to flows the flowtable admitted, which is the whole of the second
+ * half below.
  *
  * Both report what they metered. The profile counts frames per colour and has
  * no byte counter, so tc is told frames and drops and nothing else.
@@ -35,6 +36,7 @@
  * refused, so the profile it resets is retried the same way.
  */
 
+#include <linux/bitmap.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/rtnetlink.h>
@@ -428,33 +430,43 @@ struct cdx_police_filter {
 };
 
 static LIST_HEAD(cdx_police_filters);
-/* Profile 0 is the default every unclassified flow already meters against, so
- * the pool starts at 1. Bit n set means profile n is spoken for. */
-static unsigned long cdx_police_profiles;
+/* The pool: profiles 1..CDX_FT_QOS_MAX_POLICER, one FMan-wide set every port's
+ * filters draw from. Profile 0 is the default every unclassified flow already
+ * meters against, so the pool starts at 1 and bit 0 is never set. Bit n set
+ * means profile n is spoken for -- by a filter, or held for flows that outlive
+ * theirs (below). */
+#define CDX_POLICE_PROFILES	(CDX_FT_QOS_MAX_POLICER + 1)
+static DECLARE_BITMAP(cdx_police_profiles, CDX_POLICE_PROFILES);
 /* A profile a filter installed is named by every flow the flowtable admitted
  * under it, and those flows outlive the filter. Count them so a profile freed
  * by its filter's teardown is not handed to a new filter -- and reprogrammed --
  * while an old flow still meters against it. `pending` marks a profile whose
  * filter is gone but whose flows are not, held out of the pool until the last
  * unref. All under cdx_police_lock. */
-static u32 cdx_police_profile_refs[CDX_FT_QOS_MAX_POLICER + 1];
-static unsigned long cdx_police_profile_pending;
+static u32 cdx_police_profile_refs[CDX_POLICE_PROFILES];
+static DECLARE_BITMAP(cdx_police_profile_pending, CDX_POLICE_PROFILES);
 
 static int cdx_police_profile_get(void)
 {
-	unsigned int n;
+	unsigned long n;
 
-	for (n = 1; n <= CDX_FT_QOS_MAX_POLICER; n++)
-		if (!(cdx_police_profiles & BIT(n))) {
-			cdx_police_profiles |= BIT(n);
-			return n;
-		}
-	return -ENOSPC;
+	n = find_next_zero_bit(cdx_police_profiles, CDX_POLICE_PROFILES, 1);
+	if (n >= CDX_POLICE_PROFILES)
+		return -ENOSPC;
+	__set_bit(n, cdx_police_profiles);
+	return n;
 }
 
 static void cdx_police_profile_put(unsigned int n)
 {
-	cdx_police_profiles &= ~BIT(n);
+	__clear_bit(n, cdx_police_profiles);
+}
+
+/* How many of the pool's profiles are spoken for, pending ones among them:
+ * what a refused filter is told. Under cdx_police_lock. */
+static unsigned int cdx_police_profiles_held(void)
+{
+	return bitmap_weight(cdx_police_profiles, CDX_POLICE_PROFILES);
 }
 
 /* The flowtable backend refs a profile when it installs a flow that names it
@@ -485,13 +497,47 @@ void cdx_police_profile_unref(u8 profile)
 	/* The last flow of a profile whose filter is already gone: only now is it
 	 * safe to return to the pool for another filter to reprogram. */
 	if (--cdx_police_profile_refs[profile] == 0 &&
-	    (cdx_police_profile_pending & BIT(profile))) {
-		cdx_police_profile_pending &= ~BIT(profile);
+	    test_bit(profile, cdx_police_profile_pending)) {
+		__clear_bit(profile, cdx_police_profile_pending);
 		cdx_police_profile_put(profile);
 	}
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_police_profile_unref, ASK_CDX_FLOWTABLE);
+
+/* The report's view of the pool. A pending profile is still set in the pool's
+ * bitmap, so it counts as used here, as it does in a refusal. */
+unsigned int cdx_police_pool_used(void)
+{
+	unsigned long flags;
+	unsigned int used;
+
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	used = cdx_police_profiles_held();
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	return used;
+}
+
+/* Each filter holds a profile of its own, so this counts the port's filters;
+ * by profile rather than by filter all the same, which is the unit the pool
+ * is counted in. A pending profile is no filter's, and the port's no more. A
+ * profile taken by a filter being added is the pool's before it is the
+ * port's: the filter is listed only once it is programmed. The netdev is
+ * compared, never read. */
+unsigned int cdx_police_port_profiles(const struct net_device *dev)
+{
+	DECLARE_BITMAP(held, CDX_POLICE_PROFILES);
+	const struct cdx_police_filter *f;
+	unsigned long flags;
+
+	bitmap_zero(held, CDX_POLICE_PROFILES);
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	list_for_each_entry(f, &cdx_police_filters, list)
+		if (f->dev == dev)
+			__set_bit(f->profile, held);
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	return bitmap_weight(held, CDX_POLICE_PROFILES);
+}
 
 /* A field the filter did not constrain has a zero mask and matches anything,
  * which is what flower means by leaving it out. */
@@ -554,7 +600,7 @@ static bool cdx_police_overlap(const struct cdx_police_filter *a,
 }
 
 /* The profile an admitted flow should meter against, as a cdx_ft_rule.qos
- * policer nibble, or zero for the default. Among the filters that match, the
+ * policer field, or zero for the default. Among the filters that match, the
  * highest-priority (lowest tc prio) one wins, which is the one software TC
  * would have applied. The list is insertion-ordered -- fine on a block replay,
  * where tp hands filters over in priority order, but not when an operator
@@ -687,6 +733,7 @@ static int cdx_police_flower_replace(struct net_device *dev,
 	const struct flow_action_entry *act;
 	u32 cir, pir, cbs, pbs;
 	unsigned long flags;
+	unsigned int held;
 	bool byte_mode;
 	int profile, on, rc;
 
@@ -756,11 +803,18 @@ static int cdx_police_flower_replace(struct net_device *dev,
 		}
 	}
 	profile = cdx_police_profile_get();
+	held = cdx_police_profiles_held();
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
 	if (profile < 0) {
-		/* Seven meters, and the eighth caller is told so rather than
-		 * silently sharing one. tc then leaves the filter in software. */
-		NL_SET_ERR_MSG_MOD(extack, "flower: no ingress policer profile is free");
+		/* Sixty-three meters across every port, and the next caller is
+		 * told so -- with how many are held, the ones still held for
+		 * departed filters' flows among them -- rather than silently
+		 * sharing one. Without skip_sw tc keeps the filter in software
+		 * and passes this on as a warning; a consumer that wants the
+		 * refusal to fail the command adds skip_sw. */
+		NL_SET_ERR_MSG_FMT_MOD(extack,
+				       "flower: no ingress policer profile free (%u of %u held)",
+				       held, (unsigned int)CDX_FT_QOS_MAX_POLICER);
 		rc = -EOPNOTSUPP;
 		goto err_unlock;
 	}
@@ -841,7 +895,7 @@ static int cdx_police_flower_destroy(struct net_device *dev,
 	 * names it; otherwise hold it out (pending) until the last such
 	 * flow is unref'd, so it is never reprogrammed under a live flow. */
 	if (cdx_police_profile_refs[profile])
-		cdx_police_profile_pending |= BIT(profile);
+		__set_bit(profile, cdx_police_profile_pending);
 	else
 		cdx_police_profile_put(profile);
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
