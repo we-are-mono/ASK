@@ -9,7 +9,7 @@ fresh boot before using ASK again.
 """
 from __future__ import annotations
 
-from _flowtable_rig import (artifact_dir, DPORT, HEALTH_BASELINE, SPORT, TABLE, WAN_IP, ct_bytes, ct_counts, ct_listing, hardware_proof, latch_barrier_failure, links_restored, rearm_ready)
+from _flowtable_rig import (artifact_dir, DPORT, HEALTH_BASELINE, SPORT, TABLE, WAN_IP, ct_bytes, ct_counts, ct_listing, hardware_proof, latch_barrier_failure, links_restored, rearm_ready, terminal_stream)
 
 import asyncio
 import errno
