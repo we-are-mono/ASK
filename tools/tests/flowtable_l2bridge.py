@@ -98,6 +98,16 @@ def _pairs(r, state):
     return {row["in"]: row for row in state["l2flows"] if {row["dst"], row["src"]} == stations}
 
 
+async def _gone(r, timeout):
+    """The state once neither pair is installed, read again after the rows
+    said so. A snapshot reads the counters before the rows
+    (_flowtable_rig.PROC_FILES), so the one that first finds the pairs gone
+    can predate the count of what took them; the count was made before the
+    rows lost them, and only grows."""
+    await r.wait(lambda s: not _pairs(r, s), timeout=timeout)
+    return await r.state()
+
+
 async def _exchange(r, count=10, interval=0.05):
     """Pings from the station to the peer: a unicast request and a unicast
     reply per round, one frame each way between the two."""
@@ -530,7 +540,7 @@ async def test_l2_port_leaves(l2_rig):
     await _exchange(r, count=4)
     before = await _carried(r)
     await command(r.target, r.session, "ip", "link", "set", r.lan_port, "nomaster")
-    after = await r.wait(lambda s: not _pairs(r, s), timeout=5)
+    after = await _gone(r, timeout=5)
     assert after["l2_retired"] >= before["l2_retired"] + 2, (before, after)
 
 
@@ -570,7 +580,7 @@ async def test_l2_fdb_delete_retires(l2_rig):
     before = await _carried(r)
     await command(r.target, r.session, "bridge", "fdb", "del", r.station_mac,
                   "dev", TARGET_LAN_IF, "vlan", str(VID), "master")
-    after = await r.wait(lambda s: not _pairs(r, s), timeout=5)
+    after = await _gone(r, timeout=5)
     assert after["l2_retired"] >= before["l2_retired"] + 2, (before, after)
     await _carried(r)
 
@@ -594,7 +604,7 @@ async def test_l2_bridge_chain_rules(l2_rig):
         assert confirmed["l2_hook_kinds"] == HOOK_NFT, confirmed
         await command(r.target, r.session, "nft",
                       f"add rule bridge {FILTER_TABLE} forward {DROP}")
-        gone = await r.wait(lambda s: not _pairs(r, s), timeout=5)
+        gone = await _gone(r, timeout=5)
         assert _received(await _exchange(r, count=20)) == 0
         await asyncio.sleep(2.5)
         held = await r.state()
@@ -618,7 +628,7 @@ async def test_l2_idle_ages_out(l2_rig):
     try:
         await _exchange(r, count=4)
         before = await _carried(r)
-        after = await r.wait(lambda s: not _pairs(r, s), timeout=8)
+        after = await _gone(r, timeout=8)
         assert after["l2_retired"] >= before["l2_retired"] + 2, (before, after)
         await _carried(r)
     finally:
@@ -920,7 +930,7 @@ async def test_l2_br_netfilter_rules(l2_rig):
         await _exchange(r, count=4)
         carried = await _carried(r, timeout=15)
         await dut("nft", f"add rule inet {FILTER_TABLE} forward {DROP}")
-        gone = await r.wait(lambda s: not _pairs(r, s), timeout=5)
+        gone = await _gone(r, timeout=5)
         assert gone["l2_ruleset_changes"] > carried["l2_ruleset_changes"], (carried, gone)
         assert _received(await _exchange(r, count=20)) == 0
         await asyncio.sleep(2.5)
@@ -945,7 +955,7 @@ async def test_l2_br_netfilter_turned_on(l2_rig):
         carried = await _carried(r, timeout=15)
         assert carried["l2_hook_kinds"] == HOOK_BRNF, carried
         await dut("sysctl", "-w", f"{BRNF_SYSCTLS[0]}=1")
-        gone = await r.wait(lambda s: not _pairs(r, s), timeout=5)
+        gone = await _gone(r, timeout=5)
         r.record("l2-brnf-turned-on", {"carried": carried, "gone": gone})
         assert gone["l2_ruleset_changes"] > carried["l2_ruleset_changes"], (carried, gone)
         assert _received(await _exchange(r, count=20)) == 0
@@ -984,7 +994,7 @@ async def test_l2_br_netfilter_loaded_first(l2_rig):
         await dut("nft", f"add chain inet {FILTER_TABLE} post {{ type filter hook postrouting "
                          f"priority 0 ; policy accept ; }}")
         await dut("nft", f"add rule inet {FILTER_TABLE} post {DROP}")
-        gone = await r.wait(lambda s: not _pairs(r, s), timeout=5)
+        gone = await _gone(r, timeout=5)
         assert _received(await _exchange(r, count=20)) == 0
         await asyncio.sleep(2.5)
         held = await r.state()
