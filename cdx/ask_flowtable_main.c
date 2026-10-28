@@ -565,14 +565,14 @@ static int ft_qos_ports_show(struct seq_file *seq, void *v)
 
 /* A class as tc names it -- the major and minor in hex, the parent `1:' for
  * the qdisc itself -- with what the hardware gave it: its channel, and for a
- * leaf its class queue, its leaf slot, its class value (the channel field
- * counting the port's own top channel as zero, so channel n is n + 1) and
- * the mark that selects it. */
+ * leaf its class queue, its leaf slot, the tail drop its queue runs now in
+ * frames, its class value (the channel field counting the port's own top
+ * channel as zero, so channel n is n + 1) and the mark that selects it. */
 static void ft_qos_class_row(struct seq_file *seq, const char *dev,
 			     const struct cdx_qos_class *cl)
 {
 	char parent[sizeof("ffff:ffff")], queue[4] = "-", slot[4] = "-", qos[8] = "-";
-	char mark[sizeof("0xffffffff")] = "-";
+	char mark[sizeof("0xffffffff")] = "-", depth[sizeof("4294967295")] = "-";
 	u32 major = TC_H_MAJ(cl->classid) >> 16, value, selector;
 
 	if (cl->parent)
@@ -584,13 +584,14 @@ static void ft_qos_class_row(struct seq_file *seq, const char *dev,
 			(u32)cl->queue << CDX_FT_QOS_QUEUE_SHIFT;
 		scnprintf(queue, sizeof(queue), "%u", cl->queue);
 		scnprintf(slot, sizeof(slot), "%u", cl->slot);
+		scnprintf(depth, sizeof(depth), "%u", cl->depth);
 		scnprintf(qos, sizeof(qos), "%06x", value);
 		if (ft_qos_mark(value, &selector))
 			scnprintf(mark, sizeof(mark), "0x%x", selector);
 	}
-	seq_printf(seq, "class dev=%s classid=%x:%x parent=%s kind=%s channel=%u queue=%s slot=%s qos=%s mark=%s\n",
+	seq_printf(seq, "class dev=%s classid=%x:%x parent=%s kind=%s channel=%u queue=%s slot=%s depth=%s qos=%s mark=%s\n",
 		   dev, major, TC_H_MIN(cl->classid), parent, cl->inner ? "inner" : "leaf",
-		   cl->channel, queue, slot, qos, mark);
+		   cl->channel, queue, slot, depth, qos, mark);
 }
 
 /* One row per class of every live tree, port by port in cdx's order and each

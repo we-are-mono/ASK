@@ -237,9 +237,9 @@ int main(void)
      * buffers -- and the hardware qdisc trees' class queues have shares of
      * too: all of them full at once, on a board of five ports, still leave
      * SEC a share for its own jobs. The fixed shares are 128 frames each,
-     * whatever the pool, the SAs' input four of them and the trees eight. */
+     * whatever the pool, the SAs' input four of them and the trees sixteen. */
     assert(VWD_FWD_FRAMES == 128 && IPSEC_EXCEPTION_FRAMES == 128 && IPSEC_EGRESS_FRAMES == 128);
-    assert(IPSEC_TO_SEC_FRAMES == 4 * 128 && IPSEC_QDISC_FRAMES == 8 * 128);
+    assert(IPSEC_TO_SEC_FRAMES == 4 * 128 && IPSEC_QDISC_FRAMES == 16 * 128);
     assert(VWD_FWD_FRAMES + IPSEC_EXCEPTION_FRAMES + 5 * IPSEC_EGRESS_FRAMES +
            IPSEC_TO_SEC_FRAMES + IPSEC_QDISC_FRAMES + IPSEC_SHARE_FRAMES <= IPSEC_BUFCOUNT);
 

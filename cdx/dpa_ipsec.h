@@ -106,7 +106,7 @@ struct sec_descriptor {
  *   - four shares for the SAs' input queues (IPSEC_TO_SEC_FRAMES), where a
  *     frame one SA decrypted waits for the SA that encrypts it again, among
  *     frames holding the Ethernet pool's buffers it cannot be told from;
- *   - eight for the class queues of hardware qdisc trees, all of them
+ *   - sixteen for the class queues of hardware qdisc trees, all of them
  *     together (IPSEC_QDISC_FRAMES, cdx_htb.c), which carry SEC's frames among
  *     the rest and cannot tell them apart either;
  *   - and what is left, 128 on five ports, for SEC's own jobs in flight and
@@ -114,11 +114,14 @@ struct sec_descriptor {
  *     dozen at line rate -- twice that where a relayed job's input is a
  *     buffer of this pool too.
  *
- * So all of them full at once still leave SEC its own. Each buffer is an
- * order-2 allocation, 16 KiB with jumbo frames, so the pool takes 40 MiB:
- * 16 MiB more than before the qdisc trees had their eight shares (A337), and
- * 8 MiB more for the SAs' input (A345). */
-#define IPSEC_BUFCOUNT  2560
+ * 896, 512, 2,048 and 128: so all of them full at once still leave SEC its
+ * own. Each buffer is an order-2 allocation, 16 KiB with jumbo frames, so the
+ * pool takes 56 MiB: 16 MiB more than before the qdisc trees had their first
+ * eight shares (A337), 8 MiB more for the SAs' input (A345), and 16 MiB more
+ * for their second eight, so that a tree of thirty device leaves keeps the
+ * depth its port's share of the Ethernet pool gives it beside another port's
+ * tree asking no more than the 768 that leaves (A421). */
+#define IPSEC_BUFCOUNT  3584
 #define	THRESHOLD_IPSEC_BPOOL_REFILL 16
 /* One share of the pool, in frames. A literal rather than a fraction of
  * IPSEC_BUFCOUNT: what a share holds is also how long a frame may wait on its
@@ -142,8 +145,9 @@ struct sec_descriptor {
  * when they bounded bytes held thousands of these. */
 #define IPSEC_EGRESS_FRAMES	IPSEC_SHARE_FRAMES
 /* What every hardware qdisc tree's class queues together may hold of the
- * pool, which cdx_htb.c divides between the trees that are live. */
-#define IPSEC_QDISC_FRAMES	(8 * IPSEC_SHARE_FRAMES)
+ * pool, which cdx_htb.c shares between the trees that are live, by what each
+ * asks. */
+#define IPSEC_QDISC_FRAMES	(16 * IPSEC_SHARE_FRAMES)
 /* A frame waiting on an SA's input queue holds a buffer until SEC has read it,
  * and nothing replaces it meanwhile: one of the pool every DPAA port receives
  * into, or, decrypted by one SA and sent on into another, one of this pool.

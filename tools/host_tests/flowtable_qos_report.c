@@ -208,11 +208,13 @@ static void test_status(void)
 	status_is(0x7fffff, names, want, ARRAY_SIZE(names));
 }
 
-static struct cdx_qos_class leaf(u16 major, u16 minor, u16 parent, u8 channel, u8 queue, u8 slot)
+static struct cdx_qos_class leaf(u16 major, u16 minor, u16 parent, u8 channel, u8 queue, u8 slot,
+				 u32 depth)
 {
 	return (struct cdx_qos_class){
 		.classid = TC_H_MAKE((u32)major << 16, minor), .parent = parent,
 		.channel = channel, .queue = queue, .slot = slot, .inner = false,
+		.depth = depth,
 	};
 }
 
@@ -225,9 +227,10 @@ static struct cdx_qos_class inner(u16 major, u16 minor, u8 channel)
 }
 
 /* eth3's tree: an inner class holding channel 0 with a leaf under it, and
- * leaves of their own at the root, one of them the example procfs.md gives.
- * eth4 has no tree, and two channels its last one left quarantined. eth5's
- * tree has a major past nine and a minor at the top of its range. */
+ * leaves of their own at the root, one of them the example procfs.md gives,
+ * each at the depth the cap gave its queue. eth4 has no tree, and two
+ * channels its last one left quarantined. lan1's tree has a major past nine
+ * and a minor at the top of its range, and a depth at the top of its. */
 static void world(void)
 {
 	budget = (struct cdx_qos_budget){
@@ -242,9 +245,9 @@ static void world(void)
 		.leaves = 3, .policers = 2, .tree = true,
 	};
 	ports[0].classes[0] = inner(1, 1, 0);
-	ports[0].classes[1] = leaf(1, 0xa, 1, 0, 5, 0);
-	ports[0].classes[2] = leaf(1, 0x23, 0, 4, 7, 3);
-	ports[0].classes[3] = leaf(1, 0x24, 0, 20, 2, 1);
+	ports[0].classes[1] = leaf(1, 0xa, 1, 0, 5, 0, 128);
+	ports[0].classes[2] = leaf(1, 0x23, 0, 4, 7, 3, 41);
+	ports[0].classes[3] = leaf(1, 0x24, 0, 20, 2, 1, 1);
 	ports[0].count = 4;
 	ports[1].index = 4;
 	ports[1].port = (struct cdx_qos_port){
@@ -255,7 +258,7 @@ static void world(void)
 		.name = "lan1", .ifindex = 9, .channels = 0x80000000, .leaves = 1, .policers = 1,
 		.tree = true,
 	};
-	ports[2].classes[0] = leaf(0x10, 0xffff, 0, 31, 15, 0);
+	ports[2].classes[0] = leaf(0x10, 0xffff, 0, 31, 15, 0, 0xffffffff);
 	ports[2].count = 1;
 }
 
@@ -302,50 +305,50 @@ static void test_classes(void)
 	 * class is a mark. */
 	ft_qos_mark_mask = 0xffff0000;
 	rows_are(ft_qos_classes_show,
-		 "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- qos=- mark=-\n"
-		 "class dev=eth3 classid=1:a parent=1:1 kind=leaf channel=0 queue=5 slot=0 qos=000015 mark=0x150000\n"
-		 "class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 qos=000057 mark=0x570000\n"
-		 "class dev=eth3 classid=1:24 parent=1: kind=leaf channel=20 queue=2 slot=1 qos=000152 mark=0x1520000\n"
-		 "class dev=lan1 classid=10:ffff parent=10: kind=leaf channel=31 queue=15 slot=0 qos=00020f mark=0x20f0000\n");
+		 "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- depth=- qos=- mark=-\n"
+		 "class dev=eth3 classid=1:a parent=1:1 kind=leaf channel=0 queue=5 slot=0 depth=128 qos=000015 mark=0x150000\n"
+		 "class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 depth=41 qos=000057 mark=0x570000\n"
+		 "class dev=eth3 classid=1:24 parent=1: kind=leaf channel=20 queue=2 slot=1 depth=1 qos=000152 mark=0x1520000\n"
+		 "class dev=lan1 classid=10:ffff parent=10: kind=leaf channel=31 queue=15 slot=0 depth=4294967295 qos=00020f mark=0x20f0000\n");
 	/* The low half, as beside pbr: the same values, unshifted. */
 	ft_qos_mark_mask = 0xffff;
 	rows_are(ft_qos_classes_show,
-		 "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- qos=- mark=-\n"
-		 "class dev=eth3 classid=1:a parent=1:1 kind=leaf channel=0 queue=5 slot=0 qos=000015 mark=0x15\n"
-		 "class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 qos=000057 mark=0x57\n"
-		 "class dev=eth3 classid=1:24 parent=1: kind=leaf channel=20 queue=2 slot=1 qos=000152 mark=0x152\n"
-		 "class dev=lan1 classid=10:ffff parent=10: kind=leaf channel=31 queue=15 slot=0 qos=00020f mark=0x20f\n");
+		 "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- depth=- qos=- mark=-\n"
+		 "class dev=eth3 classid=1:a parent=1:1 kind=leaf channel=0 queue=5 slot=0 depth=128 qos=000015 mark=0x15\n"
+		 "class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 depth=41 qos=000057 mark=0x57\n"
+		 "class dev=eth3 classid=1:24 parent=1: kind=leaf channel=20 queue=2 slot=1 depth=1 qos=000152 mark=0x152\n"
+		 "class dev=lan1 classid=10:ffff parent=10: kind=leaf channel=31 queue=15 slot=0 depth=4294967295 qos=00020f mark=0x20f\n");
 	/* Beside both: eight bits, queue and channels 1 to 15. A class on a
 	 * channel past them has no mark this mask can carry. */
 	ft_qos_mark_mask = 0xff000000;
 	rows_are(ft_qos_classes_show,
-		 "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- qos=- mark=-\n"
-		 "class dev=eth3 classid=1:a parent=1:1 kind=leaf channel=0 queue=5 slot=0 qos=000015 mark=0x15000000\n"
-		 "class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 qos=000057 mark=0x57000000\n"
-		 "class dev=eth3 classid=1:24 parent=1: kind=leaf channel=20 queue=2 slot=1 qos=000152 mark=-\n"
-		 "class dev=lan1 classid=10:ffff parent=10: kind=leaf channel=31 queue=15 slot=0 qos=00020f mark=-\n");
+		 "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- depth=- qos=- mark=-\n"
+		 "class dev=eth3 classid=1:a parent=1:1 kind=leaf channel=0 queue=5 slot=0 depth=128 qos=000015 mark=0x15000000\n"
+		 "class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 depth=41 qos=000057 mark=0x57000000\n"
+		 "class dev=eth3 classid=1:24 parent=1: kind=leaf channel=20 queue=2 slot=1 depth=1 qos=000152 mark=-\n"
+		 "class dev=lan1 classid=10:ffff parent=10: kind=leaf channel=31 queue=15 slot=0 depth=4294967295 qos=00020f mark=-\n");
 	/* The test image's: the queue field alone, which names no channel. */
 	ft_qos_mark_mask = 0xf0;
 	rows_are(ft_qos_classes_show,
-		 "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- qos=- mark=-\n"
-		 "class dev=eth3 classid=1:a parent=1:1 kind=leaf channel=0 queue=5 slot=0 qos=000015 mark=-\n"
-		 "class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 qos=000057 mark=-\n"
-		 "class dev=eth3 classid=1:24 parent=1: kind=leaf channel=20 queue=2 slot=1 qos=000152 mark=-\n"
-		 "class dev=lan1 classid=10:ffff parent=10: kind=leaf channel=31 queue=15 slot=0 qos=00020f mark=-\n");
+		 "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- depth=- qos=- mark=-\n"
+		 "class dev=eth3 classid=1:a parent=1:1 kind=leaf channel=0 queue=5 slot=0 depth=128 qos=000015 mark=-\n"
+		 "class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 depth=41 qos=000057 mark=-\n"
+		 "class dev=eth3 classid=1:24 parent=1: kind=leaf channel=20 queue=2 slot=1 depth=1 qos=000152 mark=-\n"
+		 "class dev=lan1 classid=10:ffff parent=10: kind=leaf channel=31 queue=15 slot=0 depth=4294967295 qos=00020f mark=-\n");
 	/* Classification off. */
 	ft_qos_mark_mask = 0;
 	rows_are(ft_qos_classes_show,
-		 "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- qos=- mark=-\n"
-		 "class dev=eth3 classid=1:a parent=1:1 kind=leaf channel=0 queue=5 slot=0 qos=000015 mark=-\n"
-		 "class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 qos=000057 mark=-\n"
-		 "class dev=eth3 classid=1:24 parent=1: kind=leaf channel=20 queue=2 slot=1 qos=000152 mark=-\n"
-		 "class dev=lan1 classid=10:ffff parent=10: kind=leaf channel=31 queue=15 slot=0 qos=00020f mark=-\n");
+		 "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- depth=- qos=- mark=-\n"
+		 "class dev=eth3 classid=1:a parent=1:1 kind=leaf channel=0 queue=5 slot=0 depth=128 qos=000015 mark=-\n"
+		 "class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 depth=41 qos=000057 mark=-\n"
+		 "class dev=eth3 classid=1:24 parent=1: kind=leaf channel=20 queue=2 slot=1 depth=1 qos=000152 mark=-\n"
+		 "class dev=lan1 classid=10:ffff parent=10: kind=leaf channel=31 queue=15 slot=0 depth=4294967295 qos=00020f mark=-\n");
 
 	/* A port whose classes outgrow what the budget says a port can have
 	 * fails the read rather than leaving them out, and no memory behind. */
 	ports[0].count = 64 + 32 + 1;
 	for (int ii = 4; ii < ports[0].count; ii++)
-		ports[0].classes[ii] = leaf(1, 0x100 + ii, 0, 1, 0, 0);
+		ports[0].classes[ii] = leaf(1, 0x100 + ii, 0, 1, 0, 0, 1);
 	seq.len = 0;
 	assert(ft_qos_classes_show(&seq, NULL) == -ENOSPC && !allocations);
 	/* And a read with no memory for them fails as such. */

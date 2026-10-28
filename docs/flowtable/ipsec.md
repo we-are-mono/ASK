@@ -1451,10 +1451,11 @@ and at line rate it is also a log flood.
 
 #### Frames the offline port gives the CPU must not take SEC's pool
 
-SEC writes every job's output into one buffer of its own BMan pool, 2560
+SEC writes every job's output into one buffer of its own BMan pool, 3584
 buffers (`IPSEC_BUFCOUNT`; 512 until A335, 1024 until A337, 2048 until
-A345) shared by every SA in both directions. A frame the offline port
-forwards in hardware returns its buffer when the egress port has sent it,
+A345, 2560 until A421) shared by every SA in both directions. A frame the
+offline port forwards in hardware returns its buffer when the egress port has
+sent it,
 within microseconds; under 2.5 Gbit/s of
 offloaded traffic SEC has fewer than twenty of them out at once. A frame that
 misses the offline port's flow table goes to the
@@ -1554,13 +1555,14 @@ the port paused, the same stream now loses 1,031,091 frames there, at the
 port's share; SEC refuses none, and the pool never reads below 880.
 
 The pool grew to 1024 for this, to 2048 for the hardware qdisc trees below
-(A337), and to 2560 for the SAs' input queues (A345, under "Nor its own
-input"). The exception queues, the Wi-Fi VAP queues and every Ethernet port
-each have a fixed share of 128 frames (`IPSEC_SHARE_FRAMES`), 896 on a
-five-port board; the SAs' input queues have four shares, 512; the qdisc trees
-eight, 1,024; and what is left, 128, is SEC's own with every queue full at
-once. Each buffer is an order-2 allocation, 16 KiB with jumbo frames, so the
-pool takes 40 MiB. Each port's bound sits far below the 1.6 ms its forwarding
+(A337), to 2560 for the SAs' input queues (A345, under "Nor its own input"),
+and to 3584 for the qdisc trees' second eight shares (A421). The exception
+queues, the Wi-Fi VAP queues and every Ethernet port each have a fixed share
+of 128 frames (`IPSEC_SHARE_FRAMES`), 896 on a five-port board; the SAs' input
+queues have four shares, 512; the qdisc trees sixteen, 2,048; and what is
+left, 128, is SEC's own with every queue full at once. Each buffer is an
+order-2 allocation, 16 KiB with jumbo frames, so the pool takes 56 MiB. Each
+port's bound sits far below the 1.6 ms its forwarding
 queues allow at 10 Gbit/s (128 full-size frames is 157 µs), the cost of a pool
 that has to cover every port; it matters only where a fast port is congested
 by other traffic. `flowtable_ipsec_stalled_port.py` is the paused-port case.
@@ -1568,11 +1570,16 @@ by other traffic. `flowtable_ipsec_stalled_port.py` is the paused-port case.
 On a port a hardware qdisc owns, the offline port's frames take their class
 queue like any other frame. Those counted bytes once a RED qdisc was on them,
 and a tree of sixteen leaves held 2,048 frames even without one, more than the
-port's share. Every class queue counts frames now, and a tree's class queues
-together hold no more than the trees' eight shares of this pool divided evenly
-between the live trees -- 1,024 frames with one tree, 512 each with two --
-because a class queue cannot tell SEC's frames from the rest (qos.md,
-increment 6).
+port's share. Every class queue counts frames now, and the live trees' class
+queues together hold no more than the trees' sixteen shares of this pool,
+2,048 frames, shared between the trees max-min fair by what each asks -- a
+tree asking no more than an even share of what is left gets its ask, the
+trees asking more split the rest, so two trees asking all they may get 1,024
+each and a small tree beside a large one keeps what it asks, and what the asks
+leave over shared the same way as room -- because a class queue cannot tell
+SEC's frames from the rest (qos.md, increment 6). No tree has more than its
+port's share of the Ethernet pool, 1,280 frames with four CPUs, which is what
+a lone tree has.
 
 #### Nor its own input
 

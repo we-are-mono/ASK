@@ -152,6 +152,19 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A424 — the top channel's moves add their starting frames up past SEC's share while a paused port holds the
+  rest.** Where: `cdx_htb_implicit_sync()` and the exception `cdx/cdx_htb.c` documents above `CDX_HTB_ETH_FRAMES`.
+  Each change that moves a tree's top channel -- a class under the root added above it, or the one holding it deleted
+  -- configures queues 0 and 7 on the new top at a frame each; admission leaves the top where it is, so no command is
+  refused for them, and sch_htb discards a deletion's return value anyway. While a paused port keeps the tree's queues full, each such move adds two frames the cap
+  grows nothing into but cannot take back, and successive moves add up, bounded only by the channels the top can move
+  across. A randomized host run (consecutive root-class deletions, LAN port paused) took every tree together 7 frames
+  past SEC's share on master and 8 with A421's sharing, where SEC's share is full more often. Why it matters: those
+  frames come out of the 128 of SEC's pool left for its own jobs; 32 channels bound it at 64, half of them. Fix
+  direction: keep the departing top channel's queues 0 and 7 serving until the new top's start frames fit, or charge
+  the moved queues' frames against the next admission and refuse an addition above the top while they are owed; needs
+  the A337/A348 paused-port sweep.
+
 - [x] **A423 — class queues a `tc` change gave back, or configured on a full budget, could hold more frames than SEC's
   own reserve.** Safe only while the SoC had 128 class queues; given-back queues are now charged until the port's entries
   are confirmed retired, and a start frame with no room is refused (_:/^cdx, flowtable: raise the QoS ceilings_).
@@ -159,14 +172,9 @@ result independently of those temporary files.
 - [x] **A422 — QoS enable and disable shaped channels 0-7 only, and the ingress profile lookup read the first FMan
   whatever it was asked.** Both walks follow the board now (_:/^cdx, flowtable: raise the QoS ceilings_).
 
-- [ ] **A421 — thirty shaped leaves on one port get 16 frames of tail drop each when a second tree is live.** The
-  cap (`cdx_htb_cap()`) shares the tighter of the port's Ethernet share (1,280 frames with four CPUs) and SEC's
-  1,024 class-queue buffers divided between live trees, max-min fair: 30 device leaves plus the top channel's class
-  queue 0 get 33 frames alone, 16 beside a WAN tree (34/17 with a `default` leaf). That is 2 ms at a 100 Mbit/s device
-  limit but 0.5 ms at 400 Mbit/s, too shallow for one fast TCP flow over a long path. SEC's share binds because a class
-  queue cannot tell SEC's buffers from the Ethernet pool's. Fix direction: charge the SEC share only to queues that can
-  carry SEC output (a tree whose port has no outbound SA egress), or grow `IPSEC_BUFCOUNT`'s tree share (8 MiB per 512
-  frames at 16 KiB buffers); either needs the A337/A348 rig sweep (paused LAN port, 64-byte flood, RED leaves).
+- [x] **A421 — thirty shaped leaves on one port got 16 frames of tail drop each beside any second tree.** SEC's share
+  is shared by what each tree asks and grown to 2,048: 41 a leaf alone or beside an ISP tree
+  (_:/^cdx: share SEC's pool between qdisc trees by what each asks_).
 
 - [x] **A420 — ASK's QoS ceilings sat well below the hardware: 8 CEETM channels, 7 per-flow ingress profiles, 16
   leaves a port.** Channels follow the device tree (32), the FMan-wide profile pool holds 63, a port 64 leaves, the

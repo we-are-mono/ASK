@@ -271,18 +271,25 @@ where each kind lives has changed. `qos_ports` and `qos_classes` are new.
     the port's flower filters hold. The pool is the FMan's, so what is left
     of it (`qos_policers_free`) is left to every port alike.
 - **`qos_classes`**: `class dev= classid= parent= kind= channel= queue= slot=
-  qos= mark=`.
+  depth= qos= mark=`.
   - One row per class of every port's tree, port by port, in the order the
-    classes were made: which channel and class queue each got, and the mark
-    that selects it.
+    classes were made: which channel and class queue each got, the tail drop
+    that queue runs, and the mark that selects it.
     ```
-    class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- qos=- mark=-
-    class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 qos=000057 mark=0x570000
+    class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- depth=- qos=- mark=-
+    class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 depth=41 qos=000057 mark=0x570000
     ```
   - `classid` and `parent` are as `tc` prints them: hex, the parent `1:` for
     a class directly under the qdisc. A class there holds a channel; one
-    with children (`kind=inner`) is only that, with no class queue, leaf slot
-    or class value of its own (`-`).
+    with children (`kind=inner`) is only that, with no class queue, leaf slot,
+    depth or class value of its own (`-`).
+  - `depth` is the tail drop the leaf's class queue runs now, in frames:
+    what the cap gave the queue of its tree's budget (`docs/flowtable/qos.md`,
+    "The tree is capped"), which can be less than the 128 frames, or the RED
+    qdisc's limit, the class asked for. It is the depth the class actually
+    gets, and moves with every change to its own tree or to what other
+    ports' trees ask of SEC's share. A leaf whose class queue the hardware
+    layer cannot report reads `0`.
   - `slot` is the leaf's Tx queue above the port's direct queues, which its
     `ethtool -S` counters are named by. `qos` is the class value that selects
     the leaf, printed as on the flow rows: the channel field is the channel
@@ -310,8 +317,8 @@ caps renders once rather than once per buffer doubling.
     `qos_mark_mask`, and both QoS row files by a reader of its own: the
     health probe and the drain read none of it. Its fields are required the
     same way; it is `null` without the adapter. A port's classes come under
-    the port, with `qos` and `mark` as numbers, and `null` for what a row
-    prints as `-`:
+    the port, with `depth`, `qos` and `mark` as numbers, and `null` for what
+    a row prints as `-`:
 
     ```json
     "qos": {"mark_mask": 4294901760, "mark_shift": 16, "mark_bits": 16,
@@ -322,7 +329,7 @@ caps renders once rather than once per buffer doubling.
                                "leaves": {"total": 64, "used": 30, "free": 34},
                                "policers": {"total": 63, "used": 2, "free": 61},
                                "classes": [{"classid": "1:23", "parent": "1:", "kind": "leaf",
-                                            "channel": 4, "queue": 7, "slot": 3,
+                                            "channel": 4, "queue": 7, "slot": 3, "depth": 41,
                                             "qos": 87, "mark": 5701632}]}}}
     ```
 

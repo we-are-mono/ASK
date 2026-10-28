@@ -384,15 +384,15 @@ static bool ft_qos_port_parse(const struct ft_qos_row *r, struct ft_qos_port *p)
 struct ft_qos_class {
 	char dev[FT_IFNAME_MAX + 1], classid[sizeof("ffff:ffff")], parent[sizeof("ffff:ffff")];
 	bool inner, unmarked;
-	unsigned long channel, queue, slot, qos, mark;
+	unsigned long channel, queue, slot, depth, qos, mark;
 };
 
-/* An inner class has no class queue, slot, value or mark; a leaf has all but
- * perhaps the mark, which the mask may not reach. */
+/* An inner class has no class queue, slot, depth, value or mark; a leaf has
+ * all but perhaps the mark, which the mask may not reach. */
 static bool ft_qos_class_parse(const struct ft_qos_row *r, struct ft_qos_class *c)
 {
 	const char *kind = ft_qos_field(r, "kind"), *mark = ft_qos_field(r, "mark");
-	bool queue_none = false, slot_none = false, qos_none = false;
+	bool queue_none = false, slot_none = false, depth_none = false, qos_none = false;
 
 	memset(c, 0, sizeof(*c));
 	if (!kind || (strcmp(kind, "inner") && strcmp(kind, "leaf")))
@@ -405,11 +405,13 @@ static bool ft_qos_class_parse(const struct ft_qos_row *r, struct ft_qos_class *
 	       ft_qos_number(ft_qos_field(r, "channel"), 10, 31, &c->channel) &&
 	       ft_qos_optional(ft_qos_field(r, "queue"), 10, 15, &c->queue, &queue_none) &&
 	       ft_qos_optional(ft_qos_field(r, "slot"), 10, 0xff, &c->slot, &slot_none) &&
+	       ft_qos_optional(ft_qos_field(r, "depth"), 10, 0xffffffffUL, &c->depth,
+			       &depth_none) &&
 	       ft_qos_optional(ft_qos_field(r, "qos"), 16, 0x7fffff, &c->qos, &qos_none) &&
 	       (c->unmarked || (mark && !strncmp(mark, "0x", 2) &&
 				ft_qos_number(mark + 2, 16, 0xffffffffUL, &c->mark))) &&
-	       queue_none == c->inner && slot_none == c->inner && qos_none == c->inner &&
-	       (!c->inner || c->unmarked);
+	       queue_none == c->inner && slot_none == c->inner && depth_none == c->inner &&
+	       qos_none == c->inner && (!c->inner || c->unmarked);
 }
 
 /* Each row of a QoS file into `items', grown as it fills, up to `limit'. A
@@ -495,10 +497,10 @@ static void ft_qos_json_class(struct ft_json *j, const struct ft_qos_class *c)
 	ft_json_add(j, ", \"kind\": \"%s\", \"channel\": %lu, ", c->inner ? "inner" : "leaf",
 		    c->channel);
 	if (c->inner)
-		ft_json_add(j, "\"queue\": null, \"slot\": null, \"qos\": null, ");
+		ft_json_add(j, "\"queue\": null, \"slot\": null, \"depth\": null, \"qos\": null, ");
 	else
-		ft_json_add(j, "\"queue\": %lu, \"slot\": %lu, \"qos\": %lu, ", c->queue, c->slot,
-			    c->qos);
+		ft_json_add(j, "\"queue\": %lu, \"slot\": %lu, \"depth\": %lu, \"qos\": %lu, ",
+			    c->queue, c->slot, c->depth, c->qos);
 	if (c->unmarked)
 		ft_json_add(j, "\"mark\": null}");
 	else

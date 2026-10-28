@@ -64,12 +64,16 @@ QOS_PORTS = (
     "port dev=eth3 tree=1 channels=0,1,2 spare=0 held=- leaves=30 leaves_free=34 policers=2\n"
     'port dev=wan"0 tree=0 channels=- spare=0 held=5,6 leaves=0 leaves_free=64 policers=0\n')
 QOS_CLASSES = (
-    "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- qos=- mark=-\n"
-    "class dev=eth3 classid=1:a parent=1:1 kind=leaf channel=0 queue=5 slot=0 qos=000015 mark=0x150000\n"
-    "class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 qos=000057 mark=0x570000\n"
-    "class dev=eth3 classid=1:24 parent=1: kind=leaf channel=20 queue=2 slot=1 qos=000152 mark=-\n"
+    "class dev=eth3 classid=1:1 parent=1: kind=inner channel=0 queue=- slot=- depth=- qos=- mark=-\n"
+    "class dev=eth3 classid=1:a parent=1:1 kind=leaf channel=0 queue=5 slot=0 depth=128 qos=000015 "
+    "mark=0x150000\n"
+    "class dev=eth3 classid=1:23 parent=1: kind=leaf channel=4 queue=7 slot=3 depth=41 qos=000057 "
+    "mark=0x570000\n"
+    "class dev=eth3 classid=1:24 parent=1: kind=leaf channel=20 queue=2 slot=1 depth=1 qos=000152 "
+    "mark=-\n"
     # A port made after the ports were read: not reported until it is listed.
-    "class dev=eth9 classid=2:1 parent=2: kind=leaf channel=9 queue=0 slot=0 qos=0000a0 mark=0xa00000\n")
+    "class dev=eth9 classid=2:1 parent=2: kind=leaf channel=9 queue=0 slot=0 depth=128 qos=0000a0 "
+    "mark=0xa00000\n")
 
 
 def qos_world(c):
@@ -103,13 +107,14 @@ def test_status_reports_the_hardware_qos(controller):
                      "leaves": leaves(30), "policers": {"total": 63, "used": 2, "free": 61},
                      "classes": [
                          {"classid": "1:1", "parent": "1:", "kind": "inner", "channel": 0,
-                          "queue": None, "slot": None, "qos": None, "mark": None},
+                          "queue": None, "slot": None, "depth": None, "qos": None,
+                          "mark": None},
                          {"classid": "1:a", "parent": "1:1", "kind": "leaf", "channel": 0,
-                          "queue": 5, "slot": 0, "qos": 0x15, "mark": 0x150000},
+                          "queue": 5, "slot": 0, "depth": 128, "qos": 0x15, "mark": 0x150000},
                          {"classid": "1:23", "parent": "1:", "kind": "leaf", "channel": 4,
-                          "queue": 7, "slot": 3, "qos": 0x57, "mark": 0x570000},
+                          "queue": 7, "slot": 3, "depth": 41, "qos": 0x57, "mark": 0x570000},
                          {"classid": "1:24", "parent": "1:", "kind": "leaf", "channel": 20,
-                          "queue": 2, "slot": 1, "qos": 0x152, "mark": None}]},
+                          "queue": 2, "slot": 1, "depth": 1, "qos": 0x152, "mark": None}]},
             'wan"0': {"tree": False, "channels": [], "spare": 0, "held": [5, 6],
                       "leaves": leaves(0), "policers": {"total": 63, "used": 0, "free": 61},
                       "classes": []}}}
@@ -122,9 +127,9 @@ def test_status_reports_the_hardware_qos(controller):
         "policers=63\n" for n in names))
     (c.root / "qos_classes").write_text("".join(
         f"class dev={n} classid=ffff:{m:x} parent=ffff:{m + 1:x} kind=leaf channel=31 queue=15 "
-        f"slot={m} qos=00020f mark=0x20f0000\n" for n in names for m in range(64))
+        f"slot={m} depth=20 qos=00020f mark=0x20f0000\n" for n in names for m in range(64))
         + "".join(f"class dev={n} classid=ffff:{0x100 + m:x} parent=ffff: kind=inner channel={m} "
-                  "queue=- slot=- qos=- mark=-\n" for n in names for m in range(32)))
+                  "queue=- slot=- depth=- qos=- mark=-\n" for n in names for m in range(32)))
     big = c.status()["qos"]["ports"]
     assert list(big) == names
     assert all(len(p["classes"]) == 96 and p["held"] == list(range(32)) for p in big.values())
@@ -158,7 +163,8 @@ def test_status_needs_every_qos_field(controller):
                     row.replace("tree=1", "tree=2")]
         else:
             bad += [row.replace("channel=0", "channel=x"), row.replace("kind=inner", "kind=root"),
-                    row.replace("classid=1:1", "classid=1"), row.replace("queue=-", "queue=3")]
+                    row.replace("classid=1:1", "classid=1"), row.replace("queue=-", "queue=3"),
+                    row.replace("depth=-", "depth=41")]
         assert row not in bad
         for line in bad:
             (c.root / name).write_text(line + "\n")

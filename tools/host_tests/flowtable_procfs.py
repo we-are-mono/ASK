@@ -108,7 +108,7 @@ def test_qos_rows_and_the_class_width():
         ("port", "ft_qos_ports_show",
          ("dev", "tree", "channels", "spare", "held", "leaves", "leaves_free", "policers")),
         ("class", "ft_qos_classes_show",
-         ("dev", "classid", "parent", "kind", "channel", "queue", "slot", "qos", "mark")),
+         ("dev", "classid", "parent", "kind", "channel", "queue", "slot", "depth", "qos", "mark")),
     ):
         body = function(source, show)
         assert "cdx_ft_begin(" not in body and "rtnl_lock(" not in body, show

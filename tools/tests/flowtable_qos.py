@@ -431,9 +431,9 @@ async def test_red_leaf_leaves_the_pool(qos):
     assert leaf["frames"] + leaf["rejected"] > sent // 2 and leaf["rejected"] > sent // 2, record
     # The port it arrived on lost nothing for want of a buffer, kept
     # receiving the kernel's own traffic, and the tree held no more of the
-    # pool than its share: the leaf's 768 frames of it, the 1,024 of SEC's own
-    # pool kept for the trees less the two queues beside it, and what is in
-    # flight.
+    # pool than its share: the leaf's 1,152 frames of it -- the port's 1,280
+    # less the top channel's queue 0 beside it, which holds nothing here --
+    # and what is in flight.
     assert wan["rx_missed_errors"] == 0 and answered == 20, record
     assert idle - lowest <= POOL_SHARE, record
 
@@ -468,7 +468,7 @@ async def test_shrunk_leaf_backlog_stays_charged(qos):
     evicts nothing, and a port its link partner pauses sends nothing. Its
     frames stay in buffers of the pool every DPAA port receives into -- for an
     IPsec flow, of SEC's -- so the queues that grow meanwhile may grow only
-    into what those frames leave of the tree's 1,024 (A348).
+    into what those frames leave of the tree's 1,280 (A348).
 
     One tree on the LAN port, paused throughout, with three RED leaves fed by
     three offloaded flows of 64-byte datagrams. The first leaf takes nearly
@@ -478,11 +478,11 @@ async def test_shrunk_leaf_backlog_stays_charged(qos):
     took nearly the whole tree again on top of what the ones before it still
     held, and the three held two to three thousand frames: more than the
     port's share of the pool, and two or three times the 1,024 of SEC's pool
-    the trees may hold between them. That reads here as the pool falling that
-    far below idle. Charged what they hold, the second and third leaves get
-    only the room the frames before them left, the pool falls no further than
-    the port's share below idle, and the WAN port the floods arrive on misses
-    nothing."""
+    the trees could then hold between them. That reads here as the pool
+    falling that far below idle. Charged what they hold, the second and third
+    leaves get only the room the frames before them left, the pool falls no
+    further than the port's share below idle, and the WAN port the floods
+    arrive on misses nothing."""
     r = qos
     dev = TARGET_LAN_IF
     leaves = (("1:10", HIGH_CQ, PORT_HELD_A), ("1:11", LOW_CQ, PORT_HELD_B),
@@ -2288,3 +2288,57 @@ async def test_capacity_refusals_name_the_count(qos):
     assert last["rc"], last
     assert (f"flower: no ingress policer profile free ({total_policers} of {total_policers} held)"
             in last["stdout"] + last.get("stderr", "")), last
+
+
+# The device classes a consumer puts on its LAN port, one channel each.
+DEVICE_CLASSES = 30
+# What a plain leaf's class queue asks for, and the most a queue gets alone in
+# a tree of a few (CDX_HTB_CQ_DEPTH).
+LEAF_DEPTH = 128
+
+
+async def test_thirty_device_leaves_keep_their_depth_beside_a_wan_tree(qos):
+    """Thirty classes under the LAN tree's root, a channel each at prio 0, and
+    the top channel's class queue 0 for unclassified traffic: thirty-one queues
+    asking 128 frames each. Their tree holds no more than the port's share of
+    the Ethernet pool, so each gets an even share of it. SEC's share of its own
+    pool, which every live tree's queues draw on too, is shared between the
+    trees by what each asks for: a WAN tree of three queues beside it, the
+    shape of an ISP's upload, takes its 384 and leaves the LAN's queues theirs.
+    Before, the trees split SEC's share evenly whatever they asked, and the
+    LAN's queues got 16 frames each beside any WAN tree, an empty one too
+    (A421). Each class's row reports the tail drop its queue was given."""
+    r = qos
+    lan, wan = TARGET_LAN_IF, TARGET_WAN_IF
+    expected = POOL_SHARE // (DEVICE_CLASSES + 1)
+
+    def depths(state, dev):
+        return {row["classid"]: int(row["depth"]) for row in rows_on(state, "qos_classes", dev)
+                if row["kind"] == "leaf"}
+
+    await r.wait(lambda s: s["qos_channels_held"] == 0 and s["qos_channels_used"] == 0)
+    await r.tc("qdisc", "add", "dev", lan, "root", "handle", "1:", "htb", "offload")
+    for ii in range(1, DEVICE_CLASSES + 1):
+        await r.tc("class", "add", "dev", lan, "parent", "1:", "classid", f"1:{ii:x}",
+                   "htb", "rate", "100mbit", "ceil", "100mbit", "prio", "0")
+    alone = await r.state()
+    await r.tc("qdisc", "add", "dev", wan, "root", "handle", "2:", "htb", "offload")
+    await r.tc("class", "add", "dev", wan, "parent", "2:", "classid", "2:10",
+               "htb", "rate", "1gbit", "ceil", "1gbit")
+    for classid, prio in (("2:100", "0"), ("2:101", "1")):
+        await r.tc("class", "add", "dev", wan, "parent", "2:10", "classid", classid,
+                   "htb", "rate", "500mbit", "ceil", "1gbit", "prio", prio)
+    beside = await r.state()
+    await r.tc("qdisc", "del", "dev", wan, "root")
+    # The WAN tree's queues stay charged until its entries are shown gone,
+    # which the release that follows its teardown proves.
+    await r.wait(lambda s: s["qos_channels_held"] == 0, timeout=30)
+    after = await r.state()
+    record = {"alone": depths(alone, lan), "beside": depths(beside, lan),
+              "wan": depths(beside, wan), "after": depths(after, lan), "expected": expected}
+    r.record("qos-device-leaves-depth", record)
+
+    assert len(record["alone"]) == DEVICE_CLASSES, record
+    for phase in ("alone", "beside", "after"):
+        assert set(record[phase].values()) == {expected}, record
+    assert record["wan"] == {"2:100": LEAF_DEPTH, "2:101": LEAF_DEPTH}, record

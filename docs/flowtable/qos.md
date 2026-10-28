@@ -1074,41 +1074,65 @@ the port.
 **The tree is capped.** A tree's class queues together hold no more than the
 port's share of the Ethernet pool — half of what the port seeds it with, 1,280
 frames with four CPUs, the share its forwarding queues are held to — and all
-live trees together no more than 1,024 of SEC's 2,560 output buffers, divided
-evenly between them: a class queue
-carries SEC's frames among the rest and cannot tell them apart. With one tree
-the SEC share binds, 1,024 frames; with two, 512 each. The queues counted are
-each leaf's and the top channel's queues 0 and 7 that unclassified and control
-traffic take while no leaf holds them, sixty-six at most (eighteen before
-[increment 12](#12-the-ceilings-raised-to-the-hardwares)); queue 0 keeps a single
-frame and takes no share while a `default` leaf takes the unclassified traffic.
-Each asks for a depth — 128 frames for a plain leaf or one of those two queues,
-its limit for a RED leaf. What the tree's own queues may share is its budget,
-and the 1,024 across trees, less what is charged outside them: the queues it
-gave back while their entries may still name them, a departing port's queues,
-frames on queues no tree uses, and, for the 1,024, every other tree's queues
-(`cdx_htb_cap_shares()`). Shares of the whole budget would promise frames those
-charges hold, which no shrink of the tree's own gives back. That is shared
-max-min fair (`cdx_htb_cap()`): a queue asking for no more than an even share
-gets what it asks for, and the rest split what is left evenly. With nothing
-charged outside, the shares are the whole budget's: a small tree's three queues
-get their 128 each; sixteen leaves and the two queues get 56 each, where 128
-each would be 2,304; thirty device leaves and queue 0 get 33 each alone and 16
-beside a second tree (34 and 17 with a `default` leaf). While something is
-charged outside, the tree's queues share what it leaves and are kept short for
-it, and the regrow work looks again until it has gone. Thirty classes added
-under the root back to back beside a second tree — each moving the top channel
-and giving back the last one's queue 0 — get 15 each until the release has run,
-then 16. The class above, alone in its tree beside those two
-queues, asks for 2,594 frames and gets the 768 they leave. A RED leaf given
-less than its limit has its band scaled by what it got against what it asked
-for, so the curve keeps its shape below the shallower tail drop: that class's
-648 to 1,945 frames become 191 to 575. The shares are drawn again after every
-change to the tree, to a RED curve and to the port's MTU, and whenever a tree
-comes or goes on any port — for a port that goes, once its CEETM context is
-released. Every queue that shrinks is programmed before any that grows, so the
-depths never add up past the budget, and while a queue will not shrink none
-grows.
+live trees together no more than 2,048 of SEC's 3,584 output buffers: a class
+queue carries SEC's frames among the rest and cannot tell them apart. The
+queues counted are each leaf's and the top channel's queues 0 and 7 that
+unclassified and control traffic take while no leaf holds them, sixty-six at
+most (eighteen before [increment 12](#12-the-ceilings-raised-to-the-hardwares));
+queue 0 keeps a single frame and takes no share while a `default` leaf takes the
+unclassified traffic. Each asks for a depth — 128 frames for a plain leaf or
+one of those two queues, its limit for a RED leaf — and a tree asks for what
+its queues do, a frame for each queue it gave back that is still charged
+against it, and a frame more for its next queue's start, never more than the
+1,280 (`cdx_htb_asks()`). SEC's share is shared between the live trees max-min
+fair by what each asks (`cdx_htb_budget()`): a tree asking no more than an even
+share of what is left gets its ask, and the trees asking more split the rest
+evenly. What the asks leave over is then shared between the trees the same
+way, each up to the 1,280, as room: it moves no queue's depth, since a tree's
+queues share its budget with their asks as caps, but it takes the frames a
+tree's queues hold above what they now ask for. A lone tree's budget is the
+1,280 — for one tree the Ethernet share is the tighter of the two — and one
+asking all of that leaves another tree 768 of SEC's 2,048 before either is
+shrunk. No tree gets less than an even share, 1,024 between two, nor less than
+it asks where that is less, so another port's tree can shrink this one's no
+further than that however many leaves it adds. The frame more is what keeps an
+empty tree from being shut out where the asks take all of SEC's share and leave
+nothing over: asking nothing, it would get nothing, the others would share all
+2,048 out by depth, and its first leaf would find no room for its starting
+frame, for good. What
+the tree's own queues may share is its budget, and the 2,048 across trees, less
+what is charged outside them: the queues it gave back while their entries may
+still name them, a departing port's queues, frames on queues no tree uses, and,
+for the 2,048, every other tree's queues (`cdx_htb_cap_shares()`). Shares of the
+whole budget would promise frames those charges hold, which no shrink of the
+tree's own gives back. That is shared between the tree's queues max-min fair
+too (`cdx_htb_cap()`): a queue asking for no more than an even share gets what
+it asks for, and the rest split what is left evenly. With nothing charged
+outside, the shares are the whole budget's: a small tree's three queues get
+their 128 each; sixteen leaves and the two queues get 71 each, where 128 each
+would be 2,304; thirty device leaves and queue 0 get 41 each, alone or beside a
+WAN tree asking no more than the 768 (42 with a `default` leaf), and 33 beside
+a tree asking as much again (34). While something is charged outside, the
+tree's queues share what it leaves and are kept short for it, and the regrow
+work looks again until it has gone. Thirty classes added under the root back to
+back beside a second tree — each moving the top channel and giving back the
+last one's queue 0 — get 40 each until the release has run, then 41. The class
+above, alone in its tree beside those two queues, asks for 2,594 frames and
+gets the 1,024 they leave of the 1,280. A RED leaf given less than its limit
+has its band scaled by what it got against what it asked for, so the curve
+keeps its shape below the shallower tail drop: that class's 648 to 1,945
+frames become 255 to 767. The shares are drawn again after every change to the
+tree, to a RED curve and to the port's MTU, whenever a tree comes or goes on
+any port — for a port that goes, once its CEETM context is released — and
+whenever another tree's ask moves this one's budget, which moves the other way
+or not at all. Every queue that shrinks is programmed before any that grows,
+across trees as within one: a change that lowers other trees' budgets shrinks
+them before its own tree's queues grow, and one that raises them grows them
+only after its own tree has shrunk (`cdx_htb_cap()`). So the depths never add
+up past the budgets, and while a queue will not shrink none grows. Until A421
+SEC's share was 1,024 and divided evenly between the live trees whatever each
+asked: thirty device leaves got 33 frames alone and 16 beside any WAN tree, an
+empty one too.
 
 **What is capped is what the queues may hold, not their depths alone (A348).**
 Lowering a depth evicts nothing. A queue holding more than its new depth keeps
@@ -1118,7 +1142,7 @@ gives back — deleted, moved to another priority, turned into a channel, or one
 of queues 0 and 7 when the top channel moves — keeps its frames too, and so
 does every queue of a tree taken down until its drain. Counting depths alone,
 a RED leaf filled to about 740 frames and shrunk to one while another grew and
-filled, a few times over, would hold more than all of SEC's 2,560 buffers, and
+filled, a few times over, would hold more than all of SEC's buffers, and
 every SA's jobs would be refused; three such leaves on the rig, the LAN port
 paused, held 2,048 of the Ethernet pool's. So once the shrinks are written,
 the cap reads what every class queue holds — QMan's own count
@@ -1126,8 +1150,16 @@ the cap reads what every class queue holds — QMan's own count
 of its depth and that count, since above its depth the count can only fall,
 and every other queue what it holds. The queues that grow share, in the order
 the tree lists them, what those charges leave of the tree's budget and of the
-1,024 across every tree, whichever is less; growing up to what a queue already
-holds itself costs nothing. A queue kept short stays at what it got, a RED
+2,048 across every tree, whichever is less; growing up to what a queue already
+holds itself costs nothing. Frames a tree's queues hold above what they now
+ask for — a RED limit lowered under a full queue, a full queue given back —
+fit in the room its budget has over its ask, so while SEC's share has room to
+spare the tree's other queues keep their depths and a class added meanwhile
+goes in; held to its ask alone, the tree would count them against what the
+others ask, keeping those short and refusing the class until the port sent
+them, however idle the pools. Only where the asks take all of SEC's share do
+such frames keep the tree short until they leave. A
+queue kept short stays at what it got, a RED
 leaf's curve drawn for that depth, and the rest follows as the frames leave: a
 work item looks again 100 ms after the change, then half as often each time a
 queue is still short, down to once a second, holding only the qdisc's mutex and
@@ -1146,7 +1178,8 @@ layer parks it at one frame rather than at its module-load default of eight
 (`CEETM_PARKED_CQ_DEPTH`), and a tree taken down, or one whose port goes, has
 every queue of its channels parked the same way before they are drained
 (`ceetm_quiesce_port()`). And the cap charges it that frame, or what it holds
-if more, against its tree's budget and the 1,024 across trees, from the moment
+if more, against its tree's budget, which asks for it, and the 2,048 across
+trees, from the moment
 the tree stops using it — a leaf deleted, moved to another priority or turned
 into a channel, queues 0 and 7 when the top channel moves, every queue of a
 tree taken down — until the flowtable has shown the port's entries retired or
@@ -1175,20 +1208,33 @@ class — a leaf added under the root or under a channel, a leaf's first child
 taking its place (`TC_HTB_LEAF_TO_INNER`), a leaf moved to another priority or
 into the weighted group (`TC_HTB_NODE_MODIFY`) — is refused with `-ENOBUFS`
 when every queue, counted at what it may hold once the cap has shrunk it, would
-leave no room for that frame in the tree's budget or in the 1,024 across trees,
+leave no room for that frame in the tree's budget or in the 2,048 across trees,
 unless the change adds nothing (a leaf kept on its own queue, a class's rate).
+Other trees' depths never leave it none: every tree's budget, drawn with the
+frame its ask keeps for its next queue, has room for that frame once the others
+have been held to theirs, which every cap sees to before it returns. A RED
+curve the hardware refuses in a cap moves its tree's ask, and with it budgets
+the cap had drawn already; so the cap goes round again, over every live tree
+whose budget moved — those that fell shrunk first, those that rose grown last —
+until each tree's shares are drawn from the budget it has. Each time round
+takes another curve away for good, so it ends. Left above a budget that had
+fallen, a tree would hold frames another's first leaf needed, with nothing
+kept short to make the regrow work look again.
 tc says `no tail-drop room (N of M frames held); retry shortly`, for whichever
 budget binds. Nothing is claimed or programmed first, and the command goes
 through once those frames have gone. The bound then holds but for two things,
-each at most once per change. First, the top channel moving — a class under the
-root added above it, or the one holding it deleted — takes queues 0 and 7 with
-it, each starting at a frame on the new top channel: at most two frames past
-the budget, and only while frames the tree's queues hold fill it. Second, a
+each one change's own. First, the top channel moving — a class under the root
+added above it, or the one holding it deleted — takes queues 0 and 7 with it,
+each starting at a frame on the new top channel: at most two frames past the
+budget a move, and only while frames the tree's queues hold fill it. Those can
+add up, since a deletion that moves the top channel is not admitted: while a
+paused port's queues hold their frames, successive moves each take their two,
+bounded by the channels the tree can move the top across (A424). Second, a
 command admitted against queue counts read before its own shrinks: a busy tree
 can refill the queues about to shrink to their old depths in between, leaving
-that command's start frame past the budget until they send. Neither compounds:
-the next command's admission reads the refilled counts and refuses until they
-have gone. Deleting a leaf, its last child or the tree configures no class
+that command's start frame past the budget until they send. That one does not
+compound: the next command's admission reads the refilled counts and refuses
+until they have gone. Deleting a leaf, its last child or the tree configures no class
 queue but queues 0 and 7.
 
 **A tree taken down keeps its channels until its entries are gone (A350).**
@@ -2649,19 +2695,52 @@ takes any eight bits -- and QoS takes `0xffff0000` again. A per-device upload
 limit costs no mark bits in any of these, because a `flower` filter selects its
 profile at admission.
 
-**Tail drop, thirty leaves deep.** The cap itself is unchanged; what changes is
-how many queues share it. Thirty device leaves on the LAN port, one channel each
-at `prio 0` -- so each holds its channel's class queue 7 -- and the top
-channel's class queue 0 for unclassified traffic make thirty-one queues asking
-128 frames each. Alone, that tree's budget is the 1,024 frames of SEC's share
-and each queue gets 33; with a WAN tree live beside it the share halves and
-each gets 16. With `default` naming one of the leaves, class queue 0 keeps one
-frame and takes no share: 34, or 17. Sixteen frames is about 2 ms at a
-100 Mbit/s device limit and 0.5 ms at 400 Mbit/s -- shallow for one fast TCP
-flow over a long path, generous for a slow device. What bounds it is SEC's
-output pool, which a class queue cannot tell from the Ethernet pool; raising
-it means a larger SEC pool or a share that charges only IPsec traffic, and is
-filed as A421.
+**Tail drop, thirty leaves deep.** Thirty device leaves on the LAN port, one
+channel each at `prio 0` -- so each holds its channel's class queue 7 -- and the
+top channel's class queue 0 for unclassified traffic make thirty-one queues
+asking 128 frames each. As first raised, the ceiling left that tree the 1,024
+frames of SEC's share divided evenly between the live trees: 33 a queue alone,
+16 beside any WAN tree, an empty one too, while a small WAN tree stranded what
+it could not use -- about 2 ms at a 100 Mbit/s device limit, shallow for one
+fast TCP flow over a long path (A421). SEC's share is now 2,048 of a pool grown
+to 3,584 buffers, 16 MiB more, and shared between the trees by what each asks
+([increment 6](#6-wred), "The tree is capped"). What bounds the
+LAN tree then is the port's share of the Ethernet pool, 1,280 frames with four
+CPUs: each queue gets 41, alone and beside a WAN tree that asks no more than
+the 768 SEC's share has left -- an empty one, or an ISP's upload of one channel,
+two leaves and its queue 0, asking 385. With `default` naming one of the
+leaves, class queue 0 keeps one frame and takes no share: 42. Only a WAN tree
+asking as much as the LAN's -- thirty queues of its own, or a RED leaf with a
+limit of a thousand frames -- brings both to an even share, 1,024: 33 a queue,
+or 34. A box whose only tree is the LAN's -- per-device download caps, with
+uploads metered by `flower` profiles, which hold no class queue -- never met
+the split at all; its 33 became 41 for the larger share alone. Forty-one frames is about 5 ms at a 100 Mbit/s device limit and 1.3 ms
+at 400 Mbit/s. Each class's `qos_classes` row reports the depth its queue got
+(`depth=`, [procfs.md](procfs.md)). A421 is resolved.
+
+*Proved on hardware, 2026-10-28*, on the KASAN image.
+`test_thirty_device_leaves_keep_their_depth_beside_a_wan_tree`: thirty classes
+under the LAN port's root, a channel each at `prio 0`, read `depth=41` on every
+row alone; with the ISP-shaped WAN tree beside them -- a channel of 1 Gbit/s,
+leaves at `prio 0` and `1` -- still 41 each, and the WAN leaves 128; and 41
+again once the WAN tree went. Before, the same rows would have read 33, then 16.
+
+`test_paused_lan_tree_leaves_sec_its_buffers`: the LAN tree's one class, the
+`default`, under a RED qdisc asking 2,594 frames, beside the same WAN tree; the
+IPv6 tunnel's flow in hardware both ways, the LAN port paused (8,788 PAUSE
+frames from the LAN VM), and 1,028,032 64-byte datagrams sent down the tunnel in
+three seconds. The class read `depth=1279`, the port's share less the frame
+its unclassified queue keeps, where the even split gave it 511, and held 1,249
+decrypted frames: SEC's pool fell from 3,584 free to 2,332, 1,252 held, and
+SEC refused no job of any kind -- `ipsec_sec_refused_buffer_depletion` 0 --
+while the offline port refused the 1,026,783 the queue could not take. The
+Ethernet pool's checks kept their margin under the deeper budget:
+`test_red_leaf_leaves_the_pool` fell 886 frames below idle and
+`test_shrunk_leaf_backlog_stays_charged` 899, both inside the port's 1,280, the
+WAN port missing nothing. The scope -- `flowtable_qos` (the devlink file too),
+the stalled-port files, `flowtable_service_ipsec_dscp` and the ISP profile's
+QoS case -- passed whole, 70 tests, with no KASAN, BUG, WARNING or lockdep
+output.
 
 **What stays below the hardware, and why.**
 
@@ -3141,7 +3220,7 @@ contract](#the-consumer-contract)), under the names in the last column.
 | Leaf classes | 512 per port (32 channels × 16 class queues) | 64 per port: the frame budget, per-queue memory and the ethtool names ([increment 12](#12-the-ceilings-raised-to-the-hardwares)) | per port | `DPAA_ETH_CEETM_LEAF_QUEUES` (patch 150), `CDX_HTB_MAX_LEAVES` | `qos_leaves_per_port`; each port's `leaves=`, `leaves_free=` |
 | Weighted leaves | 8 per channel (class queues 8-15, as one group or as A and B) | the same, all in group A | per channel | `qman_ceetm_cq_claim_A` | the refusal |
 | Strict priorities | 8 per channel | the same | per channel | CEETM | the refusal |
-| Tail-drop depth | the pools: what every queue holds is a buffer | 128 frames per leaf, or a RED leaf's limit in frames, asked for; the whole tree within the port's Ethernet share (1,280 with four CPUs) and, across every live tree, 1,024 of SEC's 2,560 buffers shared evenly, each queue counted at the larger of its depth and what it holds | per tree, and across trees | `cdx_htb_cap()`, shared max-min fair; the hardware default is 8, far too shallow | -- |
+| Tail-drop depth | the pools: what every queue holds is a buffer | 128 frames per leaf, or a RED leaf's limit in frames, asked for; the whole tree within the port's Ethernet share (1,280 with four CPUs) and, across every live tree, 2,048 of SEC's 3,584 buffers shared max-min fair by what each tree asks (an even share at least), what the asks leave over shared the same way as room, each queue counted at the larger of its depth and what it holds; reported per class as `depth=` | per tree, and across trees | `cdx_htb_cap()`, shared max-min fair between trees and between a tree's queues; the hardware default is 8, far too shallow | -- |
 | Per-flow ingress profiles | 256 profiles on the FMan, of which 144 are the FMD's shared partition (patch 010) | 64 in one pool for every port, of which **63** are addressable: the policer field's six bits | the whole FMan, shared by every port | `INGRESS_FLOW_POLICER_QUEUES`, `CDX_FT_QOS_MAX_POLICER` | `qos_policers`, `_used`, `_free`; each port's `policers=` |
 | Ingress rate limiter | 1 profile per port, private | the same | per port | `matchall`, one per port | -- |
 | DSCP→class egress map | **1 port at a time** | the same | SoC-wide | "Now supporting only one interface", and the second port is refused | the refusal |

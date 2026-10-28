@@ -124,7 +124,10 @@ struct cdx_qos_port {
  * class directly under the qdisc holds a channel; one with children is only
  * that (`inner'), with no class queue or leaf slot of its own. A leaf's slot
  * is its Tx queue's index above the direct queues, which its ethtool counters
- * are named by. */
+ * are named by. A leaf's depth is the tail drop its class queue runs now, in
+ * frames: what the cap gave it of its tree's budget, which may be less than
+ * the class asked for -- zero for an inner class, and for a leaf whose class
+ * queue the hardware layer cannot report. */
 #define CDX_QOS_NONE	0xff
 struct cdx_qos_class {
 	u32 classid;	/* the tc handle, major:minor */
@@ -133,6 +136,7 @@ struct cdx_qos_class {
 	u8 queue;	/* its class queue on that channel, or CDX_QOS_NONE */
 	u8 slot;	/* its leaf slot, or CDX_QOS_NONE */
 	bool inner;
+	u32 depth;	/* its class queue's tail drop in frames, or zero */
 };
 
 /* Every port of cdx's in turn, for a reader that holds none of their netdevs
