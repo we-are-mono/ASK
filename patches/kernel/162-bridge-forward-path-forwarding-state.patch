@@ -1,4 +1,4 @@
-From b16fd93dfced3676fb17d3b74a44e2905ea3a3dc Mon Sep 17 00:00:00 2001
+From 9a12cc6540f06bdefa591fd2fa27b009dc4d5555 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 18:25:22 +0200
 Subject: [PATCH] bridge: keep flow offload off ports that are not forwarding
@@ -12,9 +12,16 @@ carried routed traffic both ways.
 The walk now refuses a port that is not FORWARDING with -EAGAIN. It
 applies the port's STP state (unless MST owns it), the port's VLAN state
 and the bridge entry's VLAN state, as should_deliver() and
-br_pass_frame_up() do. dev_fill_forward_path() passes the error up, and nft_flow_route()
-then caches no flow at all: a flow cached on the logical device would
-never reach the port once it forwards again.
+br_pass_frame_up() do. dev_fill_forward_path() passes the error up (since
+patch 140), and nft_flow_route() then caches no flow at all: a flow cached on the
+logical device would never reach the port once it forwards again.
+
+An FDB miss -- a station not learned yet, or one whose entry aged out
+while its neighbour stayed valid -- is reported as -ENXIO rather than
+-1. A flowtable with neighbour output takes it as a path not known yet
+and caches nothing, since the bridge device as the reply's ingress
+could never be redirected to a port; the station's next frame teaches
+the port again. Any other table falls back as before.
 
 br_port_forwarding() exports the same test for offloads that admit
 flows asynchronously. A VLAN state set directly now raises
@@ -22,16 +29,15 @@ SWITCHDEV_ATTR_ID_PORT_VLAN_STATE; before, only MST states had an event.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- include/linux/if_bridge.h        |  6 ++++
- include/net/switchdev.h          |  9 ++++++
- net/bridge/br_device.c           |  9 ++++++
- net/bridge/br_private.h          | 19 +++++++++++++
- net/bridge/br_stp.c              | 18 ++++++++++++
- net/bridge/br_vlan.c             | 21 ++++++++++++++
- net/bridge/br_vlan_options.c     | 25 ++++++++++++++++
- net/core/dev.c                   |  2 +-
- net/netfilter/nft_flow_offload.c | 49 +++++++++++++++++++++++---------
- 9 files changed, 144 insertions(+), 14 deletions(-)
+ include/linux/if_bridge.h        |  6 ++++++
+ include/net/switchdev.h          |  9 +++++++++
+ net/bridge/br_device.c           | 16 +++++++++++++++-
+ net/bridge/br_private.h          | 19 +++++++++++++++++++
+ net/bridge/br_stp.c              | 18 ++++++++++++++++++
+ net/bridge/br_vlan.c             | 21 +++++++++++++++++++++
+ net/bridge/br_vlan_options.c     | 25 +++++++++++++++++++++++++
+ net/netfilter/nft_flow_offload.c | 15 +++++++++++++--
+ 8 files changed, 126 insertions(+), 3 deletions(-)
 
 diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
 index f8b2b2939627..ba17e9cae800 100644
@@ -92,10 +98,26 @@ index da9e6370ed0f..f87bc384a3e6 100644
  };
  
 diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
-index 446761da4e54..f8443772f81a 100644
+index 446761da4e54..dc14cf110299 100644
 --- a/net/bridge/br_device.c
 +++ b/net/bridge/br_device.c
-@@ -405,6 +405,15 @@ static int br_fill_forward_path(struct net_device_path_ctx *ctx,
+@@ -394,9 +394,14 @@ static int br_fill_forward_path(struct net_device_path_ctx *ctx,
+ 
+ 	br_vlan_fill_forward_path_pvid(br, ctx, path);
+ 
++	/* No entry is a station not learned yet, or aged out while its
++	 * neighbour stayed valid: its next frame teaches the port again, so
++	 * it is reported apart, for a caller that would rather wait for that
++	 * than fall back to the bridge device.
++	 */
+ 	f = br_fdb_find_rcu(br, ctx->daddr, path->bridge.vlan_id);
+ 	if (!f)
+-		return -1;
++		return -ENXIO;
+ 
+ 	dst = READ_ONCE(f->dst);
+ 	if (!dst)
+@@ -405,6 +410,15 @@ static int br_fill_forward_path(struct net_device_path_ctx *ctx,
  	if (br_vlan_fill_forward_path_mode(br, dst, path))
  		return -1;
  
@@ -266,117 +288,34 @@ index 4a736e005bad..2d9c2d96921b 100644
  
  	return 0;
  }
-diff --git a/net/core/dev.c b/net/core/dev.c
-index 0c15c90691b3..e9f5d3c8c629 100644
---- a/net/core/dev.c
-+++ b/net/core/dev.c
-@@ -751,7 +751,7 @@ int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
- 		memset(path, 0, sizeof(struct net_device_path));
- 		ret = ctx.dev->netdev_ops->ndo_fill_forward_path(&ctx, path);
- 		if (ret < 0)
--			return -1;
-+			return ret;
- 
- 		if (WARN_ON_ONCE(last_dev == ctx.dev))
- 			return -1;
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
-index 9d793f43c94e..95d631ab80be 100644
+index 91ba96aa18b0..f2a872a3e1c9 100644
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
-@@ -269,10 +269,10 @@ static bool nft_flowtable_find_dev(const struct net_device *dev,
- 	return found;
- }
+@@ -307,10 +307,21 @@ static int nft_dev_forward_path(struct nf_flow_route *route,
  
--static void nft_dev_forward_path(struct nf_flow_route *route,
--				 const struct nf_conn *ct,
--				 enum ip_conntrack_dir dir,
--				 struct nft_flowtable *ft)
-+static int nft_dev_forward_path(struct nf_flow_route *route,
-+				const struct nf_conn *ct,
-+				enum ip_conntrack_dir dir,
-+				struct nft_flowtable *ft)
- {
- 	const struct dst_entry *dst = route->tuple[dir].dst;
- 	struct net_device_path_stack stack;
-@@ -283,13 +283,23 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
- 	 * the stack held. A PPPoE hop overwrites it before anything reads it,
- 	 * but only because it is always the first hop. */
- 	unsigned char ha[ETH_ALEN] = {};
--	int i;
--
--	if (nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) >= 0)
-+	int i, err;
-+
-+	err = nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack);
-+	/* A bridge port that is not forwarding is not a path to fall back
-+	 * from: a flow cached now would carry the port's traffic past
-+	 * br_handle_frame() and br_forward(), which enforce its state, and one
-+	 * cached on the logical device instead would never be offered to the
-+	 * port once it forwards again. Every other failure keeps the neighbour
-+	 * fallback below.
+ 	err = nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack,
+ 					&ft->data);
++	/* A bridge that has not learned the station's port (-ENXIO) is a path
++	 * not known yet to a table with neighbour output, exactly as an
++	 * unresolved neighbour is. Any other table keeps the fallback, which
++	 * its software path forwards through the bridge as routing does.
 +	 */
-+	if (err == -EAGAIN)
-+		return err;
-+	if (err >= 0)
- 		nft_dev_path_info(&stack, &info, ha, &ft->data);
- 
- 	if (!info.indev || !nft_flowtable_find_dev(info.indev, ft))
--		return;
-+		return 0;
- 
- 	/* Belongs to this direction's egress path, as out.h_dest does, and
- 	 * unlike out.h_dest it survives NEIGH output. */
-@@ -311,6 +321,8 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
- 		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
- 		route->tuple[dir].xmit_type = info.xmit_type;
- 	}
-+
-+	return 0;
- }
- 
- static int nft_flow_route(const struct nft_pktinfo *pkt,
-@@ -322,6 +334,7 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
- 	struct dst_entry *this_dst = skb_dst(pkt->skb);
- 	struct dst_entry *other_dst = NULL;
- 	struct flowi fl;
-+	int err = 0;
- 
- 	memset(&fl, 0, sizeof(fl));
- 	switch (nft_pf(pkt)) {
-@@ -364,8 +377,9 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
- 
- 	if (route->tuple[dir].xmit_type	== FLOW_OFFLOAD_XMIT_NEIGH &&
- 	    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
--		nft_dev_forward_path(route, ct, dir, ft);
--		nft_dev_forward_path(route, ct, !dir, ft);
-+		err = nft_dev_forward_path(route, ct, dir, ft);
-+		if (!err)
-+			err = nft_dev_forward_path(route, ct, !dir, ft);
- 	} else if (READ_ONCE(ft->data.use_neigh)) {
- 		/* A transform in one direction must not hide the other one's
- 		 * bridge/VLAN path. Its physical ingress and tags also name
-@@ -374,9 +388,18 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
- 		 * XFRM outer peer, and must never turn XFRM into DIRECT.
- 		 */
- 		if (route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
--			nft_dev_forward_path(route, ct, dir, ft);
--		if (route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
--			nft_dev_forward_path(route, ct, !dir, ft);
-+			err = nft_dev_forward_path(route, ct, dir, ft);
-+		if (!err &&
-+		    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
-+			err = nft_dev_forward_path(route, ct, !dir, ft);
-+	}
-+
-+	/* The caller's error path releases nothing: both destinations are
-+	 * still this function's to drop. */
-+	if (err) {
-+		dst_release(route->tuple[dir].dst);
-+		dst_release(route->tuple[!dir].dst);
-+		return err;
- 	}
- 
- 	return 0;
++	if (err == -ENXIO && READ_ONCE(ft->data.use_neigh))
++		err = -EAGAIN;
+ 	/* A path that cannot be known yet, as reported above or by a device's
+ 	 * own hook, is not one to fall back from: a flow cached on the logical
+-	 * device now would stay there once the path is known. Every other
+-	 * failure keeps the neighbour fallback below.
++	 * device now would stay there once the path is known. Nor is a bridge
++	 * port that is not forwarding: a flow cached now would carry the
++	 * port's traffic past br_handle_frame() and br_forward(), which
++	 * enforce its state, and one cached on the logical device instead
++	 * would never be offered to the port once it forwards again. Every
++	 * other failure keeps the neighbour fallback below.
+ 	 */
+ 	if (err == -EAGAIN)
+ 		return err;
 -- 
 2.47.3
 

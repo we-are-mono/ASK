@@ -129,6 +129,16 @@ matched on the *outer* remote in the outer header's family rather than on the
 inner destination the tuple names. The inner next hop the tuple carries is a
 fiction with a zero address, and nothing watches it.
 
+The walk needs the outer neighbour before there is a flow at all. One still
+resolving when Linux creates the flow -- as after the WAN link flapped and
+flushed it -- makes the `sit` and `ip6_tnl` hooks ask for it and report
+`-EAGAIN`, so `nft_flow_route()` caches nothing and a later packet walks
+again: a flow
+cached on the tunnel device would keep it as the reply's ingress, which no
+port is, for as long as the connection lasted. A table without neighbour
+output refuses the hop anyway and only goes without a software flow
+meanwhile.
+
 Before a direction is installed there is nothing to watch, and the outer
 address is the one the walk recorded when Linux created the flow: no later
 offer of that generation carries a newer one, and Linux never checks it -- it

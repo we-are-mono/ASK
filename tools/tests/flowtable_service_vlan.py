@@ -67,7 +67,16 @@ async def test_admission_failslab(vlan_service, target):
         r.record("vlan-" + target + "-recovery", {"before": before, "after": after, "hit": hit})
 
 
-async def test_recreation(vlan_service):
+@pytest.mark.parametrize("neighbour", ["with-route", "after-traffic"])
+async def test_recreation(vlan_service, neighbour):
+    """A routed VLAN deleted under running connections and created again
+    carries them in hardware again, through the running service alone.
+    "after-traffic" installs the client's neighbour only once the recreated
+    VLAN has carried the connections for a second, so each one's first
+    packet through it meets that neighbour unresolved, as after a network
+    reload, where nothing installs one: the flowtable has to wait for the
+    neighbour rather than cache the connection on the VLAN device, which no
+    hardware port backs (A425)."""
     r = vlan_service
     vlan = {"lan": ADDRESS, "netns": NETNS}
     flows = [
@@ -90,6 +99,16 @@ async def test_recreation(vlan_service):
             before = await r.state()
             old_index = (await read(r.target, r.session, f"/sys/class/net/{DUT_IF}/ifindex")).strip()
             before_attempts = await attempts(r)
+            window = {}
+
+            async def carried():
+                # The client sends first, so the connections' first packets
+                # through the new VLAN all precede the neighbour; the WAN
+                # receiving some proves they crossed it.
+                window["received_before"] = received(r, 2)
+                await asyncio.sleep(1)
+                window["received_after"] = received(r, 2)
+
             await p.rpc("start", [2], count=0, interval=0.05, allow_loss=True)
             await p.rpc("start", [3], count=0, interval=0.05)
             samples = []
@@ -122,10 +141,14 @@ async def test_recreation(vlan_service):
                 links = json.loads((await console_command(r.service_console, "ip", "-j", "link", "show"))["stdout"])
                 r.service_vlan_created = DUT_IF in {link["ifname"] for link in links}
                 if not r.service_vlan_created:
-                    await create_vlan(r, console=True)
+                    await create_vlan(r, console=True,
+                                      before_neighbour=carried if neighbour == "after-traffic" else None)
             restored_at = time.monotonic()
             reports = await p.rpc("stop", [2, 3])
             r.record(label + "-transfers", reports)
+            if neighbour == "after-traffic":
+                r.record(label + "-before-neighbour", window)
+                assert window["received_after"] > window["received_before"], window
             assert reports["2"]["lost"] > 0 and reports["3"]["lost"] == 0, reports
             assert reports["3"]["count"] > 0, reports
             new_index = (await read(r.target, r.session, f"/sys/class/net/{DUT_IF}/ifindex")).strip()

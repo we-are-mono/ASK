@@ -19,7 +19,11 @@ NETNS = "ask-ft-service-vlan"
 GATEWAY, ADDRESS = "172.29.84.1", "172.29.84.2"
 
 
-async def create_vlan(r, *, console=False):
+async def create_vlan(r, *, console=False, before_neighbour=None):
+    """Create the VLAN and route the client through it. `before_neighbour`
+    runs once the VLAN routes but before the client's neighbour is
+    installed: connections already running then reach that neighbour
+    unresolved, as after a network reload, where nothing installs one."""
     async def run(*args):
         if console:
             return await console_command(r.service_console, *args)
@@ -31,6 +35,8 @@ async def create_vlan(r, *, console=False):
     await run("ip", "addr", "add", GATEWAY + "/24", "dev", DUT_IF)
     await run("ip", "link", "set", "dev", DUT_IF, "up")
     await run("ip", "route", "add", ADDRESS + "/32", "dev", DUT_IF)
+    if before_neighbour:
+        await before_neighbour()
     await run("ip", "neigh", "replace", ADDRESS, "lladdr", r.lan_mac,
               "nud", "permanent", "dev", DUT_IF)
 

@@ -19,6 +19,22 @@ names the **VLAN subinterface**, because that is the netdev Linux would route
 through. Everything this increment does follows from those two being different
 objects for the first time.
 
+The redirect names the port only because Netfilter's forward-path walk got
+there, and `nft_dev_fill_forward_path()` starts that walk only from a valid
+neighbour of the client (whose address only a bridge below needs, to find its
+port). Without one, upstream caches the flow on its default path, whose reply
+ingress -- and so the redirect -- is the subinterface itself. The adapter
+refuses that at its device gate, and no refresh walks a cached flow again, so a connection whose first packet after a VLAN was
+created again met an unresolved neighbour stayed in software for as long as
+it lasted (A425; netifd recreates VLANs on every network reload). For a
+`use_neigh` table, patch 140 therefore caches nothing while the neighbour of
+a VLAN or bridge destination is unresolved: `nft_dev_fill_forward_path()`
+asks for the neighbour and returns `-EAGAIN`, which `nft_flow_route()` turns
+into no flow at all, as it does for a bridge port that is not forwarding, and
+a later packet walks the whole path. A port is its own path, so it is cached
+as before, and `flow_offload_eth_dst()` holds its rules back until the
+neighbour resolves.
+
 The tags themselves are derived from the devices, not decoded from the action
 list. `ft_path_stack()` (`cdx/ask_flowtable_core.c`) walks `cls->nf_dst->dev`
 down to the redirect port and `cls->nf_dst_reverse->dev` down to the binding's

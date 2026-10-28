@@ -220,6 +220,16 @@ STALE/DELAY/PROBE and solicit ARP, and the reply crosses the bridge. A
 a live flow — which is the case the proof below drives, because it is the one
 that would misforward if the delete were not watched.
 
+The same miss matters when Linux creates a flow: an entry aged out under a
+neighbour still valid, or flushed by a port flap, leaves `br_fill_forward_path()`
+no port to name, and the default path would cache the bridge device as the
+reply's ingress for as long as the connection lasted. Patch 162 reports that
+miss as `-ENXIO`, which a `use_neigh` table takes as a path not known yet: it
+caches nothing, and the station's next frame teaches the bridge the port
+again. Any other table falls back as before. A station that only receives,
+behind a permanent neighbour, sends nothing to teach it, and stays in
+software until it does.
+
 ## Eligibility
 
 Beyond the rules a routed, tagged flow already satisfies:

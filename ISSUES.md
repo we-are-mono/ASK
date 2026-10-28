@@ -165,16 +165,25 @@ result independently of those temporary files.
   as well. Where to look: bisect the 301 with the double read, then diff the failing boot's `ipsec_sas`, SA cache and
   xfrm state against a passing one.
 
-- [ ] **A425 — a VLAN deleted and created again often never carries offloaded flows again.** After
-  `flowtable_service_vlan.py::test_recreation` deletes and recreates `eth3.284`, admission refuses every offer leaving by
-  it, once a second for as long as the test waits: ASK-DEBUG (mask 5) prints `gate redirect=1 out=eth3.284 egress_ok=0
-  in=eth4 in_ok=1 dst=1 rdst=1` then `ft_parse:2239 refused (-95)`, `rejects` climbs and `entries` stays 6 of 8. So
-  `cdx_ft_egress_supported()` -- `cdx_ft_onif_type()` -- finds no cdx port behind the new device. Failed 6 of 8 runs on
-  master (de970a6a) and 1 of 2 on the branch after it, on the KASAN image; the other runs readmit within the test's
-  eight rounds. Why it matters: netifd recreates VLANs on every network reload, and a VLAN that comes back without its
-  interface record keeps its flows in software. Where to look: the VLAN's iface record across delete and re-register
-  (devman, the controller's VLAN add after the old record's teardown), and whether a recreate racing that teardown is
-  dropped rather than retried.
+- [ ] **A426 — a flow whose walk reaches a port the flowtable does not list yet stays on its logical device.** Where:
+  `nft_dev_forward_path()` (patch 140, `nft_flow_offload.c`), which keeps the default path when
+  `nft_flowtable_find_dev()` does not find the port the walk resolved. With `devices auto` the daemon
+  (`flowtable/src/enumerate.c`) lists only up `fsl_dpa` ports, so a connection whose first packet comes between a
+  port's carrier flap and the daemon re-adding it is cached with its VLAN, bridge or PPPoE device as the reply's
+  ingress: admission refuses it on every refresh (`egress_ok=0`) while the other direction keeps it alive in software, the A425 symptom
+  by another way. Why it matters: carrier flaps on a LAN or WAN port are routine, and every connection caught in that
+  window stays in software until it ends. Deferring as A425 does is wrong here: a port legitimately outside the table
+  (a bridged Wi-Fi interface, a USB NIC) would re-walk every packet for good. Fix direction: when a device joins the
+  table (the device-hook add, patch 152's transaction), retire the cached flows whose reply ingress is an upper device
+  of the joining port, so their next packet walks the whole path; needs a host case and a rig carrier-flap run. The
+  same frozen fallback, rarer: the `sit`/`ip6_tnl` hooks still return `-ENOENT` when the outer route lookup itself fails,
+  so a tunnel device that outlives a WAN route outage keeps flows cached on it (netifd usually tears 6in4 down with the
+  WAN); treating that lookup error as `-EAGAIN` in patch 143 is a two-line change.
+
+- [x] **A425 — a VLAN deleted and created again often never carried offloaded flows again.** Its first packet met the
+  client's neighbour unresolved and the flow was cached on the VLAN device, which admission refuses for good; patches
+  140/143/162 now cache nothing while a VLAN or bridge neighbour, a tunnel's outer next hop or a bridge FDB entry is
+  unresolved (_:/^netfilter: cache no flowtable path while its next hop resolves_).
 
 - [ ] **A424 — the top channel's moves add their starting frames up past SEC's share while a paused port holds the
   rest.** Where: `cdx_htb_implicit_sync()` and the exception `cdx/cdx_htb.c` documents above `CDX_HTB_ETH_FRAMES`.
