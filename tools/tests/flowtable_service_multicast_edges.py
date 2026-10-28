@@ -105,7 +105,9 @@ print(subprocess.check_output(['ip', '-j', '-d', 'link', 'show', 'dev', {WAN_PEE
             await ctl("add", TARGET_WAN_IF, source, group, TARGET_LAN_IF)
             # Carried once Linux has been seen forwarding it: a few frames first.
             first = await learn(r, [stream(family, group, hops=63)],
-                                lambda s: routed(s, group, source), "installed on the WAN port")
+                                lambda s: routed(s, group, source)
+                                and s["mroute_installed"] == r.initial["mroute_installed"] + 1,
+                                "installed on the WAN port")
             inbound = await r.window([stream(family, group, hops=63)], [(r.lan, {LAN_NIC: r.dut_lan_mac})],
                                      ingress=TARGET_WAN_IF, label=f"move-v{family}-wan")
             assert delivered(inbound, streamed(inbound, group), LAN_NIC)
@@ -116,10 +118,10 @@ print(subprocess.check_output(['ip', '-j', '-d', 'link', 'show', 'dev', {WAN_PEE
             # A new oif, confirmed from the stream as it now arrives.
             after = await learn(r, [stream(family, group, hops=63)],
                                 lambda s: routed(s, group, source, inbound=TARGET_LAN_IF,
-                                                 listeners={wan}),
+                                                 listeners={wan})
+                                and s["mroute_installed"] == first["mroute_installed"],
                                 "rekeyed on the LAN port", sender="lan")
             assert [g for g in after["mroute"] if same(g["group"], group)] == [row(after)], summary(after)
-            assert after["mroute_installed"] == first["mroute_installed"], summary(after)
             # A new key is a new classifier entry: counted from nothing but
             # the tail of the burst that confirmed it, not the old entry's.
             assert packets(row(after)) < 8, summary(after)
@@ -171,9 +173,9 @@ async def test_two_sources(multicast_rig, family):
         for source in (first, second):
             await ctl("add", TARGET_WAN_IF, source, group, TARGET_LAN_IF)
         both = await learn(r, [stream(family, group, hops=63, source=s) for s in (first, second)],
-                           lambda s: routed(s, group, first) and routed(s, group, second),
+                           lambda s: routed(s, group, first) and routed(s, group, second)
+                           and s["mroute_installed"] == r.initial["mroute_installed"] + 2,
                            "both sources installed")
-        assert both["mroute_installed"] == r.initial["mroute_installed"] + 2, summary(both)
 
         together = await window([first, second], "together")
         for source in (first, second):
@@ -328,9 +330,9 @@ async def test_learner_handoff(multicast_rig, mcast_bridge, family):
             # routed group is carried once it has been seen forwarding it.
             taken = await learn(r, [stream(family, group, hops=63)],
                                 lambda s: routed(s, group, source) and not mcast_rows(s, group) and
-                                owned_installed(s, [group]) == owned_installed(r.initial, [group]),
+                                owned_installed(s, [group]) == owned_installed(r.initial, [group])
+                                and s["mroute_installed"] == r.initial["mroute_installed"] + 1,
                                 "the routed learner taking the key")
-            assert taken["mroute_installed"] == r.initial["mroute_installed"] + 1, summary(taken)
             second = await r.window([stream(family, group, hops=63)], routed_observers,
                                     ingress=TARGET_WAN_IF, label=f"handoff-v{family}-routed")
             assert delivered(second, streamed(second, group), LAN_NIC)
@@ -342,9 +344,9 @@ async def test_learner_handoff(multicast_rig, mcast_bridge, family):
             await rebuild(r, console, bridge, address, gateway, r.dut_wan_mac)
             await mdb(r, bridge, group, add=True)
             await learn(r, [stream(family, group, hops=64)], bridged_carries, "the bridged group again")
-            back = await r.settle(lambda s: refused_ingress(s) and bridged_carries(s),
-                                  "the bridged learner holding the key again")
-            assert back["mroute_installed"] == r.initial["mroute_installed"], summary(back)
+            await r.settle(lambda s: refused_ingress(s) and bridged_carries(s)
+                           and s["mroute_installed"] == r.initial["mroute_installed"],
+                           "the bridged learner holding the key again")
             third = await r.window([stream(family, group, hops=64)], bridged, ingress=TARGET_WAN_IF,
                                    label=f"handoff-v{family}-bridged-again")
             assert delivered(third, streamed(third, group), LAN_NIC)
@@ -473,12 +475,13 @@ async def test_reload_routed(multicast_rig, family, failure_stage):
         async def standing():
             # Confirmations went with the module: seen afresh.
             return await learn(r, [stream(family, group, hops=63)],
-                               lambda s: routed(s, group, source), "relearned after the reload")
+                               lambda s: routed(s, group, source)
+                               and s["mroute_installed"] == r.initial["mroute_installed"] + 1,
+                               "relearned after the reload")
 
         relearned = await reload_adapter(r, "mcast-" + label, standing, unloaded,
                                         failure_stage=failure_stage)
         assert len([g for g in relearned["mroute"] if same(g["group"], group)]) == 1, summary(relearned)
-        assert relearned["mroute_installed"] == r.initial["mroute_installed"] + 1, summary(relearned)
         after = await r.window([stream(family, group, hops=63)], observers, ingress=TARGET_WAN_IF,
                                label=label + "-after")
         assert delivered(after, streamed(after, group), LAN_NIC)
@@ -708,12 +711,13 @@ async def test_reload_bridged_blocked_source(multicast_rig, mcast_bridge,
             in_software(out, streams=2)
 
         async def standing():
-            return await learn(r, streams, settled, "the blocked source standing across the reload")
+            # The allowed source carried and the blocked one discarding.
+            return await learn(r, streams,
+                               lambda s: settled(s) and
+                               owned_installed(s, [group]) == owned_installed(r.initial, [group]) + 2,
+                               "the blocked source standing across the reload")
 
-        relearned = await reload_adapter(r, f"mcast-reload-blocked-v{family}", standing, unloaded)
-        # The allowed source carried and the blocked one discarding.
-        assert owned_installed(relearned, [group]) == owned_installed(r.initial, [group]) + 2, \
-            summary(relearned)
+        await reload_adapter(r, f"mcast-reload-blocked-v{family}", standing, unloaded)
         after = await window("after")
         assert moved(after, lambda s: row(s, allowed)) == COUNT, summary(after["after"])
         assert moved(after, lambda s: row(s, blocked)) == COUNT, summary(after["after"])

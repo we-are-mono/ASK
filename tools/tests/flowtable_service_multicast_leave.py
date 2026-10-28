@@ -93,7 +93,9 @@ async def test_routed_bridge_leave(multicast_rig, listener_bridge, mechanism):
         await ctl("add", TARGET_WAN_IF, source, group, bridge.left, bridge.kept)
         # Carried once Linux has been seen forwarding it to both oifs.
         both = await learn(r, [stream(family, group, hops=63)],
-                           lambda s: carrying(s, {left, kept}), f"{mechanism}: two listeners")
+                           lambda s: carrying(s, {left, kept})
+                           and s["mroute_installed"] == r.initial["mroute_installed"] + 1,
+                           f"{mechanism}: two listeners")
         first = await window("two-listeners")
         assert delivered(first, streamed(first, group), bridge.lan_left)
         assert delivered(first, streamed(first, group), bridge.lan_kept)
@@ -221,10 +223,10 @@ async def test_bridged_leave(multicast_rig, mcast_bridge, mechanism):
         # rather than hand every frame to the CPU.
         await end(stack, hosts[1], spec, other)
         await trickle(r, [stream(family, group, hops=64)], forgotten)
-        dropping = await r.settle(lambda s: not carrying(s) and discarding(s) is not None,
-                                  f"{mechanism}: the port's last listener gone",
-                                  timeout=forgotten + 10)
-        assert dropping["mcast_discarding"] >= 1, summary(dropping)
+        await r.settle(lambda s: not carrying(s) and discarding(s) is not None
+                       and s["mcast_discarding"] >= 1,
+                       f"{mechanism}: the port's last listener gone",
+                       timeout=forgotten + 10)
         if spec["end"] != "block":
             # Refusing one source leaves the membership standing for others.
             assert TARGET_LAN_IF not in await mdb_ports(r, mcast_bridge, group)
@@ -295,11 +297,11 @@ async def test_bridged_discard_and_rejoin(multicast_rig, mcast_bridge, family):
         # The last listener goes; the stream does not.
         await viewer.do("leave")
         await trickle(r, configs, 3.5)
-        dropping = await r.settle(in_state("discarding"), f"v{family}: discarding", timeout=15)
-        assert row(dropping)["ports"] == "-", summary(dropping)
         # At least this one: the WAN segment's own multicast (SSDP, mDNS)
         # has flows of its own, which discard too when their members lapse.
-        assert dropping["mcast_discarding"] >= 1, summary(dropping)
+        dropping = await r.settle(lambda s: in_state("discarding")(s) and s["mcast_discarding"] >= 1,
+                                  f"v{family}: discarding", timeout=15)
+        assert row(dropping)["ports"] == "-", summary(dropping)
         transmitted = await hardware_tx(r, TARGET_WAN_IF)
         nobody = await window("nobody")
         assert not delivered(nobody, streamed(nobody, group), LAN_NIC)
@@ -432,10 +434,10 @@ async def test_bridged_ssm_beside_asm(multicast_rig, mcast_bridge, family):
             source=first))
         asm = await stack.enter_async_context(host(
             r.lan, family=family, group=group, iface=other, mode="asm", version=version))
-        both = await learn(r, [stream(family, group, hops=64, source=s) for s in (first, second)],
-                           lambda s: carried_to(s, group, first) and carried_to(s, group, second),
-                           f"v{family}: both sources carried")
-        assert both["mcast_installed"] >= r.initial["mcast_installed"] + 2, summary(both)
+        await learn(r, [stream(family, group, hops=64, source=s) for s in (first, second)],
+                    lambda s: carried_to(s, group, first) and carried_to(s, group, second)
+                    and s["mcast_installed"] >= r.initial["mcast_installed"] + 2,
+                    f"v{family}: both sources carried")
         together = await window("both-hosts")
         for source in (first, second):
             assert delivered(together, streamed(together, group, source), LAN_NIC), source
@@ -448,12 +450,12 @@ async def test_bridged_ssm_beside_asm(multicast_rig, mcast_bridge, family):
         # Keep both streams live through the leave queries; an idle discard
         # may expire before the next window starts.
         await trickle(r, [stream(family, group, hops=64, source=s) for s in (first, second)], 3.5)
-        alone = await r.settle(lambda s: carried_to(s, group, first) and withheld(s, group, second),
-                               f"v{family}: the second source withdrawn", timeout=15)
         # Both still installed, one discarding; at least, since the WAN
         # segment's own multicast has flows that can discard meanwhile.
+        alone = await r.settle(lambda s: carried_to(s, group, first) and withheld(s, group, second)
+                               and s["mcast_discarding"] >= 1,
+                               f"v{family}: the second source withdrawn", timeout=15)
         assert alone["mcast_installed"] >= r.initial["mcast_installed"] + 2, summary(alone)
-        assert alone["mcast_discarding"] >= 1, summary(alone)
         after = await window("ssm-host")
         assert delivered(after, streamed(after, group, first), LAN_NIC)
         assert not delivered(after, streamed(after, group, second), LAN_NIC)
@@ -569,10 +571,10 @@ async def test_bridged_block_before_the_stream(multicast_rig, mcast_bridge,
         first = await window("learning")
         assert not delivered(first, streamed(first, group, blocked), LAN_NIC)
         assert delivered(first, streamed(first, group, allowed), LAN_NIC)
-        settled = await r.settle(lambda s: carried_to(s, group, allowed) and withheld(s, group, blocked),
-                                 f"v{family}: the allowed source carried, the blocked one not")
-        assert settled["mcast_installed"] >= r.initial["mcast_installed"] + 2, summary(settled)
-        assert settled["mcast_discarding"] >= 1, summary(settled)
+        await r.settle(lambda s: carried_to(s, group, allowed) and withheld(s, group, blocked)
+                       and s["mcast_installed"] >= r.initial["mcast_installed"] + 2
+                       and s["mcast_discarding"] >= 1,
+                       f"v{family}: the allowed source carried, the blocked one not")
         second = await window("carried")
         assert not delivered(second, streamed(second, group, blocked), LAN_NIC)
         assert delivered(second, streamed(second, group, allowed), LAN_NIC)

@@ -137,15 +137,22 @@ async def test_full_bucket_preserves_other_groups_and_recovers(multicast_rig, mc
                 assert len({modeled(g, source_bytes, mac) for g in (residents[0], control, discard)}) == 3
 
                 await fill_memberships(r, mcast_bridge, [discard], add=False)
-                full = await r.settle(lambda s: has_state(s, discard, "discarding"),
+                full = await r.settle(lambda s: has_state(s, discard, "discarding")
+                                      and s["mcast_discarding"] == 1
+                                      and s["mcast_group_ids4"] == len(carried) + 1,
                                       "unrelated discard installed before overflow")
                 standing(full, full, carried)
                 assert full["mcast_install_errors"] == empty["mcast_install_errors"], summary(full)
                 assert full["mcast_discards_evicted"] == empty["mcast_discards_evicted"], summary(full)
 
                 with Fill(4, [overflow], r.wire):
-                    refused = await r.settle(lambda s: has_state(s, overflow, "refused-failed"),
-                                             "bucket overflow exhausted its bounded retries", timeout=30)
+                    await r.settle(lambda s: has_state(s, overflow, "refused-failed"),
+                                   "bucket overflow exhausted its bounded retries", timeout=30)
+                    # The last attempt is counted before the state it ends
+                    # in, but stats is read before the rows, and how many
+                    # attempts that took is not fixed: the terminal state's
+                    # count and levels come from a read after it.
+                    refused = await r.proc()
                     attempts = refused["mcast_install_errors"] - full["mcast_install_errors"]
                     assert 1 <= attempts <= RETRIES, summary(refused)
                     standing(full, refused, carried)
@@ -197,7 +204,8 @@ async def test_full_bucket_preserves_other_groups_and_recovers(multicast_rig, mc
                 assert reset["mcast_install_errors"] == held["mcast_install_errors"], summary(reset)
                 await fill_memberships(r, mcast_bridge, [overflow], add=True)
                 with Fill(4, [overflow], r.wire):
-                    recovered = await r.settle(lambda s: installed(s, survivors + [overflow]),
+                    recovered = await r.settle(lambda s: installed(s, survivors + [overflow])
+                                               and s["mcast_group_ids4"] == len(survivors) + 2,
                                                "overflow admitted into the vacant bucket", timeout=15)
                 recovered_groups = survivors + [overflow]
                 standing(recovered, recovered, recovered_groups)

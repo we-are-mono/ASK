@@ -32,6 +32,7 @@ from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack,
                        openwrt_lan, openwrt_wan)
 from _flowtable_rig import (DPORT, Echo, SPORT, WAN_IP, Rig, assert_undisturbed, command, read,
                             release_latch, stop_boot_daemon)
+from _flowtable_connections import counted
 from _gated_tcp import GatedTcp
 
 BRIDGE = "br-ft"
@@ -882,7 +883,7 @@ async def test_tcp(bridge_rig):
     async with GatedTcp(r.run_peer, source=r.lan_ip, sport=SPORT, peer=WAN_IP,
                         dport=DPORT, label="flowtable_bridge_tcp") as transfer:
         await transfer.warmed()
-        before = await r.wait(lambda s: len(s["flows"]) == 2)
+        before = await r.wait(lambda s: len(s["flows"]) == 2 and counted(s))
         await transfer.measure()
         after = await r.state()
     r.record("bridge-tcp", {"before": before, "after": after, "report": transfer.report})

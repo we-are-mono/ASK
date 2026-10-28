@@ -18,7 +18,7 @@ from _flowtable_failslab import (same_service, slab_fault)
 from _flowtable_rig import (artifact_dir, DPORT, Echo, command, console_command, read)
 from _flowtable_selective_neighbour import (hardware, keys, unchanged, warm)
 from _flowtable_service import (FIRST, managed_service, supervision_status, wait_service)
-from _flowtable_service_vlan import (attempts, balanced, denied, received)
+from _flowtable_service_vlan import (attempts, balanced, coherent, denied, received)
 
 NETNS, LAN_IF = "ask-ft-service-ipv6", "askftsv6"
 LAN_GATEWAY, NEXT_HOP = "fd42:6173:6:1::1", "fd42:6173:6:1::2"
@@ -184,7 +184,8 @@ async def test_prerequisite(ipv6_service, fault):
                     assert armed["blocked"], armed
                     await console_command(r.service_console, "ip", "-6", "neigh", "change", NEXT_HOP,
                                           "dev", TARGET_LAN_IF, "nud", "probe")
-                retired = await r.wait(lambda s: by_key(s).keys() == keys([0, 1], flows), timeout=5)
+                retired = await r.wait(lambda s: by_key(s).keys() == keys([0, 1], flows) and coherent(s),
+                                       timeout=5)
                 retirement_seconds = time.monotonic() - started
                 assert retirement_seconds < 5, retirement_seconds
                 selective(initial, retired, flows)

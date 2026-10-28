@@ -16,7 +16,7 @@ from ask_orch.counters import kernel_rx_packets
 
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from _flowtable_connections import (by_key, healthy)
+from _flowtable_connections import (by_key, consistent, healthy)
 from _flowtable_rig import (artifact_dir, DPORT, HEALTH_BASELINE, SPORT, WAN_IP, command, console_command, read)
 from _flowtable_policy import (CONFIG, apply, candidate, stop)
 from _flowtable_service_ipsec import wire_interface
@@ -219,7 +219,7 @@ assert result.returncode == 0
                 # RTNL held (`busy`) is offered again by software's next
                 # refresh, up to a second after its sibling went in.
                 present = by_key(before)
-                if len(bulk) == streams * (2 if bidirectional else 1) and all(
+                if consistent(before) and len(bulk) == streams * (2 if bidirectional else 1) and all(
                         (TARGET_WAN_IF if f["in"] == TARGET_LAN_IF else TARGET_LAN_IF,
                          number, f["new_dst"], f["new_src"]) in present for f in bulk):
                     break
@@ -489,7 +489,7 @@ print(echoed)
                 result = await lan_run_python(r.lan, warm, label="packet_rate_warm", timeout=15)
                 assert result.rc == 0, result.stdout
                 before = await r.state()
-                if len(directions(before)) == 2 * len(sports):
+                if len(directions(before)) == 2 * len(sports) and consistent(before):
                     break
                 assert loop.time() < deadline, ("the flows did not enter hardware", result.stdout, before)
                 await asyncio.sleep(0.5)

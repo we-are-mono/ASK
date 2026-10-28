@@ -54,6 +54,7 @@ from _gated_tcp import GatedTcp
 from _throughput import tcp_floor
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from _flowtable_rig import assert_undisturbed, command
+from _flowtable_connections import counted
 
 # Both modes ran at the path's ceiling on four streams: 6o4 9.15 Gb/s
 # inserting and 9.14 stripping, 4o6 9.14 and 9.08 (docs/flowtable/tunnels.md).
@@ -165,7 +166,7 @@ async def test_tcp(tunnel_rig):
         # back only on a later packet; the warm phase runs long enough for that
         # (_gated_tcp.WARM_SECONDS). Wait admission in before reading the
         # baseline the record and the direction check share.
-        before = await r.wait(lambda s: len(s["flows"]) == _expected(r, "tcp"))
+        before = await r.wait(lambda s: len(s["flows"]) == _expected(r, "tcp") and counted(s))
         flows = await _both_directions(r, "tcp", before)
         record = _tunnel_record(r, before)
         link = await _tunnel_counters(r)

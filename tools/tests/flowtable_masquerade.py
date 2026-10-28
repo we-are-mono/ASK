@@ -13,7 +13,7 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from _flowtable_connections import (FLOWS, healthy, peer)
+from _flowtable_connections import (FLOWS, consistent, healthy, peer)
 from _flowtable_rig import (artifact_dir, DPORT, TABLE, WAN_IP, command, console_command, proc_paths, status_text)
 from _flowtable_policy import (CONFIG, apply, candidate, stop)
 from _flowtable_snat import (udp_snat as _udp)
@@ -83,7 +83,7 @@ async def warm_mapping(r, p, ids, external):
     for _ in range(10):
         await p.batch(ids, 64, 0.01)
         state = await r.state()
-        if state["entries"] == len(ids) * 2:
+        if state["entries"] == len(ids) * 2 and consistent(state):
             mapping_rows(r, state, ids, external)
             return state
     pytest.fail(f"MASQUERADE did not install: {state}")

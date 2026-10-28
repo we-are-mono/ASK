@@ -267,9 +267,11 @@ async def test_routed_yields_to_the_host(multicast_rig, family, side):
 
         async with dut_member(r, family=family, group=group,
                               iface=TARGET_WAN_IF if side == "parent" else TARGET_LAN_IF) as member:
-            refused = await r.settle(lambda s: row(s) and row(s)["state"] == "refused-host",
-                                     "the host's membership refused the route", timeout=15)
-            assert refused["mroute_installed"] == r.initial["mroute_installed"], summary(refused)
+            # status is read before the rows: the level that counts the
+            # route out is part of the wait, not a check of its snapshot.
+            await r.settle(lambda s: row(s) and row(s)["state"] == "refused-host"
+                           and s["mroute_installed"] == r.initial["mroute_installed"],
+                           "the host's membership refused the route", timeout=15)
             line, _, _ = await kernel_mroute(r, family, source, group, offloaded=False)
             assert line and "offload" not in line, line
             shared = await window("host-joined")

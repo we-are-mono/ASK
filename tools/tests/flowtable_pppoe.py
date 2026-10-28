@@ -59,6 +59,7 @@ from _gated_tcp import GatedTcp
 from _topology import LAN_IPV6, TARGET_LAN_IF, TARGET_WAN_IF, lan_run
 import _flowtable_rig as ft
 from _flowtable_rig import Echo, SPORT, command, console_command, read
+from _flowtable_connections import counted
 
 
 @pytest.mark.rfc("2516")
@@ -178,7 +179,7 @@ async def test_ipv6_tcp(pppoe_rig):
     async with GatedTcp(r.run_peer, source=LAN_IPV6, sport=SPORT6, peer=INNER_LOCAL6,
                         dport=DPORT6, label="flowtable_pppoe_v6_tcp") as transfer:
         await transfer.warmed()
-        before = await r.wait(lambda s: len(s["flows"]) == 2)
+        before = await r.wait(lambda s: len(s["flows"]) == 2 and counted(s))
         flows = await _both_directions(r, before)
         await transfer.measure()
         after = await r.state()

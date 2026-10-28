@@ -152,6 +152,30 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A427 — after an earlier stretch of the suite, a packet-offload SA's restart reinstalls a flow during its
+  proof, and keeps doing so on that boot.** Where: `flowtable_service_ipsec_restart.py::
+  test_packet_offload_sa_unproven_delete_restarts[in-esp]`, 302nd at `--module-order-seed=930325968`: the post-restart
+  `hardware()` proof sees the `eth4` UDP direction's cookie change (`admission_invalidations 3` before and after). It
+  passes on a fresh boot (on master and with A421) and after the same 301 tests (on master, and with A421 and today's
+  test agent); it failed there only with a test-agent `read_state()` that read `status` and `stats` again after the
+  rows, and the whole state again while `entries`/`handle_refs`/`neighbour_refs`/`installs`/`deletes` moved, up to
+  four times (dropped unmerged for the harness's coherent waits). Once it had failed, three reruns on that boot failed
+  with today's read too. Why it matters: a failure that outlives its trigger on one boot is state some earlier test
+  or the adapter leaves behind, and `status` reads take the adapter transaction, which the daemon's health probe does
+  as well. Where to look: bisect the 301 with the double read, then diff the failing boot's `ipsec_sas`, SA cache and
+  xfrm state against a passing one.
+
+- [ ] **A425 — a VLAN deleted and created again often never carries offloaded flows again.** After
+  `flowtable_service_vlan.py::test_recreation` deletes and recreates `eth3.284`, admission refuses every offer leaving by
+  it, once a second for as long as the test waits: ASK-DEBUG (mask 5) prints `gate redirect=1 out=eth3.284 egress_ok=0
+  in=eth4 in_ok=1 dst=1 rdst=1` then `ft_parse:2239 refused (-95)`, `rejects` climbs and `entries` stays 6 of 8. So
+  `cdx_ft_egress_supported()` -- `cdx_ft_onif_type()` -- finds no cdx port behind the new device. Failed 6 of 8 runs on
+  master (de970a6a) and 1 of 2 on the branch after it, on the KASAN image; the other runs readmit within the test's
+  eight rounds. Why it matters: netifd recreates VLANs on every network reload, and a VLAN that comes back without its
+  interface record keeps its flows in software. Where to look: the VLAN's iface record across delete and re-register
+  (devman, the controller's VLAN add after the old record's teardown), and whether a recreate racing that teardown is
+  dropped rather than retried.
+
 - [ ] **A424 — the top channel's moves add their starting frames up past SEC's share while a paused port holds the
   rest.** Where: `cdx_htb_implicit_sync()` and the exception `cdx/cdx_htb.c` documents above `CDX_HTB_ETH_FRAMES`.
   Each change that moves a tree's top channel -- a class under the root added above it, or the one holding it deleted

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from _flowtable_service_vlan import ADDRESS
 
-from _flowtable_service_vlan import (DUT_IF, NETNS, VID, attempts, balanced, create_vlan, denied, received, tagged, vlan_row)
+from _flowtable_service_vlan import (DUT_IF, NETNS, VID, attempts, balanced, coherent, create_vlan, denied, received, tagged, vlan_row)
 
 import asyncio
 import json
@@ -97,8 +97,8 @@ async def test_recreation(vlan_service):
                 await console_command(r.service_console, "ip", "link", "del", DUT_IF)
                 r.service_vlan_created = False
                 removed_at = time.monotonic()
-                retired = await r.wait(lambda s: not tagged(s) and s["vlan_records"] == r.service_vlan_records_before,
-                                       timeout=5)
+                retired = await r.wait(lambda s: not tagged(s) and s["vlan_records"] == r.service_vlan_records_before
+                                       and coherent(s), timeout=5)
                 r.record(label + "-retired", retired)
                 balanced(retired, initial["errors"])
                 # Allow in-flight packets to drain, then require zero VLAN

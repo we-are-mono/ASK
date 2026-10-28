@@ -22,6 +22,7 @@ import pytest
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from _flowtable_rig import (DPORT, SPORT, TABLE, WAN_IP, artifact_dir, assert_undisturbed,
                             command, ct_listing, read)
+from _flowtable_connections import counted
 from _flowtable_udp_wire import udp_wire_payload
 from _gated_tcp import GatedTcp
 from ask_orch.counters import kernel_tx_packets
@@ -326,7 +327,7 @@ async def test_tcp(vlan_rig):
     async with GatedTcp(r.run_peer, source=r.lan_ip, sport=SPORT, peer=WAN_IP,
                         dport=DPORT, label="flowtable_vlan_tcp") as transfer:
         await transfer.warmed()
-        before = await r.wait(lambda s: len(s["flows"]) == 2)
+        before = await r.wait(lambda s: len(s["flows"]) == 2 and counted(s))
         await transfer.measure()
         after = await r.state()
     r.record("vlan-tcp", {"before": before, "after": after, "report": transfer.report})

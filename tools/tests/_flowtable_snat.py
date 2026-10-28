@@ -8,7 +8,7 @@ import re
 import socket
 
 import pytest
-from _flowtable_connections import FLOWS, healthy, peer
+from _flowtable_connections import FLOWS, consistent, healthy, peer
 from _flowtable_policy import CONFIG, apply, candidate, stop
 from _flowtable_rig import DPORT, WAN_IP, artifact_dir, command, console_command, read
 from _flowtable_tcp import cpu, cpu_delta, software_tx
@@ -83,7 +83,7 @@ async def snat_warm(r, p, external, port, label):
             await path_counters(r, f"{label}-counters-failed")
             raise
         state = await r.state()
-        if state["entries"] == 2:
+        if state["entries"] == 2 and consistent(state):
             snat_flows(r, state, external, port)
             r.record(label, state)
             return state

@@ -6,7 +6,7 @@ import asyncio
 from _ehash_bucket import crowded_ipv4
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from ask_orch.uart import Console
-from _flowtable_connections import (healthy, peer)
+from _flowtable_connections import (consistent, healthy, peer)
 from _flowtable_failslab import (slab_fault)
 from _flowtable_rig import (artifact_dir, DPORT, TABLE, WAN_IP, Echo, command)
 
@@ -71,7 +71,7 @@ async def test_rebuilds_under_allocation_failure(rig):
         async with peer(r, specs, initial_ids=[]) as p:
             await p.rpc("open", ids)
             await p.batch(ids, count=8, interval=0.02)
-            healthy(await r.wait(lambda s: s["entries"] == 2 * len(ids), timeout=30))
+            healthy(await r.wait(lambda s: s["entries"] == 2 * len(ids) and consistent(s), timeout=30))
             await in_hardware(r, p, ids, "ehash-delete-crowded")
             async with slab_fault(r, "ehash-delete", "ehash-delete", continuous=True,
                                   console=r.recovery_console) as fault:
@@ -88,7 +88,7 @@ async def test_rebuilds_under_allocation_failure(rig):
 
             await r.nft(table)
             await p.batch(ids, count=8, interval=0.02)
-            healthy(await r.wait(lambda s: s["entries"] == 2 * len(ids), timeout=30))
+            healthy(await r.wait(lambda s: s["entries"] == 2 * len(ids) and consistent(s), timeout=30))
             await in_hardware(r, p, ids, "ehash-delete-readmitted")
     finally:
         for server in servers:

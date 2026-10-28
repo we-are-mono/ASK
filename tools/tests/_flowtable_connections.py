@@ -73,6 +73,14 @@ def consistent(state):
     return state["entries"] == state["neighbour_refs"] == state["handle_refs"] == rows
 
 
+# The same agreement without neighbour_refs, which a direction leaving by a
+# PPPoE session does not hold: status counts the rows read after it, so the
+# installs and deletes stats counted after status cover them too.
+def counted(state):
+    rows = state["flow_count"] if "snapshot" in state else len(state["flows"])
+    return state["entries"] == state["handle_refs"] == rows
+
+
 def unchanged(r, before, after, ids):
     healthy(after)
     old, new = by_key(before), by_key(after)

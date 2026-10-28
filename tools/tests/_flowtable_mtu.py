@@ -9,7 +9,7 @@ import threading
 import time
 
 import pytest
-from _flowtable_connections import by_key, healthy
+from _flowtable_connections import by_key, consistent, healthy
 from _flowtable_rig import (
     DPORT,
     SPORT,
@@ -80,7 +80,7 @@ async def udp_warm(r, sport, mtus):
     for _ in range(8):
         await r.exchange(64, sport=sport, promiscuous=False)
         state = await r.state()
-        if (sorted(f["in"] for f in state["flows"]) == sorted(wanted)
+        if (consistent(state) and sorted(f["in"] for f in state["flows"]) == sorted(wanted)
                 and all(f["proto"] == "17" for f in state["flows"])):
             current_mtus(state, mtus)
             return state

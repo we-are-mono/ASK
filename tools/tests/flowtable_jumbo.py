@@ -28,7 +28,7 @@ import time
 
 import pytest
 
-from _flowtable_connections import by_key, healthy
+from _flowtable_connections import by_key, consistent, healthy
 from _flowtable_ipv6 import PayloadEcho, _drive, _drop_tables, _offload_table, _udp_exchange
 from _flowtable_jumbo import (
     JUMBO,
@@ -151,7 +151,7 @@ print(json.dumps({{'argv': argv, 'rc': result.returncode, 'stdout': result.stdou
             bulk = [f for f in before["flows"] if f["proto"] == "6"
                     and f"{WAN_IP}:{TCP_PORT}" in (f["src"], f["dst"]) and f["in"] == ingress
                     and int(f["bytes"]) > max(1_000_000, 512 * int(f["packets"]))]
-            if len(bulk) == STREAMS:
+            if len(bulk) == STREAMS and consistent(before):
                 break
             assert not lan_task.done(), "iperf ended before hardware admission"
             assert loop.time() < deadline, before

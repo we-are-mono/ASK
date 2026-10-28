@@ -13,7 +13,7 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from _flowtable_connections import (by_key, peer)
+from _flowtable_connections import (by_key, consistent, peer)
 from _flowtable_failslab import (same_service, slab_fault)
 from _flowtable_rig import (artifact_dir, DPORT, Echo, WAN_IP, command, console_command, read)
 from _flowtable_selective_neighbour import (keys, unchanged, warm)
@@ -237,7 +237,8 @@ async def test_recreated(tunnel_service):
             await console_command(r.service_console, 'ip', 'link', 'del', r.shape.device)
             try:
                 retired = await r.wait(lambda s: by_key(s).keys() == (keys([0, 1], flows) if selective else set())
-                                       and s['tunnel_records'] == s['tunnel_slots'] == 0, timeout=5)
+                                       and s['tunnel_records'] == s['tunnel_slots'] == 0
+                                       and (consistent(s) or not selective), timeout=5)
                 retire_seconds = time.monotonic() - started
                 assert retire_seconds < 5
                 if selective:

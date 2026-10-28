@@ -8,7 +8,7 @@ from collections import Counter
 
 import pytest
 import pytest_asyncio
-from _flowtable_connections import by_key, healthy
+from _flowtable_connections import by_key, consistent, healthy
 from _flowtable_rig import DPORT, SPORT, TABLE, WAN_IP, command, read
 from _flowtable_tcp import cpu, cpu_delta, software_tx
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
@@ -168,7 +168,7 @@ async def warm(r, p, ids, label, flows=FLOWS):
         await p.batch(ids, count=128, interval=0.01)
         state = await r.state()
         samples.append(state)
-        if state["entries"] == len(expected):
+        if state["entries"] == len(expected) and consistent(state):
             healthy(state)
             assert state["handle_refs"] == len(expected) and by_key(state).keys() == expected, state
             r.record(label, samples)
@@ -221,7 +221,7 @@ async def hardware(r, p, label, flows=FLOWS, bindings=2):
 
 
 async def retired(r, before, label):
-    state = await r.wait(lambda s: s["entries"] == 4)
+    state = await r.wait(lambda s: s["entries"] == 4 and consistent(s))
     unchanged(before, state, B)
     assert by_key(state).keys() == keys(B), state
     assert state["neighbour_invalidations"] == before["neighbour_invalidations"] + 2, (before, state)

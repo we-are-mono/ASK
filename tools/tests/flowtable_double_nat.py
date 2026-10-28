@@ -8,7 +8,7 @@ import pytest_asyncio
 
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from _flowtable_connections import (healthy, peer)
+from _flowtable_connections import (consistent, healthy, peer)
 from _flowtable_dnat import (PUBLIC_PORT, hardware, warm, dnat as _dnat)
 from _flowtable_rig import (artifact_dir, DPORT, HEALTH_BASELINE, SPORT, command, console_command, read)
 from _flowtable_policy import (CONFIG, apply, candidate, stop)
@@ -179,7 +179,8 @@ async def test_flowtable_hairpin(hairpin, zero_checksum):
                 assert not status["errors"], status
                 r.record("received", status)
                 await p.rpc("close", [0, 1])
-                closed = await r.wait(lambda s: s["entries"] == 2 and all(f["proto"] == "17" for f in s["flows"]), timeout=8)
+                closed = await r.wait(lambda s: s["entries"] == 2 and consistent(s)
+                                      and all(f["proto"] == "17" for f in s["flows"]), timeout=8)
                 healthy(closed)
                 ct_closed = await conntracks()
                 assert any(state in ct_closed["tcp"] for state in ("TIME_WAIT", "LAST_ACK")), ct_closed

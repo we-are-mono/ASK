@@ -18,7 +18,7 @@ from _flowtable_connections import (peer)
 from _flowtable_rig import (artifact_dir, DPORT, SPORT, TABLE, WAN_IP, command, console_command, drive, read)
 from _flowtable_selective_neighbour import (hardware, warm)
 from _flowtable_service import FIRST, service_status, supervision_status, wait_service
-from _flowtable_service_vlan import (attempts, balanced, denied, received)
+from _flowtable_service_vlan import (attempts, balanced, coherent, denied, received)
 
 
 async def test_membership(bridge_service):
@@ -57,7 +57,7 @@ async def test_membership(bridge_service):
                 removed_at = time.monotonic()
                 await asyncio.sleep(0.2)  # in-flight traffic may finish
                 absent_received = received(r, 2)
-                retired = await r.wait(lambda s: not guest_rows(s), timeout=5)
+                retired = await r.wait(lambda s: not guest_rows(s) and coherent(s), timeout=5)
                 r.record(label + "-retired", retired)
                 balanced(retired, initial["errors"])
                 assert received(r, 2) == absent_received, "guest uplink survived membership removal"
@@ -153,7 +153,7 @@ async def test_stp(bridge_service):
             # It has to hold: with STP off the kernel would already have put
             # the port back to forwarding.
             assert await port_state(r) == "blocking"
-            retired = await r.wait(lambda s: not s["flows"], timeout=5)
+            retired = await r.wait(lambda s: not s["flows"] and coherent(s), timeout=5)
             r.record("service-bridge-stp-retired", retired)
             balanced(retired, initial["errors"])
             # One retirement per connection: both directions share a handle.
@@ -210,7 +210,7 @@ async def test_vlan_state(bridge_service):
             states = await vlan_states(r)
             assert states[GUEST_VID] == "blocking" and states[TRUST_VID] == "forwarding", states
             assert await port_state(r) == "forwarding"
-            retired = await r.wait(lambda s: not guest_rows(s), timeout=5)
+            retired = await r.wait(lambda s: not guest_rows(s) and coherent(s), timeout=5)
             r.record("service-bridge-vlan-state-retired", retired)
             balanced(retired, initial["errors"])
             # The whole port's connections: rules are not mapped onto VLANs.

@@ -16,7 +16,7 @@ import pytest
 
 from ask_orch.client import Agent
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from _flowtable_connections import (FLOWS, by_key, peer)
+from _flowtable_connections import (FLOWS, by_key, consistent, peer)
 from _flowtable_rig import (DPORT, SPORT, WAN_IP, command, read)
 from _flowtable_selective_neighbour import (hardware, keys, warm)
 from _flowtable_tcp import (connection, hardware_transfer, installed, software_tx, tcp_table)
@@ -52,7 +52,7 @@ async def test_recovery(connections):
                     await command(r.target, r.session, "ip", "link", "set", "dev", dev, "mtu", str(mtu))
                     mtus[dev] = mtu
                     expected = keys(ids, carried(flows, mtus))
-                    after = await r.wait(lambda s: by_key(s).keys() == expected
+                    after = await r.wait(lambda s: consistent(s) and by_key(s).keys() == expected
                                          and s["deletes"] >= before["deletes"] + before["entries"]
                                          and all(int(f["mtu"]) == mtus[f["out"]] for f in s["flows"]))
                     reports = await p.rpc("stop", ids)

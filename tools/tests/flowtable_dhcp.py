@@ -13,7 +13,7 @@ import pytest
 
 from ask_orch.commands import console_command, console_python
 from ask_orch.uart import Console
-from _flowtable_connections import healthy, peer
+from _flowtable_connections import consistent, healthy, peer
 from _flowtable_policy import CONFIG, apply, candidate, stop
 from _flowtable_rig import DPORT
 from _native_process import dut_process
@@ -168,7 +168,7 @@ os.kill(pid, signal.SIGUSR1)
                 for _ in range(12):
                     await p.batch([0], 32, 0.02)
                     state = await r.state()
-                    if len(state["flows"]) == 2:
+                    if len(state["flows"]) == 2 and consistent(state):
                         break
                 healthy(state)
                 assert len(state["flows"]) == 2, state

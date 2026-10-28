@@ -14,7 +14,7 @@ import pytest
 
 from ask_orch.commands import console_command, console_python
 from ask_orch.uart import Console
-from _flowtable_connections import healthy, peer
+from _flowtable_connections import consistent, healthy, peer
 from _flowtable_policy import CONFIG, apply, candidate, stop
 from _flowtable_rig import DPORT
 from _topology import TARGET_WAN_IF, TopologyStack
@@ -126,7 +126,7 @@ print(json.dumps(rows))
         for _ in range(12):
             await p.batch([0], 32, 0.02)
             before = await r.state()
-            if len(before["flows"]) == 2:
+            if len(before["flows"]) == 2 and consistent(before):
                 break
         healthy(before)
         assert len(before["flows"]) == 2, before

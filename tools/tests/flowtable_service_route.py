@@ -16,7 +16,7 @@ from _flowtable_connections import (by_key, peer)
 from _flowtable_rig import (artifact_dir, command, console_command, read)
 from _flowtable_selective_neighbour import (hardware, keys, unchanged, warm)
 from _flowtable_service import (FIRST, managed_service, service_status, supervision_status)
-from _flowtable_service_vlan import (attempts, balanced, denied, received)
+from _flowtable_service_vlan import (attempts, balanced, coherent, denied, received)
 
 NETNS, LAN_IF = "ask-ft-service-route", "askftroute"
 ADDRESS, NETWORK = "172.29.87.2", "172.29.87.0/24"
@@ -176,7 +176,8 @@ async def test_recovery(route_service, fault):
                     # later restores ARP replies only, never inserts a MAC.
                     await console_command(r.service_console, "ip", "neigh", "change", NEXT_HOP,
                                           "dev", TARGET_LAN_IF, "nud", "probe")
-                retired = await r.wait(lambda s: by_key(s).keys() == keys([0, 1], flows), timeout=5)
+                retired = await r.wait(lambda s: by_key(s).keys() == keys([0, 1], flows) and coherent(s),
+                                       timeout=5)
                 retirement_seconds = time.monotonic() - started
                 assert retirement_seconds < 5, retirement_seconds
                 selective(initial, retired, flows)

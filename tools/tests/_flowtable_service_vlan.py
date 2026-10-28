@@ -128,6 +128,17 @@ def tagged(state):
             if f["src"].startswith(ADDRESS + ":") or f["dst"].startswith(ADDRESS + ":")]
 
 
+def coherent(state):
+    """Whether a snapshot's counters agree with its rows. The adapter's files
+    are read one after another -- status, then stats, then the rows -- so a
+    snapshot taken while a retirement settles can count entries status still
+    held and deletes stats has since made, beside rows already gone. A wait
+    that ends on the rows alone can end on such a snapshot; one that ends on
+    this as well reads what balanced() asserts."""
+    return (state["installs"] - state["deletes"] == state["entries"] == state["handle_refs"]
+            == state["neighbour_refs"] == len(state["flows"]))
+
+
 def balanced(state, errors):
     assert state["errors"] == errors and state["fatal"] == state["quarantine"] == 0, state
     assert state["installs"] - state["deletes"] == state["entries"], state

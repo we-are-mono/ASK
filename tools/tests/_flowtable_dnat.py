@@ -5,7 +5,7 @@ import json
 import re
 
 import pytest
-from _flowtable_connections import by_key, healthy, peer
+from _flowtable_connections import by_key, consistent, healthy, peer
 from _flowtable_policy import CONFIG, apply, candidate, stop
 from _flowtable_rig import (
     DPORT,
@@ -67,7 +67,7 @@ async def warm(r, clients, expected):
     for _ in range(10):
         await clients.batch([0, 1])
         state = await r.state()
-        if state["entries"] == len(expected):
+        if state["entries"] == len(expected) and consistent(state):
             translation_rows(r, state, expected)
             return state
     pytest.fail(f"NAT admission did not converge: {state}")
@@ -209,7 +209,8 @@ async def dnat(rig, zero_checksum, double_nat=False):
                     r.record("dnat-received", status)
                 finally:
                     await clients.close()
-                closed = await r.wait(lambda s: s["entries"] == 2 and all(f["proto"] == "17" for f in s["flows"]), timeout=8)
+                closed = await r.wait(lambda s: s["entries"] == 2 and consistent(s)
+                                      and all(f["proto"] == "17" for f in s["flows"]), timeout=8)
                 healthy(closed)
                 ct_closed = await conntracks()
                 # The final ACK may precede asynchronous hardware deletion,

@@ -130,7 +130,8 @@ async def test_sa_recovery(ipsec_service, direction, allocation_failure):
             started = time.monotonic()
             old_spi = await r.ipsec.remove(direction)
             try:
-                retired = await r.wait(lambda s: by_key(s).keys() == keys([0, 1], flows), timeout=5)
+                retired = await r.wait(lambda s: consistent(s) and by_key(s).keys() == keys([0, 1], flows),
+                                       timeout=5)
                 retire_seconds = time.monotonic() - started
                 assert retire_seconds < 5
                 unchanged(initial, retired, [0, 1], flows)

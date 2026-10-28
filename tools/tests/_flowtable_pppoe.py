@@ -14,6 +14,7 @@ import time
 import _flowtable_rig as ft
 import pytest
 import pytest_asyncio
+from _flowtable_connections import counted
 from _flowtable_rig import (
     DPORT,
     SPORT,
@@ -991,7 +992,7 @@ async def _tcp_carried(r, label):
         # back only on a later packet; the warm phase runs long enough for that
         # (_gated_tcp.WARM_SECONDS). Wait both in before reading the baseline
         # the record and the direction check share.
-        before = await r.wait(lambda s: len(s["flows"]) == 2)
+        before = await r.wait(lambda s: len(s["flows"]) == 2 and counted(s))
         flows = await _both_directions(r, before)
         record = _session_halves(before, r.session_identity)
         link = await _ppp_link(r)
