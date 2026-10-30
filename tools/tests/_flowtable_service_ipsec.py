@@ -457,8 +457,38 @@ class Wire(Capture):
         return {"esp": len(esp), "plaintext": 0}
 
 
+async def teardowns(r):
+    """The kernel's own flow retirements, which no adapter counter sees: the
+    flowtable GC's reasons (decimal) and conntrack's (hexadecimal), summed
+    over the per-CPU rows. A cookie that changed while these held still
+    points at the forward hook's stale-route teardown, which nothing counts
+    (A427)."""
+    counts = {}
+    for name, base in (("nf_flowtable", 10), ("nf_conntrack", 16)):
+        lines = (await read(r.target, r.session, f"/proc/net/stat/{name}")).splitlines()
+        fields = lines[0].split()
+        counts[name] = dict.fromkeys(fields, 0)
+        for line in lines[1:]:
+            for field, value in zip(fields, line.split()):
+                counts[name][field] += int(value, base)
+    return counts
+
+
+async def paths(r):
+    """What the forward hook's cached routes depend on: the route to the SA's
+    peer, the path-MTU exceptions and the neighbours."""
+    found = {}
+    for name, argv in (("route", ("ip", "route", "get", WAN_IP)),
+                       ("cache", ("ip", "route", "show", "cache")),
+                       ("cache6", ("ip", "-6", "route", "show", "cache")),
+                       ("neigh", ("ip", "neigh", "show"))):
+        found[name] = (await command(r.target, r.session, *argv, check=False))["stdout"]
+    return found
+
+
 async def hardware(r, p, label, flows):
     before = await r.state()
+    kernel = await teardowns(r)
     forwarded = await r.software_forwarded()
     enc = await sec_counter(r.session, r.target, TARGET_WAN_IF, "tx toenc")
     dec = await sec_counter(r.session, r.target, TARGET_WAN_IF, "tx todec")
@@ -466,8 +496,16 @@ async def hardware(r, p, label, flows):
     async with Wire(r, label) as wire:
         reports = await p.batch(list(range(len(flows))), count=256, interval=0.03125)
     after = await r.state()
-    unchanged(before, after, list(range(len(flows))), flows)
-    assert (before["installs"], before["deletes"]) == (after["installs"], after["deletes"]), (before, after)
+    moved = {name: {field: value - kernel[name][field] for field, value in counts.items()
+                    if value != kernel[name][field]}
+             for name, counts in (await teardowns(r)).items()}
+    try:
+        unchanged(before, after, list(range(len(flows))), flows)
+        assert (before["installs"], before["deletes"]) == (after["installs"], after["deletes"]), (before, after)
+    except AssertionError as error:
+        # Which retirement replaced the flow: the adapter's own counters are
+        # in before and after, the kernel's here.
+        raise AssertionError({"teardowns": moved, "paths": await paths(r)}) from error
     old, new = by_key(before), by_key(after)
     for ident in range(len(flows)):
         for key in keys([ident], flows):
@@ -486,7 +524,7 @@ async def hardware(r, p, label, flows):
     slow_path = await r.software_forwarded() - forwarded
     assert 0 <= slow_path <= 64, slow_path
     r.record(label, {"before": before, "after": after, "reports": reports, "software_tx": delta,
-                     "toenc": enc, "todec": dec, "software_forwarded": slow_path,
+                     "toenc": enc, "todec": dec, "software_forwarded": slow_path, "teardowns": moved,
                      "wire": wire.check(encrypted=True, spi=r.ipsec.active["out"])})
     return after
 
