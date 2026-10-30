@@ -537,8 +537,8 @@ sample in which the host's `rx_dropped` or `rx_fifo_errors` moved is measured
 again, up to three samples, and fails as the host's, not the DUT's, if every
 one overflowed; a sample in which anything else fell short is not retried.
 Keep the host's default 1024-entry receive rings: 8192 still overflowed and
-cost its TCP receive enough to fail `profile_isp`'s 8.8 Gbit/s upload
-floor. Lossless,
+cost its TCP receive enough to fail `profile_isp`'s upload floor (then
+8.8 Gbit/s). Lossless,
 one paced generator thread offers at least 1.8 Mpps; the MAC drops nothing,
 less than 1e-4 of the frames goes missing, and the DUT's kernel transmits
 next to nothing. Even one descheduled pktgen thread catches up at full speed,

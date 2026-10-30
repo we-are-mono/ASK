@@ -1708,17 +1708,15 @@ async def test_throughput(isp, splat_window, family, upload):
     """
     ctx = isp
     client = BY_NAME["main"]
-    # This path's own ceiling, not the plain-NAT one. Every frame here
-    # spends both encapsulation slots -- a session inside a carrier tag --
-    # and the roadmap's paired measurement of exactly this shape records
-    # 8.948 and 8.936 Gb/s under the flowtable against 8.984 and 8.931
-    # under CMM. A 9 Gb/s floor borrowed from the untagged benchmark
-    # therefore fails a path that is at its ceiling, which is the opposite
-    # of what a throughput gate is for. IPv6's floor is IPv4's less its
-    # twenty extra header bytes a segment; the samples behind both were
-    # 8.97-9.12 Gb/s uploading and 9.16-9.33 downloading.
-    floor = float(os.environ.get(*(("ASK_PROFILE_ISP_MIN_GBPS6", "8.6") if family == 6
-                                   else ("ASK_PROFILE_ISP_MIN_GBPS", "8.8")))) * 1e9
+    # A floor that tells hardware from the CPU, not one at this path's
+    # ceiling. Every frame here spends both encapsulation slots -- a session
+    # inside a carrier tag -- and the samples sit at 8.9-9.3 Gb/s only while
+    # the WAN host's PPPoE receive keeps up: on one host core at 100% softirq
+    # the upload measures 8.4-8.8 Gb/s, master included, with the DUT
+    # unchanged. The CPU forwards nowhere near 8 Gb/s, so 8 still fails a path
+    # that lost its offload and stops failing on the host's ceiling.
+    floor = float(os.environ.get(*(("ASK_PROFILE_ISP_MIN_GBPS6", "8") if family == 6
+                                   else ("ASK_PROFILE_ISP_MIN_GBPS", "8")))) * 1e9
 
     async def run(script, *, label, timeout):
         return await _client_python(ctx, client, script, label=label, timeout=timeout)
