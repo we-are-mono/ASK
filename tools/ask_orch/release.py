@@ -45,6 +45,9 @@ MATRIX = {
     "cdx-unload": Run("dut", ("tests/flowtable_offload.py::test_cdx_unload",),
                       {"ASK_FLOWTABLE_UNLOAD": "1"}, ENDS),
     "unregister": Run("dut", ("tests/flowtable_unregister.py",), {"ASK_FLOWTABLE_UNREGISTER": "1"}, ENDS),
+    "transit-off": Run("dut", ("tests/flowtable_transit.py::test_transit_switched_off",),
+                       {"ASK_FLOWTABLE_TRANSIT": "off"},
+                       "the staged test image with cdx.transit=0 on the kernel command line"),
     "startup": Run("startup", boot="the staged test image with rdinit=/bin/sh, which it ends"),
 }
 

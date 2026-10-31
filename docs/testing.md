@@ -717,6 +717,7 @@ against one checkout and one DUT image:
 | `invalidation-barrier` | `test_invalidation`, `ASK_FLOWTABLE_INVALIDATION=barrier` | staged test image |
 | `cdx-unload` | `test_cdx_unload`, `ASK_FLOWTABLE_UNLOAD=1` | ends its boot |
 | `unregister` | `flowtable_unregister.py`, `ASK_FLOWTABLE_UNREGISTER=1` | ends its boot |
+| `transit-off` | `test_transit_switched_off`, `ASK_FLOWTABLE_TRANSIT=off` | `cdx.transit=0` on the kernel command line |
 | `startup` | `startup_tests` | `rdinit=/bin/sh`; ends its boot |
 
 ```sh
@@ -767,8 +768,10 @@ passed on the same image as `suite`. Any edit to the checkout starts the matrix
 again.
 
 Run the entries that end their boot last on each boot, then boot the staged
-image again. The startup run needs the `rdinit=/bin/sh` boot that the CDX
-startup rollback section above describes.
+image again. The transit-off run needs a boot with `cdx.transit=0` added to
+the kernel command line, since the test image turns transit on, and the
+startup run needs the `rdinit=/bin/sh` boot that the CDX startup rollback
+section above describes.
 
 ## How the harness reaches each node
 

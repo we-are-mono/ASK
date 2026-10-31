@@ -212,15 +212,17 @@ async def test_transit_in_hardware(transit):
     await _handed_back(transit, "ipv4")
 
 
+@pytest.mark.explicit("ASK_FLOWTABLE_TRANSIT", "off",
+                      reason="cdx.transit=0 on the kernel command line")
 async def test_transit_switched_off(rig):  # noqa: F811
     """With cdx booted with transit=0 (cdx.transit=0 on the kernel's command
     line), a tunnel the ruleset offers stays in software, and the classifier's
-    misses run as 1.0.7's did. Skipped on a boot with transit, which every
-    other case here covers."""
+    misses run as 1.0.7's did. The test image boots with transit, which every
+    other case here covers, so this one has a boot and a run of its own (the
+    release matrix's transit-off entry)."""
     r = rig
     state = await r.state()
-    if state["transit"]:
-        pytest.skip("cdx was booted with transit")
+    assert not state["transit"], "boot with cdx.transit=0 on the kernel command line"
     # Untranslated, so it is the adapter that turns it away, not the kernel.
     nat = ["POSTROUTING", "-s", r.lan_ip, "-d", WAN_IP, "-p", "47", "-j", "ACCEPT"]
     await command(r.target, r.session, "iptables", "-t", "nat", "-I", *nat)
