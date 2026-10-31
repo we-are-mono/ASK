@@ -1,19 +1,20 @@
 /* The forward-path walk and the route builder around it are production code
  * (nft_flow_offload.c, from nft_xmit_type to nft_flow_offload_skip), and so
  * are the walker and the hooks it calls: dev_fill_forward_path() and the VLAN,
- * bridge, sit and ip6_tnl hooks. The FIB, the neighbour table and the bridge's
- * FDB, port and VLAN state are the simulated boundaries, and a PPPoE hop is
- * simulated whole. A LAN client sits behind VLAN 284 on eth3 or behind br-lan
- * on eth3; the WAN is eth4, which an IPv6-in-IPv4 and an IPv4-in-IPv6 tunnel
- * also leave by. The flowtable hooks the two ports.
+ * bridge, sit, ip6_tnl, ppp and PPPoE hooks. The FIB, the neighbour table, the
+ * bridge's FDB, port and VLAN state, and the ppp unit, its channel and the
+ * PPPoE socket are the simulated boundaries. A LAN client sits behind VLAN
+ * 284 on eth3 or behind br-lan on eth3; the WAN is eth4, which a PPPoE
+ * session, an IPv6-in-IPv4 and an IPv4-in-IPv6 tunnel also leave by. The
+ * flowtable hooks the two ports.
  *
  * A flow's first packet can meet a hop that has not resolved yet: the
  * client's neighbour on a VLAN just created again, a tunnel's outer next hop
  * or route after the WAN link flapped, the client's FDB entry after it aged
- * out. Or it can reach a port the flowtable does not list, as one that lost
- * carrier before the table follows it back. Each group of cases can run
- * alone (argv[1]: neighbour, tunnel, bridge, controls, unlisted); no argument
- * runs them all. */
+ * out, a ppp unit whose session is down. Or it can reach a port the flowtable
+ * does not list, as one that lost carrier before the table follows it back.
+ * Each group of cases can run alone (argv[1]: neighbour, tunnel, bridge,
+ * session, controls, unlisted); no argument runs them all. */
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
@@ -490,12 +491,64 @@ static inline bool br_port_forwarding_vid(const struct net_bridge_port *p, u16 v
 	return p->forwarding;
 }
 
+/* The ppp unit, its channel and the PPPoE socket behind it: only what the two
+ * hooks read, named as the kernel names it. A unit lists the channels
+ * attached to it; the channel's chan is cleared before it leaves the list. */
+#define SC_MULTILINK 0x00000400
+enum { PPPOX_NONE = 0, PPPOX_CONNECTED = 1, PPPOX_BOUND = 2, PPPOX_DEAD = 16 };
+enum sock_flags { SOCK_DEAD };
+struct sock {
+	int sk_state;
+	unsigned long sk_flags;
+};
+static inline bool sock_flag(const struct sock *sk, enum sock_flags flag)
+{
+	return sk->sk_flags & (1UL << flag);
+}
+struct ppp_channel;
+struct ppp_channel_ops {
+	int (*fill_forward_path)(struct net_device_path_ctx *ctx,
+				 struct net_device_path *path,
+				 const struct ppp_channel *chan);
+};
+struct ppp_channel {
+	void *private;
+	const struct ppp_channel_ops *ops;
+};
+struct channel {
+	struct ppp_channel *chan;
+	struct list_head clist;
+};
+struct ppp {
+	unsigned int flags;
+	struct list_head channels;
+};
+struct pppox_sock {
+	struct sock sk;
+	struct net_device *pppoe_dev;
+	__be16 num;
+	struct { u8 remote[ETH_ALEN]; } pppoe_pa;
+};
+static inline struct pppox_sock *pppox_sk(struct sock *sk)
+{
+	return container_of(sk, struct pppox_sock, sk);
+}
+#define be16_to_cpu(x) ntohs(x)
+#define list_first_or_null_rcu(head, type, member)			\
+	((head)->next != (head) ? container_of((head)->next, type, member) : NULL)
+
 #include "forward_path_devices.inc"
 
-/* A PPPoE session over the WAN port, simulated whole. */
+/* A PPPoE session over the WAN port: session 7 to the concentrator at
+ * session_mac. A channel of another kind -- PPTP, L2TP, a tty -- has no
+ * hook. */
 static u8 session_mac[ETH_ALEN] = { 0x02, 0, 0, 0, 7, 7 };
-static int ppp_fill_forward_path(struct net_device_path_ctx *ctx,
-				 struct net_device_path *path);
+static const struct ppp_channel_ops pppoe_chan_ops = { pppoe_fill_forward_path },
+	hookless_chan_ops = {};
+static struct pppox_sock pppoe_sock;
+static struct ppp_channel pppoe_chan;
+static struct channel ppp_channel;
+static struct ppp ppp_priv;
 
 static const struct net_device_ops port_ops = {},
 	vlan_ops = { vlan_dev_fill_forward_path },
@@ -520,7 +573,7 @@ static struct net_device bridge = {
 	ETHER(40, 3, 0x40, &bridge_ops), .priv = &bridge_priv,
 };
 static struct net_device ppp = {
-	.ifindex = 50, .type = ARPHRD_PPP, .netdev_ops = &ppp_ops,
+	.ifindex = 50, .type = ARPHRD_PPP, .netdev_ops = &ppp_ops, .priv = &ppp_priv,
 };
 static struct ip_tunnel sit_priv;
 static struct net_device sit = {
@@ -549,17 +602,20 @@ static void init_devices(void)
 	ip6tnl_priv.fl.u.ip6 = (struct flowi6){ .daddr = remote, .saddr = local };
 }
 
-static int ppp_fill_forward_path(struct net_device_path_ctx *ctx,
-				 struct net_device_path *path)
+/* The session up: the unit has one channel, a connected PPPoE socket over
+ * eth4. */
+static void session_up(void)
 {
-	path->type = DEV_PATH_PPPOE;
-	path->encap.id = 7;
-	path->encap.proto = htons(ETH_P_PPP_SES);
-	memcpy(path->encap.h_dest, session_mac, ETH_ALEN);
-	path->dev = ctx->dev;
-	memcpy(ctx->daddr, session_mac, ETH_ALEN);
-	ctx->dev = &eth4;
-	return 0;
+	pppoe_sock = (struct pppox_sock){
+		.sk.sk_state = PPPOX_CONNECTED | PPPOX_BOUND,
+		.pppoe_dev = &eth4, .num = htons(7),
+	};
+	memcpy(pppoe_sock.pppoe_pa.remote, session_mac, ETH_ALEN);
+	pppoe_chan = (struct ppp_channel){ &pppoe_sock.sk, &pppoe_chan_ops };
+	ppp_channel.chan = &pppoe_chan;
+	ppp_priv.flags = 0;
+	ppp_priv.channels.next = ppp_priv.channels.prev = &ppp_channel.clist;
+	ppp_channel.clist.next = ppp_channel.clist.prev = &ppp_priv.channels;
 }
 
 /* Every walk the route builder starts, counted on the device it starts from;
@@ -620,6 +676,7 @@ static void prepare(struct setup *s, bool use_neigh, struct net_device *lan,
 	s->pkt = (struct nft_pktinfo){ &s->skb, lan_bound ? wan : lan, family };
 	for (size_t i = 0; i < ARRAY_SIZE(devices); i++)
 		devices[i]->walks = 0;
+	session_up();
 }
 
 /* The direction a packet to the LAN takes, given the routed packet's. */
@@ -877,6 +934,98 @@ static void bridge_cases(enum ip_conntrack_dir dir, bool lan_bound, int nf)
 	}
 }
 
+/* Each way a ppp unit can be without a session up. pppd dialling on demand
+ * keeps the unit, its addresses and routes while the session is down, the
+ * channel gone from it; a channel leaving clears its chan first; and a
+ * socket can be not connected yet, ended, dead or without its device for a
+ * moment under a channel still attached. */
+enum session_down {
+	NO_CHANNEL, NO_CHAN, NOT_CONNECTED, ENDED, DEAD_SOCKET, NO_DEVICE,
+	SESSION_DOWN_STATES
+};
+
+static void session_down(enum session_down how)
+{
+	switch (how) {
+	case NO_CHANNEL:
+		ppp_priv.channels.next = ppp_priv.channels.prev = &ppp_priv.channels;
+		break;
+	case NO_CHAN:
+		ppp_channel.chan = NULL;
+		break;
+	case NOT_CONNECTED:
+		pppoe_sock.sk.sk_state = PPPOX_NONE;
+		break;
+	case ENDED:
+		pppoe_sock.sk.sk_state = PPPOX_DEAD;
+		break;
+	case DEAD_SOCKET:
+		pppoe_sock.sk.sk_flags |= 1UL << SOCK_DEAD;
+		break;
+	case NO_DEVICE:
+		pppoe_sock.pppoe_dev = NULL;
+		break;
+	default:
+		assert(!"state");
+	}
+}
+
+/* A ppp unit with no session up is a path not known yet, for every table:
+ * nothing is cached, so the packet goes on to the unit -- which queues or
+ * drops it, and loops it to a demand-dialling pppd -- and a later packet walks
+ * the session once one is up. A flow cached now would keep the ppp device as
+ * the reply's ingress, which admission refuses for as long as the connection
+ * lasts. With the session up the walk crosses it to the WAN port and records
+ * it whole. A multilink bundle, and a channel with no hook of its own, keep
+ * the fallback on the ppp device as before. */
+static void session_cases(enum ip_conntrack_dir dir, bool lan_bound, int nf)
+{
+	enum ip_conntrack_dir to_lan = lan_dir(dir, lan_bound);
+	struct setup s;
+
+	for (int use_neigh = 0; use_neigh < 2; use_neigh++) {
+		for (int how = 0; how < SESSION_DOWN_STATES; how++) {
+			prepare(&s, use_neigh, &vlan, NUD_REACHABLE, &ppp, lan_bound, nf);
+			session_down(how);
+			assert(route(&s, dir) == -EAGAIN);
+			released(&s, 0);
+			/* A WAN-bound packet's own direction is walked first,
+			 * and the deferral ends the walk there. */
+			assert(ppp.walks == 1 && vlan.walks == lan_bound);
+		}
+
+		prepare(&s, use_neigh, &vlan, NUD_REACHABLE, &ppp, lan_bound, nf);
+		assert(route(&s, dir) == 0);
+		released(&s, 1);
+		assert(ppp.walks == 1 && vlan.walks == 1);
+		assert(s.route.tuple[to_lan].in.ifindex == (u32)eth4.ifindex);
+		assert(s.route.tuple[to_lan].in.num_encaps == 1);
+		assert(s.route.tuple[to_lan].in.encap[0].id == 7);
+		assert(s.route.tuple[to_lan].in.encap[0].proto == htons(ETH_P_PPP_SES));
+		assert(s.route.tuple[!to_lan].session.lower_ifindex == eth4.ifindex);
+		assert(s.route.tuple[!to_lan].session.id == 7);
+		assert(!memcmp(s.route.tuple[!to_lan].session.h_dest, session_mac, ETH_ALEN));
+		none_unlisted(&s);
+		drop(&s);
+
+		for (int how = 0; how < 2; how++) {
+			prepare(&s, use_neigh, &vlan, NUD_REACHABLE, &ppp, lan_bound, nf);
+			if (how)
+				ppp_priv.flags |= SC_MULTILINK;
+			else
+				pppoe_chan.ops = &hookless_chan_ops;
+			assert(route(&s, dir) == 0);
+			released(&s, 1);
+			assert(ppp.walks == 1);
+			assert(s.route.tuple[to_lan].in.ifindex == (u32)ppp.ifindex);
+			assert(!s.route.tuple[to_lan].in.num_encaps);
+			assert(!s.route.tuple[!to_lan].session.lower_ifindex);
+			none_unlisted(&s);
+			drop(&s);
+		}
+	}
+}
+
 static void control_cases(enum ip_conntrack_dir dir, bool lan_bound, int nf)
 {
 	enum ip_conntrack_dir to_lan = lan_dir(dir, lan_bound);
@@ -1022,6 +1171,7 @@ int main(int argc, char **argv)
 		{ "neighbour", neighbour_cases },
 		{ "tunnel", tunnel_cases },
 		{ "bridge", bridge_cases },
+		{ "session", session_cases },
 		{ "controls", control_cases },
 		{ "unlisted", unlisted_cases },
 	};

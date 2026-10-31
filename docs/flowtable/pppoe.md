@@ -36,7 +36,12 @@ Taking a second `dev_fill_forward_path()` in the adapter was rejected. Two
 walks can disagree, and the one that would then describe the hardware is not
 the one the rule was built from. One walk, one truth — which also means the
 only cross-check available is the one thing the rule does carry, the
-`FLOW_ACTION_PPPOE_PUSH` sid, and that is checked against the record.
+`FLOW_ACTION_PPPOE_PUSH` sid, and that is checked against the record. The
+adapter does ask the ppp unit's own hop once more at admission, but only
+whether the record is still the session the unit runs
+([Retirement](#retirement)): nothing is described from that answer, and a
+record it does not confirm retires the flow, which the next packet walks
+again.
 
 The record is only taken from a walk that ends on a port the flowtable lists.
 One that ends on the WAN port between a carrier flap and the daemon adding it
@@ -307,6 +312,43 @@ entry holds and watches as devices its path crosses. The bindings stay up,
 admission is never disabled, nothing re-arms, and the next packet re-offers
 the flow against whatever session exists then.
 
+A session can also end under a unit that stays. pppd dialling on demand
+(`demand`) keeps the ppp device, its addresses and its routes across a
+redial: only the PPPoE channel leaves the unit, and the device raises no link
+event, so neither the route watch nor the device watch notices. Left alone,
+the hardware would go on inserting the ended session, which the concentrator
+drops, and since the hardware carries that traffic, none of it would reach
+the unit, whose pppd then never sees a packet to dial for. Patch 070 has the
+unit announce a channel joining or leaving as `NETDEV_CHANGEINFODATA` — a
+connect at once, a disconnect from a work item queued after the grace period
+that lets every walk which saw the channel add its flow — and the adapter
+retires every flow through the ppp device on it (`ft_netdev_event()`), as it
+does for a tunnel whose parameters changed. While the unit has no session the
+walk caches nothing: `ppp_fill_forward_path()` and
+`pppoe_fill_forward_path()` report a missing channel and an unconnected
+session as `-EAGAIN`, so a retired flow's next packet goes on to the unit,
+which loops it to pppd and dials, and the first packet once the session is
+back walks it whole. A flow cached on the ppp device meanwhile would keep it
+as the reply's ingress, which admission refuses for as long as the connection
+lasts.
+
+The event retires only what is published by then, and an offer made from a
+walk before the session ended can reach admission later: queued behind
+others, or declined while RTNL was taken and made again. Admission asks the
+unit's own hop for the session it runs now (`ft_session_current()`) and
+retires an offer whose recorded id, concentrator or lower device it does not
+run; a redial that got the same session from the same concentrator is
+admitted, since that is what the unit sends. Admission and the event both
+hold RTNL, and the event comes only after the channel has left, so an offer
+is either published before the event and retired by it, or sees the unit as
+the event reports it. A channel joining is announced the same way, which
+costs a flow through the device a walk and an offer at most.
+
+On OpenWrt, netifd's `ppp-down` hook marks the interface down when the
+session ends and removes the routes netifd owns, so there a demand unit keeps
+its device but not those routes until the next session; neither the
+retirement nor the deferral depends on them.
+
 What the adapter depends on otherwise is the ppp device itself: its MTU — which
 arrives at 1492 without anyone setting it, the eight bytes of overhead already
 in it — its link state and its removal, all through `ft_entry_uses()` on
@@ -332,7 +374,21 @@ renegotiated under the same device, the record kept with its slot when the
 last direction retires and freed only when the device goes, the receive
 framing growing by the tag a session runs over, a device the pool has nothing
 for admitted without a slot and keeping that answer, and the index of zero the
-encoder is then given.
+encoder is then given. `test_pppoe_session_ended` covers a session ending under
+its unit: the announcement retiring the flows through either direction's ppp
+device and nothing through any other device, an offer from before it retired
+at admission for a unit with no session or another id, concentrator or lower
+device, a redial to the same session admitted, and the hop asked under a
+tunnel as well. `tools/host_tests/flowtable_forward_path.c` compiles the
+kernel's ppp and PPPoE hooks into the walk: every way a unit can be without a
+session caches nothing, for either kind of table, and a bundle or a channel
+without a hook falls back as before. `tools/host_tests/flowtable_ppp_link.c`
+compiles the connect, the disconnect, the work item and rtnetlink's answer to
+the event: a connect told at once under RTNL after `all_ppp_mutex`, a
+disconnect queued after the grace period and never taking RTNL itself,
+disconnects pending together told once, nothing for a closing or unregistered
+unit, the device reference balanced on every path, and a NEWLINK that names no
+bonding event.
 `tools/host_tests/ifstats.c` covers the allocator underneath that — the two
 pools' geometry, the index each record yields against the address it names,
 exhaustion, reuse and the lifetime of a record across deinit — because an index
@@ -373,18 +429,14 @@ counters at zero afterwards.
 
 ## What this does not carry
 
-**A session renegotiated under a surviving `pppN` device.** The dependency is
-the ppp device, and every change to the device the session runs over destroys
-the session outright — `pppoe_device_event()` flushes on `CHANGEADDR`,
-`CHANGEMTU`, `GOING_DOWN` and `DOWN` — which pppd then turns into the device
-going away. What is not covered is a reconnection that keeps the unit, as
-`persist` with a reconnect script can: the id and the concentrator would change
-under a device that never disappeared, and nothing would notice. The failure
-mode is loss rather than misdelivery — the concentrator drops frames for a
-session it no longer knows, and the DUT's own source address does not match any
-other subscriber's — and no exported interface reports a session change, so
-closing it would need a notifier that does not exist. Stated rather than
-silently assumed away.
+**A multilink bundle, or a ppp channel other than PPPoE.**
+`ppp_fill_forward_path()` declines a bundle, and a PPTP, L2TP or tty channel
+has no hook of its own: the walk falls back to the ppp device as the reply's
+ingress, which admission refuses, and such a flow stays in software. A session
+ending under a unit that stays is carried ([Retirement](#retirement)); that is
+`demand`, and multilink, which never offloads. `persist` alone does not keep
+the unit: unless it dials on demand or bundles links, pppd closes the unit
+when the link goes down, and its unregistration retires the flows.
 
 **Counters for a fifth session.** The firmware pool is four records deep and
 shared with the legacy owner, so a fifth session forwards without any. That is

@@ -47,6 +47,8 @@ from _flowtable_pppoe import (INNER_LOCAL, INNER_LOCAL6, INNER_REMOTE, INNER_REM
 import asyncio
 import json
 import math
+import os
+import signal
 import socket
 import struct
 import subprocess
@@ -54,11 +56,11 @@ import time
 
 import pytest
 
-from _flowtable_pppoe import CLONED_WAN_MAC, DPORT6, _concentrator_if
+from _flowtable_pppoe import CLONED_WAN_MAC, DPORT6, _concentrator_if, _session_pids, DUT_LOG
 from _gated_tcp import GatedTcp
 from _topology import LAN_IPV6, TARGET_LAN_IF, TARGET_WAN_IF, lan_run
 import _flowtable_rig as ft
-from _flowtable_rig import Echo, SPORT, command, console_command, read
+from _flowtable_rig import DPORT, Echo, SPORT, command, console_command, read
 from _flowtable_connections import counted
 
 
@@ -1319,6 +1321,111 @@ async def test_session_retires_and_redials(pppoe_rig):
     assert all(final[c] - counts[c] == 32 for c in counts), (counts, final)
     r.record("pppoe-redial", {"first": _session_text(first),
                               "second": _session_text(second),
+                              "before": before, "retired": retired, "after": after})
+
+
+@pytest.mark.parametrize("pppoe_rig", ["demand"], indirect=True)
+async def test_demand_session_redials(pppoe_rig):
+    """A session dialled on demand ends, and the next traffic dials another and
+    is carried across it in hardware, on the same ppp device.
+
+    pppd's `demand` keeps the unit, its addresses and its routes when a session
+    ends, and waits for traffic to dial the next: nothing about the device
+    changes that the route or device watch would notice. A flow left in the
+    hardware would go on inserting the session the concentrator has
+    forgotten, and since the hardware carries its traffic, none of it would
+    reach the unit to dial again. So the session's channel leaving the unit
+    has to retire the flow, and while the unit has none, the walk has to cache
+    nothing: a flow cached on the ppp device then would stay in software once
+    the session is back (A428). The concentrator ends the session, as an ISP's
+    does on a forced reconnect, with the connection's traffic still running.
+    """
+    r = pppoe_rig
+    flows, delta = await _established(r)
+    _assert_session(r, _direction(flows, r.lan_ip, INNER_LOCAL),
+                    _direction(flows, INNER_LOCAL, r.lan_ip))
+    assert all(d == 64 for d in delta.values()), delta
+    before = await r.state()
+    first = r.session_identity
+    unit = (await read(r.target, r.session, f"/sys/class/net/{r.ppp_if}/ifindex")).strip()
+    lossy = 1 << 40
+    sender = f'''
+import socket, struct, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(({r.lan_ip!r}, {SPORT}))
+n, end = {lossy}, time.monotonic() + 20
+while time.monotonic() < end:
+    s.sendto(struct.pack('!Q', n) + b'ASK-demand'.ljust(248, b'.'), ({INNER_LOCAL!r}, {DPORT}))
+    n += 1
+    time.sleep(0.02)
+print(n - {lossy})
+'''
+    pids = _session_pids()
+    assert len(pids) == 1, pids
+    # The connection keeps sending on its own socket meanwhile, which nothing
+    # echoes until a session exists again: on a forced reconnect, that is the
+    # traffic that has to dial.
+    sending = asyncio.create_task(r.run_peer(sender, label="pppoe_demand_sender", timeout=40))
+    samples = []
+    try:
+        os.kill(pids[0], signal.SIGTERM)
+        deadline = time.monotonic() + 40
+        while True:
+            text = await read(r.target, r.session, "/proc/net/pppoe")
+            rows = [line.split() for line in text.splitlines()[1:] if line.strip()]
+            state = await r.state()
+            samples.append({"pppoe": text, "state": state})
+            if rows and (int(rows[0][0], 16), rows[0][1].lower()) != first:
+                break
+            if time.monotonic() >= deadline:
+                log = await console_command(r.console, "sh", "-c", f"tail -40 {DUT_LOG}",
+                                            check=False)
+                r.record("pppoe-demand-no-redial", {"samples": samples, "pppd": log["stdout"]})
+                pytest.fail(f"the traffic never dialled a session again: {state['flows']}\n"
+                            f"pppd: {log['stdout']}")
+            await asyncio.sleep(0.5)
+    finally:
+        sent = await sending
+    r.record("pppoe-demand-redial", {"samples": samples, "sent": sent.stdout})
+    # The same unit throughout: dial-on-demand is the case a device watch
+    # never sees.
+    assert (await read(r.target, r.session,
+                       f"/sys/class/net/{r.ppp_if}/ifindex")).strip() == unit
+    # Selective, as a hangup's retirement is: the table untouched. And by the
+    # unit's channel leaving, which no route or device watch would have seen.
+    retired = samples[-1]["state"]
+    assert retired["link_invalidations"] > before["link_invalidations"], (before, retired)
+    assert retired["bindings"] == 2 and retired["rearms"] == before["rearms"], retired
+    assert retired["invalidated"] == retired["invalidation_done"] == 0, retired
+    assert retired["errors"] == before["errors"], retired
+    # The concentrator's end is a new ppp device, and its way back to the LAN
+    # with it.
+    server_ppp_if = await _concentrator_if(r)
+    for prefix in (r.reachable, f"{SNAT_ADDR}/32"):
+        await command(r.wan, r.session, "ip", "route", "replace", prefix, "dev", server_ppp_if)
+    second = await _session_identity(r)
+    r.session_identity = second
+    await _wait_reachable(r)
+    for _ in range(10):
+        await r.exchange(count=4)
+        state = await r.state()
+        if state["entries"] == 2:
+            break
+    else:
+        pytest.fail(f"the flow was not carried again after the redial: {state}")
+    readmitted = await _udp_directions(r)
+    _assert_session(r, _direction(readmitted, r.lan_ip, INNER_LOCAL),
+                    _direction(readmitted, INNER_LOCAL, r.lan_ip), session=second)
+    after = await r.state()
+    assert after["bindings"] == 2 and after["invalidated"] == 0, after
+    assert after["errors"] == before["errors"], after
+    counts = {f["cookie"]: int(f["packets"]) for f in readmitted}
+    await r.exchange(count=32)
+    measured = await r.state()
+    final = {f["cookie"]: int(f["packets"]) for f in measured["flows"]}
+    _assert_undisturbed(r, after, measured, set(final) == set(counts))
+    assert all(final[c] - counts[c] == 32 for c in counts), (counts, final)
+    r.record("pppoe-demand", {"first": _session_text(first), "second": _session_text(second),
                               "before": before, "retired": retired, "after": after})
 
 

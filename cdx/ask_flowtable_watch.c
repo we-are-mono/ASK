@@ -653,6 +653,23 @@ int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		/* Names carry no forwarding semantics; backend lookup uses the
 		 * pinned physical device, including after table recreation. */
 		break;
+	case NETDEV_CHANGEINFODATA:
+		/* A ppp unit raises this when it gains or loses its channel
+		 * (patch 070), and nothing else when its session ends: the
+		 * device stays up with its addresses and routes, as pppd
+		 * dialling on demand keeps them across a redial, so the check
+		 * under NETDEV_CHANGE passes it. Every flow through it would
+		 * keep inserting a session the concentrator has ended, and
+		 * since the hardware carries that traffic, none of it would
+		 * reach the unit to have it dial again. Retire them: each is
+		 * walked again and offered against the session the unit runs
+		 * then, and an offer still carrying the old one when it comes
+		 * to admission is retired there (ft_session_current()). A bond
+		 * raises this when an option changes, which nothing here
+		 * depends on. */
+		if (dev->type == ARPHRD_PPP)
+			ft_device_retire(dev, &ft_link_invalidations);
+		break;
 	case NETDEV_UNREGISTER:
 		/* Drop the ops before the device goes, so nothing can reach
 		 * this module through a device it no longer owns. Any SA still

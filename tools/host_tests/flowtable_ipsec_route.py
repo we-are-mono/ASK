@@ -44,11 +44,13 @@ def test_flowtable_forward_path_unresolved_hops(tmp_path):
     entry after it aged out. A table with neighbour output then caches no flow
     -- one cached on the logical device would never be walked again -- and
     asks for the neighbour where there is one to ask; a tunnel hop defers for
-    every table. Ports, tables without neighbour output, PPPoE and a bridge
-    port that is not forwarding keep their behaviour. A walk that reaches a
-    port the table does not list falls back, and records the port when the
-    fallback names a device above it, so that the port joining the table can
-    retire the flow."""
+    every table, and so does a ppp unit with no session up, as pppd dialling
+    on demand keeps the unit while the session is down. Ports, tables without
+    neighbour output, a PPPoE session that is up, a multilink bundle and a
+    bridge port that is not forwarding keep their behaviour. A walk that
+    reaches a port the table does not list falls back, and records the port
+    when the fallback names a device above it, so that the port joining the
+    table can retire the flow."""
     source = _source()
     dev = _source("net/core/dev.c")
     _run(tmp_path, "flowtable_forward_path.c", {
@@ -57,7 +59,9 @@ def test_flowtable_forward_path_unresolved_hops(tmp_path):
             + function(_source("net/8021q/vlan_dev.c"), "vlan_dev_fill_forward_path")
             + function(_source("net/bridge/br_device.c"), "br_fill_forward_path")
             + function(_source("net/ipv6/sit.c"), "ipip6_fill_forward_path")
-            + function(_source("net/ipv6/ip6_tunnel.c"), "ip6_tnl_fill_forward_path"),
+            + function(_source("net/ipv6/ip6_tunnel.c"), "ip6_tnl_fill_forward_path")
+            + function(_source("drivers/net/ppp/ppp_generic.c"), "ppp_fill_forward_path")
+            + function(_source("drivers/net/ppp/pppoe.c"), "pppoe_fill_forward_path"),
         "forward_path_production.inc":
             source[source.index("static enum flow_offload_xmit_type nft_xmit_type"):
                    source.index("static bool nft_flow_offload_skip")],

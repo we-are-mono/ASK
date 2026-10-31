@@ -172,16 +172,27 @@ result independently of those temporary files.
   route to the peer, the path-MTU exceptions and the neighbours; on the next failure, a cookie that changed while no
   `gc_*` moved names the stale-dst teardown.
 
-- [ ] **A428 — a ppp unit without a connected session leaves a flow built through it on the ppp device for good.**
-  Where: `ppp_fill_forward_path()` (`drivers/net/ppp/ppp_generic.c`) returns `-ENODEV` while the unit has no channel,
-  and `pppoe_fill_forward_path()` (`pppoe.c`) returns -1 while its session is not connected; `nft_dev_forward_path()`
-  (patch 140) defers only on `-EAGAIN`, so a flow built then is cached with the ppp device as the reply's ingress and
-  admission refuses it for good, the A425/A426 freeze. OpenWrt's default PPPoE (no `persist`, `maxfail 1`) has pppd
-  exit on a drop, and the unit's unregistration cleans those flows up; `demand` keeps the unit across redials, so every
-  connection that sends while it redials stays in software after the session returns. Why it matters: a dial-on-demand
-  WAN loses offload for those connections on every reconnect. Fix direction: report a missing channel and an
-  unconnected session as `-EAGAIN` (the unit queues or drops those packets anyway); first confirm whether `persist`
-  keeps the unit too, then a host case beside the walk's PPPoE ones and a rig run of a `demand` session redialing.
+- [ ] **A430 — `pppoe_fill_forward_path()` reads the session's device, id and peer without annotation while
+  `pppoe_unbind_sock_work()` clears them.** Where: `drivers/net/ppp/pppoe.c` (mainline), racing the PADT work. A data
+  race KCSAN would report, not a use-after-free: the lower device cannot be freed under the walk's RCU section, and the
+  worst a torn read gives is a walk on the ending session, which admission's session check (`ft_session_current()`)
+  then refuses. Why it matters: correctness by inspection only, and it hides real races from KCSAN. Fix direction:
+  `READ_ONCE()` the three fields in the hook and `WRITE_ONCE()` them in the unbind and connect paths, in patch 070.
+
+- [ ] **A429 — a flow the adapter did not carry keeps its old PPPoE session as the reply's ingress after a redial
+  that changes the session id.** Where: the walk records the reply ingress as the WAN port plus the session's encap
+  (patch 140), and only cdx retires a session's flows when the channel leaves the unit (patch 070's event); a flow it
+  refused for another reason -- tc in software on the ppp device (SQM), the MTU bound, a full table, a parked binding
+  -- or one in a table it does not bind is never retired. The upload still reaches the unit, so redialling works, but
+  replies arrive with the new id and miss the flowtable for the rest of the connection. `nf_flow_table_cleanup()` on the
+  ppp device cannot reach them: it matches ingress devices only. Why it matters: software throughput only, for
+  connections that outlive a redial on a box running SQM on a PPPoE WAN. Fix direction: have the flowtable itself
+  retire flows whose path crossed a ppp unit that raised the channel event (record the unit in the tuple beside the
+  session, as A426 records the unlisted port), then a rig case with software tc on the ppp device.
+
+- [x] **A428 — a session dialled on demand ended under a surviving ppp unit, and its flows stayed on the ended
+  session.** The unit now announces a channel change, cdx retires its flows and re-checks a session at admission,
+  and the walk defers while none is up (_:/^ppp, cdx: carry a session dialled on demand across its redial_).
 
 - [x] **A426 — a flow whose walk reached a port the flowtable did not list yet stayed on its logical device.** The flow
   records the port, and the port joining the table retires it; a tunnel whose outer route fails caches nothing

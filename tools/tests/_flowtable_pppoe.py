@@ -317,13 +317,19 @@ def _server_stop(proc):
             pass
 
 
-async def _dial(console, lower, ipv6=False):
+async def _dial(console, lower, ipv6=False, demand=False):
     """Start pppd on the DUT over `lower` and wait for the session.
 
     pppd is not in the agent's exec allowlist, so the whole of it goes over the
     console. The config files are staged through console_python rather than a
     heredoc: the staging is checksum-verified, which a heredoc over a
     115200-baud line is not.
+
+    `demand` dials on demand, as OpenWrt's `demand` option does: the unit is
+    up, addressed and routed before any session exists, and a session that
+    ends only sends pppd back to waiting for traffic, the unit kept. The
+    concentrator's address is given up front, so the peer route every case
+    sends by exists before the first dial, which a ping then starts.
     """
     peer = (
         # plugin pppoe.so is the in-kernel PPPoE channel; the device named on
@@ -337,12 +343,13 @@ async def _dial(console, lower, ipv6=False):
         # default route, so the control channel never moves into the session.
         # nodetach: the process we start is the process we later signal.
         # No persist: a redial has to be this test's doing rather than pppd's,
-        # or the dependency case races an automatic reconnection.
+        # or the dependency case races an automatic reconnection -- except on
+        # demand, where redialling on the next traffic is the point.
         "noauth\n"
         "nodefaultroute\n"
         "nodetach\n"
-        "maxfail 3\n"
-        "holdoff 2\n"
+        + (f":{INNER_LOCAL}\nipcp-accept-local\ndemand\npersist\nmaxfail 0\nholdoff 1\n"
+           if demand else "maxfail 3\nholdoff 2\n") +
         f"mtu {SESSION_MTU}\n"
         f"mru {SESSION_MTU}\n"
         f"lcp-echo-interval {LCP_ECHO_INTERVAL}\n"
@@ -379,12 +386,20 @@ async def _dial(console, lower, ipv6=False):
     # round-trip is robust against kernel log noise arriving mid-stream, and
     # the ppp_generic lockdep warning fires on the first PPPIOCNEWUNIT of a
     # boot (ISSUES.md A13) right where a tight polling loop would read.
+    # On demand the unit is addressed from the start, with pppd's stand-in
+    # 10.64.64.64 + unit, so what says the session is up is a session in
+    # /proc/net/pppoe and the address IPCP replaced the stand-in with; the
+    # ping, queued on the unit, is the traffic that dials.
+    session = ("[ $(wc -l < /proc/net/pppoe) -gt 1 ] && "
+               "! ip -4 addr show $iface | grep -q 'inet 10\\.64\\.64\\.' && " if demand else "")
+    dial = (f"[ -n \"$iface\" ] && ping -c 1 -W 1 {INNER_LOCAL} >/dev/null 2>&1; "
+            if demand else "")
     poll = ("found=; for i in $(seq 1 60); do "
             "  iface=$(ip -br link show | awk '/^ppp[0-9]/ {print $1; exit}'); "
-            "  if [ -n \"$iface\" ] && ip -4 addr show $iface | grep -q 'inet '; then "
-            "    found=$iface; break; fi; sleep 0.5; done; "
+            f"  if [ -n \"$iface\" ] && {session}ip -4 addr show $iface | grep -q 'inet '; then "
+            f"    found=$iface; break; fi; {dial}sleep 0.5; done; "
             "if [ -n \"$found\" ]; then echo PPPIFACE=$found; else echo PPPIFACE_TIMEOUT; fi")
-    probe = await asyncio.to_thread(console.run, poll, 45.0)
+    probe = await asyncio.to_thread(console.run, poll, 100.0)
     match = re.search(r"PPPIFACE=(ppp\d+)", probe.stdout)
     if not match:
         log = await console_command(console, "sh", "-c", f"tail -60 {DUT_LOG}", check=False)
@@ -697,7 +712,8 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
     OpenWrt's own multi-port br-lan behind the session, "cloned-tcp" for a
     session over a device carrying a cloned MAC, or "bridged-wan-tcp" for a
     session over a VLAN device on a bridged WAN whose address is its own
-    (_topology.openwrt_wan). Teardown reverses only what came up.
+    (_topology.openwrt_wan), or "demand" for the UDP session dialled on demand
+    (_dial). Teardown reverses only what came up.
 
     The far endpoint is the session's own inner address, not the orchestrator's
     ordinary WAN address. It has to be: a host route for the WAN address down
@@ -708,7 +724,7 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
     """
     shape = getattr(request, "param", "udp")
     assert shape in {"udp", "tcp", "tagged", "tagged-tcp", "ipv6", "chap",
-                     "openwrt", "openwrt-tcp", "cloned-tcp", "bridged-wan-tcp"}
+                     "openwrt", "openwrt-tcp", "cloned-tcp", "bridged-wan-tcp", "demand"}
     monkeypatch.setattr(ft, "WAN_IP", INNER_LOCAL)
     r = Rig()
     r.proto = "tcp" if shape.endswith("tcp") else "udp"
@@ -779,7 +795,8 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
             _, err = server.communicate(timeout=2)
             pytest.fail(f"pppoe-server exited rc={server.returncode} on {SERVER_IF}: "
                         f"{err.decode('utf-8', 'replace')[:1000]!r}")
-        r.ppp_if, r.ppp_pid = await _dial(console, r.ppp_lower, ipv6=r.session_ipv6)
+        r.ppp_if, r.ppp_pid = await _dial(console, r.ppp_lower, ipv6=r.session_ipv6,
+                                          demand=shape == "demand")
         stack.push(lambda: _hangup(console))
         r.console = console
         r.reachable = await _lan_segment(r, stack, "tagged" if shape.startswith("tagged") else

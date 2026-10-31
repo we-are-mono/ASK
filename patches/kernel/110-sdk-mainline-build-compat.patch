@@ -1,4 +1,4 @@
-From 1e338aa326d6432a20f4979ab4494dadfb85c9e5 Mon Sep 17 00:00:00 2001
+From 80d7d84d7821ea16f28213a1ee89bfaca1c7dc51 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 23 Aug 2026 18:48:54 +0200
 Subject: [PATCH] sdk: build the vendored SDK on stock mainline
@@ -7,8 +7,8 @@ The vendored NXP DPAA SDK drivers (sdk_fman, sdk_dpaa, staging/fsl_qbman)
 target the NXP LSDK kernel, which carries wiring and APIs that stock
 mainline lacks. Bundle every change needed to build the SDK overlay on a
 stock kernel.org tree into one ASK-owned patch; each consumer that bases
-on mainline (rather than the NXP vendor tag) needs it. Folds four
-previously-separate OpenWrt build-compat patches (705/710/712/713).
+on mainline (rather than the NXP vendor tag) needs it. Folds three
+previously-separate OpenWrt build-compat patches (705/710/712).
 
 Driver wiring (ex-705):
  - source the sdk_fman/sdk_dpaa Kconfigs and add their obj-$() entries
@@ -61,12 +61,6 @@ Board support (ex-712):
    code). The Mono Gateway's 10G (xfi) MACs use fixed-link 10000; mainline
    swphy returns -EINVAL and the MAC fails to probe.
 
-Export for the ppp hook (ex-713):
- - export rtmsg_ifinfo(): ASK patch 070's PPP fast-path hook calls it from
-   ppp_generic; mainline dropped the export after its last in-tree caller
-   went away, so a modular ppp_generic fails modpost. CPE_FAST_PATH=n
-   builds compile the hook out, so this only matters for the ASK image.
-
 NOTE (phylink vs OpenWrt 702): the phylink hunk here only un-statics the
 phylink_interface_max_speed() signature and appends EXPORT_SYMBOL_GPL after
 the function's closing brace. OpenWrt's 702 (2.5G-SGMII, deliberately not
@@ -93,9 +87,8 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  drivers/staging/Makefile                      |  1 +
  include/linux/phylink.h                       |  1 +
  include/linux/skbuff.h                        |  1 +
- net/core/rtnetlink.c                          |  1 +
  net/core/skbuff.c                             | 26 +++++++++++++
- 16 files changed, 97 insertions(+), 11 deletions(-)
+ 15 files changed, 96 insertions(+), 11 deletions(-)
 
 diff --git a/arch/arm64/include/asm/io.h b/arch/arm64/include/asm/io.h
 index 16a423101bdc..73daee06fd57 100644
@@ -365,18 +358,6 @@ index a1bcfe394390..a25be74b5bd4 100644
  void  __kfree_skb(struct sk_buff *skb);
  
  void kfree_skb_partial(struct sk_buff *skb, bool head_stolen);
-diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
-index 6ad562621f7d..72e39dd3ccfb 100644
---- a/net/core/rtnetlink.c
-+++ b/net/core/rtnetlink.c
-@@ -4270,6 +4270,7 @@ void rtmsg_ifinfo(int type, struct net_device *dev, unsigned int change,
- 	rtmsg_ifinfo_event(type, dev, change, rtnl_get_event(0), flags,
- 			   NULL, 0, portid, nlh);
- }
-+EXPORT_SYMBOL(rtmsg_ifinfo);
- 
- void rtmsg_ifinfo_newnet(int type, struct net_device *dev, unsigned int change,
- 			 gfp_t flags, int *new_nsid, int new_ifindex)
 diff --git a/net/core/skbuff.c b/net/core/skbuff.c
 index 6558a6def663..02727ce60778 100644
 --- a/net/core/skbuff.c

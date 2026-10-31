@@ -123,8 +123,8 @@ CDX loaded.
 
 pppd normally creates a ppp device per dial and destroys it when the session
 ends, so a ppp device's record lives exactly as long as its session; with
-`persist`, or a session renegotiated under a unit that stays, it lives across
-them, which is what the device's own counters do too.
+`demand`, which keeps the unit across sessions, it lives across them, which is
+what the device's own counters do too.
 
 The plain pool is 122 records deep and the timestamped one 4, both shared with
 the legacy owner. Exhaustion is an ordinary outcome: the record exists, says it

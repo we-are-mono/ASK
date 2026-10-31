@@ -156,7 +156,7 @@ enum { FIB_EVENT_ENTRY_REPLACE, FIB_EVENT_ENTRY_APPEND, FIB_EVENT_ENTRY_ADD,
        FIB_EVENT_ENTRY_DEL, FIB_EVENT_RULE_ADD, FIB_EVENT_RULE_DEL, FIB_EVENT_NH_ADD, FIB_EVENT_NH_DEL };
 enum { NETDEV_GOING_DOWN, NETDEV_UNREGISTER, NETDEV_CHANGEMTU, NETDEV_CHANGEADDR,
        NETDEV_CHANGEUPPER, NETDEV_CHANGENAME, NETDEV_REGISTER, NETDEV_CHANGE,
-       NETDEV_UP, NETDEV_DOWN };
+       NETDEV_UP, NETDEV_DOWN, NETDEV_CHANGEINFODATA };
 enum { NEXTHOP_EVENT_DEL, NEXTHOP_EVENT_REPLACE, NEXTHOP_EVENT_RES_TABLE_PRE_REPLACE,
        NEXTHOP_EVENT_BUCKET_REPLACE, NEXTHOP_EVENT_HW_STATS_REPORT_DELTA };
 struct fib_notifier_info { int family; };
@@ -283,8 +283,22 @@ struct bridge_vlan_info { u16 vid, flags; };
  * they build, and that is what Netfilter then writes into the Ethernet
  * destination of a flow leaving by one. priv is what netdev_priv() hands back,
  * which is where the adapter reads the tunnel's configuration from. */
+/* The one hop of the forward-path walk the adapter asks itself: a ppp unit's,
+ * for the session it runs now. Only what that hop fills in. */
+enum net_device_path_type { DEV_PATH_ETHERNET, DEV_PATH_VLAN, DEV_PATH_BRIDGE,
+                            DEV_PATH_PPPOE };
+struct net_device_path {
+    enum net_device_path_type type;
+    const struct net_device *dev;
+    struct { u16 id; __be16 proto; u8 h_dest[6]; } encap;
+};
+struct net_device_path_ctx { const struct net_device *dev; u8 daddr[6]; };
+struct net_device_ops {
+    int (*ndo_fill_forward_path)(struct net_device_path_ctx *ctx, struct net_device_path *path);
+};
 struct net_device { int ifindex, refs, mtu, ip6_mtu; u8 dev_addr[6]; struct net *net; bool carrier_lost, down;
                     unsigned short type; unsigned char addr_len; void *priv;
+                    const struct net_device_ops *netdev_ops;
                     struct net_device *real_dev; u16 vlan_id; __be16 vlan_proto;
                     bool bridge, vlan_filtering, stp_blocked, mst; struct net_device *master;
                     u16 br_proto, pvid; struct br_vlan_entry br_vlans[BR_MAX_VLANS];
@@ -2018,9 +2032,13 @@ static struct net_device br_qinq = { .ifindex = 15, .mtu = 1500, .type = ARPHRD_
                                      .real_dev = &br_tag, .vlan_id = 300 };
 /* Two ppp devices, one per direction. No address (addr_len is zero in the
  * kernel, so dev_addr stays the zero one arp_constructor leaves behind), no
- * lower device, and the reduced MTU pppd negotiates for a session. */
-static struct net_device ppp = { .ifindex = 16, .mtu = 1492, .type = ARPHRD_PPP };
-static struct net_device in_ppp = { .ifindex = 17, .mtu = 1492, .type = ARPHRD_PPP };
+ * lower device, and the reduced MTU pppd negotiates for a session. Each
+ * answers the walk's hop for the session its unit runs (ppp_unit_ops). */
+static const struct net_device_ops ppp_unit_ops;
+static struct net_device ppp = { .ifindex = 16, .mtu = 1492, .type = ARPHRD_PPP,
+                                 .netdev_ops = &ppp_unit_ops };
+static struct net_device in_ppp = { .ifindex = 17, .mtu = 1492, .type = ARPHRD_PPP,
+                                    .netdev_ops = &ppp_unit_ops };
 static struct cdx_ft_binding binding = { .dev = &in, .entries = LIST_HEAD_INIT(binding.entries) };
 static struct dst_ops ipv4_ops = { .family = AF_INET };
 static struct dst_ops ipv6_ops6 = { .family = AF_INET6 };
@@ -2042,6 +2060,39 @@ static union nf_inet_addr next_hop;
  * in. */
 static struct nf_flow_session egress_session, ingress_session;
 static struct nf_flow_tunnel egress_tunnel, ingress_tunnel;
+/* What each ppp unit runs, as its own hook reports it (ppp_fill_forward_path()
+ * and pppoe_fill_forward_path() in the kernel): by default the session the
+ * walk recorded for the direction its device sits on, which is what a flow
+ * made a moment ago finds. A case can end it -- the unit left with no channel,
+ * as pppd dialling on demand leaves it while the session is down -- or have
+ * the unit run another. */
+static struct ppp_unit {
+    bool down;
+    const struct nf_flow_session *running;
+    unsigned asked;
+} ppp_unit, in_ppp_unit;
+static int ppp_unit_fill_forward_path(struct net_device_path_ctx *ctx, struct net_device_path *path)
+{
+    bool inbound = ctx->dev == &in_ppp;
+    struct ppp_unit *unit = inbound ? &in_ppp_unit : &ppp_unit;
+    const struct nf_flow_session *session = unit->running ? unit->running :
+                                            inbound ? &ingress_session : &egress_session;
+
+    assert(inbound || ctx->dev == &ppp);
+    unit->asked++;
+    if (unit->down)
+        return -EAGAIN;
+    path->type = DEV_PATH_PPPOE;
+    path->dev = ctx->dev;
+    path->encap.id = session->id;
+    memcpy(path->encap.h_dest, session->h_dest, ETH_ALEN);
+    memcpy(ctx->daddr, session->h_dest, ETH_ALEN);
+    ctx->dev = __dev_get_by_index(&init_net, session->lower_ifindex);
+    return 0;
+}
+static const struct net_device_ops ppp_unit_ops = {
+    .ndo_fill_forward_path = ppp_unit_fill_forward_path,
+};
 static struct nf_conn ct;
 static struct flow_dissector dissector;
 static struct flow_rule rule;
@@ -2106,6 +2157,7 @@ static void fixture(void)
     rule.action.entries[4].dev = &out;
     egress_session = ingress_session = (struct nf_flow_session){};
     egress_tunnel = ingress_tunnel = (struct nf_flow_tunnel){};
+    ppp_unit = in_ppp_unit = (struct ppp_unit){};
     /* The path as large as the port the flow arrives on, the ordinary
      * Ethernet case: a case about a smaller one narrows it. */
     cls = (struct flow_cls_offload){ .rule = &rule, .nf_ct = &ct, .nf_dst = &route.dst, .nf_mtu = 1500,
@@ -8279,6 +8331,132 @@ static void device_event(struct net_device *dev, unsigned long event, bool inval
     assert(ft_invalid == invalid && !cdx_info->ctrl.mutex && !ft_watch_lock);
 }
 
+/* Admits the fixture's offer, published and in hardware. */
+static void admitted(void)
+{
+    cdx_ft_begin();
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    cdx_ft_end();
+    assert(!handle.invalid);
+}
+
+/* The flowtable's GC taking out what the adapter retired. */
+static void retired(struct net_device *unit)
+{
+    ft_retire_workfn(NULL);
+    drop_dev_records();
+    assert(!ft_count && !unit->refs && !out.refs && !allocated);
+}
+
+/* A ppp unit whose session ended under it -- pppd dialling on demand keeps
+ * the unit, its addresses and routes across a redial; only the channel leaves
+ * -- raises NETDEV_CHANGEINFODATA, and nothing else: the device stays up with
+ * carrier. Every flow through it is retired, so that its next packet walks the
+ * session that is up, or caches nothing while none is, rather than have the
+ * hardware go on inserting a session the concentrator has ended -- which would
+ * also keep every packet from the unit, and so from a pppd that dials when it
+ * sees one. An offer made from a walk before the session ended can reach
+ * admission after the event, which retired only what was published: admission
+ * asks the unit and retires an offer for a session it no longer runs. */
+static void test_pppoe_session_ended(void)
+{
+    static struct nf_flow_session other;
+    struct cdx_ft_rule decoded;
+    u64 links;
+
+    /* Published before the event: retired by it, whichever direction's
+     * device the unit is. */
+    for (int inbound = 0; inbound < 2; inbound++) {
+        struct net_device *dev = inbound ? &in_ppp : &ppp;
+
+        if (inbound)
+            pppoe_in_fixture();
+        else
+            pppoe_out_fixture();
+        admitted();
+        (inbound ? &in_ppp_unit : &ppp_unit)->down = true;
+        links = ft_link_invalidations;
+        device_event(dev, NETDEV_CHANGEINFODATA, false);
+        assert(handle.invalid && ft_link_invalidations == links + 1);
+        retired(dev);
+    }
+
+    /* The event on anything but a ppp unit -- a bond whose options changed,
+     * the port the session runs over -- retires nothing. */
+    pppoe_out_fixture();
+    admitted();
+    links = ft_link_invalidations;
+    device_event(&out, NETDEV_CHANGEINFODATA, false);
+    device_event(&in, NETDEV_CHANGEINFODATA, false);
+    assert(!handle.invalid && ft_link_invalidations == links);
+    /* One with the session still up, as a channel joining raises, costs the
+     * flow a walk and an offer: the next one is admitted again. */
+    device_event(&ppp, NETDEV_CHANGEINFODATA, false);
+    assert(handle.invalid && ft_link_invalidations == links + 1);
+    retired(&ppp);
+    pppoe_out_fixture();
+    admitted();
+    device_event(&ppp, NETDEV_CHANGEINFODATA, false);
+    retired(&ppp);
+
+    /* Offered after the event, from a walk before it: the unit has no
+     * session, or runs another -- another id, another concentrator, over
+     * another device. Retired at admission, publishing nothing. */
+    for (int how = 0; how < 5; how++) {
+        bool inbound = how == 4;
+        struct ppp_unit *unit = inbound ? &in_ppp_unit : &ppp_unit;
+
+        if (inbound)
+            pppoe_in_fixture();
+        else
+            pppoe_out_fixture();
+        other = inbound ? ingress_session : egress_session;
+        switch (how) {
+        case 0: case 4: unit->down = true; break;
+        case 1: other.id++; break;
+        case 2: other.h_dest[5]++; break;
+        case 3: other.lower_ifindex = out_tag.ifindex; break;
+        }
+        if (!unit->down)
+            unit->running = &other;
+        device_event(inbound ? &in_ppp : &ppp, NETDEV_CHANGEINFODATA, false);
+        links = ft_link_invalidations;
+        cdx_ft_begin();
+        assert(ft_replace(&binding, &cls) == -ENOTCONN);
+        cdx_ft_end();
+        assert(unit->asked == 1);
+        assert(handle.invalid && ft_link_invalidations == links + 1);
+        assert(!ft_count && ft_neigh_entries.next == &ft_neigh_entries);
+        retired(inbound ? &in_ppp : &ppp);
+    }
+
+    /* A redial that got the same id from the same concentrator over the
+     * same device: the offer describes what the unit sends, and is
+     * admitted. */
+    pppoe_out_fixture();
+    other = egress_session;
+    ppp_unit.running = &other;
+    admitted();
+    assert(ppp_unit.asked == 1);
+    device_event(&ppp, NETDEV_CHANGEINFODATA, false);
+    retired(&ppp);
+
+    /* Asked of the hop under a tunnel too, where the unit is the device the
+     * outer packet leaves by: DS-Lite on a PPPoE WAN. */
+    ip6tnl_out_fixture();
+    egress_tunnel.lower_ifindex = ppp.ifindex;
+    memset(egress_tunnel.h_dest, 0, ETH_ALEN);
+    egress_session = (struct nf_flow_session){ .lower_ifindex = out.ifindex,
+                                               .id = SESSION_ID };
+    memcpy(egress_session.h_dest, AC_MAC, ETH_ALEN);
+    tunnel_ethernet_dest(&ip6tnl);
+    session_push(SESSION_ID);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_session.present && ppp_unit.asked == 1);
+    ppp_unit.down = true;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -ENOTCONN);
+}
+
 /* An upper change on a device a binding or a flow uses retires the flows
  * using it and queues a sweep of its software flows, which then cleans
  * `devices` devices under RTNL, this one first; it never stops admission.
@@ -10034,6 +10212,7 @@ int main(void)
     test_bridge_fdb();
     test_pppoe();
     test_pppoe_stats();
+    test_pppoe_session_ended();
     test_tunnel();
     test_tunnel_stats();
     test_snat();

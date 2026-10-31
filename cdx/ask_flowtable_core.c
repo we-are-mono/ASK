@@ -1357,6 +1357,37 @@ static struct net_device *ft_bridge_port(struct net_device *bridge,
 	return walk.found == 1 ? walk.port : NULL;
 }
 
+/* Whether a ppp unit still runs the session a walk recorded through it.
+ * Linux walked the path when it made the flow, and the offer can come much
+ * later: queued behind others, or declined while RTNL was taken and made
+ * again. A unit that gained or lost its channel since -- pppd dialling on
+ * demand keeps the unit, its addresses and routes across a redial -- raises
+ * NETDEV_CHANGEINFODATA, which retires every entry through it, but only the
+ * entries published by then. So the unit is asked, through the hook the walk
+ * asked, under the RTNL admission holds: the event is raised under it too and
+ * only after the channel has gone, so an offer is either published before the
+ * event, which retires it, or sees what the event reports. Only this hop: what
+ * the session runs over is checked against the devices below, as on any path,
+ * and a bridge there would need its FDB asked as well. Under RTNL. */
+static bool ft_session_current(const struct net_device *ppp,
+			       const struct nf_flow_session *session)
+{
+	struct net_device_path_ctx ctx = { .dev = ppp };
+	struct net_device_path path = {};
+	bool runs = false;
+
+	ASSERT_RTNL();
+	if (!ppp->netdev_ops->ndo_fill_forward_path)
+		return false;
+	rcu_read_lock();
+	if (!ppp->netdev_ops->ndo_fill_forward_path(&ctx, &path))
+		runs = path.type == DEV_PATH_PPPOE && path.encap.id == session->id &&
+		       ether_addr_equal(path.encap.h_dest, session->h_dest) &&
+		       ctx.dev && ctx.dev->ifindex == session->lower_ifindex;
+	rcu_read_unlock();
+	return runs;
+}
+
 static int ft_path_stack(struct net_device *logical, struct net_device *physical,
 			 const struct nf_flow_session *session,
 			 const struct nf_flow_tunnel *tunnel,
@@ -1409,6 +1440,12 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 		lower = __dev_get_by_index(&init_net, session->lower_ifindex);
 		if (!lower)
 			return -EOPNOTSUPP;
+		/* A session the unit no longer runs has its own answer: the
+		 * flow is retired, not only refused, so that its next packet
+		 * walks the session that is up, or caches nothing while none
+		 * is (ft_replace()). */
+		if (!ft_session_current(logical, session))
+			return -ENOTCONN;
 		out_session->present = true;
 		out_session->id = session->id;
 		out_session->lower_ifindex = session->lower_ifindex;
@@ -2546,6 +2583,9 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	rc = ft_parse(binding, cls, &rule, &next_hop);
 	if (rc == -ESTALE)
 		ft_handle_invalidate(cls->nf_handle, &ft_mac_invalidations);
+	/* A session its unit no longer runs (ft_session_current()). */
+	if (rc == -ENOTCONN)
+		ft_handle_invalidate(cls->nf_handle, &ft_link_invalidations);
 	if (!rc)
 		ft_validated++;
 	if (rc || cdx_ft_observing() || atomic_read(&ft_invalid) || ft_stopping || cdx_ft_failed()) {
