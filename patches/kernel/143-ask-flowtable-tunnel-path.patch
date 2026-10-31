@@ -1,4 +1,4 @@
-From c4bf769aff1c28ca27dcd96b67ac77486f6e3891 Mon Sep 17 00:00:00 2001
+From bd0bcd3add1e9358b9a265ba63354631655d5cef Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 02:14:51 +0200
 Subject: [PATCH] netfilter: walk the forwarding path through sit and ip6_tnl
@@ -25,7 +25,13 @@ route are refused by the hook. A next hop whose neighbour is unresolved,
 as after the link below flapped, is asked for and reported as -EAGAIN,
 so the flowtable caches nothing until it resolves: a flow cached on the
 tunnel device would stay there. A table without neighbour output, which
-refuses the hop anyway, only goes without a software flow meanwhile.
+refuses the hop anyway, only goes without a software flow meanwhile. An
+outer route lookup that fails, as while the link below is down, is
+-EAGAIN for the same reason: the transmit path cannot send the outer
+packet either, and a later packet walks the whole path once the route
+is back. So is an IPv6 reject route that carries no error of its own, a
+unicast route through the loopback device, which discards the outer
+packet as surely.
 
 The flowtable carries the hop whole, as it carries a PPPoE session:
 nf_flow_tunnel on the route and the tuple, handed to the driver as
@@ -40,15 +46,15 @@ port below would lose.
 
 Context version 13 adds the two tunnel records.
 ---
- include/linux/netdevice.h             | 32 ++++++++++
- include/net/flow_offload.h            | 23 ++++++-
- include/net/netfilter/nf_flow_table.h | 29 +++++++++
- net/ipv6/ip6_tunnel.c                 | 91 +++++++++++++++++++++++++++
- net/ipv6/sit.c                        | 78 +++++++++++++++++++++++
- net/netfilter/nf_flow_table_core.c    |  1 +
- net/netfilter/nf_flow_table_offload.c |  2 +
- net/netfilter/nft_flow_offload.c      | 38 +++++++++++
- 8 files changed, 292 insertions(+), 2 deletions(-)
+ include/linux/netdevice.h             |  32 ++++++++
+ include/net/flow_offload.h            |  23 +++++-
+ include/net/netfilter/nf_flow_table.h |  29 +++++++
+ net/ipv6/ip6_tunnel.c                 | 106 ++++++++++++++++++++++++++
+ net/ipv6/sit.c                        |  84 ++++++++++++++++++++
+ net/netfilter/nf_flow_table_core.c    |   1 +
+ net/netfilter/nf_flow_table_offload.c |   2 +
+ net/netfilter/nft_flow_offload.c      |  38 +++++++++
+ 8 files changed, 313 insertions(+), 2 deletions(-)
 
 diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
 index 1d0a3ff4e88c..1c92244baebf 100644
@@ -150,10 +156,10 @@ index cf62dca18c9e..1624a45cbca7 100644
  	u64 nf_xfrm_genid;
  	u32 nf_dst_cookie;
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index ad9c4081f6a3..def106973f89 100644
+index 894e2afa06bd..806cd953022a 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
-@@ -130,6 +130,32 @@ struct nf_flow_session {
+@@ -133,6 +133,32 @@ struct nf_flow_session {
  	u8				h_dest[ETH_ALEN];
  };
  
@@ -186,15 +192,15 @@ index ad9c4081f6a3..def106973f89 100644
  struct flow_offload_tuple {
  	union {
  		struct in_addr		src_v4;
-@@ -164,6 +190,7 @@ struct flow_offload_tuple {
+@@ -167,6 +193,7 @@ struct flow_offload_tuple {
  	/* Below __hash, so it never widens a lookup key, and outside the
  	 * union below, which a NEIGH tuple spends on its destination. */
  	struct nf_flow_session		session;
 +	struct nf_flow_tunnel		tunnel;
- 	union {
- 		struct {
- 			struct dst_entry *dst_cache;
-@@ -250,6 +277,8 @@ struct nf_flow_route {
+ 	/* The port this direction arrives on, when the walk reached one the
+ 	 * table did not list: iifidx then names a device above it, which the
+ 	 * port's hook never matches. Zero otherwise. The port joining the
+@@ -263,6 +290,8 @@ struct nf_flow_route {
  		 * out.h_dest would otherwise be the only record of -- and that
  		 * member is not carried over to a NEIGH tuple. */
  		struct nf_flow_session		session;
@@ -204,10 +210,10 @@ index ad9c4081f6a3..def106973f89 100644
  	} tuple[FLOW_OFFLOAD_DIR_MAX];
  };
 diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
-index 7eb2e67842f4..a47736ca8b90 100644
+index 7eb2e67842f4..df8cdff8b3db 100644
 --- a/net/ipv6/ip6_tunnel.c
 +++ b/net/ipv6/ip6_tunnel.c
-@@ -1416,6 +1416,96 @@ ipxip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev,
+@@ -1416,6 +1416,111 @@ ipxip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev,
  	return 0;
  }
  
@@ -244,18 +250,33 @@ index 7eb2e67842f4..a47736ca8b90 100644
 +	fl6.flowi6_proto = IPPROTO_IPIP;
 +	fl6.flowi6_mark = p->fwmark;
 +	fl6.flowi6_uid = sock_net_uid(dev_net(dev), NULL);
++	/* No route for the outer packet -- as while the WAN link is down --
++	 * is a path not known yet, exactly as an unresolved next hop below:
++	 * the transmit path cannot send the outer packet either, and a flow
++	 * cached on the tunnel device now would stay there once the route is
++	 * back. Have the caller cache nothing until then.
++	 */
 +	dst = ip6_route_output(dev_net(dev), NULL, &fl6);
 +	if (dst->error) {
 +		dst_release(dst);
-+		return -ENOENT;
++		return -EAGAIN;
 +	}
 +	dst = xfrm_lookup(dev_net(dev), dst, flowi6_to_flowi(&fl6), NULL, 0);
 +	if (IS_ERR(dst))
-+		return -ENOENT;
++		return -EAGAIN;
 +	rt = dst_rt6_info(dst);
 +	if (dst_xfrm(dst) || dst->dev == dev || dst->lwtstate ||
-+	    (rt->rt6i_flags & (RTF_REJECT | RTF_LOCAL | RTF_ANYCAST))) {
++	    (rt->rt6i_flags & (RTF_LOCAL | RTF_ANYCAST))) {
 +		ret = -EOPNOTSUPP;
++		goto out;
++	}
++	/* A reject route that carries no error of its own -- a unicast route
++	 * through the loopback device, a common null route -- discards the
++	 * outer packet just as the failed lookups above do: cache nothing
++	 * until it changes.
++	 */
++	if (rt->rt6i_flags & RTF_REJECT) {
++		ret = -EAGAIN;
 +		goto out;
 +	}
 +	/* A next hop still resolving -- as after the link below flapped -- is
@@ -304,7 +325,7 @@ index 7eb2e67842f4..a47736ca8b90 100644
  static netdev_tx_t
  ip6_tnl_start_xmit(struct sk_buff *skb, struct net_device *dev)
  {
-@@ -1825,6 +1915,7 @@ static const struct net_device_ops ip6_tnl_netdev_ops = {
+@@ -1825,6 +1930,7 @@ static const struct net_device_ops ip6_tnl_netdev_ops = {
  	.ndo_change_mtu = ip6_tnl_change_mtu,
  	.ndo_get_stats64 = dev_get_tstats64,
  	.ndo_get_iflink = ip6_tnl_get_iflink,
@@ -313,10 +334,10 @@ index 7eb2e67842f4..a47736ca8b90 100644
  
  #define IPXIPX_FEATURES (NETIF_F_SG |		\
 diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
-index 1f980e827d04..727d088fbbc2 100644
+index 1f980e827d04..94c32d3d762c 100644
 --- a/net/ipv6/sit.c
 +++ b/net/ipv6/sit.c
-@@ -1066,6 +1066,83 @@ static netdev_tx_t sit_tunnel_xmit__(struct sk_buff *skb,
+@@ -1066,6 +1066,89 @@ static netdev_tx_t sit_tunnel_xmit__(struct sk_buff *skb,
  	return NETDEV_TX_OK;
  }
  
@@ -349,8 +370,14 @@ index 1f980e827d04..727d088fbbc2 100644
 +			   IPPROTO_IPV6, 0, tiph->daddr, tiph->saddr, 0, 0,
 +			   sock_net_uid(tunnel->net, NULL));
 +	rt = ip_route_output_flow(tunnel->net, &fl4, NULL);
++	/* No route for the outer packet -- as while the WAN link is down --
++	 * is a path not known yet, exactly as an unresolved next hop below:
++	 * the transmit path cannot send the outer packet either, and a flow
++	 * cached on the tunnel device now would stay there once the route is
++	 * back. Have the caller cache nothing until then.
++	 */
 +	if (IS_ERR(rt))
-+		return -ENOENT;
++		return -EAGAIN;
 +	/* A transformed outer packet, a routing loop, a route with its own
 +	 * encapsulation or an IPv6 next hop are all shapes the walk does not
 +	 * describe. */
@@ -400,7 +427,7 @@ index 1f980e827d04..727d088fbbc2 100644
  static netdev_tx_t sit_tunnel_xmit(struct sk_buff *skb,
  				   struct net_device *dev)
  {
-@@ -1406,6 +1483,7 @@ static const struct net_device_ops ipip6_netdev_ops = {
+@@ -1406,6 +1489,7 @@ static const struct net_device_ops ipip6_netdev_ops = {
  	.ndo_siocdevprivate = ipip6_tunnel_siocdevprivate,
  	.ndo_get_iflink = ip_tunnel_get_iflink,
  	.ndo_tunnel_ctl = ipip6_tunnel_ctl,
@@ -409,10 +436,10 @@ index 1f980e827d04..727d088fbbc2 100644
  
  static void ipip6_dev_free(struct net_device *dev)
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index 1c1b802f57fe..d836f799f361 100644
+index 7c1fdfbaede3..230e235b5ad0 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -260,6 +260,7 @@ static int flow_offload_fill_route(struct flow_offload *flow,
+@@ -261,6 +261,7 @@ static int flow_offload_fill_route(struct flow_offload *flow,
  	 * path, not to how the path is transmitted, and a DIRECT tuple has no
  	 * room for it once the union holds its cached addresses. */
  	flow_tuple->session = route->tuple[dir].session;
@@ -434,7 +461,7 @@ index 5228df2a0d28..e3c4cb3fb74c 100644
  		.nf_xfrm_genid = flow->xfrm_genid,
  		.nf_dst_cookie = nf_flow_offload_dst_cookie(&flow->tuplehash[dir].tuple),
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
-index a899fc307c8f..91ba96aa18b0 100644
+index 2f2bcae721bf..ddec0850159f 100644
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
 @@ -114,6 +114,8 @@ struct nft_forward_info {
@@ -488,7 +515,7 @@ index a899fc307c8f..91ba96aa18b0 100644
  		default:
  			goto refuse;
  		}
-@@ -286,6 +323,7 @@ static int nft_dev_forward_path(struct nf_flow_route *route,
+@@ -301,6 +338,7 @@ static int nft_dev_forward_path(struct nf_flow_route *route,
  	/* Belongs to this direction's egress path, as out.h_dest does, and
  	 * unlike out.h_dest it survives NEIGH output. */
  	route->tuple[dir].session = info.session;

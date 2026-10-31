@@ -38,6 +38,13 @@ the one the rule was built from. One walk, one truth — which also means the
 only cross-check available is the one thing the rule does carry, the
 `FLOW_ACTION_PPPOE_PUSH` sid, and that is checked against the record.
 
+The record is only taken from a walk that ends on a port the flowtable lists.
+One that ends on the WAN port between a carrier flap and the daemon adding it
+back keeps the default path, the ppp device as the reply's ingress and no
+session, which the adapter cannot offload; the route records the port, and
+the port joining the table retires the flow, so that its next packet walks
+the session again (see [VLAN](vlan.md), which works the same way).
+
 ## What Linux describes, and what it does not
 
 Three gaps, and the contract is mostly about them.

@@ -35,6 +35,28 @@ a later packet walks the whole path. A port is its own path, so it is cached
 as before, and `flow_offload_eth_dst()` holds its rules back until the
 neighbour resolves.
 
+The walk can also end on a port the table does not list: one that lost
+carrier, before the daemon's [device following](policy.md#device-membership)
+adds it back. `nft_dev_forward_path()` (patch 140) keeps the default path
+then too: deferring would have every packet walk again for good past a port
+that never joins -- a bridged Wi-Fi interface, a USB NIC. What it adds is a
+record of the port, the route's `in.unlisted_ifindex`, which the flow's tuple
+carries as `unlisted_iifidx` below the lookup key, whenever the default path
+names another device (the subinterface; a port destination already names
+itself and records nothing). When the daemon's `add flowtable`
+puts the port back, the commit publishes each new hook and has the flowtable
+retire every flow that recorded it (`nf_flow_table_listed()`, the nftables
+flowtable types' `listed` op): the GC removes them, and their next packet
+walks to the port as a flow does that started after the join. The port going
+down retires them too, as it does the flows cached on it
+(`nf_flow_table_do_cleanup()`): a port unregistered and registered again, as
+a driver rebind does, comes back under another index, which no flow
+recorded. A flow whose
+walk read the hook list before the commit but was added after its sweep looks
+at the list again once it is in the table, behind a full barrier that pairs
+with the commit's, and retires itself if the port is there now; a flow that
+recorded no port pays nothing for that.
+
 The tags themselves are derived from the devices, not decoded from the action
 list. `ft_path_stack()` (`cdx/ask_flowtable_core.c`) walks `cls->nf_dst->dev`
 down to the redirect port and `cls->nf_dst_reverse->dev` down to the binding's

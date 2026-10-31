@@ -182,7 +182,11 @@ came up and `delete flowtable` for ports that went down, without deleting the
 table or draining the hardware. Ports that stay keep their bindings and their
 hardware flows; the adapter binds or unbinds only the ports the update names.
 A deleted port's binding retires the directions it held as it is released,
-each reporting what it counted to its conntrack.
+each reporting what it counted to its conntrack. A connection that starts
+while a port is out of the table is cached on the VLAN, bridge, ppp or tunnel
+device above it, which the adapter cannot offload; the kernel records the
+port, and the `add flowtable` that brings it back retires those flows so that
+their next packet walks to the port ([VLAN](vlan.md) has the mechanism).
 The result is verified as strictly as a replacement: marker, device list, one
 binding per device, no invalidation. If the update fails or does not verify,
 the same check falls back to the drain/install/verify transaction.

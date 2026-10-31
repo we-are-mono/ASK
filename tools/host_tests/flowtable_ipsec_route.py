@@ -40,12 +40,15 @@ def test_flowtable_ipsec_route(tmp_path):
 def test_flowtable_forward_path_unresolved_hops(tmp_path):
     """A flow's first packet can meet a hop of its path not resolved yet: the
     client's neighbour on a VLAN or bridge just created again, a tunnel's
-    outer next hop after the WAN link flapped, the client's FDB entry after it
-    aged out. A table with neighbour output then caches no flow -- one cached
-    on the logical device would never be walked again -- and asks for the
-    neighbour where there is one to ask; a tunnel hop defers for every table.
-    Ports, tables without neighbour output, PPPoE and a bridge port that is
-    not forwarding keep their behaviour."""
+    outer next hop or outer route after the WAN link flapped, the client's FDB
+    entry after it aged out. A table with neighbour output then caches no flow
+    -- one cached on the logical device would never be walked again -- and
+    asks for the neighbour where there is one to ask; a tunnel hop defers for
+    every table. Ports, tables without neighbour output, PPPoE and a bridge
+    port that is not forwarding keep their behaviour. A walk that reaches a
+    port the table does not list falls back, and records the port when the
+    fallback names a device above it, so that the port joining the table can
+    retire the flow."""
     source = _source()
     dev = _source("net/core/dev.c")
     _run(tmp_path, "flowtable_forward_path.c", {

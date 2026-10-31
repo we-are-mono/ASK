@@ -230,6 +230,15 @@ again. Any other table falls back as before. A station that only receives,
 behind a permanent neighbour, sends nothing to teach it, and stays in
 software until it does.
 
+A port the bridge does name but the flowtable does not list -- a LAN port
+that lost carrier, before the daemon adds it back -- falls back to the bridge
+device as well, since a bridged Wi-Fi interface is such a port for good and
+must not have every packet walk again. The route records the port, and the
+port joining the table retires the flows that recorded it, so that their next
+packet walks the whole path (see [VLAN](vlan.md), which works the same way). A
+station on the Wi-Fi interface records that interface, which never joins, and
+stays on the bridge device in software, as before.
+
 ## Eligibility
 
 Beyond the rules a routed, tagged flow already satisfies:

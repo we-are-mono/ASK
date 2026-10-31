@@ -172,20 +172,20 @@ result independently of those temporary files.
   route to the peer, the path-MTU exceptions and the neighbours; on the next failure, a cookie that changed while no
   `gc_*` moved names the stale-dst teardown.
 
-- [ ] **A426 — a flow whose walk reaches a port the flowtable does not list yet stays on its logical device.** Where:
-  `nft_dev_forward_path()` (patch 140, `nft_flow_offload.c`), which keeps the default path when
-  `nft_flowtable_find_dev()` does not find the port the walk resolved. With `devices auto` the daemon
-  (`flowtable/src/enumerate.c`) lists only up `fsl_dpa` ports, so a connection whose first packet comes between a
-  port's carrier flap and the daemon re-adding it is cached with its VLAN, bridge or PPPoE device as the reply's
-  ingress: admission refuses it on every refresh (`egress_ok=0`) while the other direction keeps it alive in software, the A425 symptom
-  by another way. Why it matters: carrier flaps on a LAN or WAN port are routine, and every connection caught in that
-  window stays in software until it ends. Deferring as A425 does is wrong here: a port legitimately outside the table
-  (a bridged Wi-Fi interface, a USB NIC) would re-walk every packet for good. Fix direction: when a device joins the
-  table (the device-hook add, patch 152's transaction), retire the cached flows whose reply ingress is an upper device
-  of the joining port, so their next packet walks the whole path; needs a host case and a rig carrier-flap run. The
-  same frozen fallback, rarer: the `sit`/`ip6_tnl` hooks still return `-ENOENT` when the outer route lookup itself fails,
-  so a tunnel device that outlives a WAN route outage keeps flows cached on it (netifd usually tears 6in4 down with the
-  WAN); treating that lookup error as `-EAGAIN` in patch 143 is a two-line change.
+- [ ] **A428 — a ppp unit without a connected session leaves a flow built through it on the ppp device for good.**
+  Where: `ppp_fill_forward_path()` (`drivers/net/ppp/ppp_generic.c`) returns `-ENODEV` while the unit has no channel,
+  and `pppoe_fill_forward_path()` (`pppoe.c`) returns -1 while its session is not connected; `nft_dev_forward_path()`
+  (patch 140) defers only on `-EAGAIN`, so a flow built then is cached with the ppp device as the reply's ingress and
+  admission refuses it for good, the A425/A426 freeze. OpenWrt's default PPPoE (no `persist`, `maxfail 1`) has pppd
+  exit on a drop, and the unit's unregistration cleans those flows up; `demand` keeps the unit across redials, so every
+  connection that sends while it redials stays in software after the session returns. Why it matters: a dial-on-demand
+  WAN loses offload for those connections on every reconnect. Fix direction: report a missing channel and an
+  unconnected session as `-EAGAIN` (the unit queues or drops those packets anyway); first confirm whether `persist`
+  keeps the unit too, then a host case beside the walk's PPPoE ones and a rig run of a `demand` session redialing.
+
+- [x] **A426 — a flow whose walk reached a port the flowtable did not list yet stayed on its logical device.** The flow
+  records the port, and the port joining the table retires it; a tunnel whose outer route fails caches nothing
+  (_:/^netfilter: retire a flow cached above a port that joins the flowtable_).
 
 - [x] **A425 — a VLAN deleted and created again often never carried offloaded flows again.** Its first packet met the
   client's neighbour unresolved and the flow was cached on the VLAN device, which admission refuses for good; patches

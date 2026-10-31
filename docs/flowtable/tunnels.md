@@ -137,7 +137,18 @@ again: a flow
 cached on the tunnel device would keep it as the reply's ingress, which no
 port is, for as long as the connection lasted. A table without neighbour
 output refuses the hop anyway and only goes without a software flow
-meanwhile.
+meanwhile. An outer route lookup that fails outright -- no route while the
+WAN link is down, or an outer transform that cannot be had -- is `-EAGAIN`
+in both hooks (patch 143) for the same reason: the tunnel's transmit path
+cannot send the outer packet either, and a later packet walks the whole path
+once the route is back.
+
+The port the walk crosses to may also be one the flowtable does not list yet,
+as the WAN port is between a carrier flap and the daemon adding it back. The
+flow then keeps the tunnel device as the reply's ingress and records the port,
+and the port joining the table retires it, so that its next packet walks
+through the tunnel to the port (see [VLAN](vlan.md), which works the same
+way).
 
 Before a direction is installed there is nothing to watch, and the outer
 address is the one the walk recorded when Linux created the flow: no later

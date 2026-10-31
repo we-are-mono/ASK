@@ -1,4 +1,5 @@
-"""Recover persistent connections when a routed VLAN disappears and returns."""
+"""Recover persistent connections when a routed VLAN, or the port under it,
+disappears and returns."""
 from __future__ import annotations
 
 from _flowtable_service_vlan import ADDRESS
@@ -11,11 +12,11 @@ import time
 
 import pytest
 
-from _topology import TARGET_LAN_IF
+from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from _flowtable_connections import (peer)
-from _flowtable_rig import (console_command, read)
+from _flowtable_rig import (command, console_command, read)
 from _flowtable_selective_neighbour import (hardware, unchanged, warm)
-from _flowtable_service import FIRST, service_status, supervision_status, wait_service
+from _flowtable_service import FIRST, rendered_devices, service_status, supervision_status, wait_service
 
 
 @pytest.mark.parametrize("target", ["dev-stats", "hardware"])
@@ -185,3 +186,87 @@ async def test_recreation(vlan_service, neighbour):
         await hardware(r, p, "service-vlan-new-hardware", flows[:5])
         for ident in (5, 6):
             await denied(r, p, ident)
+
+
+async def test_port_rejoin(vlan_service):
+    """The LAN port leaving the flowtable and joining it again, as `devices
+    auto` follows its link going down and coming back on a box with a third
+    port up, carries the connections that crossed it in between in hardware
+    again. The port going down retires their flows; each one's next packet
+    then walked through the VLAN to a port the flowtable did not list, and was
+    cached on the VLAN device, which no hardware port backs: the port's join
+    has to retire it, so that its next packet walks the whole path (A426).
+    The connections on the port itself are cached on it either way. The rig
+    has no third port with a link, so the controller is held stopped and the
+    test makes the two membership changes it would make, the only ones made;
+    the port leaves first, so no flow can be cached between its link going
+    down and its leaving."""
+    r = vlan_service
+    vlan = {"lan": ADDRESS, "netns": NETNS}
+    flows = [
+        {"id": 0, "proto": "udp", "sport": FIRST, "lan": r.lan_ip},
+        {"id": 1, "proto": "tcp", "sport": FIRST, "lan": r.lan_ip},
+        {"id": 2, "proto": "udp", "sport": FIRST, **vlan},
+        {"id": 3, "proto": "tcp", "sport": FIRST, **vlan},
+    ]
+    member = f'hook ingress priority 0; devices = {{ "{TARGET_LAN_IF}" }};'
+
+    def software(conntrack):
+        # Each VLAN connection cached again, in the software flowtable only.
+        return all(any(f"src={ADDRESS} " in line and f"sport={flow['sport']} " in line
+                       and f" {flow['proto']} " in line and "[OFFLOAD]" in line
+                       for line in conntrack.splitlines()) for flow in flows[2:])
+
+    async with peer(r, flows, lease=300) as p:
+        await warm(r, p, [0, 1, 2, 3], "service-rejoin-baseline", flows)
+        initial = await hardware(r, p, "service-rejoin-baseline-hardware", flows)
+        before_attempts = await attempts(r)
+        await p.rpc("start", [0, 2], count=0, interval=0.02, allow_loss=True)
+        await p.rpc("start", [1, 3], count=0, interval=0.02)
+        await console_command(r.service_console, "kill", "-STOP", r.service_pid)
+        try:
+            await command(r.target, r.session, "nft",
+                          f"delete flowtable inet ask_flowtable fast {{ {member} }}")
+            assert await rendered_devices(r) == [TARGET_WAN_IF], "the LAN port did not leave"
+            await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "down")
+            try:
+                await asyncio.sleep(1)
+            finally:
+                # Going down takes the fixture's host routes and neighbours:
+                # the port's, and the VLAN's, which goes down and up with it.
+                await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "up")
+                for address, mac, dev in ((r.lan_ip, r.lan_mac, TARGET_LAN_IF), (ADDRESS, r.lan_mac, DUT_IF)):
+                    await command(r.target, r.session, "ip", "route", "replace", f"{address}/32", "dev", dev)
+                    await command(r.target, r.session, "ip", "neigh", "replace", address, "lladdr", mac,
+                                  "nud", "permanent", "dev", dev)
+            # The LAN link retrains for a few seconds after the port returns.
+            deadline, samples = time.monotonic() + 20, []
+            try:
+                while True:
+                    state = await r.state()
+                    conntrack = await read(r.target, r.session, "/proc/net/nf_conntrack")
+                    samples.append({"state": state, "conntrack": conntrack})
+                    if not tagged(state) and software(conntrack):
+                        break
+                    assert time.monotonic() < deadline, ("the VLAN connections were not cached "
+                                                         "again while the LAN port was out")
+                    await asyncio.sleep(0.2)
+            finally:
+                r.record("service-rejoin-out", samples)
+            await command(r.target, r.session, "nft",
+                          f"add flowtable inet ask_flowtable fast {{ {member} counter; flags offload; }}")
+            assert await rendered_devices(r) == sorted([TARGET_LAN_IF, TARGET_WAN_IF])
+        finally:
+            await console_command(r.service_console, "kill", "-CONT", r.service_pid)
+        reports = await p.rpc("stop", [0, 1, 2, 3])
+        r.record("service-rejoin-transfers", reports)
+        assert reports["1"]["lost"] == reports["3"]["lost"] == 0, reports
+        rejoined = time.monotonic()
+        ready = await warm(r, p, [0, 1, 2, 3], "service-rejoin-readmitted", flows)
+        assert time.monotonic() - rejoined < 30, ready
+        after = await hardware(r, p, "service-rejoin-hardware", flows)
+        balanced(after, initial["errors"])
+        assert after["invalidated"] == 0 and after["bindings"] == 2, after
+        # Neither change was the controller's, and it made none of its own.
+        assert await attempts(r) == before_attempts
+        assert (await read(r.target, r.session, "/run/ask-flowtable/worker.pid")).strip() == r.service_pid

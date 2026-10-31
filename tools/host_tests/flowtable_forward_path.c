@@ -9,9 +9,11 @@
  *
  * A flow's first packet can meet a hop that has not resolved yet: the
  * client's neighbour on a VLAN just created again, a tunnel's outer next hop
- * after the WAN link flapped, the client's FDB entry after it aged out. Each
- * group of cases can run alone (argv[1]: neighbour, tunnel, bridge, controls);
- * no argument runs them all. */
+ * or route after the WAN link flapped, the client's FDB entry after it aged
+ * out. Or it can reach a port the flowtable does not list, as one that lost
+ * carrier before the table follows it back. Each group of cases can run
+ * alone (argv[1]: neighbour, tunnel, bridge, controls, unlisted); no argument
+ * runs them all. */
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
@@ -236,6 +238,7 @@ struct nf_flow_route {
 		struct dst_entry *dst;
 		struct {
 			u32 ifindex;
+			u32 unlisted_ifindex;
 			struct {
 				u16 id;
 				__be16 proto;
@@ -309,6 +312,11 @@ struct setup {
 	struct nft_pktinfo pkt;
 	struct nf_conn ct;
 	struct nf_flow_route route;
+	/* The outer IPv4 route lookup's error, and whether the outer IPv6
+	 * route's transform lookup fails; the IPv6 route's own error is its
+	 * dst's. */
+	int outer4_error;
+	bool xfrm_error;
 };
 static struct setup *cur;
 
@@ -410,6 +418,8 @@ static inline void flowi4_init_output(struct flowi4 *fl4, int oif, u32 mark,
 static inline struct rtable *ip_route_output_flow(void *net, struct flowi4 *fl4,
 						  void *sk)
 {
+	if (cur->outer4_error)
+		return ERR_PTR(cur->outer4_error);
 	cur->outer4.dst.refs++;
 	return &cur->outer4;
 }
@@ -427,10 +437,14 @@ static inline struct dst_entry *ip6_route_output(void *net, void *sk,
 	cur->outer6.dst.refs++;
 	return &cur->outer6.dst;
 }
+/* A failed lookup releases the route it was given, as the kernel's does. */
 static inline struct dst_entry *xfrm_lookup(void *net, struct dst_entry *dst,
 					    struct flowi *fl, void *sk, int flags)
 {
-	return dst;
+	if (!cur->xfrm_error)
+		return dst;
+	dst_release(dst);
+	return ERR_PTR(-EPERM);
 }
 static inline const struct in6_addr *rt6_nexthop(const struct rt6_info *rt,
 						 const struct in6_addr *daddr)
@@ -497,6 +511,8 @@ static u8 wan_mac[ETH_ALEN] = { 0x02, 0, 0, 0, 4, 1 };
 	.dev_addr = { 0x02, 0, 0, 0, (port), (last) }, .netdev_ops = (ops)
 static struct net_device eth3 = { ETHER(3, 3, 0, &port_ops) };
 static struct net_device eth4 = { ETHER(4, 4, 0, &port_ops) };
+/* A Wi-Fi interface br-lan can bridge, which the flowtable never lists. */
+static struct net_device wlan = { ETHER(8, 8, 0, &port_ops) };
 static struct vlan_dev_priv vlan_priv;
 static struct net_device vlan = { ETHER(30, 3, 0, &vlan_ops), .priv = &vlan_priv };
 static struct net_bridge bridge_priv;
@@ -566,7 +582,8 @@ static void prepare(struct setup *s, bool use_neigh, struct net_device *lan,
 		    u8 lan_state, struct net_device *wan, bool lan_bound,
 		    int family)
 {
-	struct net_device *devices[] = { &eth3, &eth4, &vlan, &bridge, &ppp, &sit, &ip6tnl };
+	struct net_device *devices[] = { &eth3, &eth4, &wlan, &vlan, &bridge, &ppp, &sit,
+					 &ip6tnl };
 
 	memset(s, 0, sizeof(*s));
 	cur = s;
@@ -614,6 +631,31 @@ static enum ip_conntrack_dir lan_dir(enum ip_conntrack_dir dir, bool lan_bound)
 static int route(struct setup *s, enum ip_conntrack_dir dir)
 {
 	return nft_flow_route(&s->pkt, &s->ct, &s->route, dir, &s->ft);
+}
+
+/* Takes dev's hook off the table's list, as a port that lost carrier leaves
+ * a table that follows its ports. */
+static void unlist(struct setup *s, const struct net_device *dev)
+{
+	struct list_head *prev = &s->ft.hook_list;
+
+	while (prev->next != &s->ft.hook_list) {
+		struct nft_hook *hook = container_of(prev->next, struct nft_hook, list);
+
+		if (hook->ops.dev == dev) {
+			prev->next = hook->list.next;
+			return;
+		}
+		prev = prev->next;
+	}
+	assert(!"listed");
+}
+
+/* Neither direction recorded a port the table does not list. */
+static void none_unlisted(const struct setup *s)
+{
+	assert(!s->route.tuple[0].in.unlisted_ifindex);
+	assert(!s->route.tuple[1].in.unlisted_ifindex);
 }
 
 /* Everything the walk borrowed is back, and the route holds what it says. */
@@ -680,6 +722,7 @@ static void lan_walked(struct net_device *lan, u8 state, enum ip_conntrack_dir d
 	assert(s.route.tuple[to_lan].in.num_encaps == 0);
 	assert(s.route.tuple[0].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH);
 	assert(s.route.tuple[1].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH);
+	none_unlisted(&s);
 	drop(&s);
 }
 
@@ -743,7 +786,41 @@ static void tunnel_cases(enum ip_conntrack_dir dir, bool lan_bound, int nf)
 				assert(s.route.tuple[to_lan].in.ifindex == (u32)tun->ifindex);
 				assert(!s.route.tuple[!to_lan].tunnel.lower_ifindex);
 			}
+			none_unlisted(&s);
 			drop(&s);
+
+			/* No outer route at all -- the WAN link down, or an
+			 * outer transform that cannot be had -- is as much a
+			 * hop not known yet: the transmit path cannot send the
+			 * outer packet either. Nothing is cached, and there is
+			 * no neighbour to ask for. */
+			for (int how = 0; how < (tun == &ip6tnl ? 2 : 1); how++) {
+				prepare(&s, use_neigh, &vlan, NUD_REACHABLE, tun,
+					lan_bound, nf);
+				if (tun == &sit)
+					s.outer4_error = -ENETUNREACH;
+				else if (!how)
+					s.outer6.dst.error = -ENETUNREACH;
+				else
+					s.xfrm_error = true;
+				assert(route(&s, dir) == -EAGAIN);
+				released(&s, 0);
+				assert(!s.outer_neigh.kicks && tun->walks == 1);
+			}
+
+			/* A reject route that carries no error of its own:
+			 * IPv6 turns a unicast route through the loopback
+			 * device, a common null route, into a reject route of
+			 * type unicast, and that type's error is zero. It
+			 * discards the outer packet all the same, so its flag
+			 * alone defers the hop, as the failed lookups do. */
+			if (tun != &ip6tnl)
+				continue;
+			prepare(&s, use_neigh, &vlan, NUD_REACHABLE, tun, lan_bound, nf);
+			s.outer6.rt6i_flags = RTF_REJECT;
+			assert(route(&s, dir) == -EAGAIN);
+			released(&s, 0);
+			assert(!s.outer_neigh.kicks && tun->walks == 1);
 		}
 	}
 }
@@ -825,6 +902,8 @@ static void control_cases(enum ip_conntrack_dir dir, bool lan_bound, int nf)
 	assert(!s.lan_neigh.kicks && !vlan.walks && eth4.walks == 1);
 	assert(s.route.tuple[!to_lan].in.ifindex == (u32)vlan.ifindex);
 	assert(s.route.tuple[!to_lan].in.num_encaps == 0);
+	/* Nothing walked, so no port was reached to record. */
+	none_unlisted(&s);
 	drop(&s);
 	/* Resolved, it walks to the port as before. */
 	prepare(&s, false, &vlan, NUD_REACHABLE, &eth4, lan_bound, nf);
@@ -847,6 +926,93 @@ static void control_cases(enum ip_conntrack_dir dir, bool lan_bound, int nf)
 	drop(&s);
 }
 
+/* A walk that reaches a port the table does not list -- one that lost carrier,
+ * before a table that follows its ports adds it back -- falls back for every
+ * table: deferring would walk every packet for good past a port that never
+ * joins, as the bridged Wi-Fi interface here never does. When the fallback
+ * names a device above the port, the route records the port, so that the port
+ * joining the table can retire the flow. A port destination names itself and
+ * records nothing, and neither does a walk that ends on a listed port. */
+static void unlisted_cases(enum ip_conntrack_dir dir, bool lan_bound, int nf)
+{
+	enum ip_conntrack_dir to_lan = lan_dir(dir, lan_bound);
+	struct net_device *uppers[] = { &vlan, &bridge };
+	struct net_device *tunnels[] = { &sit, &ip6tnl };
+	struct setup s;
+
+	for (int use_neigh = 0; use_neigh < 2; use_neigh++) {
+		/* The client behind a VLAN or the bridge on eth3. */
+		for (size_t u = 0; u < ARRAY_SIZE(uppers); u++) {
+			prepare(&s, use_neigh, uppers[u], NUD_REACHABLE, &eth4,
+				lan_bound, nf);
+			unlist(&s, &eth3);
+			assert(route(&s, dir) == 0);
+			released(&s, 1);
+			assert(uppers[u]->walks == 1 && eth4.walks == 1);
+			assert(s.route.tuple[!to_lan].in.ifindex == (u32)uppers[u]->ifindex);
+			assert(s.route.tuple[!to_lan].in.unlisted_ifindex == (u32)eth3.ifindex);
+			assert(!s.route.tuple[!to_lan].in.num_encaps);
+			assert(s.route.tuple[to_lan].in.ifindex == (u32)eth4.ifindex);
+			assert(!s.route.tuple[to_lan].in.unlisted_ifindex);
+			drop(&s);
+		}
+
+		/* The client on the bridged Wi-Fi interface. */
+		prepare(&s, use_neigh, &bridge, NUD_REACHABLE, &eth4, lan_bound, nf);
+		s.port.dev = &wlan;
+		assert(route(&s, dir) == 0);
+		released(&s, 1);
+		assert(s.route.tuple[!to_lan].in.ifindex == (u32)bridge.ifindex);
+		assert(s.route.tuple[!to_lan].in.unlisted_ifindex == (u32)wlan.ifindex);
+		assert(!s.route.tuple[to_lan].in.unlisted_ifindex);
+		drop(&s);
+
+		/* The client on eth3 itself: the fallback is the walked path. */
+		prepare(&s, use_neigh, &eth3, NUD_REACHABLE, &eth4, lan_bound, nf);
+		unlist(&s, &eth3);
+		assert(route(&s, dir) == 0);
+		released(&s, 1);
+		assert(eth3.walks == 1);
+		assert(s.route.tuple[!to_lan].in.ifindex == (u32)eth3.ifindex);
+		none_unlisted(&s);
+		drop(&s);
+
+		/* A PPPoE session over eth4: the session is not recorded
+		 * either, as the walk's result is not taken. */
+		prepare(&s, use_neigh, &vlan, NUD_REACHABLE, &ppp, lan_bound, nf);
+		unlist(&s, &eth4);
+		assert(route(&s, dir) == 0);
+		released(&s, 1);
+		assert(ppp.walks == 1);
+		assert(s.route.tuple[to_lan].in.ifindex == (u32)ppp.ifindex);
+		assert(s.route.tuple[to_lan].in.unlisted_ifindex == (u32)eth4.ifindex);
+		assert(!s.route.tuple[to_lan].in.num_encaps);
+		assert(!s.route.tuple[!to_lan].session.lower_ifindex);
+		assert(s.route.tuple[!to_lan].in.ifindex == (u32)eth3.ifindex);
+		assert(!s.route.tuple[!to_lan].in.unlisted_ifindex);
+		drop(&s);
+
+		/* A tunnel whose outer packet leaves by eth4. Only a table with
+		 * neighbour output crosses the hop to reach the port at all;
+		 * any other refuses it, which records nothing. */
+		for (size_t t = 0; t < ARRAY_SIZE(tunnels); t++) {
+			struct net_device *tun = tunnels[t];
+
+			prepare(&s, use_neigh, &vlan, NUD_REACHABLE, tun, lan_bound, nf);
+			unlist(&s, &eth4);
+			assert(route(&s, dir) == 0);
+			released(&s, 1);
+			assert(tun->walks == 1);
+			assert(s.route.tuple[to_lan].in.ifindex == (u32)tun->ifindex);
+			assert(s.route.tuple[to_lan].in.unlisted_ifindex ==
+			       (use_neigh ? (u32)eth4.ifindex : 0));
+			assert(!s.route.tuple[!to_lan].tunnel.lower_ifindex);
+			assert(!s.route.tuple[!to_lan].in.unlisted_ifindex);
+			drop(&s);
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {
 	static const struct {
@@ -857,6 +1023,7 @@ int main(int argc, char **argv)
 		{ "tunnel", tunnel_cases },
 		{ "bridge", bridge_cases },
 		{ "controls", control_cases },
+		{ "unlisted", unlisted_cases },
 	};
 
 	init_devices();
