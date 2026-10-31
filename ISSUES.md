@@ -179,16 +179,8 @@ result independently of those temporary files.
   and connect changed them.** Both are now marked; the state is volatile and needs none
   (_:/^ppp: mark the PPPoE session fields read without the socket lock_).
 
-- [ ] **A429 — a flow the adapter did not carry keeps its old PPPoE session as the reply's ingress after a redial
-  that changes the session id.** Where: the walk records the reply ingress as the WAN port plus the session's encap
-  (patch 140), and only cdx retires a session's flows when the channel leaves the unit (patch 070's event); a flow it
-  refused for another reason -- tc in software on the ppp device (SQM), the MTU bound, a full table, a parked binding
-  -- or one in a table it does not bind is never retired. The upload still reaches the unit, so redialling works, but
-  replies arrive with the new id and miss the flowtable for the rest of the connection. `nf_flow_table_cleanup()` on the
-  ppp device cannot reach them: it matches ingress devices only. Why it matters: software throughput only, for
-  connections that outlive a redial on a box running SQM on a PPPoE WAN. Fix direction: have the flowtable itself
-  retire flows whose path crossed a ppp unit that raised the channel event (record the unit in the tuple beside the
-  session, as A426 records the unlisted port), then a rig case with software tc on the ppp device.
+- [-] **A429 — a flow the adapter did not carry keeps its old PPPoE session after a redial changes the id.** Wontfix:
+  demand only (the default's unit dies and its dst check re-walks), slow path only, mainline's too (_:/^ISSUES: close A429_).
 
 - [x] **A428 — a session dialled on demand ended under a surviving ppp unit, and its flows stayed on the ended
   session.** The unit now announces a channel change, cdx retires its flows and re-checks a session at admission,
