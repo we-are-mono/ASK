@@ -172,15 +172,8 @@ result independently of those temporary files.
   route to the peer, the path-MTU exceptions and the neighbours; on the next failure, a cookie that changed while no
   `gc_*` moved names the stale-dst teardown.
 
-- [ ] **A431 — a relayed PPPoE frame processed from the socket backlog can transmit on a device already freed.**
-  Where: `pppoe_rcv_core()` (`drivers/net/ppp/pppoe.c`, mainline) relays to another session's socket through
-  `__pppoe_xmit()`, which reads that socket's `pppoe_dev` with no lock. From softirq it runs inside the receive path's
-  RCU section, but a frame queued to the backlog while the socket was owned runs later from `__release_sock()` in
-  process context, outside any RCU section, so `pppoe_flush_dev()` clearing and releasing that device, and its
-  unregistration completing, need not wait for it. Relay mode only (PPPOEIOCSFWD), which neither ASK nor OpenWrt's
-  netifd uses; from review, not reproduced. Why it matters: a use-after-free reachable by a local process that sets up
-  a relay while the relayed session's lower device goes down. Fix direction: hold the device across the relayed
-  transmit (`dev_hold()` under RCU, or take the relay socket's lock), upstream rather than in ASK's series.
+- [-] **A431 — a relayed PPPoE frame processed from the socket backlog may transmit on a freed device.** Wontfix:
+  mainline relay mode (PPPOEIOCSFWD), unused on this device, from review only (_:/^ISSUES: close A431_).
 
 - [x] **A430 — the PPPoE hook and transmit read the session's device and id unannotated while the PADT work, release
   and connect changed them.** Both are now marked; the state is volatile and needs none
