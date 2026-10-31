@@ -4,6 +4,7 @@ forward-path walk under it."""
 from ask_orch.process import run_process
 import os
 from pathlib import Path
+import re
 
 from _host_qos_lifecycle import (function)
 from _kernel_source import (kernel_source)
@@ -68,3 +69,36 @@ def test_flowtable_forward_path_unresolved_hops(tmp_path):
     # The hooks compare an int count with ARRAY_SIZE(), as the kernel, which
     # builds without this warning, lets them.
     }, flags=("-Wno-sign-compare",))
+
+
+def _code(source):
+    """C source without its comments, which name the fields too."""
+    return re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.S)
+
+
+def test_pppoe_session_fields_marked():
+    """The walk reaches a PPPoE channel under RCU through the unit it is
+    attached to, and the channel transmits under ppp_generic's channel
+    lock, neither under the socket's. Both read the session's device while
+    the PADT work and release clear it before they unregister the channel,
+    and its id, which the relay path reads on another socket that connect
+    hashes and marks connected before it writes the id. Each reads both
+    once, through READ_ONCE(), and so does the device flush's scan the
+    device, holding the hash lock but not the socket's; every write of
+    either goes through WRITE_ONCE(). The state is left alone: sk_state is
+    volatile, which KCSAN already treats as marked."""
+    pppoe = _code(_source("drivers/net/ppp/pppoe.c"))
+    for name in ("pppoe_fill_forward_path", "__pppoe_xmit"):
+        body = function(pppoe, name)
+        for field in ("po->pppoe_dev", "po->num"):
+            assert body.count(f"READ_ONCE({field})") == 1, f"{name} reads {field} without READ_ONCE()"
+            assert len(re.findall(rf"\b{re.escape(field)}\b", body)) == 1, \
+                f"{name} reads {field} more than once"
+    assert "READ_ONCE(po->pppoe_dev) != dev" in function(pppoe, "pppoe_flush_dev")
+    assert not re.findall(r"->pppoe_dev\s*=(?!=)", pppoe), "a plain write of pppoe_dev"
+    # The flush, the PADT work, release, and connect's reset, bind and error
+    # path.
+    assert pppoe.count("WRITE_ONCE(po->pppoe_dev, ") == 6
+    assert not re.findall(r"->num\s*=(?!=)", pppoe), "a plain write of num"
+    # Connect's reset and its store of the new id.
+    assert pppoe.count("WRITE_ONCE(po->num, ") == 2

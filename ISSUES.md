@@ -172,12 +172,19 @@ result independently of those temporary files.
   route to the peer, the path-MTU exceptions and the neighbours; on the next failure, a cookie that changed while no
   `gc_*` moved names the stale-dst teardown.
 
-- [ ] **A430 — `pppoe_fill_forward_path()` reads the session's device, id and peer without annotation while
-  `pppoe_unbind_sock_work()` clears them.** Where: `drivers/net/ppp/pppoe.c` (mainline), racing the PADT work. A data
-  race KCSAN would report, not a use-after-free: the lower device cannot be freed under the walk's RCU section, and the
-  worst a torn read gives is a walk on the ending session, which admission's session check (`ft_session_current()`)
-  then refuses. Why it matters: correctness by inspection only, and it hides real races from KCSAN. Fix direction:
-  `READ_ONCE()` the three fields in the hook and `WRITE_ONCE()` them in the unbind and connect paths, in patch 070.
+- [ ] **A431 — a relayed PPPoE frame processed from the socket backlog can transmit on a device already freed.**
+  Where: `pppoe_rcv_core()` (`drivers/net/ppp/pppoe.c`, mainline) relays to another session's socket through
+  `__pppoe_xmit()`, which reads that socket's `pppoe_dev` with no lock. From softirq it runs inside the receive path's
+  RCU section, but a frame queued to the backlog while the socket was owned runs later from `__release_sock()` in
+  process context, outside any RCU section, so `pppoe_flush_dev()` clearing and releasing that device, and its
+  unregistration completing, need not wait for it. Relay mode only (PPPOEIOCSFWD), which neither ASK nor OpenWrt's
+  netifd uses; from review, not reproduced. Why it matters: a use-after-free reachable by a local process that sets up
+  a relay while the relayed session's lower device goes down. Fix direction: hold the device across the relayed
+  transmit (`dev_hold()` under RCU, or take the relay socket's lock), upstream rather than in ASK's series.
+
+- [x] **A430 — the PPPoE hook and transmit read the session's device and id unannotated while the PADT work, release
+  and connect changed them.** Both are now marked; the state is volatile and needs none
+  (_:/^ppp: mark the PPPoE session fields read without the socket lock_).
 
 - [ ] **A429 — a flow the adapter did not carry keeps its old PPPoE session as the reply's ingress after a redial
   that changes the session id.** Where: the walk records the reply ingress as the WAN port plus the session's encap
