@@ -76,26 +76,50 @@ async def dut_up(r, dev, timeout=20):
         await asyncio.sleep(0.25)
 
 
-async def lan_up(r, dev=LAN_NIC, timeout=20):
-    """The LAN client's NIC reinitialises on an MTU change and drops its link."""
+async def lan_up(r, dev=LAN_NIC, timeout=20, stable=0):
+    """The LAN client's NIC reinitialises on an MTU change and drops its link.
+    `stable` asks the link to stay up that many seconds: the rig's copper SFP
+    link can come up after a change, drop again two seconds later and stay
+    down for minutes, and a link that was up only for that instant hands the
+    next case a LAN it cannot reach. Each drop seen while waiting is
+    recorded."""
     result = await lan_run_python(r.lan, f'''
-import pathlib, time
+import json, pathlib, time
 state = pathlib.Path('/sys/class/net/{dev}/operstate')
-for _ in range({int(timeout * 4)}):
-    if state.read_text().strip() == 'up':
-        print('up')
-        break
+start = time.monotonic()
+up_since, drops, last = None, 0, None
+while True:
+    now, current = time.monotonic(), state.read_text().strip()
+    if current == 'up':
+        up_since = now if up_since is None else up_since
+        if now - up_since >= {stable}:
+            print(json.dumps({{'drops': drops, 'seconds': round(now - start, 1)}}))
+            break
+    else:
+        if last == 'up':
+            drops += 1
+        up_since = None
+    last = current
+    if now - start > {timeout}:
+        raise SystemExit('{dev} not up for {stable} s within {timeout} s: ' + current +
+                         ', ' + str(drops) + ' drops')
     time.sleep(0.25)
-else:
-    raise SystemExit('{dev} stayed ' + state.read_text().strip())
-''', timeout=timeout + 10, label="jumbo_lan_up")
+''', timeout=timeout + 15, label="jumbo_lan_up")
     assert result.rc == 0, result.stdout
+    report = json.loads(result.stdout.strip().splitlines()[-1])
+    if report["drops"]:
+        r.record("jumbo-lan-link-drops", {"dev": dev, **report})
+
+
+# Long enough for the copper SFP link to come back after it drops following a
+# change: about four minutes on the rig.
+LAN_RECOVERY = 360
 
 
 async def links_up(r):
-    """Both ends of the LAN cable and the DUT's WAN port, then a moment for
-    the switch and neighbours to settle."""
-    await lan_up(r)
+    """Both ends of the LAN cable, the client's held up a few seconds, and the
+    DUT's WAN port, then a moment for the switch and neighbours to settle."""
+    await lan_up(r, timeout=LAN_RECOVERY, stable=3)
     for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
         await dut_up(r, dev)
     await asyncio.sleep(1)
@@ -128,7 +152,9 @@ async def lan_mtu(stack, r, mtu, dev=LAN_NIC):
 
     async def restore():
         result = checked(await lan_run(r.lan, f"ip link set dev {dev} mtu {old}"))
-        await lan_up(r, dev)
+        # What the next case inherits: a link that stays up, not one that came
+        # up for an instant.
+        await lan_up(r, dev, timeout=LAN_RECOVERY, stable=5)
         return result
     checked(await lan_run(r.lan, f"ip link set dev {dev} mtu {mtu}"))
     stack.push(restore)
