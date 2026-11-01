@@ -1,4 +1,4 @@
-From dc5a8a9ef48fb68ef5233eef05d00e2fef8c5a39 Mon Sep 17 00:00:00 2001
+From 10ef0dc856d4f1a9799f34cad7eb3375b4d9ae46 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 01:01:33 +0200
 Subject: [PATCH] netfilter: flowtable: extend offloaded conntrack timeouts
@@ -60,10 +60,10 @@ index 3d938a19d332..59c395be63fe 100644
  
  int nf_conntrack_set_hashsize(const char *val, const struct kernel_param *kp);
 diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
-index 77a445a59af3..b076047c830a 100644
+index 8c28a6045e27..69839ad5004a 100644
 --- a/net/netfilter/nf_conntrack_core.c
 +++ b/net/netfilter/nf_conntrack_core.c
-@@ -1515,12 +1515,6 @@ static void gc_worker(struct work_struct *work)
+@@ -1514,12 +1514,6 @@ static void gc_worker(struct work_struct *work)
  
  			tmp = nf_ct_tuplehash_to_ctrack(h);
  
@@ -77,10 +77,10 @@ index 77a445a59af3..b076047c830a 100644
  				rcu_read_unlock();
  
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index 70ef1e27c792..042b8de49c4d 100644
+index 0c735768aed3..7ae390103d54 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -386,7 +386,7 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
+@@ -479,7 +479,7 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
  		return err;
  	}
  
@@ -89,19 +89,19 @@ index 70ef1e27c792..042b8de49c4d 100644
  
  	if (nf_flowtable_hw_offload(flow_table)) {
  		__set_bit(NF_FLOW_HW, &flow->flags);
-@@ -438,8 +438,9 @@ void flow_offload_teardown(struct flow_offload *flow)
- 	 * collector calls this again on every pass while the flow waits for its
- 	 * hardware retirement, and a tuple reopened in the meantime has already
- 	 * given the conntrack to a new flow, which the repeat would rob of the
--	 * only refresh it can get: gc_worker skips conntracks without
+@@ -526,8 +526,9 @@ void flow_offload_teardown(struct flow_offload *flow)
+ 	 * cleanup sweep over its device calls this again while the flow waits
+ 	 * for its hardware retirement, and a tuple reopened in the meantime has
+ 	 * already given the conntrack to a new flow, which the repeat would rob
+-	 * of the only refresh it can get: gc_worker skips conntracks without
 -	 * IPS_OFFLOAD, and the new flow is forwarded in hardware, so no packet
-+	 * only refresh it can get: nf_flow_table_extend_ct_timeout() skips
-+	 * conntracks without IPS_OFFLOAD, and the new flow is forwarded in
++	 * of the only refresh it can get: nf_flow_table_extend_ct_timeout()
++	 * skips conntracks without IPS_OFFLOAD, and the new flow is forwarded in
 +	 * hardware, so no packet
  	 * reaches the software path to set the bit again.
  	 */
  	if (!test_and_set_bit(NF_FLOW_TEARDOWN, &flow->flags)) {
-@@ -515,6 +516,116 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
+@@ -603,6 +604,116 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
  	return flow_table->type->gc && flow_table->type->gc(flow);
  }
  
@@ -218,7 +218,7 @@ index 70ef1e27c792..042b8de49c4d 100644
  static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  				    struct flow_offload *flow, void *data)
  {
-@@ -537,6 +648,8 @@ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+@@ -651,6 +762,8 @@ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  
  	if (retire)
  		flow_offload_teardown(flow);

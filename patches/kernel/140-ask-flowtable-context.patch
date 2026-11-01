@@ -1,4 +1,4 @@
-From f8932090de9ddb63cc0edf02907141115ae8b749 Mon Sep 17 00:00:00 2001
+From 23250850f463b88d9354c5e2a388b53aea0a003a Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 02:43:47 +0200
 Subject: [PATCH] netfilter: provide flowtable hardware lifecycle and policy
@@ -68,37 +68,49 @@ counter mode the table had at its last command about the flow, and takes
 64-bit deltas, as a counter read's now does: a read every few seconds
 exceeds 32 bits on one flow above eight gigabits per second.
 
+A driver that reads its counters on its own reports each flow's last use
+through the handle (nf_flow_offload_handle_used()) and is then asked for
+none. The GC applies that report before it judges a flow's expiry:
+applied with the statistics after the judgement, it reached the timeout
+a pass late, and a flow whose traffic resumed in the pass before it timed
+out was torn down although the report in hand said it was in use. Nor do
+reports made before the timeout expire the flow: the GC waits until the
+older of the driver's last two reports, which covers both directions of a
+flow read one after the other, comes from the timeout on and so carries any
+traffic that came just before it, and for no longer than a report is
+trusted. A last use later than its report is taken as the report's time.
+
 A table freed once its devices are all unbound frees its flows in place:
 each driver retired its directions as its binding was released, and a
 deletion per hardware flow would only run past an empty callback list.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- drivers/net/bonding/bond_main.c           |  80 +++++---
+ drivers/net/bonding/bond_main.c           |  80 ++++--
  include/linux/netdevice.h                 |   2 +
  include/net/flow.h                        |   2 +
- include/net/flow_offload.h                |  47 +++++
+ include/net/flow_offload.h                |  47 ++++
  include/net/netevent.h                    |  32 +++
  include/net/netfilter/nf_conntrack_acct.h |   3 +-
- include/net/netfilter/nf_flow_table.h     | 113 ++++++++++
+ include/net/netfilter/nf_flow_table.h     | 122 +++++++++
  include/net/netns/xfrm.h                  |   2 +
- include/net/xfrm.h                        | 106 +++++++++-
+ include/net/xfrm.h                        | 106 +++++++-
  net/core/dev.c                            |   2 +-
  net/ipv4/fib_trie.c                       |  20 ++
  net/ipv4/route.c                          |   3 +-
- net/ipv6/ip6_fib.c                        |  23 +++
+ net/ipv6/ip6_fib.c                        |  23 ++
  net/netfilter/nf_conntrack_core.c         |   3 +-
- net/netfilter/nf_flow_table_core.c        | 236 ++++++++++++++++++++-
+ net/netfilter/nf_flow_table_core.c        | 293 +++++++++++++++++++++-
  net/netfilter/nf_flow_table_inet.c        |   3 +
- net/netfilter/nf_flow_table_ip.c          |  25 ++-
- net/netfilter/nf_flow_table_offload.c     | 183 ++++++++++++++++-
+ net/netfilter/nf_flow_table_ip.c          |  25 +-
+ net/netfilter/nf_flow_table_offload.c     | 205 ++++++++++++++-
  net/netfilter/nf_tables_api.c             |  34 ++-
- net/netfilter/nft_flow_offload.c          | 240 +++++++++++++++++++---
+ net/netfilter/nft_flow_offload.c          | 240 +++++++++++++++---
  net/xfrm/xfrm_device.c                    |  29 ++-
- net/xfrm/xfrm_policy.c                    | 124 ++++++++++-
- net/xfrm/xfrm_state.c                     |  25 ++-
+ net/xfrm/xfrm_policy.c                    | 124 ++++++++-
+ net/xfrm/xfrm_state.c                     |  25 +-
  net/xfrm/xfrm_user.c                      |   6 +
- 24 files changed, 1233 insertions(+), 110 deletions(-)
+ 24 files changed, 1320 insertions(+), 111 deletions(-)
 
 diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
 index d10bbe4c3571..f910915934cb 100644
@@ -503,7 +515,7 @@ index a120685cac93..a6700a0cca06 100644
  static inline void nf_ct_acct_update(struct nf_conn *ct, u32 dir,
  				     unsigned int bytes)
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index 1a6fca013165..894e2afa06bd 100644
+index 1a6fca013165..d84faf4f2744 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
 @@ -64,6 +64,9 @@ struct nf_flowtable_type {
@@ -607,7 +619,7 @@ index 1a6fca013165..894e2afa06bd 100644
  		enum flow_offload_xmit_type	xmit_type;
  	} tuple[FLOW_OFFLOAD_DIR_MAX];
  };
-@@ -221,6 +270,68 @@ struct nf_flow_route {
+@@ -221,6 +270,75 @@ struct nf_flow_route {
  struct flow_offload *flow_offload_alloc(struct nf_conn *ct);
  void flow_offload_free(struct flow_offload *flow);
  
@@ -659,16 +671,23 @@ index 1a6fca013165..894e2afa06bd 100644
 + * it says and asks the driver for no counters: one pass of the driver's over
 + * every flow replaces a request per flow, and conntrack's counts follow the
 + * hardware at the driver's pace. A flow whose driver stops saying so is asked
-+ * again, as any other, with half its timeout left. lastused is in jiffies, as
-+ * a counter read's reply gives it. The driver serializes its calls for any
-+ * one handle. What it suppresses is the flow's requests, to every callback
-+ * bound to the table: a table shared with a driver that relies on them must
-+ * not be served by one that reports on its own. */
++ * again, as any other, with half its timeout left. A flow whose timeout passes
++ * is retired only once the driver has said so twice since: its reports before
++ * may not have seen traffic that came just before, and a report names no
++ * direction. That takes the driver to report every direction of a flow once a
++ * round, in the same order each round, so that its last two reports cover
++ * both; one that skips a direction, or reorders them, can have a flow retired
++ * on a direction's read from before the timeout. lastused is in jiffies, as a
++ * counter read's reply gives it, and is taken as no later than the call. The
++ * driver serializes its calls for any one handle. What it suppresses is the
++ * flow's requests, to every callback bound to the table: a table shared with a
++ * driver that relies on them must not be served by one that reports on its
++ * own. */
 +void nf_flow_offload_handle_used(struct nf_flow_offload_handle *handle,
 +				 unsigned long lastused);
 +/* Netfilter's own reading of the above; not for drivers. */
 +bool nf_flow_offload_handle_reported(struct nf_flow_offload_handle *handle,
-+				     u32 period, u32 *used);
++				     u32 period, u32 *used, u32 *covered);
 +/* Netfilter's own sampling of the counter mode; not for drivers. */
 +void nf_flow_offload_handle_counting(struct nf_flow_offload_handle *handle,
 +				     bool counter);
@@ -676,7 +695,7 @@ index 1a6fca013165..894e2afa06bd 100644
  static inline int
  nf_flow_table_offload_add_cb(struct nf_flowtable *flow_table,
  			     flow_setup_cb_t *cb, void *cb_priv)
-@@ -288,6 +399,8 @@ void nf_flow_table_gc_run(struct nf_flowtable *flow_table);
+@@ -288,6 +406,8 @@ void nf_flow_table_gc_run(struct nf_flowtable *flow_table);
  void nf_flow_table_gc_cleanup(struct nf_flowtable *flowtable,
  			      struct net_device *dev);
  void nf_flow_table_cleanup(struct net_device *dev);
@@ -685,6 +704,15 @@ index 1a6fca013165..894e2afa06bd 100644
  
  int nf_flow_table_init(struct nf_flowtable *flow_table);
  void nf_flow_table_free(struct nf_flowtable *flow_table);
+@@ -332,6 +452,8 @@ void nf_flow_offload_add(struct nf_flowtable *flowtable,
+ 			 struct flow_offload *flow);
+ void nf_flow_offload_del(struct nf_flowtable *flowtable,
+ 			 struct flow_offload *flow);
++bool nf_flow_offload_refresh(struct nf_flowtable *flowtable,
++			     struct flow_offload *flow, bool *early);
+ void nf_flow_offload_stats(struct nf_flowtable *flowtable,
+ 			   struct flow_offload *flow);
+ 
 diff --git a/include/net/netns/xfrm.h b/include/net/netns/xfrm.h
 index 77d04c715e01..8501771fb327 100644
 --- a/include/net/netns/xfrm.h
@@ -1037,10 +1065,10 @@ index 77a445a59af3..8c28a6045e27 100644
  	struct nf_conn_acct *acct;
  
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index b00f1c68a8e7..2e1f508ba791 100644
+index b00f1c68a8e7..0e6d442919b2 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -9,14 +9,151 @@
+@@ -9,14 +9,183 @@
  #include <net/ip6_route.h>
  #include <net/netfilter/nf_tables.h>
  #include <net/netfilter/nf_flow_table.h>
@@ -1065,10 +1093,13 @@ index b00f1c68a8e7..2e1f508ba791 100644
 +	/* The flow's, held for as long as the handle is. */
 +	struct nf_conn *ct;
 +	/* What nf_flow_offload_handle_used() last said, in flowtable time:
-+	 * when the flow was last used, and when the driver said so. reported
-+	 * is published after used, and is zero until the driver first does. */
++	 * when the flow was last used, when the driver said so, and when it
++	 * said so the time before. earlier is published after used, and
++	 * reported after earlier; reported is zero until the driver first
++	 * says so, earlier until it has said so twice. */
 +	u32 used;
 +	u32 reported;
++	u32 earlier;
 +	struct rcu_head rcu_head;
 +};
 +
@@ -1129,22 +1160,43 @@ index b00f1c68a8e7..2e1f508ba791 100644
 +void nf_flow_offload_handle_used(struct nf_flow_offload_handle *handle,
 +				 unsigned long lastused)
 +{
++	u32 now = nf_flowtable_time_stamp, reported;
++
 +	if (!handle)
 +		return;
-+	if (!READ_ONCE(handle->reported) || (__s32)((u32)lastused - handle->used) > 0)
++	/* No use is later than its report: a later one would hold the flow's
++	 * timeout out past anything a report, trusted for a period, vouches
++	 * for. */
++	if ((__s32)((u32)lastused - now) > 0)
++		lastused = now;
++	reported = READ_ONCE(handle->reported);
++	if (!reported || (__s32)((u32)lastused - handle->used) > 0)
 +		WRITE_ONCE(handle->used, (u32)lastused);
++	smp_store_release(&handle->earlier, reported);
 +	/* Never zero, which reads as never reported. */
-+	smp_store_release(&handle->reported, nf_flowtable_time_stamp | 1);
++	smp_store_release(&handle->reported, now | 1);
 +}
 +EXPORT_SYMBOL_GPL(nf_flow_offload_handle_used);
 +
 +/* Whether the driver reported within the last period, and if so when the flow
-+ * was last used, as it said. A report older than that is forgotten, so that
-+ * the clock, once it wraps, cannot make it read as recent again. */
++ * was last used, as it said, and up to when its reports cover the flow: the
++ * older of its last two, or zero while it has not made two within twice the
++ * period. A report names no direction, and a driver that reads a flow's two
++ * directions one after the other has read both by the older of its last two
++ * reports, but by the latest only the direction it read last; keeping a
++ * stamp per direction would take the direction from every driver. A flow in
++ * hardware one way only waits one report longer for it: its last two reports
++ * are two reads of its one direction, and the older is as much as twice the
++ * driver's period old -- as much as twice this period, at the pace the
++ * driver may keep -- so it is kept for that long, or the flow would wait for
++ * good for a pass that comes right after a read. A report older than the
++ * period is forgotten, so that the clock, once it wraps, cannot make it read
++ * as recent again. */
 +bool nf_flow_offload_handle_reported(struct nf_flow_offload_handle *handle,
-+				     u32 period, u32 *used)
++				     u32 period, u32 *used, u32 *covered)
 +{
 +	u32 reported = handle ? smp_load_acquire(&handle->reported) : 0;
++	u32 earlier;
 +
 +	if (!reported)
 +		return false;
@@ -1152,7 +1204,15 @@ index b00f1c68a8e7..2e1f508ba791 100644
 +		cmpxchg(&handle->reported, reported, 0);
 +		return false;
 +	}
++	/* Read before used, as it is written after it: an earlier stamp
++	 * that a report newer than reported wrote comes with that report's
++	 * use, and is that report's own older stamp. */
++	earlier = smp_load_acquire(&handle->earlier);
 +	*used = READ_ONCE(handle->used);
++	if (earlier &&
++	    (__s32)(nf_flowtable_time_stamp - earlier) > (__s32)(2 * period))
++		earlier = 0;
++	*covered = earlier;
 +	return true;
 +}
 +
@@ -1192,7 +1252,7 @@ index b00f1c68a8e7..2e1f508ba791 100644
  static void
  flow_offload_fill_dir(struct flow_offload *flow,
  		      enum flow_offload_tuple_dir dir)
-@@ -111,6 +248,7 @@ static int flow_offload_fill_route(struct flow_offload *flow,
+@@ -111,6 +280,7 @@ static int flow_offload_fill_route(struct flow_offload *flow,
  	}
  
  	flow_tuple->iifidx = route->tuple[dir].in.ifindex;
@@ -1200,7 +1260,7 @@ index b00f1c68a8e7..2e1f508ba791 100644
  	for (i = route->tuple[dir].in.num_encaps - 1; i >= 0; i--) {
  		flow_tuple->encap[j].id = route->tuple[dir].in.encap[i].id;
  		flow_tuple->encap[j].proto = route->tuple[dir].in.encap[i].proto;
-@@ -119,6 +257,10 @@ static int flow_offload_fill_route(struct flow_offload *flow,
+@@ -119,6 +289,10 @@ static int flow_offload_fill_route(struct flow_offload *flow,
  		j++;
  	}
  	flow_tuple->encap_num = route->tuple[dir].in.num_encaps;
@@ -1211,7 +1271,7 @@ index b00f1c68a8e7..2e1f508ba791 100644
  
  	switch (route->tuple[dir].xmit_type) {
  	case FLOW_OFFLOAD_XMIT_DIRECT:
-@@ -215,6 +357,8 @@ static void flow_offload_free_rcu(struct rcu_head *rcu_head)
+@@ -215,6 +389,8 @@ static void flow_offload_free_rcu(struct rcu_head *rcu_head)
  
  void flow_offload_free(struct flow_offload *flow)
  {
@@ -1220,7 +1280,7 @@ index b00f1c68a8e7..2e1f508ba791 100644
  	switch (flow->type) {
  	case NF_FLOW_OFFLOAD_ROUTE:
  		flow_offload_route_release(flow);
-@@ -283,6 +427,15 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
+@@ -283,6 +459,15 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
  {
  	int err;
  
@@ -1236,7 +1296,7 @@ index b00f1c68a8e7..2e1f508ba791 100644
  	flow->timeout = nf_flowtable_time_stamp + flow_offload_get_timeout(flow);
  
  	err = rhashtable_insert_fast(&flow_table->rhashtable,
-@@ -371,7 +524,7 @@ flow_offload_lookup(struct nf_flowtable *flow_table,
+@@ -371,7 +556,7 @@ flow_offload_lookup(struct nf_flowtable *flow_table,
  
  	dir = tuplehash->tuple.dir;
  	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
@@ -1245,16 +1305,48 @@ index b00f1c68a8e7..2e1f508ba791 100644
  		return NULL;
  
  	if (unlikely(nf_ct_is_dying(flow->ct)))
-@@ -425,7 +578,7 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
+@@ -425,7 +610,30 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
  static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  				    struct flow_offload *flow, void *data)
  {
 -	if (nf_flow_has_expired(flow) ||
-+	if (flow_offload_hw_invalid(flow) || nf_flow_has_expired(flow) ||
++	bool refreshed = false, early = false;
++
++	/* A flow whose driver reports on its own is judged against the
++	 * timeout its latest report gives it, so the report is applied before
++	 * the judgement rather than with the statistics after it. Applied
++	 * after, it reaches the timeout a pass late: a flow whose traffic
++	 * resumed in the last pass before it timed out is torn down although
++	 * the report in hand says it is in use, and its next packet adds it
++	 * again. Nor do reports that cover the flow only up to before the
++	 * timeout retire it once the timeout has passed: the driver reads each
++	 * direction once a pass of its own, and traffic just before the timeout
++	 * reaches only the next read of its direction. The first reports that
++	 * cover the flow from the timeout on either move the timeout or leave
++	 * the flow idle; if none come, the timeout alone decides once the last
++	 * report is no longer trusted, so a driver that stops reporting keeps
++	 * no flow past that. nf_flow_offload_stats()
++	 * would only apply the same report again, so a flow it was applied to
++	 * is spared that call. */
++	if (test_bit(NF_FLOW_HW, &flow->flags) &&
++	    !test_bit(NF_FLOW_TEARDOWN, &flow->flags))
++		refreshed = nf_flow_offload_refresh(flow_table, flow, &early);
++
++	if (flow_offload_hw_invalid(flow) ||
++	    (nf_flow_has_expired(flow) && !early) ||
  	    nf_ct_is_dying(flow->ct) ||
  	    nf_flow_custom_gc(flow_table, flow))
  		flow_offload_teardown(flow);
-@@ -550,6 +703,8 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
+@@ -439,7 +647,7 @@ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+ 		} else {
+ 			flow_offload_del(flow_table, flow);
+ 		}
+-	} else if (test_bit(NF_FLOW_HW, &flow->flags)) {
++	} else if (test_bit(NF_FLOW_HW, &flow->flags) && !refreshed) {
+ 		nf_flow_offload_stats(flow_table, flow);
+ 	}
+ }
+@@ -550,6 +758,8 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
  {
  	int err;
  
@@ -1263,7 +1355,7 @@ index b00f1c68a8e7..2e1f508ba791 100644
  	INIT_DELAYED_WORK(&flowtable->gc_work, nf_flow_offload_work_gc);
  	flow_block_init(&flowtable->flow_block);
  	init_rwsem(&flowtable->flow_block_lock);
-@@ -570,6 +725,12 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
+@@ -570,6 +780,12 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
  }
  EXPORT_SYMBOL_GPL(nf_flow_table_init);
  
@@ -1276,7 +1368,7 @@ index b00f1c68a8e7..2e1f508ba791 100644
  static void nf_flow_table_do_cleanup(struct nf_flowtable *flow_table,
  				     struct flow_offload *flow, void *data)
  {
-@@ -582,7 +743,9 @@ static void nf_flow_table_do_cleanup(struct nf_flowtable *flow_table,
+@@ -582,7 +798,9 @@ static void nf_flow_table_do_cleanup(struct nf_flowtable *flow_table,
  
  	if (net_eq(nf_ct_net(flow->ct), dev_net(dev)) &&
  	    (flow->tuplehash[0].tuple.iifidx == dev->ifindex ||
@@ -1287,7 +1379,7 @@ index b00f1c68a8e7..2e1f508ba791 100644
  		flow_offload_teardown(flow);
  }
  
-@@ -605,8 +768,56 @@ void nf_flow_table_cleanup(struct net_device *dev)
+@@ -605,8 +823,56 @@ void nf_flow_table_cleanup(struct net_device *dev)
  }
  EXPORT_SYMBOL_GPL(nf_flow_table_cleanup);
  
@@ -1344,7 +1436,7 @@ index b00f1c68a8e7..2e1f508ba791 100644
  	mutex_lock(&flowtable_lock);
  	list_del(&flow_table->list);
  	mutex_unlock(&flowtable_lock);
-@@ -614,9 +825,22 @@ void nf_flow_table_free(struct nf_flowtable *flow_table)
+@@ -614,9 +880,22 @@ void nf_flow_table_free(struct nf_flowtable *flow_table)
  	cancel_delayed_work_sync(&flow_table->gc_work);
  	nf_flow_table_offload_flush(flow_table);
  	/* ... no more pending work after this stage ... */
@@ -1478,7 +1570,7 @@ index 98edcaa37b38..ff35d601699a 100644
  	ret = nf_flow_offload_ipv6_forward(&ctx, flow_table, tuplehash, skb);
  	if (ret < 0)
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 8e3edc7c37b3..5228df2a0d28 100644
+index 8e3edc7c37b3..bbfea68d8e1b 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -12,6 +12,7 @@
@@ -1732,10 +1824,47 @@ index 8e3edc7c37b3..5228df2a0d28 100644
  	offload = nf_flow_offload_work_alloc(flowtable, flow, FLOW_CLS_REPLACE);
  	if (!offload)
  		return;
-@@ -1130,20 +1257,56 @@ void nf_flow_offload_del(struct nf_flowtable *flowtable,
+@@ -1130,20 +1257,78 @@ void nf_flow_offload_del(struct nf_flowtable *flowtable,
  	flow_offload_queue_work(offload);
  }
  
++/* A driver that reports on its own (nf_flow_offload_handle_used()) has
++ * counted the flow already and says when it was last used: the flow is kept
++ * alive from what it says, as a counter read's reply keeps it
++ * (flow_offload_work_stats()), and whether a report was applied is returned.
++ * Sent no command, the handle samples the table's counter mode here instead,
++ * so a table that starts or stops counting in place is still followed. The
++ * driver's reports are trusted for half the flow's timeout, two seconds at
++ * least: it may report as seldom as that to spend less, and a flow whose
++ * reports stop is asked again with half its timeout left. Applied again, the
++ * same report changes nothing. @early, when given, says whether the reports
++ * cover the flow, both ways, only up to a time before its timeout as the
++ * report leaves it, or not yet at all: they cannot yet say whether it was
++ * used up to then.
++ */
++bool nf_flow_offload_refresh(struct nf_flowtable *flowtable,
++			     struct flow_offload *flow, bool *early)
++{
++	u32 trusted = max_t(u32, flow_offload_get_timeout(flow) / 2, 2 * HZ);
++	u32 used, covered, timeout;
++
++	if (!nf_flow_offload_handle_reported(flow->hw_handle, trusted, &used,
++					     &covered))
++		return false;
++
++	nf_flow_offload_handle_counting(flow->hw_handle,
++					READ_ONCE(flowtable->flags) & NF_FLOWTABLE_COUNTER);
++	used += flow_offload_get_timeout(flow);
++	timeout = READ_ONCE(flow->timeout);
++	if ((__s32)(used - timeout) > 0) {
++		WRITE_ONCE(flow->timeout, used);
++		timeout = used;
++	}
++	if (early)
++		*early = !covered || (__s32)(covered - timeout) < 0;
++	return true;
++}
++
 +/* Hardware counters are asked for once a tenth of the offload timeout has
 + * passed since the flow was last known to be alive. For a fully offloaded flow
 + * that is its timeout running down. For one with a direction in hardware and
@@ -1752,27 +1881,12 @@ index 8e3edc7c37b3..5228df2a0d28 100644
  {
  	struct flow_offload_work *offload;
 +	u32 period = flow_offload_get_timeout(flow) / 10;
-+	u32 trusted = max_t(u32, flow_offload_get_timeout(flow) / 2, 2 * HZ);
-+	u32 used;
  	__s32 delta;
  
-+	/* A driver that reports on its own (nf_flow_offload_handle_used())
-+	 * has counted the flow already and says when it was last used: it is
-+	 * asked for nothing, and the flow is kept alive from what it says, as
-+	 * a counter read's reply keeps it (flow_offload_work_stats()). Sent no
-+	 * command, the handle samples the table's counter mode here instead,
-+	 * so a table that starts or stops counting in place is still followed.
-+	 * The driver's reports are trusted for half the flow's timeout, two
-+	 * seconds at least: it may report as seldom as that to spend less, and
-+	 * a flow whose reports stop is asked again with half its timeout left. */
-+	if (nf_flow_offload_handle_reported(flow->hw_handle, trusted, &used)) {
-+		nf_flow_offload_handle_counting(flow->hw_handle,
-+						READ_ONCE(flowtable->flags) & NF_FLOWTABLE_COUNTER);
-+		used += flow_offload_get_timeout(flow);
-+		if ((__s32)(used - READ_ONCE(flow->timeout)) > 0)
-+			WRITE_ONCE(flow->timeout, used);
++	/* A driver that reports on its own is asked for nothing while its
++	 * reports are trusted. */
++	if (nf_flow_offload_refresh(flowtable, flow, NULL))
 +		return;
-+	}
 +
  	delta = nf_flow_timeout_delta(flow->timeout);
 -	if ((delta >= (9 * flow_offload_get_timeout(flow)) / 10))

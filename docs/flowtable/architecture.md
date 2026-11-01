@@ -930,7 +930,15 @@ While a flow's driver keeps saying so at least once half its timeout (two
 seconds at least), Netfilter keeps the flow alive from that and sends it no
 `FLOW_CLS_STATS`; a flow whose passes stop, say because `stats_ms` was set to
 zero, is asked again as above with half its timeout left, and a report older
-than that is forgotten so a wrapped clock cannot revive it. A `stats_ms` up to
+than that is forgotten so a wrapped clock cannot revive it. The collector
+applies a flow's latest report before it judges the flow's expiry, not with
+the statistics after it: applied a pass late, a report would let a flow whose
+traffic resumed in the last pass before its timeout be torn down while the
+report in hand said it was in use. Nor does a report made before the timeout
+retire a flow once the timeout has passed: traffic just before the timeout
+reaches only the next pass's report, so the collector waits for the first
+report made from the timeout on, and for no longer than the last one is
+trusted. A `stats_ms` up to
 half the timeout -- fifteen seconds at the default thirty -- therefore spends
 less for coarser counts; zero, Netfilter's own requests, spends more. Asked
 flow by flow, conntrack -- and nlbwmon, `conntrack -L`, Verso's per-device

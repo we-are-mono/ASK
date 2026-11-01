@@ -35,7 +35,11 @@ enum { NF_FLOW_TEARDOWN, NF_FLOW_HW, NF_FLOW_HW_DYING, NF_FLOW_HW_DEAD };
 enum flow_offload_tuple_dir { FLOW_OFFLOAD_DIR_ORIGINAL, FLOW_OFFLOAD_DIR_REPLY, FLOW_OFFLOAD_DIR_MAX };
 #define NF_FLOW_OFFLOAD_ROUTE 1
 #define NF_FLOWTABLE_COUNTER 0x2
-#define nf_flowtable_time_stamp 1000
+/* The flowtable's clock, which the collector judges each flow's timeout by. */
+static u32 flowtable_clock = 1000;
+#define nf_flowtable_time_stamp flowtable_clock
+#define HZ 10
+#define max_t(t, a, b) ((t)(a) > (t)(b) ? (t)(a) : (t)(b))
 struct nf_flow_offload_handle;
 /* One count for every reference, the flow's and the handle's alike. */
 struct nf_conntrack { int unused; };
@@ -90,7 +94,7 @@ struct nf_flowtable {
  * before they define it. */
 void nf_flow_offload_handle_counting(struct nf_flow_offload_handle *handle, bool counter);
 static const int nf_flow_offload_rhash_params;
-static bool allocation_fail, expired;
+static bool allocation_fail;
 static unsigned allocations, insertions, fail_insert, adds, deletes, stats, teardowns, route_releases;
 static void *deferred[32];
 static unsigned deferred_count;
@@ -169,7 +173,6 @@ void nf_flow_offload_add(struct nf_flowtable *table, struct flow_offload *flow);
 static void nf_flow_offload_del(struct nf_flowtable *table, struct flow_offload *flow)
 { deletes++; set_bit(NF_FLOW_HW_DYING, &flow->flags); }
 static void nf_flow_offload_stats(struct nf_flowtable *table, struct flow_offload *flow) { stats++; }
-static bool nf_flow_has_expired(struct flow_offload *flow) { return expired; }
 static bool nf_flow_custom_gc(struct nf_flowtable *table, struct flow_offload *flow) { return false; }
 static void flow_offload_teardown(struct flow_offload *flow)
 { teardowns++; set_bit(NF_FLOW_TEARDOWN, &flow->flags); }
@@ -224,6 +227,39 @@ static struct flow_offload *new_flow(struct nf_conn *ct)
     return flow;
 }
 
+/* The first tick from @from on of a pace that starts at @base and repeats
+ * every @step ticks. */
+static unsigned next_at(unsigned from, unsigned base, unsigned step)
+{
+    return from <= base ? base : base + (from - base + step - 1) / step * step;
+}
+
+/* A flow in hardware one way only, idle since it was added at @start: its
+ * one direction read every @every ticks from @first on, the collector run
+ * every @stride ticks from @phase on, a read before a pass on a tick they
+ * share. Returns the tick after @start that retires it. */
+static unsigned one_way_idle(struct nf_flowtable *table, struct nf_conn *ct, u32 start,
+                             unsigned first, unsigned every, unsigned phase, unsigned stride)
+{
+    struct flow_offload *flow;
+    unsigned t;
+
+    flowtable_clock = start;
+    flow = new_flow(ct); assert(flow_offload_add(table, flow) == 0);
+    for (t = 1; t < 1000; t++) {
+        flowtable_clock = start + t;
+        if (t >= first && (t - first) % every == 0)
+            nf_flow_offload_handle_used(flow->hw_handle, start);
+        if (t >= phase && (t - phase) % stride == 0) {
+            nf_flow_offload_gc_step(table, flow, NULL);
+            if (test_bit(NF_FLOW_TEARDOWN, &flow->flags))
+                break;
+        }
+    }
+    flow_offload_del(table, flow); grace_period(); assert(!allocations && !ct->refs);
+    return t;
+}
+
 int main(void)
 {
     struct nf_conn ct = {0};
@@ -236,7 +272,8 @@ int main(void)
     assert(refreshes == 1);
     allocation_fail = false;
     assert(!flow_offload_hw_invalid(flow) && flow_offload_lookup(&table, &key[0]));
-    expired = true; nf_flow_offload_gc_step(&table, flow, NULL); expired = false;
+    /* Its timeout reached, the flow has expired. */
+    flowtable_clock = flow->timeout; nf_flow_offload_gc_step(&table, flow, NULL); flowtable_clock = 1000;
     /* Unhashed at once; the conntrack is only put after the grace period,
      * since a datapath reader may still reach it through the flow. */
     assert(ct.refs == 1 && !table.rhashtable.slots[0] && !extensions);
@@ -318,10 +355,16 @@ int main(void)
     nf_flow_offload_gc_step(&table, flow, NULL);
     assert(test_bit(NF_FLOW_TEARDOWN, &flow->flags));
     assert(gc_stats.count_gc_hw_invalid == invalidations + 1);
+    /* Torn down, the flow waits for its hardware retirement over passes
+     * that neither judge it nor count its retirement again. */
+    unsigned pending = deletes;
+    nf_flow_offload_gc_step(&table, flow, NULL);
+    assert(gc_stats.count_gc_hw_invalid == invalidations + 1 && deletes == pending);
     policy_generation++;
     assert(flow_offload_hw_invalid(flow));
     set_bit(NF_FLOW_HW_DEAD, &flow->flags);
     nf_flow_offload_gc_step(&table, flow, NULL);
+    assert(gc_stats.count_gc_hw_invalid == invalidations + 1);
     grace_period(); assert(!allocations && !ct.refs);
     flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
     assert(!flow_offload_hw_invalid(flow) && flow_offload_lookup(&table, &key[0]));
@@ -381,5 +424,237 @@ int main(void)
     nf_flow_table_free(&table);
     assert(deletes == deleted + 1 && flush_cleanups == cleanups + 1 && !table.rhashtable.slots[0]);
     grace_period(); assert(!allocations && !ct.refs);
-    puts("Flowtable handles: opt-in allocation, rollback, shared ownership, the conntrack held for accounting, lookup, GC, RCU and generation isolation passed");
+    /* A driver that reports on its own says through the handle when a
+     * hardware flow was last used, and the collector judges the flow against
+     * the timeout that report gives it. Applied only after the judgement, a
+     * report reaches the timeout a pass late, and a flow whose traffic
+     * resumed in the last pass before it timed out is torn down although
+     * the report in hand says it is in use. Nor is a flow retired on
+     * reports made before its timeout: traffic just before the timeout
+     * reaches only the next read of its direction, so the collector waits
+     * until the older of the driver's last two reports, which covers both
+     * directions, is from the timeout on -- as long as the last report is
+     * trusted, and no longer. Either side
+     * of the 32-bit clock's wrap; the stub's timeout is 100, a report is
+     * trusted for 50, and every report lands on an odd stamp, which a
+     * report's time is rounded to. */
+    for (unsigned wrap = 0; wrap < 2; wrap++) {
+        const u32 start = wrap ? UINT32_MAX - 60 : 1001;
+        unsigned expirations = gc_stats.count_gc_expired, asked = stats;
+
+        table.use_hw_handles = table.hardware = true;
+        /* Reported in use just before its timeout: kept, with the timeout
+         * that use gives it, and not asked for counters as well -- that
+         * would only apply the same report again. */
+        flowtable_clock = start;
+        flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+        assert(flow->timeout == start + 100 && test_bit(NF_FLOW_HW, &flow->flags));
+        flowtable_clock = start + 98;
+        nf_flow_offload_handle_used(flow->hw_handle, start + 98);
+        flowtable_clock = start + 100;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+        assert(flow->timeout == start + 198 && gc_stats.count_gc_expired == expirations);
+        assert(stats == asked);
+        /* Applied again on the next pass, the report changes nothing. */
+        flowtable_clock = start + 101;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags) && flow->timeout == start + 198);
+        assert(stats == asked);
+        /* Its reports stopped, the flow is asked for counters once the last
+         * is no longer trusted, and runs down from the use it reported. */
+        flowtable_clock = start + 196;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags) && stats == asked + 1);
+        flowtable_clock = start + 198;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+        assert(gc_stats.count_gc_expired == expirations + 1);
+        /* Waiting for its hardware retirement, it is not counted again. */
+        flowtable_clock = start + 199;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(gc_stats.count_gc_expired == expirations + 1);
+        flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+
+        /* Used just before its timeout, after the driver's last report: that
+         * report, idle, is no reason to retire the flow once the timeout has
+         * passed. The driver's next one carries the use, and moves the
+         * timeout. */
+        flowtable_clock = start;
+        flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+        flowtable_clock = start + 98;
+        nf_flow_offload_handle_used(flow->hw_handle, start);
+        flowtable_clock = start + 100;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags) && flow->timeout == start + 100);
+        assert(gc_stats.count_gc_expired == expirations + 1 && stats == asked + 1);
+        nf_flow_offload_handle_used(flow->hw_handle, start + 99);
+        flowtable_clock = start + 101;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags) && flow->timeout == start + 199);
+        assert(gc_stats.count_gc_expired == expirations + 1 && stats == asked + 1);
+        flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+
+        /* In hardware both ways, its directions read one after the other,
+         * one just before the timeout and one at it: the latest report does
+         * not cover the first direction from the timeout on, so the flow is
+         * kept, and that direction's next read carries the traffic it had
+         * just before the timeout. */
+        flowtable_clock = start;
+        flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+        flowtable_clock = start + 98;
+        nf_flow_offload_handle_used(flow->hw_handle, start);
+        flowtable_clock = start + 100;
+        nf_flow_offload_handle_used(flow->hw_handle, start);
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags) && flow->timeout == start + 100);
+        assert(gc_stats.count_gc_expired == expirations + 1);
+        flowtable_clock = start + 102;
+        nf_flow_offload_handle_used(flow->hw_handle, start + 99);
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags) && flow->timeout == start + 199);
+        assert(gc_stats.count_gc_expired == expirations + 1 && stats == asked + 1);
+        flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+
+        /* Idle through its timeout, and in hardware one way only: kept past
+         * it until the older of the driver's last two reports is from the
+         * timeout on -- a report names no direction, so one alone may be
+         * the other direction's -- and then expired, once. */
+        flowtable_clock = start;
+        flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+        flowtable_clock = start + 98;
+        nf_flow_offload_handle_used(flow->hw_handle, start);
+        flowtable_clock = start + 100;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+        flowtable_clock = start + 102;
+        nf_flow_offload_handle_used(flow->hw_handle, start);
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+        flowtable_clock = start + 104;
+        nf_flow_offload_handle_used(flow->hw_handle, start);
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(test_bit(NF_FLOW_TEARDOWN, &flow->flags) && flow->timeout == start + 100);
+        assert(gc_stats.count_gc_expired == expirations + 2);
+        flowtable_clock = start + 105;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(gc_stats.count_gc_expired == expirations + 2);
+        flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+
+        /* A driver that stops reporting before the timeout keeps the flow
+         * only while its last report is trusted: never past the timeout and
+         * that trust together. */
+        flowtable_clock = start;
+        flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+        flowtable_clock = start + 98;
+        nf_flow_offload_handle_used(flow->hw_handle, start);
+        for (flowtable_clock = start + 100; flowtable_clock != start + 149; flowtable_clock++) {
+            nf_flow_offload_gc_step(&table, flow, NULL);
+            assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+        }
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+        assert(gc_stats.count_gc_expired == expirations + 3 && stats == asked + 1);
+        flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+
+        /* Idle, with the older of the last two reports made exactly at the
+         * timeout: that covers the timeout, and the flow expires. */
+        flowtable_clock = start;
+        flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+        flowtable_clock = start + 100;
+        nf_flow_offload_handle_used(flow->hw_handle, start);
+        flowtable_clock = start + 102;
+        nf_flow_offload_handle_used(flow->hw_handle, start);
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(test_bit(NF_FLOW_TEARDOWN, &flow->flags) && flow->timeout == start + 100);
+        assert(gc_stats.count_gc_expired == expirations + 4);
+        flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+
+        /* A use the driver puts after its report counts as the report's
+         * time: it holds the timeout out no further than a use then would,
+         * and the flow, its reports stopped, expires there. */
+        flowtable_clock = start;
+        flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+        flowtable_clock = start + 50;
+        nf_flow_offload_handle_used(flow->hw_handle, start + 90);
+        flowtable_clock = start + 51;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags) && flow->timeout == start + 150);
+        flowtable_clock = start + 150;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+        assert(gc_stats.count_gc_expired == expirations + 5 && stats == asked + 1);
+        flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+
+        /* Never reported: it expires at its timeout. */
+        flowtable_clock = start;
+        flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+        flowtable_clock = start + 100;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+        assert(gc_stats.count_gc_expired == expirations + 6);
+        flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+
+        /* Reported in use, but longer ago than a report is trusted: it is
+         * forgotten, and the flow expires at its timeout. */
+        flowtable_clock = start;
+        flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+        flowtable_clock = start + 40;
+        nf_flow_offload_handle_used(flow->hw_handle, start + 40);
+        flowtable_clock = start + 100;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(test_bit(NF_FLOW_TEARDOWN, &flow->flags) && flow->timeout == start + 100);
+        assert(gc_stats.count_gc_expired == expirations + 7);
+        flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+
+        /* A flow in software alone is judged by its own timeout: a report
+         * through its handle is not applied, and it expires. */
+        table.hardware = false;
+        flowtable_clock = start;
+        flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+        assert(flow->hw_handle && !test_bit(NF_FLOW_HW, &flow->flags));
+        flowtable_clock = start + 98;
+        nf_flow_offload_handle_used(flow->hw_handle, start + 98);
+        flowtable_clock = start + 100;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(!table.rhashtable.slots[0] && gc_stats.count_gc_expired == expirations + 8);
+        grace_period(); assert(!allocations && !ct.refs);
+        table.hardware = true;
+
+        /* A hardware flow with no handle, on a table whose driver asks for
+         * none: asked for its counters on each pass, as ever, and expired
+         * at its timeout. */
+        table.use_hw_handles = false;
+        flowtable_clock = start;
+        flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+        assert(!flow->hw_handle && test_bit(NF_FLOW_HW, &flow->flags));
+        flowtable_clock = start + 99;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags) && stats == asked + 2);
+        flowtable_clock = start + 100;
+        nf_flow_offload_gc_step(&table, flow, NULL);
+        assert(test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+        assert(gc_stats.count_gc_expired == expirations + 9 && stats == asked + 2);
+        flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
+        table.use_hw_handles = true;
+
+        /* In hardware one way only and idle, its direction read as seldom
+         * as a report is trusted, or nearly, and the collector out of step
+         * with the reads: retired by the first pass after the second read
+         * from the timeout on, however the two paces fall. */
+        static const struct { unsigned first, every, phase, stride; } paces[] = {
+            { 2, 50, 1, 7 }, { 10, 46, 4, 11 }, { 2, 48, 1, 1 }, { 2, 50, 2, 3 },
+        };
+        for (unsigned i = 0; i < sizeof(paces) / sizeof(paces[0]); i++) {
+            unsigned retired = gc_stats.count_gc_expired;
+            unsigned second = next_at(100, paces[i].first, paces[i].every) + paces[i].every;
+
+            assert(one_way_idle(&table, &ct, start, paces[i].first, paces[i].every,
+                                paces[i].phase, paces[i].stride)
+                   == next_at(second, paces[i].phase, paces[i].stride));
+            assert(gc_stats.count_gc_expired == retired + 1);
+        }
+    }
+    flowtable_clock = 1000;
+    puts("Flowtable handles: opt-in allocation, rollback, shared ownership, the conntrack held for accounting, lookup, GC judged on the driver's latest report and counted once, RCU and generation isolation passed");
 }

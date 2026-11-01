@@ -185,12 +185,16 @@ def test_stats_poll(tmp_path):
     header = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
     core = (kernel / "net/netfilter/nf_flow_table_core.c").read_text()
     stats = function(offload, "nf_flow_offload_stats")
+    # What applies a driver's report, which the gate tries before asking; a
+    # tree that applies it in the gate itself has no helper for it.
+    refresh = (function(offload, "nf_flow_offload_refresh")
+               if "nf_flow_offload_refresh(" in offload else "")
     handle = re.search(r"^struct nf_flow_offload_handle \{.*?^\};\n", core, re.M | re.S).group()
     (tmp_path / "stats_poll_production.inc").write_text(
         handle + function(core, "nf_flow_offload_handle_counting")
         + function(core, "nf_flow_offload_handle_used")
         + function(core, "nf_flow_offload_handle_reported")
-        + function(header, "nf_flow_timeout_delta") + stats)
+        + function(header, "nf_flow_timeout_delta") + refresh + stats)
     binary = tmp_path / "flowtable_stats_poll"
     run_process([
         # Upstream compares the signed timeout delta with the unsigned

@@ -152,25 +152,8 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A427 — after an earlier stretch of the suite, a packet-offload SA's restart reinstalls a flow during its
-  proof, and keeps doing so on that boot.** Where: `flowtable_service_ipsec_restart.py::
-  test_packet_offload_sa_unproven_delete_restarts[in-esp]`, 302nd at `--module-order-seed=930325968`: the post-restart
-  `hardware()` proof sees the `eth4` UDP direction's cookie change (`admission_invalidations 3` before and after). It
-  passes on a fresh boot (on master and with A421) and after the same 301 tests (on master, and with A421 and today's
-  test agent); it failed there only with a test-agent `read_state()` that read `status` and `stats` again after the
-  rows, and the whole state again while `entries`/`handle_refs`/`neighbour_refs`/`installs`/`deletes` moved, up to
-  four times (dropped unmerged for the harness's coherent waits). Once it had failed, three reruns on that boot failed
-  with today's read too. On 2026-10-30 the same 229 DUT tests and the target, in that order, with that double read on
-  a fresh boot, all passed: the order and the read are not enough, so there is nothing to bisect. A changed cookie
-  means Linux freed the flow and a later packet created it again; every read path is side-effect-free (it only
-  lengthens the transaction's holds), and the `rig` fixture stops the daemon. Two retirements bypass every adapter
-  counter: the flowtable GC (`/proc/net/stat/nf_flowtable` `gc_*`) and the forward hook's `nf_flow_dst_check()`
-  teardown (patch 140), counted nowhere, which one software-encrypted packet triggers once a route, address, MTU or
-  xfrm policy change has staled its cached dst (`hardware()` allows five `tx toenc`). Why it matters: a failure that
-  outlives its trigger on one boot is state some earlier test leaves behind. Where to look: `hardware()` now records
-  the kernel's teardown counters around its window and, when the cookie changes, raises with their deltas, the
-  route to the peer, the path-MTU exceptions and the neighbours; on the next failure, a cookie that changed while no
-  `gc_*` moved names the stale-dst teardown.
+- [x] **A427 — the IPsec restart case's flows were expired under its proof.** The GC judged expiry before the driver's
+  report and the case idled ~30 s (_:/^netfilter, tests: expire a hardware flow on its driver's_).
 
 - [-] **A431 — a relayed PPPoE frame processed from the socket backlog may transmit on a freed device.** Wontfix:
   mainline relay mode (PPPOEIOCSFWD), unused on this device, from review only (_:/^ISSUES: close A431_).

@@ -504,7 +504,11 @@ async def hardware(r, p, label, flows):
         assert (before["installs"], before["deletes"]) == (after["installs"], after["deletes"]), (before, after)
     except AssertionError as error:
         # Which retirement replaced the flow: the adapter's own counters are
-        # in before and after, the kernel's here.
+        # in before and after, the kernel's here. Both states are recorded
+        # whole, each entry's lastused among them: a failure's message is
+        # truncated, and the states are what tell an expiry from a retirement.
+        r.record(label + "-failed", {"before": before, "after": after, "reports": reports,
+                                     "teardowns": moved})
         raise AssertionError({"teardowns": moved, "paths": await paths(r)}) from error
     old, new = by_key(before), by_key(after)
     for ident in range(len(flows)):

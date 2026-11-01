@@ -12,8 +12,8 @@ ports the classifier back. An offloaded SA's traffic has no path while it is
 bypassed; the restart installs it again.
 
 Nothing else is touched. The fixture's long-lived SA pair keeps its entries and
-its SEC contexts across the restart, and its flows forward in hardware after
-it with SEC counting; the deleted SA installs again with the same SPI and
+its SEC contexts across the restart, its connections sending throughout, and
+its flows forward in hardware after it with SEC counting; the deleted SA installs again with the same SPI and
 addresses. Bare ESP keys the deleted SA's entry on the SPI, NAT-T on the UDP
 pair with the SA picked by SPI inside it, so both are run.
 """
@@ -64,6 +64,15 @@ async def test_packet_offload_sa_unproven_delete_restarts(ipsec_service, directi
                 restart_budget(con, r, (ROOT_FAULT,)):
             await warm(r, p, [0, 1, 2, 3], "restart-baseline", flows[:4])
             baseline = await hardware(r, p, "restart-baseline-hardware", flows[:4])
+            # The pair's connections keep sending, as a gateway's do, through
+            # the delete, the bypass and the restart. The SA's traffic is
+            # dropped while bypassed, but each datagram still passes the
+            # flowtable's hook, which keeps its flow alive. Left idle, the
+            # sequence takes about the flowtable timeout, and a flow could
+            # expire as the readmission traffic resumed and be replaced under
+            # the proof.
+            await p.rpc("start", [0, 2], count=0, interval=1.0, allow_loss=True)
+            await p.rpc("start", [1, 3], count=0, interval=1.0)
             sas = dict(r.ipsec.active)
             sec_before = {direction: await sa_state(r, spi, direction) for direction, spi in sas.items()}
             reply = await sa_add(r.target, r.session, src=src, dst=dst, spi=SPI, reqid=REQID,
@@ -110,6 +119,10 @@ async def test_packet_offload_sa_unproven_delete_restarts(ipsec_service, directi
             assert resolved == 1 and released == 1, line
             r.record("ipsec-restart", {"installed": installed, "bypassed": bypassed,
                                        "restarted": restarted, "log": line})
+            # The TCP connections came through the outage whole.
+            kept = await p.rpc("stop", [0, 1, 2, 3])
+            r.record("restart-kept-alive", kept)
+            assert kept["1"]["lost"] == kept["3"]["lost"] == 0, kept
             # The pair's flows carry the tunnel in hardware again, SEC
             # counting both ways.
             await warm(r, p, [0, 1, 2, 3], "restart-readmitted", flows[:4])

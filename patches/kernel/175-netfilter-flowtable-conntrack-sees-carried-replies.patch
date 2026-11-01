@@ -1,4 +1,4 @@
-From a7f7930fda1564a3e62714e280a4db06cf4c59dd Mon Sep 17 00:00:00 2001
+From 8abcb9a5183f905494aa08d36f147ccef36f82ae Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 21 Oct 2026 14:22:58 +0200
 Subject: [PATCH] netfilter: flowtable: tell conntrack about the replies it
@@ -36,10 +36,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  4 files changed, 42 insertions(+), 5 deletions(-)
 
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index d28713255a26..f4221cc1d084 100644
+index a51e59e5865d..618a4374ae08 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
-@@ -323,7 +323,8 @@ void nf_flow_offload_handle_watch(struct nf_flow_offload_handle *handle);
+@@ -336,7 +336,8 @@ void nf_flow_offload_handle_watch(struct nf_flow_offload_handle *handle);
   * asked of it any more. The handle holds the conntrack, so the count reaches
   * it after the flow, the table and the driver's binding are gone; the
   * conntrack's table entry still expires as before, only its memory waits for
@@ -49,17 +49,17 @@ index d28713255a26..f4221cc1d084 100644
  void nf_flow_offload_handle_account(struct nf_flow_offload_handle *handle,
  				    enum flow_offload_tuple_dir dir,
  				    u64 packets, u64 bytes);
-@@ -342,6 +343,8 @@ void nf_flow_offload_handle_used(struct nf_flow_offload_handle *handle,
+@@ -361,6 +362,8 @@ void nf_flow_offload_handle_used(struct nf_flow_offload_handle *handle,
  /* Netfilter's own reading of the above; not for drivers. */
  bool nf_flow_offload_handle_reported(struct nf_flow_offload_handle *handle,
- 				     u32 period, u32 *used);
+ 				     u32 period, u32 *used, u32 *covered);
 +/* The flowtable's own: what a reply it carried tells the conntrack. */
 +void nf_flow_ct_seen_reply(struct nf_conn *ct);
  /* Netfilter's own sampling of the counter mode; not for drivers. */
  void nf_flow_offload_handle_counting(struct nf_flow_offload_handle *handle,
  				     bool counter);
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index fcfde6fc6b28..aa5b88f943ee 100644
+index 0ba11bff2fdc..d893e3d82037 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
 @@ -13,6 +13,7 @@
@@ -70,7 +70,7 @@ index fcfde6fc6b28..aa5b88f943ee 100644
  #include <net/netfilter/nf_conntrack_l4proto.h>
  #include <net/netfilter/nf_conntrack_tuple.h>
  
-@@ -82,11 +83,38 @@ void nf_flow_offload_handle_counting(struct nf_flow_offload_handle *handle,
+@@ -85,11 +86,38 @@ void nf_flow_offload_handle_counting(struct nf_flow_offload_handle *handle,
  		WRITE_ONCE(handle->counter, counter);
  }
  
@@ -142,7 +142,7 @@ index e2edd607afe7..47b521670e6c 100644
  	nf_reset_ct(skb);
  	nf_conntrack_get(&ct->ct_general);
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 604f3e90f456..31f6a92c6432 100644
+index 8419d76db4cb..98d6ec297a5b 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -1149,6 +1149,8 @@ static void flow_offload_work_stats(struct flow_offload_work *offload)

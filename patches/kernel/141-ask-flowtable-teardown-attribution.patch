@@ -1,6 +1,6 @@
-From 736a1b61f3d8dd2d45e5362e7a7c0534b922c537 Mon Sep 17 00:00:00 2001
+From c1894f0366a98b4c5486102d7bf3cf0431fc84cd Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
-Date: Mon, 19 Oct 2026 11:13:16 +0200
+Date: Sun, 1 Nov 2026 04:12:17 +0100
 Subject: [PATCH] netfilter: attribute flowtable teardowns to their cause
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -22,14 +22,16 @@ one call site, and three of the four predicates are inlined.
 Count each condition separately and publish the totals alongside the
 existing work-queue depths in /proc/net/stat/nf_flowtable. The counters
 are per-CPU and incremented only on the retirement path, which runs at
-most once per flow.
+most once per flow: a flow already torn down, waiting in the collector for
+its hardware retirement, is no longer judged again on every pass, which
+counted one retirement once a pass until then.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  include/net/netns/flow_table.h       |  4 ++++
- net/netfilter/nf_flow_table_core.c   | 21 ++++++++++++++++++---
+ net/netfilter/nf_flow_table_core.c   | 27 +++++++++++++++++++++++----
  net/netfilter/nf_flow_table_procfs.c | 11 ++++++++---
- 3 files changed, 30 insertions(+), 6 deletions(-)
+ 3 files changed, 35 insertions(+), 7 deletions(-)
 
 diff --git a/include/net/netns/flow_table.h b/include/net/netns/flow_table.h
 index 1c5fc657e267..16c12f3d67d0 100644
@@ -47,25 +49,38 @@ index 1c5fc657e267..16c12f3d67d0 100644
  
  struct netns_ft {
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index 3e051b1c9260..04c939a1c501 100644
+index 933d60b206d6..2cf93b982f2f 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -508,9 +508,24 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
+@@ -580,6 +580,8 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
  static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  				    struct flow_offload *flow, void *data)
  {
--	if (flow_offload_hw_invalid(flow) || nf_flow_has_expired(flow) ||
--	    nf_ct_is_dying(flow->ct) ||
--	    nf_flow_custom_gc(flow_table, flow))
 +	struct net *net = nf_ct_net(flow->ct);
 +	bool retire = true;
-+
+ 	bool refreshed = false, early = false;
+ 
+ 	/* A flow whose driver reports on its own is judged against the
+@@ -601,10 +603,27 @@ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+ 	    !test_bit(NF_FLOW_TEARDOWN, &flow->flags))
+ 		refreshed = nf_flow_offload_refresh(flow_table, flow, &early);
+ 
+-	if (flow_offload_hw_invalid(flow) ||
+-	    (nf_flow_has_expired(flow) && !early) ||
+-	    nf_ct_is_dying(flow->ct) ||
+-	    nf_flow_custom_gc(flow_table, flow))
 +	/* Evaluate each condition separately so that a retirement can be
 +	 * attributed to its cause. Order and short-circuiting are unchanged.
++	 * A flow already torn down is not judged again: it waits here for its
++	 * hardware retirement, and judging it on every pass until then would
++	 * count one retirement once a pass, under whichever cause holds by
++	 * then.
 +	 */
-+	if (flow_offload_hw_invalid(flow))
++	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags))
++		retire = false;
++	else if (flow_offload_hw_invalid(flow))
 +		NF_FLOW_TABLE_STAT_INC_ATOMIC(net, count_gc_hw_invalid);
-+	else if (nf_flow_has_expired(flow))
++	else if (nf_flow_has_expired(flow) && !early)
 +		NF_FLOW_TABLE_STAT_INC_ATOMIC(net, count_gc_expired);
 +	else if (nf_ct_is_dying(flow->ct))
 +		NF_FLOW_TABLE_STAT_INC_ATOMIC(net, count_gc_dying);

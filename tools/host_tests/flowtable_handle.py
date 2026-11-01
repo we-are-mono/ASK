@@ -12,6 +12,7 @@ def test_lifecycle(tmp_path):
     kernel = kernel_source()
     source = (kernel / "net/netfilter/nf_flow_table_core.c").read_text()
     offload = (kernel / "net/netfilter/nf_flow_table_offload.c").read_text()
+    header = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
     (tmp_path / "handle_production.inc").write_text(
         source[source.index("struct nf_flow_offload_handle {"):
                source.index("static void\nflow_offload_fill_dir")]
@@ -20,6 +21,13 @@ def test_lifecycle(tmp_path):
         + function(source, "flow_offload_add")
         + source[source.index("struct flow_offload_tuple_rhash *\nflow_offload_lookup"):
                  source.index("EXPORT_SYMBOL_GPL(flow_offload_lookup);")]
+        # The collector judges expiry by the flowtable's clock, and applies
+        # the driver's latest report first; a tree that applies it only
+        # with the statistics has no helper for it.
+        + function(header, "nf_flow_timeout_delta")
+        + function(source, "nf_flow_has_expired")
+        + (function(offload, "nf_flow_offload_refresh")
+           if "nf_flow_offload_refresh(" in offload else "")
         + function(source, "nf_flow_offload_gc_step")
         + function(source, "nf_flow_table_gc_run")
         # A tree that predates the in-place free has no helper for it.
