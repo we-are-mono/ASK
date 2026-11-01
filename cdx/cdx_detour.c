@@ -436,9 +436,18 @@ static void cdx_detour_exit(void)
 	}
 	/* The two FQIDs go back unless a deletion failed: then an entry
 	 * enqueueing to the first may still be linked, and the range is held
-	 * for the reboot that alone settles it, as an SA's are. */
-	if (cdx_detour.fqids && !cdx_ft_failed())
-		qman_release_fqid_range(cdx_detour.fqids, 2);
+	 * for the reboot that alone settles it, as an SA's are. The failure is
+	 * the transaction's to read, which neither caller -- module exit's
+	 * deinit chain, an initialization that failed -- holds. */
+	if (cdx_detour.fqids) {
+		bool failed;
+
+		cdx_ft_begin();
+		failed = cdx_ft_failed();
+		cdx_ft_end();
+		if (!failed)
+			qman_release_fqid_range(cdx_detour.fqids, 2);
+	}
 	cdx_detour.fqids = 0;
 	if (cdx_detour.handle >= 0) {
 		release_offline_port(FMAN_IDX, cdx_detour.handle);
