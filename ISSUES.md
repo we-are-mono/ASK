@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A432 — the cdx timer thread held an idle router's load average at 1.0.** Its 100 ms tick slept
+  uninterruptibly; it now waits in TASK_IDLE (_:/^cdx: wait out the timer tick outside the load average_).
+
 - [x] **A427 — the IPsec restart case's flows were expired under its proof.** The GC judged expiry before the driver's
   report and the case idled ~30 s (_:/^netfilter, tests: expire a hardware flow on its driver's_).
 

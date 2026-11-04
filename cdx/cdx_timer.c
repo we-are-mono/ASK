@@ -137,7 +137,15 @@ int cdx_ctrl_timer(void *data)
 
 	while (!kthread_should_stop())
 	{
-		schedule_timeout_uninterruptible(INNER_WHEEL_PERIOD);
+		/*
+		 * Wait out the tick in TASK_IDLE. The thread sleeps nearly all
+		 * its life, and an uninterruptible sleep counts toward the load
+		 * average: an idle router would report a load of 1.0. Only the
+		 * timeout or kthread_stop() ends this one, and it counts toward
+		 * neither the load average nor the hung-task check, which still
+		 * covers the mutex wait below.
+		 */
+		schedule_timeout_idle(INNER_WHEEL_PERIOD);
 
 		mutex_lock(&ctrl->mutex);
 
