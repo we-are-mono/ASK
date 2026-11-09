@@ -935,6 +935,11 @@ static int dpa_private_napi_add(struct net_device *net_dev)
 	for_each_possible_cpu(cpu) {
 		percpu_priv = per_cpu_ptr(priv->percpu_priv, cpu);
 
+		/* It drains this CPU's portal, which only this CPU's poll may
+		 * do, with DQRI masked: never from a busy-polling socket's task.
+		 * Out of the NAPI hash, as netif_napi_add_tx() keeps a NAPI, so
+		 * GRO has no id of its to stamp either. */
+		set_bit(NAPI_STATE_NO_BUSY_POLL, &percpu_priv->np.napi.state);
 		netif_napi_add(net_dev, &percpu_priv->np.napi, dpaa_eth_poll);
 	}
 

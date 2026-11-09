@@ -399,8 +399,11 @@ int dpaa_eth_poll(struct napi_struct *napi, int budget)
 {
 	struct dpa_napi_portal *np =
 			container_of(napi, struct dpa_napi_portal, napi);
+	int cleaned;
 
-	int cleaned = qman_p_poll_dqrr(np->p, budget);
+	this_cpu_write(qman_poll_napi, napi);
+	cleaned = qman_p_poll_dqrr(np->p, budget);
+	this_cpu_write(qman_poll_napi, NULL);
 
 	if (cleaned < budget) {
 		int tmp;
@@ -946,9 +949,16 @@ static int dpa_private_napi_add(struct net_device *net_dev)
 			return -ENOMEM;
 		}
 
-		for (i = 0; i < qman_portal_max; i++)
+		/* Each drains one CPU's portal, which only that CPU's poll may do,
+		 * with DQRI masked: never from a busy-polling socket's task. Out of
+		 * the NAPI hash, as netif_napi_add_tx() keeps a NAPI, so GRO has no
+		 * id of theirs to stamp either. */
+		for (i = 0; i < qman_portal_max; i++) {
+			set_bit(NAPI_STATE_NO_BUSY_POLL,
+				&percpu_priv->np[i].napi.state);
 			netif_napi_add(net_dev, &percpu_priv->np[i].napi,
 					dpaa_eth_poll);
+		}
 	}
 
 	return 0;

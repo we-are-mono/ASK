@@ -3995,6 +3995,8 @@ const struct qman_portal_config *qman_p_get_portal_config(struct qman_portal
 int qman_p_irqsource_add(struct qman_portal *p, u32 bits);
 int qman_p_irqsource_remove(struct qman_portal *p, u32 bits);
 int qman_p_poll_dqrr(struct qman_portal *p, unsigned int limit);
+/* The NAPI instance polling this CPU's portal, or NULL outside a poll. */
+DECLARE_PER_CPU(struct napi_struct *, qman_poll_napi);
 u32 qman_p_poll_slow(struct qman_portal *p);
 void qman_p_poll(struct qman_portal *p);
 void qman_p_stop_dequeues(struct qman_portal *p);

@@ -581,8 +581,6 @@ struct dev_pm_domain qman_portal_device_pm_domain = {
 	}
 };
 
-
-
 #ifdef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
 static int qman_portal_dqrr_poll(struct napi_struct *napi, int budget)
 {
@@ -769,6 +767,11 @@ struct qman_portal *qman_create_portal(
 		pr_err("qman_portal - can't allocate the NAPI device\n");
 		goto fail_napi;
 	}
+	/* The portal is this CPU's and is drained only with DQRI masked, so its
+	 * poll must never run from a busy-polling socket's task: keep it out of
+	 * the NAPI hash, as netif_napi_add_tx() does, which also leaves GRO no
+	 * id to stamp on what it receives. */
+	set_bit(NAPI_STATE_NO_BUSY_POLL, &portal->napi.state);
 	netif_napi_add(portal->dummy_dev, &portal->napi, qman_portal_dqrr_poll);
 	napi_enable(&portal->napi);
 #endif

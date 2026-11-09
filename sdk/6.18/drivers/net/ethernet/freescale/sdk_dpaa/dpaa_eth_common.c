@@ -310,13 +310,9 @@ EXPORT_SYMBOL(dpa_set_features);
 netdev_features_t dpa_fix_features(struct net_device *dev,
 				   netdev_features_t features)
 {
-	netdev_features_t unsupported_features = 0;
-
-	/* We don't support enabling Rx csum through ethtool yet */
-	unsupported_features |= NETIF_F_RXCSUM;
-
-	features &= ~unsupported_features;
-
+	/* Rx checksum validation is supported: dpa_set_features() switches the
+	 * parser's L4 check, and _dpa_process_parse_results() trusts it only
+	 * when the parse result says the checksum passed. */
 	return features;
 }
 

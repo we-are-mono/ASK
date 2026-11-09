@@ -819,16 +819,13 @@ void __hot _dpa_rx(struct net_device *net_dev,
 
 	skb_record_rx_queue(skb, raw_smp_processor_id());
 
-	if (use_gro) {
-		const struct qman_portal_config *pc =
-					qman_p_get_portal_config(portal);
-		struct dpa_napi_portal *np = &percpu_priv->np[pc->index];
-
-		np->p = portal;
-		napi_gro_receive(&np->napi, skb);
-	} else {
+	/* GRO only into the NAPI instance actually polling: a portal is drained
+	 * by whichever poll runs on it (the portal's own, VWD's, any port's), and
+	 * packets left in a NAPI that is not polled wait for its next poll. */
+	if (use_gro && this_cpu_read(qman_poll_napi))
+		napi_gro_receive(this_cpu_read(qman_poll_napi), skb);
+	else
 		netif_receive_skb(skb);
-	}
 
 	return;
 
