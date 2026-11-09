@@ -112,7 +112,9 @@ int ft_neigh_attach(struct cdx_ft_entry *entry)
 	 * Publish the entry on the watch list all the same -- that list is what
 	 * every device and route notifier scans, and an entry missing from it
 	 * is retired by nothing at all. */
-	if (entry->rule.out_session.present) {
+	/* A WireGuard egress resolves no neighbour either: its address is made
+	 * up (cdx_l3_vap_mac()) and the device itself is the dependency. */
+	if (entry->rule.out_session.present || cdx_l3_vap_dev(entry->rule.out)) {
 		spin_lock_bh(&ft_watch_lock);
 		ft_watch_publish(entry);
 		spin_unlock_bh(&ft_watch_lock);

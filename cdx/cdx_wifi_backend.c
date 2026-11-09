@@ -110,7 +110,8 @@ bool cdx_wifi_vap_supported(struct net_device *dev)
 	 * enqueueing it, and vap_rx_fwd_pkt() hands the result to the device's
 	 * ordinary transmit. A device that does not present that header has
 	 * nothing for either half to write, so it is refused here. */
-	if (dev->type != ARPHRD_ETHER || dev->addr_len != ETH_ALEN)
+	if ((dev->type != ARPHRD_ETHER || dev->addr_len != ETH_ALEN) &&
+	    !cdx_l3_vap_dev(dev))
 		return false;
 	/* VWD owns the offline port a VAP's frames are classified against and
 	 * the slot table the id comes from. It is brought up during cdx module
@@ -153,7 +154,10 @@ int cdx_wifi_vap_add(struct net_device *dev, struct cdx_wifi_vap **result)
 		return -ENOMEM;
 
 	port = phy_port_get(PORT_WIFI_IDX + vapid);
-	ether_addr_copy(mac, dev->dev_addr);
+	if (cdx_l3_vap_dev(dev))
+		cdx_l3_vap_mac(dev, mac);
+	else
+		ether_addr_copy(mac, dev->dev_addr);
 
 	/* The order is the one the failure handling below unwinds: the
 	 * logical interface first because

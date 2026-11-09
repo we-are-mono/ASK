@@ -884,7 +884,8 @@ static U8 cdx_ft_onif_type(struct net_device *dev)
 	 * is not -- a VRF moves the route lookup somewhere this contract does
 	 * not follow. */
 	if (!dev || !net_eq(dev_net(dev), &init_net) ||
-	    dev->type != ARPHRD_ETHER || dev->addr_len != ETH_ALEN ||
+	    ((dev->type != ARPHRD_ETHER || dev->addr_len != ETH_ALEN) &&
+	     !cdx_l3_vap_dev(dev)) ||
 	    dev->reg_state != NETREG_REGISTERED ||
 	    netif_is_l3_slave(dev) || cdx_ft_switch_port(dev) ||
 	    !netif_running(dev) || !netif_carrier_ok(dev))

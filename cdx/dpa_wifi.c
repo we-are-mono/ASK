@@ -17,6 +17,7 @@
 #include <linux/netdevice.h>
 #include <linux/if_vlan.h>
 #include <linux/etherdevice.h>
+#include <linux/if_arp.h>
 #include <linux/if_ether.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
@@ -409,6 +410,12 @@ static void vwd_send_to_vap(struct sk_buff* skb)
 
 	skb_reset_mac_header(skb);
 	skb_set_network_header(skb, sizeof(struct ethhdr));
+	/* A device with no link layer (WireGuard) takes the packet, not the
+	 * frame the classifier finished with a made-up header. */
+	if (skb->dev->type != ARPHRD_ETHER) {
+		skb_pull(skb, sizeof(struct ethhdr));
+		skb_reset_network_header(skb);
+	}
 	skb->priority = 0;
 	dev_queue_xmit(skb);
 	return;

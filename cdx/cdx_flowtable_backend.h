@@ -4,8 +4,11 @@
 
 #include <linux/bits.h>
 #include <linux/types.h>
+#include <linux/if_arp.h>
 #include <linux/if_ether.h>
+#include <linux/netdevice.h>
 #include <linux/netfilter.h>
+#include <net/rtnetlink.h>
 
 struct net_device;
 struct cdx_ft_hw;
@@ -436,6 +439,26 @@ static inline bool cdx_ft_portless(u8 family, u8 proto)
 	default:
 		return false;
 	}
+}
+
+/* A WireGuard device as a VAP egress. It has no link layer, so the entry is
+ * given a made-up, locally administered address to write, and the VAP consumer
+ * strips the Ethernet header again before handing the packet to the device.
+ * ponytail: matched by link kind; a cleaner contract is a netdev feature bit. */
+static inline bool cdx_l3_vap_dev(const struct net_device *dev)
+{
+	return dev && dev->type == ARPHRD_NONE && dev->rtnl_link_ops &&
+	       !strcmp(dev->rtnl_link_ops->kind, "wireguard");
+}
+
+static inline void cdx_l3_vap_mac(const struct net_device *dev, u8 *mac)
+{
+	mac[0] = 0x02;
+	mac[1] = 'w';
+	mac[2] = 'g';
+	mac[3] = dev->ifindex >> 16;
+	mac[4] = dev->ifindex >> 8;
+	mac[5] = dev->ifindex;
 }
 
 /* Process-context transactions serialize adapter state with CDX hardware

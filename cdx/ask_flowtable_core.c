@@ -2165,6 +2165,9 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	struct flow_match_tcp tcp;
 	const struct flow_action_entry *action;
 	struct net_device *source;
+	u8 l3_mac[ETH_ALEN];
+	const u8 *src_mac;
+	bool l3;
 	u32 mark, mtu;
 	u8 policer;
 	static const u32 offsets[4] = { 4, 8, 0, 4 };
@@ -2327,13 +2330,17 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * from it, and software sends with the bridge's. The encoder writes the
 	 * entry's own source, so nothing about the port has to agree; only an
 	 * address no frame may carry is declined. */
-	if (!source || !is_valid_ether_addr(source->dev_addr))
+	l3 = cdx_l3_vap_dev(out->out);
+	if (l3)
+		cdx_l3_vap_mac(out->out, l3_mac);
+	src_mac = l3 ? l3_mac : source ? source->dev_addr : NULL;
+	if (!src_mac || !is_valid_ether_addr(src_mac))
 		return ask_refuse(-EOPNOTSUPP);
 	/* A VAP is the exception for now: its frames leave through the Wi-Fi
 	 * driver, and a source other than its own has not been proved there on
 	 * the wire, so it keeps the rule it had -- the VAP's own address or
 	 * software. */
-	if (!cdx_ft_port_supported(out->out) &&
+	if (!cdx_ft_port_supported(out->out) && !l3 &&
 	    !ether_addr_equal(source->dev_addr, out->out->dev_addr))
 		return ask_refuse(-EOPNOTSUPP);
 	/* Re-entering the port a frame arrived on is a hairpin, and needs full
@@ -2506,6 +2513,9 @@ static int ft_parse(struct cdx_ft_binding *binding,
 							 out->out_tunnel.mac) ?
 					  -ESTALE : -EOPNOTSUPP);
 		ether_addr_copy(out->dst_mac, out->out_tunnel.mac);
+	} else if (l3) {
+		/* No neighbour: the consumer strips what the entry writes. */
+		ether_addr_copy(out->dst_mac, l3_mac);
 	} else {
 		if (!is_valid_ether_addr(ethernet) ||
 		    !ft_neigh_check(out->next_hop_family, out->out_logical, next_hop,
@@ -2528,7 +2538,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		ft_handle_invalidate(cls->nf_handle, &ft_mtu_invalidations);
 		return ask_refuse(-EOPNOTSUPP);
 	}
-	ether_addr_copy(out->src_mac, source->dev_addr);
+	ether_addr_copy(out->src_mac, src_mac);
 	/* Last, because a tc police filter is matched against the finished
 	 * tuple. A filter is the more specific statement of the same intent as
 	 * the mark, so where one claims this flow its profile replaces the
