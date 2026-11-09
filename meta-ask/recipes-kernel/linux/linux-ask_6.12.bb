@@ -121,6 +121,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://184-sdk_dpaa-rx-checksum-feature.patch \
            file://185-sdk_dpaa-shared-pool-count.patch \
            file://186-wireguard-netfilter-open-forward.patch \
+           file://187-wireguard-open-on-every-cpu.patch \
           "
 
 SRCREV_kernel = "${KERNEL_SRCREV}"

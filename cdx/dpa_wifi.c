@@ -115,6 +115,7 @@ static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq
 struct vwd_wg_rx_stats {
 	unsigned int steers;
 	unsigned long delivered, to_stack, dropped, forwarded, opened;
+	unsigned long skipped, skip_fail;
 };
 static void vwd_wg_steers_stats(const struct net_device *wg,
 				struct vwd_wg_rx_stats *st);
@@ -162,6 +163,8 @@ static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *a
 	len += sprintf(buf + len, "  WireGuard rx dropped : %lu\n", wg_rx.dropped);
 	len += sprintf(buf + len, "  WireGuard rx forwarded : %lu\n", wg_rx.forwarded);
 	len += sprintf(buf + len, "  WireGuard rx opened : %lu\n", wg_rx.opened);
+	len += sprintf(buf + len, "  WireGuard rx order skipped : %lu\n", wg_rx.skipped);
+	len += sprintf(buf + len, "  WireGuard rx order skip fail : %lu\n", wg_rx.skip_fail);
 
 	return len;
 }
@@ -558,18 +561,36 @@ enum {
 	VWD_WG_STEER_FAILED,
 };
 
-/* An installed steer's frame queue: on one CPU's portal channel, in VWD's
- * forwarding congestion group, polled by VWD's NAPI like a VAP's forwarding
- * queues (create_vap_fwd_from_fman_fqs()). Allocated per install rather than
+/* A steer queue's counters, per CPU, as an ordered queue is dequeued on every
+ * CPU at once; read racily for statistics. */
+struct vwd_wg_rxq_pc {
+	unsigned long delivered, to_stack, dropped;
+	/* Of delivered: opened where they lay and sent out of a port from the
+	 * same buffer, or opened and handed to the device as an skb. */
+	unsigned long forwarded, opened;
+	/* Ordered queues: sequence numbers given up for a frame not sent on in
+	 * order (vwd_wg_skip()), and those QMan never took. */
+	unsigned long skipped, skip_fail;
+};
+
+/* An installed steer's frame queue, in VWD's forwarding congestion group,
+ * polled by VWD's NAPI like a VAP's forwarding queues
+ * (create_vap_fwd_from_fman_fqs()). Allocated per install rather than
  * embedded in the slot, because a delete that cannot prove the entry unlinked
  * must leave the queue standing after the slot is reused
  * (vwd_wg_rxq_abandon()).
  *
+ * Either on one CPU's portal channel, or `ordered`: on the port's pool
+ * channel, which every CPU's portal dequeues, avoiding blocking, so one
+ * tunnel's frames are opened on every CPU at once, and with an order
+ * restoration point, so QMan puts the frames sent on back in the order they
+ * arrived (vwd_wg_rxq_create()). An ordered queue's forwarded frames all
+ * leave by egress queue `txq`: restored order across two queues would be lost
+ * again at the port.
+ *
  * `wg`, `vap` and `gen` name the device the dequeue delivers to and the VWD
  * open it must still be in (vwd_wg_rxq_dev()); `wg` is cleared before the queue
- * is drained or abandoned, after which every frame goes to the stack. The
- * counters are written only by the one portal the queue is dequeued on (and by
- * a drain, once it is retired), and read racily for statistics. */
+ * is drained or abandoned, after which every frame goes to the stack. */
 struct vwd_wg_rxq {
 	struct qman_fq fq;
 	struct net_device *port;
@@ -577,10 +598,9 @@ struct vwd_wg_rxq {
 	struct vap_desc_s *vap;
 	u32 gen;
 	unsigned int cpu;
-	unsigned long delivered, to_stack, dropped;
-	/* Of delivered: opened where they lay and sent out of a port from the
-	 * same buffer, or opened and handed to the device as an skb. */
-	unsigned long forwarded, opened;
+	bool ordered;
+	unsigned int txq;
+	struct vwd_wg_rxq_pc __percpu *pc;
 	/* delivered at the last vwd_wg_inline_update() tick. */
 	unsigned long seen;
 };
@@ -676,9 +696,70 @@ static struct vap_desc_s *vwd_wg_open_vap(const struct net_device *dev, u32 *gen
 	return found;
 }
 
-static inline void vwd_wg_count(unsigned long *c)
+#define vwd_wg_count(q, f)	this_cpu_inc((q)->pc->f)
+
+static unsigned long vwd_wg_sum(const struct vwd_wg_rxq *q, size_t off)
 {
-	WRITE_ONCE(*c, READ_ONCE(*c) + 1);
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += READ_ONCE(*(unsigned long *)((u8 *)per_cpu_ptr(q->pc, cpu) + off));
+	return sum;
+}
+#define vwd_wg_total(q, f)	vwd_wg_sum(q, offsetof(struct vwd_wg_rxq_pc, f))
+
+/* An ordered queue's frame owes the queue's order restoration point exactly
+ * one enqueue under its sequence number: the frame itself, sent on in order,
+ * or a hole, which lets the frames behind it go. */
+struct vwd_wg_seq {
+	u16 seq;
+	bool owed;
+};
+
+/* How long an enqueue under an order restoration point waits for room in the
+ * portal's ring. It must not be given up lightly: a sequence number never
+ * enqueued holds every later frame until the window overflows, and at idle
+ * for good. QMan leaves every portal's ring full at once for up to ~200 us
+ * under load (measured), past a fixed retry count's reach.
+ * ponytail: a ring full past this is not recovered; the queue's next open
+ * (wg down/up) gives it a fresh restoration point. */
+#define VWD_WG_ORP_WAIT_NS	(5 * NSEC_PER_MSEC)
+
+static int vwd_wg_orp_enqueue(struct vwd_wg_rxq *q, struct qman_fq *fq,
+			      const struct qm_fd *fd, u32 flags, u16 seq)
+{
+	u64 start = 0, now;
+	int err;
+
+	while ((err = qman_enqueue_orp(fq, fd, flags, &q->fq, seq)) == -EBUSY) {
+		now = ktime_get_ns();
+		if (!start)
+			start = now;
+		else if (now - start > VWD_WG_ORP_WAIT_NS)
+			break;
+		cpu_relax();
+	}
+	if (unlikely(err))
+		pr_warn_ratelimited("cdx: WireGuard rx order: portal ring full for 5 ms, sequence %u of fqid 0x%x lost\n",
+				    seq, q->fq.fqid);
+	return err;
+}
+
+/* Give up the frame's place in the order, before anything slow is done with
+ * it. A hole goes in under the steer queue's own object with an empty
+ * descriptor, so a rejection has nothing to free (vwd_wg_hole_ern()). */
+static void vwd_wg_skip(struct vwd_wg_rxq *q, struct vwd_wg_seq *s)
+{
+	static const struct qm_fd none;
+
+	if (!s->owed)
+		return;
+	s->owed = false;
+	if (unlikely(vwd_wg_orp_enqueue(q, &q->fq, &none, QMAN_ENQUEUE_FLAG_HOLE, s->seq)))
+		vwd_wg_count(q, skip_fail);
+	else
+		vwd_wg_count(q, skipped);
 }
 
 /* The device a steered datagram may be handed to, or NULL for the stack.
@@ -775,14 +856,29 @@ static struct eth_iface_info *vwd_wg_port(const struct net_device *dev);
 static bool vwd_wg_can_tx(const struct net_device *dev);
 
 /* The download fast path (vwd_wg_rx_raw()): 0 off, 1 on, 2 while the steered
- * tunnels that delivered in the last second sit on two CPUs or more. One
- * tunnel's packets are opened on its one receive CPU in arrival order, which
- * a single tunnel's decryption workers outrun; two or more do not.
+ * tunnels that delivered in the last second sit on two CPUs or more, or for
+ * an ordered queue (wg_rx_spread) always. A tunnel on one receive CPU is
+ * opened there in arrival order, which its decryption workers outrun; two or
+ * more such tunnels, or one opened on every CPU, do not.
  * ponytail: a knob while the trade-off is measured. */
 static unsigned int wg_rx_raw = 2;
 module_param(wg_rx_raw, uint, 0644);
 MODULE_PARM_DESC(wg_rx_raw, "WireGuard download fast path: 0 off, 1 on, 2 with two or more active tunnels");
 static bool vwd_wg_raw_auto;
+
+/* Steer queues ordered (struct vwd_wg_rxq): a tunnel opened on every CPU
+ * rather than on one receive CPU of its own. Read as a steer is installed and
+ * as a tunnel opens, so a change takes effect on the tunnel's next open.
+ * ponytail: a knob while the trade-off is measured. */
+static unsigned int wg_rx_spread = 1;
+module_param(wg_rx_spread, uint, 0644);
+MODULE_PARM_DESC(wg_rx_spread, "WireGuard receive: 1 opens each tunnel on every CPU, order restored by QMan; 0 on one CPU per tunnel");
+
+/* The restoration window, as QMan encodes it (0: 32 frames, doubling, 7: 4096):
+ * how far ahead of the oldest frame still owed a frame may be sent on before
+ * QMan moves on without it -- which it then takes late, out of order (OA and
+ * OLWS, vwd_wg_rxq_create()), rather than rejecting either. */
+#define VWD_WG_ORP_WINDOW	5
 
 /* The parser's checksum verdict, as _dpa_process_parse_results() reads it. */
 #define VWD_WG_CSUM_VALID	0xFFFF
@@ -804,7 +900,7 @@ static void vwd_wg_rx_open_stack(struct vwd_wg_rxq *q, struct net_device *wg,
 	if (unlikely(dpaa_eth_refill_bpools(dpa_bp, count_ptr,
 					    CONFIG_FSL_DPAA_ETH_REFILL_THRESHOLD))) {
 		dpa_fd_release(q->port, fd);
-		vwd_wg_count(&q->dropped);
+		vwd_wg_count(q, dropped);
 		return;
 	}
 	dma_unmap_single(dpa_bp->dev, qm_fd_addr(fd), dpa_bp->size,
@@ -822,7 +918,7 @@ static void vwd_wg_rx_open_stack(struct vwd_wg_rxq *q, struct net_device *wg,
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
 	skb->csum_level = ~0;
 	netif_receive_skb(skb);
-	vwd_wg_count(&q->opened);
+	vwd_wg_count(q, opened);
 }
 
 /* A steered frame opened where it lies (wg_fastpath_open()) and, when the
@@ -830,8 +926,11 @@ static void vwd_wg_rx_open_stack(struct vwd_wg_rxq *q, struct net_device *wg,
  * out of a DPAA port from the same buffer: the buffer keeps its pool, so the
  * port returns it on transmission and the pool's count is left alone, as for
  * a frame the classifier forwards. Returns false, with the frame untouched,
- * for the skb path; true once the frame is forwarded, delivered or dropped. */
-static bool vwd_wg_rx_raw(struct vwd_wg_rxq *q, const struct qm_fd *fd)
+ * for the skb path; true once the frame is forwarded, delivered or dropped.
+ * An ordered queue's frame is sent on in order under `s`, or gives its place
+ * up before the slow path. */
+static bool vwd_wg_rx_raw(struct vwd_wg_rxq *q, const struct qm_fd *fd,
+			  struct vwd_wg_seq *s)
 {
 	struct net_device *port = q->port, *wg;
 	struct dpa_priv_s *priv = netdev_priv(port);
@@ -846,8 +945,9 @@ static bool vwd_wg_rx_raw(struct vwd_wg_rxq *q, const struct qm_fd *fd)
 	struct qm_fd tfd;
 	int i, err;
 
+	/* An ordered queue is opened on every CPU already, so auto is on. */
 	if (fd->format != qm_fd_contig || !READ_ONCE(wg_rx_raw) ||
-	    (READ_ONCE(wg_rx_raw) == 2 && !READ_ONCE(vwd_wg_raw_auto)))
+	    (READ_ONCE(wg_rx_raw) == 2 && !READ_ONCE(vwd_wg_raw_auto) && !q->ordered))
 		return false;
 	wg = vwd_wg_rxq_dev(q);
 	if (!wg)
@@ -890,16 +990,17 @@ static bool vwd_wg_rx_raw(struct vwd_wg_rxq *q, const struct qm_fd *fd)
 		percpu_priv->stats.rx_packets++;
 		percpu_priv->stats.rx_bytes += len;
 		dpa_fd_release(port, fd);
-		vwd_wg_count(&q->dropped);
+		vwd_wg_count(q, dropped);
 		return true;
 	}
 	percpu_priv->stats.rx_packets++;
 	percpu_priv->stats.rx_bytes += len;
-	vwd_wg_count(&q->delivered);
+	vwd_wg_count(q, delivered);
 
 	if ((inner[0] >> 4) != 4 || !(ft = nf_flow_table_ingress(wg)) ||
 	    nf_flow_offload_ip_raw(ft, wg, (struct iphdr *)inner, ilen,
 				   vwd_wg_can_tx, &x)) {
+		vwd_wg_skip(q, s);
 		vwd_wg_rx_open_stack(q, wg, fd, data, inner, ilen);
 		return true;
 	}
@@ -914,15 +1015,22 @@ static bool vwd_wg_rx_raw(struct vwd_wg_rxq *q, const struct qm_fd *fd)
 	tfd.length20 = ilen + ETH_HLEN;
 	tfd.cmd = 0;
 	err = -EBUSY;
-	for (i = 0; i < 1000 && err == -EBUSY; i++)
-		err = qman_enqueue(&eth->fwd_tx_fqinfo[smp_processor_id() &
-						       (DPAA_FWD_TX_QUEUES - 1)],
-				   &tfd, 0);
+	if (s->owed) {
+		err = vwd_wg_orp_enqueue(q, &eth->fwd_tx_fqinfo[q->txq], &tfd, 0, s->seq);
+		/* Still owed on failure: the caller gives the place up. */
+		s->owed = !!err;
+	} else {
+		/* One CPU's queue: the frames are in order already. */
+		for (i = 0; i < 1000 && err == -EBUSY; i++)
+			err = qman_enqueue(&eth->fwd_tx_fqinfo[smp_processor_id() &
+							       (DPAA_FWD_TX_QUEUES - 1)],
+					   &tfd, 0);
+	}
 	if (unlikely(err)) {
 		dpa_fd_release(port, &tfd);
-		vwd_wg_count(&q->dropped);
+		vwd_wg_count(q, dropped);
 	} else {
-		vwd_wg_count(&q->forwarded);
+		vwd_wg_count(q, forwarded);
 	}
 	return true;
 }
@@ -933,7 +1041,8 @@ static bool vwd_wg_rx_raw(struct vwd_wg_rxq *q, const struct qm_fd *fd)
  * against the port's per-CPU count, the skb built zero-copy over the buffer
  * (scatter/gather too, a jumbo frame's), the parse results read for the L4
  * checksum, and the port's receive counters advanced. */
-static void vwd_wg_rxq_rx(struct vwd_wg_rxq *q, const struct qm_fd *fd)
+static void vwd_wg_rxq_rx(struct vwd_wg_rxq *q, const struct qm_fd *fd,
+			  struct vwd_wg_seq *s)
 {
 	struct net_device *port = q->port, *wg;
 	struct dpa_priv_s *priv = netdev_priv(port);
@@ -953,8 +1062,9 @@ static void vwd_wg_rxq_rx(struct vwd_wg_rxq *q, const struct qm_fd *fd)
 	if (unlikely(dpa_bpid2pool(fd->bpid) != dpa_bp ||
 		     (fd->format != qm_fd_contig && fd->format != qm_fd_sg)))
 		goto release;
-	if (vwd_wg_rx_raw(q, fd))
+	if (vwd_wg_rx_raw(q, fd, s))
 		return;
+	vwd_wg_skip(q, s);
 	count_ptr = raw_cpu_ptr(priv->percpu_count);
 	if (unlikely(dpaa_eth_refill_bpools(dpa_bp, count_ptr,
 					    CONFIG_FSL_DPAA_ETH_REFILL_THRESHOLD)))
@@ -973,7 +1083,7 @@ static void vwd_wg_rxq_rx(struct vwd_wg_rxq *q, const struct qm_fd *fd)
 	if (unlikely(skb->len < ETH_HLEN)) {
 		dev_core_stats_rx_dropped_inc(port);
 		kfree_skb(skb);
-		vwd_wg_count(&q->dropped);
+		vwd_wg_count(q, dropped);
 		return;
 	}
 	skb->protocol = eth_type_trans(skb, port);
@@ -987,13 +1097,13 @@ static void vwd_wg_rxq_rx(struct vwd_wg_rxq *q, const struct qm_fd *fd)
 	case VWD_WG_RX_DROP:
 		dev_core_stats_rx_dropped_inc(port);
 		kfree_skb(skb);
-		vwd_wg_count(&q->dropped);
+		vwd_wg_count(q, dropped);
 		return;
 	case VWD_WG_RX_DELIVER:
 		wg = vwd_wg_rxq_dev(q);
 		if (likely(wg)) {
 			wg_fastpath_receive(wg, skb);
-			vwd_wg_count(&q->delivered);
+			vwd_wg_count(q, delivered);
 			return;
 		}
 		fallthrough;
@@ -1001,14 +1111,14 @@ static void vwd_wg_rxq_rx(struct vwd_wg_rxq *q, const struct qm_fd *fd)
 		/* A well-formed frame with its network header set: the stack
 		 * receives it as the port would have. */
 		netif_receive_skb(skb);
-		vwd_wg_count(&q->to_stack);
+		vwd_wg_count(q, to_stack);
 		return;
 	}
 
 release:
 	/* Every buffer of the frame, a scatter/gather frame's too. */
 	dpa_fd_release(port, fd);
-	vwd_wg_count(&q->dropped);
+	vwd_wg_count(q, dropped);
 }
 
 static enum qman_cb_dqrr_result vwd_wg_rxq_dqrr(struct qman_portal *portal,
@@ -1016,25 +1126,47 @@ static enum qman_cb_dqrr_result vwd_wg_rxq_dqrr(struct qman_portal *portal,
 						const struct qm_dqrr_entry *dq)
 {
 	struct vwd_wg_rxq *q = container_of(fq, struct vwd_wg_rxq, fq);
+	struct vwd_wg_seq s;
 
 	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
 		return qman_cb_dqrr_consume;
 	if (unlikely(vwd_napi_schedule(portal)))
 		return qman_cb_dqrr_stop;
+	s.seq = dq->seqnum & QM_EQCR_SEQNUM_SEQMASK;
+	s.owed = q->ordered;
 	rcu_read_lock();
-	vwd_wg_rxq_rx(q, &dq->fd);
+	vwd_wg_rxq_rx(q, &dq->fd, &s);
+	/* Whatever path the frame took, its place is settled. */
+	vwd_wg_skip(q, &s);
 	rcu_read_unlock();
 	return qman_cb_dqrr_consume;
 }
 
-/* A steer's queue on `cpu`'s portal channel, set up as a VAP's forwarding
- * queues are (create_vap_fwd_from_fman_fqs()): VWD's work queue and stashing,
- * VWD's forwarding congestion group, VWD's NAPI, and an ERN callback that
- * returns a rejected frame to its pool. Control mutex held. */
+/* Only a hole is enqueued under the steer queue's own object (the classifier
+ * enqueues the frames, and takes its own rejections back), with an empty
+ * descriptor: nothing to free, and the place it gave up is QMan's to skip on
+ * its own (VWD_WG_ORP_WINDOW). */
+static void vwd_wg_hole_ern(struct qman_portal *portal, struct qman_fq *fq,
+			    const struct qm_mr_entry *msg)
+{
+	struct vwd_wg_rxq *q = container_of(fq, struct vwd_wg_rxq, fq);
+
+	pr_warn_ratelimited("cdx: WireGuard rx order: hole %u of fqid 0x%x rejected (rc 0x%02x)\n",
+			    msg->ern.seqnum, q->fq.fqid, msg->ern.rc);
+	vwd_wg_count(q, skip_fail);
+}
+
+/* A steer's queue, set up as a VAP's forwarding queues are
+ * (create_vap_fwd_from_fman_fqs()): VWD's work queue and stashing, VWD's
+ * forwarding congestion group and VWD's NAPI. On `cpu`'s portal channel, or
+ * `ordered` (struct vwd_wg_rxq): on the port's pool channel with an order
+ * restoration point that, past its window, moves on without a frame still
+ * owed (OA) and takes that frame late rather than rejecting it (OLWS 3), so a
+ * CPU held up costs order, never a frame. Control mutex held. */
 static struct vwd_wg_rxq *vwd_wg_rxq_create(struct net_device *port,
 					    struct net_device *wg,
 					    struct vap_desc_s *vap, u32 gen,
-					    unsigned int cpu)
+					    unsigned int cpu, bool ordered)
 {
 	struct qm_mcc_initfq opts;
 	struct vwd_wg_rxq *q;
@@ -1042,14 +1174,22 @@ static struct vwd_wg_rxq *vwd_wg_rxq_create(struct net_device *port,
 	q = kzalloc(sizeof(*q), GFP_KERNEL);
 	if (!q)
 		return ERR_PTR(-ENOMEM);
+	q->pc = alloc_percpu(struct vwd_wg_rxq_pc);
+	if (!q->pc) {
+		kfree(q);
+		return ERR_PTR(-ENOMEM);
+	}
 	q->port = port;
 	q->wg = wg;
 	q->vap = vap;
 	q->gen = gen;
 	q->cpu = cpu;
+	q->ordered = ordered;
+	q->txq = cpu & (DPAA_FWD_TX_QUEUES - 1);
 	q->fq.cb.dqrr = vwd_wg_rxq_dqrr;
-	q->fq.cb.ern = vap_fwd_ern;
+	q->fq.cb.ern = vwd_wg_hole_ern;
 	if (qman_create_fq(0, QMAN_FQ_FLAG_DYNAMIC_FQID, &q->fq)) {
+		free_percpu(q->pc);
 		kfree(q);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -1067,9 +1207,21 @@ static struct vwd_wg_rxq *vwd_wg_rxq_create(struct net_device *port,
 		QM_STASHING_EXCL_DATA | QM_STASHING_EXCL_ANNOTATION;
 	opts.fqd.context_a.stashing.data_cl = NUM_PKT_DATA_LINES_IN_CACHE;
 	opts.fqd.context_a.stashing.annotation_cl = NUM_ANN_LINES_IN_CACHE;
+	if (ordered) {
+		opts.fqd.dest.channel = ((struct dpa_priv_s *)netdev_priv(port))->channel;
+		/* Default scheduling keeps an active queue on the one portal it
+		 * was given, waiting on that portal's ring while the others idle;
+		 * avoid-blocking hands each frame to any portal with room. */
+		opts.fqd.fq_ctrl |= QM_FQCTRL_ORP | QM_FQCTRL_AVOIDBLOCK;
+		opts.we_mask |= QM_INITFQ_WE_ORPC;
+		opts.fqd.orprws = VWD_WG_ORP_WINDOW;
+		opts.fqd.oa = 1;
+		opts.fqd.olws = 3;
+	}
 	if (qman_init_fq(&q->fq, QMAN_INITFQ_FLAG_SCHED, &opts)) {
 		/* Never initialised, so out of service already. */
 		qman_destroy_fq(&q->fq, 0);
+		free_percpu(q->pc);
 		kfree(q);
 		return ERR_PTR(-EIO);
 	}
@@ -1087,6 +1239,7 @@ static void vwd_wg_rxq_destroy(struct vwd_wg_rxq *q)
 {
 	WRITE_ONCE(q->wg, NULL);
 	cdx_destroy_fq(&q->fq);
+	free_percpu(q->pc);
 	kfree(q);
 }
 
@@ -1139,6 +1292,7 @@ static int vwd_wg_steer_install(struct vwd_wg_steer *s, struct vap_desc_s *vap,
 				u32 gen)
 {
 	const struct cpumask *cpus = qman_affine_cpus();
+	bool ordered = READ_ONCE(wg_rx_spread);
 	struct vwd_wg_rxq *q;
 	unsigned int cpu, n;
 	int rc;
@@ -1150,9 +1304,10 @@ static int vwd_wg_steer_install(struct vwd_wg_steer *s, struct vap_desc_s *vap,
 	n = cpumask_weight(cpus);
 	if (!n)
 		return -ENODEV;
-	cpu = vap->wg_rx_cpu >= 0 ? vap->wg_rx_cpu :
+	/* An ordered queue's turn only picks its egress queue. */
+	cpu = !ordered && vap->wg_rx_cpu >= 0 ? vap->wg_rx_cpu :
 	      cpumask_nth(vwd_wg_steer_cpu++ % n, cpus);
-	q = vwd_wg_rxq_create(s->port, s->wg, vap, gen, cpu);
+	q = vwd_wg_rxq_create(s->port, s->wg, vap, gen, cpu, ordered);
 	if (IS_ERR(q))
 		return PTR_ERR(q);
 	rc = cdx_ehash_steer4_add(s->port, s->saddr, s->daddr, s->sport,
@@ -1164,9 +1319,10 @@ static int vwd_wg_steer_install(struct vwd_wg_steer *s, struct vap_desc_s *vap,
 		return rc;
 	}
 	WRITE_ONCE(s->rxq, q);
-	pr_info("cdx: WireGuard rx steer %pI4:%u -> %pI4:%u on %s to fqid 0x%x (cpu %u)\n",
+	pr_info("cdx: WireGuard rx steer %pI4:%u -> %pI4:%u on %s to fqid 0x%x (%s %u)\n",
 		&s->saddr, ntohs(s->sport), &s->daddr, ntohs(s->dport),
-		netdev_name(s->port), q->fq.fqid, cpu);
+		netdev_name(s->port), q->fq.fqid,
+		ordered ? "every cpu, ordered, txq" : "cpu", ordered ? q->txq : cpu);
 	return 0;
 }
 
@@ -1197,9 +1353,13 @@ static void vwd_wg_inline_fn(struct work_struct *work)
 		q = READ_ONCE(s->rxq);
 		if (!q)
 			continue;
-		d = READ_ONCE(q->delivered);
-		if (d != q->seen)
-			cpumask_set_cpu(q->cpu, &cpus);
+		d = vwd_wg_total(q, delivered);
+		if (d != q->seen) {
+			if (q->ordered)
+				cpumask_or(&cpus, &cpus, qman_affine_cpus());
+			else
+				cpumask_set_cpu(q->cpu, &cpus);
+		}
 		q->seen = d;
 	}
 	rcu_read_unlock();
@@ -1319,11 +1479,13 @@ static void vwd_wg_steers_stats(const struct net_device *wg,
 		q = READ_ONCE(s->rxq);
 		if (!q)
 			continue;
-		st->delivered += READ_ONCE(q->delivered);
-		st->to_stack += READ_ONCE(q->to_stack);
-		st->dropped += READ_ONCE(q->dropped);
-		st->forwarded += READ_ONCE(q->forwarded);
-		st->opened += READ_ONCE(q->opened);
+		st->delivered += vwd_wg_total(q, delivered);
+		st->to_stack += vwd_wg_total(q, to_stack);
+		st->dropped += vwd_wg_total(q, dropped);
+		st->forwarded += vwd_wg_total(q, forwarded);
+		st->opened += vwd_wg_total(q, opened);
+		st->skipped += vwd_wg_total(q, skipped);
+		st->skip_fail += vwd_wg_total(q, skip_fail);
 	}
 	rcu_read_unlock();
 }
@@ -2054,13 +2216,14 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 			{
 				/* A WireGuard tunnel's receive CPU, dealt in turn
 				 * when it opens, so its steer and its flows' seal
-				 * queues agree before the first entry exists. */
+				 * queues agree before the first entry exists. None
+				 * when its steer is ordered: every CPU receives it. */
 				static unsigned int wg_rx_turn;
 				const struct cpumask *cpus = qman_affine_cpus();
 
 				vap->wg_rx_cpu = -1;
 				if (vap->wifi_dev && vap->wifi_dev->type != ARPHRD_ETHER &&
-				    cpumask_weight(cpus))
+				    !READ_ONCE(wg_rx_spread) && cpumask_weight(cpus))
 					vap->wg_rx_cpu = cpumask_nth(wg_rx_turn++ %
 								     cpumask_weight(cpus), cpus);
 				/* Last: the dequeue path reads this first, and
