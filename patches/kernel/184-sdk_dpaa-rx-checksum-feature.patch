@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Mon, 9 Nov 2026 21:00:00 +0100
+Subject: [PATCH] sdk_dpaa: enable Rx checksum validation and GRO safely
+
+dpa_fix_features() cleared NETIF_F_RXCSUM unconditionally ("not
+supported through ethtool yet"), so every frame the stack receives
+from a DPAA port was checksummed in software and none took GRO. On a
+WireGuard tunnel's receive CPU the outer UDP checksum alone was 7% of
+its time. The support exists: dpa_set_features() switches the parser's
+L4 check and _dpa_process_parse_results() trusts it only when the parse
+result says the checksum passed. Stop masking the feature.
+
+That exposes GRO, which had never run: _dpa_rx() handed GRO packets to
+the port's own per-portal NAPI instance, but with
+CONFIG_FSL_ASK_QMAN_PORTAL_NAPI a portal is drained by the portal's
+NAPI, or by VWD's, never by that one -- so packets waited in a GRO list
+nobody flushed (TCP SYN-ACKs held for seconds, connections timing out).
+The poller now records itself per CPU (qman_poll_napi) around each
+DQRR poll, and _dpa_rx() uses GRO only through it, falling back to
+netif_receive_skb() outside a poll.
+---
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
+@@ -395,8 +395,11 @@
+ {
+ 	struct dpa_napi_portal *np =
+ 			container_of(napi, struct dpa_napi_portal, napi);
++	int cleaned;
+ 
+-	int cleaned = qman_p_poll_dqrr(np->p, budget);
++	this_cpu_write(qman_poll_napi, napi);
++	cleaned = qman_p_poll_dqrr(np->p, budget);
++	this_cpu_write(qman_poll_napi, NULL);
+ 
+ 	if (cleaned < budget) {
+ 		int tmp;
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
+@@ -310,13 +310,9 @@
+ netdev_features_t dpa_fix_features(struct net_device *dev,
+ 				   netdev_features_t features)
+ {
+-	netdev_features_t unsupported_features = 0;
+-
+-	/* We don't support enabling Rx csum through ethtool yet */
+-	unsupported_features |= NETIF_F_RXCSUM;
+-
+-	features &= ~unsupported_features;
+-
++	/* Rx checksum validation is supported: dpa_set_features() switches the
++	 * parser's L4 check, and _dpa_process_parse_results() trusts it only
++	 * when the parse result says the checksum passed. */
+ 	return features;
+ }
+ 
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
+@@ -819,16 +819,13 @@
+ 
+ 	skb_record_rx_queue(skb, raw_smp_processor_id());
+ 
+-	if (use_gro) {
+-		const struct qman_portal_config *pc =
+-					qman_p_get_portal_config(portal);
+-		struct dpa_napi_portal *np = &percpu_priv->np[pc->index];
+-
+-		np->p = portal;
+-		napi_gro_receive(&np->napi, skb);
+-	} else {
++	/* GRO only into the NAPI instance actually polling: a portal is drained
++	 * by whichever poll runs on it (the portal's own, VWD's, any port's), and
++	 * packets left in a NAPI that is not polled wait for its next poll. */
++	if (use_gro && this_cpu_read(qman_poll_napi))
++		napi_gro_receive(this_cpu_read(qman_poll_napi), skb);
++	else
+ 		netif_receive_skb(skb);
+-	}
+ 
+ 	return;
+ 
+--- a/drivers/staging/fsl_qbman/qman_high.c
++++ b/drivers/staging/fsl_qbman/qman_high.c
+@@ -591,14 +591,22 @@
+ 	}
+ };
+ 
++/* The NAPI instance polling this CPU's portal right now, NULL outside a
++ * poll: the only one a receive callback may hand GRO packets to, since only
++ * the poller's completion flushes them. */
++DEFINE_PER_CPU(struct napi_struct *, qman_poll_napi);
++EXPORT_PER_CPU_SYMBOL(qman_poll_napi);
+ 
+ 
+ #ifdef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
+ static int qman_portal_dqrr_poll(struct napi_struct *napi, int budget)
+ {
+ 	struct qman_portal *portal = container_of(napi, struct qman_portal, napi);
++	int cleaned;
+ 
+-	int cleaned = qman_p_poll_dqrr(portal, budget);
++	this_cpu_write(qman_poll_napi, napi);
++	cleaned = qman_p_poll_dqrr(portal, budget);
++	this_cpu_write(qman_poll_napi, NULL);
+ 
+ 	if (cleaned < budget) {
+ 		napi_complete(napi);
+--- a/include/linux/fsl_qman.h
++++ b/include/linux/fsl_qman.h
+@@ -3971,6 +3971,8 @@
+ int qman_p_irqsource_add(struct qman_portal *p, u32 bits);
+ int qman_p_irqsource_remove(struct qman_portal *p, u32 bits);
+ int qman_p_poll_dqrr(struct qman_portal *p, unsigned int limit);
++/* The NAPI instance polling this CPU's portal, or NULL outside a poll. */
++DECLARE_PER_CPU(struct napi_struct *, qman_poll_napi);
+ u32 qman_p_poll_slow(struct qman_portal *p);
+ void qman_p_poll(struct qman_portal *p);
+ void qman_p_stop_dequeues(struct qman_portal *p);
+-- 
+2.47.3

@@ -118,6 +118,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://181-wireguard-tx-lanes.patch \
            file://182-wireguard-fastpath-seal.patch \
            file://183-wireguard-rx-inline-small.patch \
+           file://184-sdk_dpaa-rx-checksum-feature.patch \
           "
 
 SRCREV_kernel = "${KERNEL_SRCREV}"
