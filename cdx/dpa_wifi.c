@@ -986,7 +986,8 @@ static int vwd_wg_steer_install(struct vwd_wg_steer *s, struct vap_desc_s *vap,
 	n = cpumask_weight(cpus);
 	if (!n)
 		return -ENODEV;
-	cpu = cpumask_nth(vwd_wg_steer_cpu++ % n, cpus);
+	cpu = vap->wg_rx_cpu >= 0 ? vap->wg_rx_cpu :
+	      cpumask_nth(vwd_wg_steer_cpu++ % n, cpus);
 	q = vwd_wg_rxq_create(s->port, s->wg, vap, gen, cpu);
 	if (IS_ERR(q))
 		return PTR_ERR(q);
@@ -1596,13 +1597,17 @@ int dpaa_get_vap_fwd_fq(uint16_t vap_id, uint32_t* fqid, uint32_t hash)
 	if (vap_id >= MAX_WIFI_VAPS)
 		return -1;
 	/* A WireGuard VAP's queue is where its frames are sealed, a CPU's worth
-	 * of work per flow, and the queues are dealt round-robin over the CPU
-	 * portals. By hash, four flows land on four CPUs one time in eleven;
-	 * dealt in turn, consecutive entries always do. */
+	 * of work per flow; queue i is on the i-th CPU's portal. Flows are dealt
+	 * in turn over every CPU but the one receiving their tunnel, which
+	 * carries all its ACKs (and would bounce them, vwd_wg_fast()). */
 	if (vwd.vaps[vap_id].wifi_dev && vwd.vaps[vap_id].wifi_dev->type != ARPHRD_ETHER) {
 		static atomic_t wg_turn;
+		unsigned int n = num_online_cpus();
+		int rx = READ_ONCE(vwd.vaps[vap_id].wg_rx_cpu);
 
-		hash = atomic_inc_return(&wg_turn);
+		do
+			hash = (unsigned int)atomic_inc_return(&wg_turn) % n;
+		while (n > 1 && (int)hash == rx);
 	}
 	dpa_fq = vwd.vaps[vap_id].wlan_fq_from_fman[hash & (CDX_VWD_FWD_FQ_MAX - 1)];
 	if (!dpa_fq)
@@ -1880,6 +1885,17 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 			}
 			else
 			{
+				/* A WireGuard tunnel's receive CPU, dealt in turn
+				 * when it opens, so its steer and its flows' seal
+				 * queues agree before the first entry exists. */
+				static unsigned int wg_rx_turn;
+				const struct cpumask *cpus = qman_affine_cpus();
+
+				vap->wg_rx_cpu = -1;
+				if (vap->wifi_dev && vap->wifi_dev->type != ARPHRD_ETHER &&
+				    cpumask_weight(cpus))
+					vap->wg_rx_cpu = cpumask_nth(wg_rx_turn++ %
+								     cpumask_weight(cpus), cpus);
 				/* Last: the dequeue path reads this first, and
 				 * the queues' device pointers were stored above. */
 				smp_store_release(&vap->state, VAP_ST_OPEN);

@@ -54,6 +54,9 @@ struct vap_desc_s {
 	char								ifname[IFNAMSIZ];
 	unsigned char  				macaddr[ETH_ALEN];
 	unsigned short 				vapid;
+	/* WireGuard VAP: the CPU its tunnel is received on (steer queue),
+	 * which its flows are sealed away from; -1 otherwise. */
+	int					wg_rx_cpu;
 	struct dpa_fq				*wlan_fq_from_fman[CDX_VWD_FWD_FQ_MAX];
 	struct vap_stats_s  __percpu         	*vap_stats;
 };
