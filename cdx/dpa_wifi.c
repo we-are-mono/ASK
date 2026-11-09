@@ -575,6 +575,8 @@ struct vwd_wg_rxq {
 	u32 gen;
 	unsigned int cpu;
 	unsigned long delivered, to_stack, dropped;
+	/* delivered at the last vwd_wg_inline_update() tick. */
+	unsigned long seen;
 };
 
 #define VWD_WG_STEERS 16
@@ -1003,6 +1005,44 @@ static int vwd_wg_steer_install(struct vwd_wg_steer *s, struct vap_desc_s *vap,
 	return 0;
 }
 
+/* Once every CPU is receiving a steered tunnel of its own, WireGuard decrypts
+ * where packets arrive instead of handing them to a worker on another, equally
+ * busy CPU (wg_fastpath_rx_inline()). Only a tunnel that delivered since the
+ * last tick counts, so an idle one leaves its CPU to the workers. Runs every
+ * second while a steer is installed; reads the queues under RCU, as the
+ * statistics do. ponytail: one-second hysteresis, no traffic weighting. */
+static void vwd_wg_inline_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(vwd_wg_inline_work, vwd_wg_inline_fn);
+
+static void vwd_wg_inline_fn(struct work_struct *work)
+{
+	struct cpumask cpus;
+	unsigned int i, installed = 0;
+
+	cpumask_clear(&cpus);
+	rcu_read_lock();
+	for (i = 0; i < VWD_WG_STEERS; i++) {
+		struct vwd_wg_steer *s = &vwd_wg_steers[i];
+		struct vwd_wg_rxq *q;
+		unsigned long d;
+
+		if (smp_load_acquire(&s->state) != VWD_WG_STEER_INSTALLED)
+			continue;
+		installed++;
+		q = READ_ONCE(s->rxq);
+		if (!q)
+			continue;
+		d = READ_ONCE(q->delivered);
+		if (d != q->seen)
+			cpumask_set_cpu(q->cpu, &cpus);
+		q->seen = d;
+	}
+	rcu_read_unlock();
+	wg_fastpath_rx_inline(cpumask_weight(&cpus) >= num_online_cpus());
+	if (installed && !READ_ONCE(vwd_stopping))
+		schedule_delayed_work(&vwd_wg_inline_work, HZ);
+}
+
 static void vwd_wg_steer_work_fn(struct work_struct *work)
 {
 	unsigned int i, j;
@@ -1047,6 +1087,8 @@ static void vwd_wg_steer_work_fn(struct work_struct *work)
 		}
 		smp_store_release(&s->state, VWD_WG_STEER_INSTALLED);
 	}
+	if (!READ_ONCE(vwd_stopping))
+		schedule_delayed_work(&vwd_wg_inline_work, HZ);
 	cdx_ft_end();
 }
 
@@ -1079,6 +1121,10 @@ static void vwd_wg_steers_exit(void)
 {
 	synchronize_net();
 	cancel_work_sync(&vwd_wg_steer_work);
+	/* After the steer worker, which arms it; it re-arms only while not
+	 * stopping. */
+	cancel_delayed_work_sync(&vwd_wg_inline_work);
+	wg_fastpath_rx_inline(false);
 	cdx_ft_begin();
 	vwd_wg_steers_drop(NULL);
 	cdx_ft_end();

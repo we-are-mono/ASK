@@ -42,24 +42,35 @@ poll delivers in that order.
  	queue_work_on(cpu, wq, &per_cpu_ptr(device_queue->worker, cpu)->work);
 --- a/drivers/net/wireguard/receive.c
 +++ b/drivers/net/wireguard/receive.c
-@@ -25,6 +25,9 @@
+@@ -25,6 +25,20 @@
  
  #define SKB_TYPE_LE32(skb) (((struct message_header *)(skb)->data)->type)
  
 +/* Data messages up to this size are decrypted where they arrive. */
-+#define WG_RX_INLINE_MAX 256
++static unsigned int wg_rx_inline_max = 256;
++module_param_named(rx_inline_max, wg_rx_inline_max, uint, 0644);
++MODULE_PARM_DESC(rx_inline_max, "Data messages up to this many bytes are decrypted on the receiving CPU");
++
++/* With every CPU already receiving a tunnel of its own, the hop to a
++ * decryption worker only moves work between equally busy CPUs; decrypt
++ * everything where it arrives. Otherwise only small messages. */
++void wg_fastpath_rx_inline(bool all)
++{
++	WRITE_ONCE(wg_rx_inline_max, all ? U16_MAX : 256);
++}
++EXPORT_SYMBOL_GPL(wg_fastpath_rx_inline);
 +
  static size_t validate_header_len(struct sk_buff *skb)
  {
  	if (unlikely(skb->len < sizeof(struct message_header)))
-@@ -526,8 +529,22 @@
+@@ -526,8 +540,22 @@
  	if (READ_ONCE(peer->fp_rx_cpu) != raw_smp_processor_id())
  		WRITE_ONCE(peer->fp_rx_cpu, raw_smp_processor_id());
  
 +	/* A packet this small -- an ACK, a keepalive -- costs less to decrypt
 +	 * here than to hand to a worker on another CPU and back. It still takes
 +	 * its place in the peer's queue first, so delivery stays in order. */
-+	if (skb->len <= WG_RX_INLINE_MAX) {
++	if (skb->len <= READ_ONCE(wg_rx_inline_max)) {
 +		atomic_set_release(&PACKET_CB(skb)->state, PACKET_STATE_UNCRYPTED);
 +		if (unlikely(!wg_prev_queue_enqueue(&peer->rx_queue, skb)))
 +			goto err;
@@ -87,5 +98,15 @@ poll delivers in that order.
  	if (unlikely(ret == -EPIPE))
  		wg_queue_enqueue_per_peer_tx(first, PACKET_STATE_DEAD);
  err:
+--- a/include/net/wg_fastpath.h
++++ b/include/net/wg_fastpath.h
+@@ -28,4 +28,7 @@
+  * holds rcu_read_lock() and keeps @wg_dev registered across the call. */
+ void wg_fastpath_receive(struct net_device *wg_dev, struct sk_buff *skb);
+ 
++/* Decrypt every data message on the receiving CPU (true) or only small ones. */
++void wg_fastpath_rx_inline(bool all);
++
+ #endif /* _NET_WG_FASTPATH_H */
 -- 
 2.47.3
