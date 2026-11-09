@@ -1803,11 +1803,11 @@ err_ret1:
 
 /* A receive steer: one exact IPv4 UDP five-tuple on the ingress port's UDP
  * table, whose only action is to enqueue the frame as it arrived to `fqid` --
- * one of the port's own distribution queues (cdx_pcd_fq_for_cpu()), so it is
- * received exactly as a classifier miss would be, only on the CPU that queue's
- * portal serves rather than the one the port's Ethernet distribution hashes
- * every frame of one L2 pair to. The key is the one the inbound NAT-T root
- * builds (fill_natt_key_info()): the port, the pair, the ports moved before
+ * a CPU queue the caller owns (a WireGuard peer's, in dpa_wifi.c), so it is
+ * received, by whatever that queue's owner does with it, on the CPU the
+ * queue's portal serves rather than the one the port's Ethernet distribution
+ * hashes every frame of one L2 pair to. The key is the one the inbound NAT-T
+ * root builds (fill_natt_key_info()): the port, the pair, the ports moved before
  * the first-header guard, which names a native UDP header. No preemptive
  * checks, TTL, NAT, rx statistics or header change: the frame is not
  * forwarded, only queued. The MTU is the unlimited one, so nothing is

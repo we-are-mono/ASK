@@ -1727,51 +1727,6 @@ int find_pcd_fq_info(uint32_t fqid)
 	return -1;
 }
 
-/* The queue of `dev`'s Ethernet distribution that `cpu`'s portal serves: the
- * one a classifier entry enqueues to so that the frame is received, as a miss
- * of the port would be, on that CPU. 0 with *fqid set, -EINVAL for a CPU with
- * no affine portal, -ENOENT when the port has no such queue.
- *
- * Caller holds the control mutex, which dpa_get_ifinfo_by_netdev() asserts.
- * The queue list itself needs no lock: it is built once at module init
- * (cdx_create_port_fqs()) and released only by the initialization rollback
- * and unload (dpa_release_pcd_fqs()), so for as long as a caller can reach
- * this it neither grows nor shrinks -- the reasoning fman_info's readers rely
- * on. */
-int cdx_pcd_fq_for_cpu(struct net_device *dev, unsigned int cpu, uint32_t *fqid)
-{
-	struct cdx_dist_info *dist = NULL;
-	struct dpa_iface_info *iface;
-	struct dpa_fq *fq;
-	uint32_t base, ii;
-	u16 channel;
-
-	if (cpu >= nr_cpu_ids || !cpumask_test_cpu(cpu, qman_affine_cpus()))
-		return -EINVAL;
-	iface = dpa_get_ifinfo_by_netdev(dev);
-	if (!iface || !(iface->if_flags & IF_TYPE_ETHERNET))
-		return -ENOENT;
-	for (ii = 0; ii < iface->eth_info.max_dist; ii++)
-		if (iface->eth_info.dist_info[ii].type == ETHERNET_DIST) {
-			dist = &iface->eth_info.dist_info[ii];
-			break;
-		}
-	if (!dist || !dist->count)
-		return -ENOENT;
-	/* The same arithmetic cdxdrv_create_pcd_fqs() names them by. */
-	base = dist->base_fqid + (iface->eth_info.portid << 8);
-	channel = qman_affine_channel(cpu);
-	for (fq = dpa_pcd_fq; fq; fq = (struct dpa_fq *)fq->list.next) {
-		if (fq->net_dev != dev || fq->channel != channel)
-			continue;
-		if (fq->fqid < base || fq->fqid >= base + dist->count)
-			continue;
-		*fqid = fq->fqid;
-		return 0;
-	}
-	return -ENOENT;
-}
-
 void add_pcd_fq_info(struct dpa_fq *fq_info)
 {
 	//add to tail of resource list

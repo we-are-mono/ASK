@@ -18,6 +18,8 @@
 #include <linux/if_vlan.h>
 #include <linux/etherdevice.h>
 #include <linux/if_arp.h>
+#include <linux/udp.h>
+#include <net/ip.h>
 #include <net/wg_fastpath.h>
 #include <linux/if_ether.h>
 #include <linux/netfilter.h>
@@ -107,7 +109,14 @@ static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *a
 static DEVICE_ATTR(vwd_debug_stats, 0444, vwd_show_dump_stats, NULL);
 static struct device_attribute dev_attr_vap[MAX_WIFI_VAPS];
 static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq, const struct qm_dqrr_entry *dq);
-static unsigned int vwd_wg_steers_installed(const struct net_device *wg);
+
+/* A WireGuard VAP's receive steers, summed over its installed slots. */
+struct vwd_wg_rx_stats {
+	unsigned int steers;
+	unsigned long delivered, to_stack, dropped;
+};
+static void vwd_wg_steers_stats(const struct net_device *wg,
+				struct vwd_wg_rx_stats *st);
 
 static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *attribute, char *buf)
 {
@@ -117,6 +126,7 @@ static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *a
 
 	struct vap_stats_s *per_cpu_stats;
 	struct vap_stats_s total_stats;
+	struct vwd_wg_rx_stats wg_rx;
 	int i;
 
 	for (ii = 0; ii < MAX_WIFI_VAPS; ii++) {
@@ -144,8 +154,11 @@ static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *a
 	len += sprintf(buf + len, "  WiFi Tx ipsec pkts : %u\n", total_stats.pkts_rx_ipsec);
 	len += sprintf(buf + len, "  WireGuard sealed : %u\n", total_stats.pkts_wg_sealed);
 	len += sprintf(buf + len, "  WireGuard tx fail : %u\n", total_stats.pkts_wg_tx_fail);
-	len += sprintf(buf + len, "  WireGuard rx steers : %u\n",
-		       vwd_wg_steers_installed(READ_ONCE(priv->vaps[ii].wifi_dev)));
+	vwd_wg_steers_stats(READ_ONCE(priv->vaps[ii].wifi_dev), &wg_rx);
+	len += sprintf(buf + len, "  WireGuard rx steers : %u\n", wg_rx.steers);
+	len += sprintf(buf + len, "  WireGuard rx delivered : %lu\n", wg_rx.delivered);
+	len += sprintf(buf + len, "  WireGuard rx to stack : %lu\n", wg_rx.to_stack);
+	len += sprintf(buf + len, "  WireGuard rx dropped : %lu\n", wg_rx.dropped);
 
 	return len;
 }
@@ -502,24 +515,32 @@ static bool vwd_wg_can_tx(const struct net_device *dev)
  * tunnel behind one upstream gateway, so every tunnel lands on one queue and
  * one CPU, through the exception policer. The seal reports the outer tuple it
  * wrote; its reverse is the peer's, and a classifier entry for that exact
- * tuple (cdx_ehash_steer4_add()) enqueues it, unmodified, to one of the port's
- * own distribution queues, picked for a CPU round robin, where it is received
- * exactly as before. A steered tuple skips the exception policer
- * CDX_EXPT_ETH_RATELIMIT: only an established peer's exact five-tuple is ever
- * steered, the one the router itself just sealed for.
+ * tuple (cdx_ehash_steer4_add()) enqueues it, unmodified, to a frame queue of
+ * the slot's own on a CPU picked round robin (struct vwd_wg_rxq below), whose
+ * dequeue hands the datagram straight to WireGuard, as its socket would --
+ * without the IP input, routing, netfilter and socket lookup the stack spends
+ * on every packet.
+ *
+ * Security: a steered tuple skips the exception policer
+ * CDX_EXPT_ETH_RATELIMIT, and its datagrams skip the netfilter PREROUTING and
+ * INPUT hooks (and conntrack, tc ingress and rp_filter with them). Only an
+ * established peer's exact five-tuple is ever steered, the one the router
+ * itself just sealed for, and WireGuard authenticates every datagram it takes.
  *
  * The fast path only notes a tuple: it claims an empty slot without a lock
  * (EMPTY -> CLAIMING by cmpxchg, the fields written, then PENDING with
  * release) and schedules the worker. Everything after that -- the install,
  * the delete, every transition out of PENDING, INSTALLED or FAILED, and the
- * slot's `ct` -- happens under the control mutex. The fast path reads the
+ * slot's `ct` and `rxq` -- happens under the control mutex. The fast path reads the
  * fields of a slot it does not own racily: a torn read can only make it skip
  * one claim, which the next frame makes again.
  *
- * Neither netdev is referenced. `wg` is only compared: the worker installs only
- * for a device dpa_get_ifinfo_by_netdev() still names as a VAP (which asks VWD,
- * which clears its binding synchronously), and cdx_wifi_vap_del() drops every
- * slot of the device before the VAP's record goes. `port` is a DPAA port,
+ * Neither netdev is referenced. `wg` is compared by the slot: the worker
+ * installs only for a device VWD still holds open as a VAP, and
+ * cdx_wifi_vap_del() drops every slot of the device before the VAP's record
+ * goes. The queue's dequeue does follow its device, and so may not rely on
+ * that drop -- which can come after the device has unregistered -- but only on
+ * VWD's own unregister notifier: see vwd_wg_rxq_dev(). `port` is a DPAA port,
  * which is load-once (vwd_wg_ports above).
  *
  * ponytail: 16 slots, first come; a peer past them stays on the miss path.
@@ -534,15 +555,40 @@ enum {
 	VWD_WG_STEER_FAILED,
 };
 
+/* An installed steer's frame queue: on one CPU's portal channel, in VWD's
+ * forwarding congestion group, polled by VWD's NAPI like a VAP's forwarding
+ * queues (create_vap_fwd_from_fman_fqs()). Allocated per install rather than
+ * embedded in the slot, because a delete that cannot prove the entry unlinked
+ * must leave the queue standing after the slot is reused
+ * (vwd_wg_rxq_abandon()).
+ *
+ * `wg`, `vap` and `gen` name the device the dequeue delivers to and the VWD
+ * open it must still be in (vwd_wg_rxq_dev()); `wg` is cleared before the queue
+ * is drained or abandoned, after which every frame goes to the stack. The
+ * counters are written only by the one portal the queue is dequeued on (and by
+ * a drain, once it is retired), and read racily for statistics. */
+struct vwd_wg_rxq {
+	struct qman_fq fq;
+	struct net_device *port;
+	struct net_device *wg;
+	struct vap_desc_s *vap;
+	u32 gen;
+	unsigned int cpu;
+	unsigned long delivered, to_stack, dropped;
+};
+
 #define VWD_WG_STEERS 16
 static struct vwd_wg_steer {
 	unsigned int state;
-	const struct net_device *wg;
+	struct net_device *wg;
 	struct net_device *port;
 	/* As the peer sends them: peer -> router, network order. */
 	__be32 saddr, daddr;
 	__be16 sport, dport;
 	struct hw_ct *ct;
+	/* Set with the entry, cleared before the queue is freed; statistics
+	 * read it under RCU, which the free waits out (cdx_destroy_fq()). */
+	struct vwd_wg_rxq *rxq;
 } vwd_wg_steers[VWD_WG_STEERS];
 /* The next CPU, round robin over the affine ones; under the control mutex. */
 static unsigned int vwd_wg_steer_cpu;
@@ -558,7 +604,7 @@ static bool vwd_wg_steer_same(const struct vwd_wg_steer *a, const struct vwd_wg_
 }
 
 /* The fast path's half: lock-free, never sleeps. */
-static void vwd_wg_steer_note(const struct net_device *wg, const struct wg_fastpath_tx *tx)
+static void vwd_wg_steer_note(struct net_device *wg, const struct wg_fastpath_tx *tx)
 {
 	struct vwd_wg_steer *s;
 	int i, slot = -1;
@@ -600,23 +646,335 @@ static void vwd_wg_steer_note(const struct net_device *wg, const struct wg_fastp
 	schedule_work(&vwd_wg_steer_work);
 }
 
+/* The VAP `dev` is open as, and that open's generation. Under vaplock, which
+ * every state change holds; the generation only moves while the slot is
+ * VAP_ST_CONFIGURING (vwd_vap_up()), so an open slot's is stable. */
+static struct vap_desc_s *vwd_wg_open_vap(const struct net_device *dev, u32 *gen)
+{
+	struct vap_desc_s *found = NULL;
+	int ii;
+
+	spin_lock_bh(&vwd.vaplock);
+	for (ii = 0; ii < MAX_WIFI_VAPS; ii++) {
+		struct vap_desc_s *vap = &vwd.vaps[ii];
+
+		if (vap->state == VAP_ST_OPEN && vap->wifi_dev == dev) {
+			*gen = vap->generation;
+			found = vap;
+			break;
+		}
+	}
+	spin_unlock_bh(&vwd.vaplock);
+	return found;
+}
+
+static inline void vwd_wg_count(unsigned long *c)
+{
+	WRITE_ONCE(*c, READ_ONCE(*c) + 1);
+}
+
+/* The device a steered datagram may be handed to, or NULL for the stack.
+ *
+ * Under rcu_read_lock(). The device is not referenced, and the slot's delete
+ * (cdx_wifi_vap_del()) may come after the device has unregistered, so what
+ * keeps it alive here is VWD's own binding: vwd_netdev_event() takes the VAP
+ * out of VAP_ST_OPEN inside the device's NETDEV_UNREGISTER notifier, and the
+ * core runs synchronize_net() after its notifiers and before the device can be
+ * freed or WireGuard's destructor run (unregister_netdevice_many_notify(), then
+ * netdev_run_todo()). A read section that saw the open therefore began before
+ * that grace period and ends before either. The generation, bumped by every
+ * open (vwd_vap_up()) before the state is published, keeps a later open of the
+ * slot -- by another device at a reused address, say -- from passing for the
+ * one the steer was installed under. netif_running() keeps a device being
+ * closed, whose socket WireGuard has already let go of, on the stack's path. */
+static struct net_device *vwd_wg_rxq_dev(const struct vwd_wg_rxq *q)
+{
+	struct net_device *wg = READ_ONCE(q->wg);
+	const struct vap_desc_s *vap = q->vap;
+
+	if (!wg || smp_load_acquire(&vap->state) != VAP_ST_OPEN)
+		return NULL;
+	if (READ_ONCE(vap->generation) != q->gen || READ_ONCE(vap->wifi_dev) != wg)
+		return NULL;
+	if (!netif_running(wg))
+		return NULL;
+	return wg;
+}
+
+enum {
+	VWD_WG_RX_DELIVER,
+	VWD_WG_RX_STACK,
+	VWD_WG_RX_DROP,
+};
+
+/* What becomes of a steered frame, the skb at its IPv4 header: delivered as
+ * WireGuard's socket would take it, handed to the stack for anything that is
+ * well formed but not a plain datagram, or dropped as malformed. On delivery
+ * the transport header is set and the UDP checksum is validated --
+ * CHECKSUM_UNNECESSARY when the parser vouched for it (contig_fd_to_skb() and
+ * sg_fd_to_skb() trust FM_FD_STAT_L4CV only with the parse result's checksum
+ * at its valid value, and only on a port with NETIF_F_RXCSUM), otherwise
+ * checked here over the UDP length. WireGuard checks the UDP length framing
+ * again itself (prepare_skb_header()). */
+static int vwd_wg_rx_check(struct sk_buff *skb)
+{
+	const struct iphdr *iph;
+	const struct udphdr *uh;
+	unsigned int ihl, len, ulen;
+
+	if (skb->protocol != htons(ETH_P_IP) || skb->pkt_type != PACKET_HOST)
+		return VWD_WG_RX_STACK;
+	if (!pskb_may_pull(skb, sizeof(*iph)))
+		return VWD_WG_RX_DROP;
+	iph = ip_hdr(skb);
+	if (iph->version != 4 || iph->ihl < 5)
+		return VWD_WG_RX_DROP;
+	ihl = iph->ihl * 4;
+	if (!pskb_may_pull(skb, ihl))
+		return VWD_WG_RX_DROP;
+	iph = ip_hdr(skb);
+	if (ip_fast_csum((const u8 *)iph, iph->ihl))
+		return VWD_WG_RX_DROP;
+	len = ntohs(iph->tot_len);
+	if (len < ihl || skb->len < len)
+		return VWD_WG_RX_DROP;
+	if (pskb_trim_rcsum(skb, len))
+		return VWD_WG_RX_DROP;
+	iph = ip_hdr(skb);
+	/* Options are the stack's to act on and a fragment its to reassemble;
+	 * neither is how a WireGuard peer sends. */
+	if (ihl != sizeof(*iph) || ip_is_fragment(iph) ||
+	    iph->protocol != IPPROTO_UDP)
+		return VWD_WG_RX_STACK;
+	skb_set_transport_header(skb, ihl);
+	if (!pskb_may_pull(skb, ihl + sizeof(*uh)))
+		return VWD_WG_RX_DROP;
+	iph = ip_hdr(skb);
+	uh = udp_hdr(skb);
+	ulen = ntohs(uh->len);
+	if (ulen < sizeof(*uh) || ulen > len - ihl)
+		return VWD_WG_RX_DROP;
+	/* A zero checksum is IPv4 UDP's "none", which the socket takes too. */
+	if (uh->check && skb->ip_summed != CHECKSUM_UNNECESSARY &&
+	    csum_tcpudp_magic(iph->saddr, iph->daddr, ulen, IPPROTO_UDP,
+			      skb_checksum(skb, ihl, ulen, 0)))
+		return VWD_WG_RX_DROP;
+	skb->ip_summed = CHECKSUM_UNNECESSARY;
+	return VWD_WG_RX_DELIVER;
+}
+
+/* One steered frame, under rcu_read_lock(). It was received by `port` and
+ * enqueued as it arrived, so it is taken exactly as the port's own receive
+ * would take it (priv_rx_default_dqrr(), _dpa_rx()): the port's pool refilled
+ * against the port's per-CPU count, the skb built zero-copy over the buffer
+ * (scatter/gather too, a jumbo frame's), the parse results read for the L4
+ * checksum, and the port's receive counters advanced. */
+static void vwd_wg_rxq_rx(struct vwd_wg_rxq *q, const struct qm_fd *fd)
+{
+	struct net_device *port = q->port, *wg;
+	struct dpa_priv_s *priv = netdev_priv(port);
+	struct dpa_percpu_priv_s *percpu_priv = raw_cpu_ptr(priv->percpu_priv);
+	struct dpa_bp *dpa_bp = priv->dpa_bp;
+	bool use_gro = false, l4c;
+	struct sk_buff *skb;
+	int *count_ptr;
+
+	if (unlikely(fd->status & FM_FD_STAT_RX_ERRORS)) {
+		percpu_priv->stats.rx_errors++;
+		goto release;
+	}
+	/* Only the port's own pool: anything else -- SEC's output pool or the
+	 * fragment pool, which the VAP queues copy out of -- was not received
+	 * by the port, and no steer enqueues it. */
+	if (unlikely(dpa_bpid2pool(fd->bpid) != dpa_bp ||
+		     (fd->format != qm_fd_contig && fd->format != qm_fd_sg)))
+		goto release;
+	count_ptr = raw_cpu_ptr(priv->percpu_count);
+	if (unlikely(dpaa_eth_refill_bpools(dpa_bp, count_ptr,
+					    CONFIG_FSL_DPAA_ETH_REFILL_THRESHOLD)))
+		goto release;
+	dma_unmap_single(dpa_bp->dev, qm_fd_addr(fd), dpa_bp->size,
+			 DMA_BIDIRECTIONAL);
+	l4c = !!(READ_ONCE(port->features) & NETIF_F_RXCSUM);
+	if (likely(fd->format == qm_fd_contig)) {
+		skb = contig_fd_to_skb(priv, fd, &use_gro, l4c);
+	} else {
+		skb = sg_fd_to_skb(priv, fd, &use_gro, count_ptr, l4c);
+		percpu_priv->rx_sg++;
+	}
+	/* The contig buffer or the table, as _dpa_rx() accounts it. */
+	(*count_ptr)--;
+	if (unlikely(skb->len < ETH_HLEN)) {
+		dev_core_stats_rx_dropped_inc(port);
+		kfree_skb(skb);
+		vwd_wg_count(&q->dropped);
+		return;
+	}
+	skb->protocol = eth_type_trans(skb, port);
+	percpu_priv->stats.rx_packets++;
+	percpu_priv->stats.rx_bytes += skb->len;
+	skb_record_rx_queue(skb, raw_smp_processor_id());
+	skb_reset_network_header(skb);
+	skb->skb_iif = port->ifindex;
+
+	switch (vwd_wg_rx_check(skb)) {
+	case VWD_WG_RX_DROP:
+		dev_core_stats_rx_dropped_inc(port);
+		kfree_skb(skb);
+		vwd_wg_count(&q->dropped);
+		return;
+	case VWD_WG_RX_DELIVER:
+		wg = vwd_wg_rxq_dev(q);
+		if (likely(wg)) {
+			wg_fastpath_receive(wg, skb);
+			vwd_wg_count(&q->delivered);
+			return;
+		}
+		fallthrough;
+	default:
+		/* A well-formed frame with its network header set: the stack
+		 * receives it as the port would have. */
+		netif_receive_skb(skb);
+		vwd_wg_count(&q->to_stack);
+		return;
+	}
+
+release:
+	/* Every buffer of the frame, a scatter/gather frame's too. */
+	dpa_fd_release(port, fd);
+	vwd_wg_count(&q->dropped);
+}
+
+static enum qman_cb_dqrr_result vwd_wg_rxq_dqrr(struct qman_portal *portal,
+						struct qman_fq *fq,
+						const struct qm_dqrr_entry *dq)
+{
+	struct vwd_wg_rxq *q = container_of(fq, struct vwd_wg_rxq, fq);
+
+	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
+		return qman_cb_dqrr_consume;
+	if (unlikely(vwd_napi_schedule(portal)))
+		return qman_cb_dqrr_stop;
+	rcu_read_lock();
+	vwd_wg_rxq_rx(q, &dq->fd);
+	rcu_read_unlock();
+	return qman_cb_dqrr_consume;
+}
+
+/* A steer's queue on `cpu`'s portal channel, set up as a VAP's forwarding
+ * queues are (create_vap_fwd_from_fman_fqs()): VWD's work queue and stashing,
+ * VWD's forwarding congestion group, VWD's NAPI, and an ERN callback that
+ * returns a rejected frame to its pool. Control mutex held. */
+static struct vwd_wg_rxq *vwd_wg_rxq_create(struct net_device *port,
+					    struct net_device *wg,
+					    struct vap_desc_s *vap, u32 gen,
+					    unsigned int cpu)
+{
+	struct qm_mcc_initfq opts;
+	struct vwd_wg_rxq *q;
+
+	q = kzalloc(sizeof(*q), GFP_KERNEL);
+	if (!q)
+		return ERR_PTR(-ENOMEM);
+	q->port = port;
+	q->wg = wg;
+	q->vap = vap;
+	q->gen = gen;
+	q->cpu = cpu;
+	q->fq.cb.dqrr = vwd_wg_rxq_dqrr;
+	q->fq.cb.ern = vap_fwd_ern;
+	if (qman_create_fq(0, QMAN_FQ_FLAG_DYNAMIC_FQID, &q->fq)) {
+		kfree(q);
+		return ERR_PTR(-ENOMEM);
+	}
+	memset(&opts, 0, sizeof(opts));
+	opts.fqid = q->fq.fqid;
+	opts.count = 1;
+	opts.we_mask = QM_INITFQ_WE_DESTWQ | QM_INITFQ_WE_FQCTRL |
+		       QM_INITFQ_WE_CONTEXTB | QM_INITFQ_WE_CONTEXTA |
+		       QM_INITFQ_WE_CGID;
+	opts.fqd.dest.channel = qman_affine_channel(cpu);
+	opts.fqd.dest.wq = DEFA_VWD_WQ_ID;
+	opts.fqd.fq_ctrl = QM_FQCTRL_CGE;
+	opts.fqd.cgid = (u8)vwd.fwd_cgr.cgrid;
+	opts.fqd.context_a.stashing.exclusive =
+		QM_STASHING_EXCL_DATA | QM_STASHING_EXCL_ANNOTATION;
+	opts.fqd.context_a.stashing.data_cl = NUM_PKT_DATA_LINES_IN_CACHE;
+	opts.fqd.context_a.stashing.annotation_cl = NUM_ANN_LINES_IN_CACHE;
+	if (qman_init_fq(&q->fq, QMAN_INITFQ_FLAG_SCHED, &opts)) {
+		/* Never initialised, so out of service already. */
+		qman_destroy_fq(&q->fq, 0);
+		kfree(q);
+		return ERR_PTR(-EIO);
+	}
+	return q;
+}
+
+/* Control mutex held, and nothing left to enqueue to the queue: its entry was
+ * never linked, or is out of the table. Frames still queued go to the stack
+ * (`wg` cleared first); cdx_destroy_fq() retires the queue, waits out its
+ * asynchronous retirement, drains it through the callback and takes it out of
+ * service, as release_vap_fqs() does a VAP's, then runs synchronize_net()
+ * before destroying it -- after which no callback and no statistics reader
+ * still holds `q` (the slot's pointer was cleared before this). */
+static void vwd_wg_rxq_destroy(struct vwd_wg_rxq *q)
+{
+	WRITE_ONCE(q->wg, NULL);
+	cdx_destroy_fq(&q->fq);
+	kfree(q);
+}
+
+/* The entry may still be linked (cdx_ehash_steer_del() could not prove the
+ * unlink), so frames may still arrive: a queue destroyed under them would
+ * raise enqueue errors, and once its FQID went back to the allocator they
+ * would land in whatever queue took it next. So the queue is left in service,
+ * delivering to the stack from now on, and deliberately leaked -- one per
+ * failed delete, which has latched the datapath restart that settles the key.
+ * The module is pinned with it: the callback must not be unloaded from under a
+ * queue still in service. */
+static void vwd_wg_rxq_abandon(struct vwd_wg_rxq *q)
+{
+	WRITE_ONCE(q->wg, NULL);
+	__module_get(THIS_MODULE);
+	pr_warn("cdx: WireGuard rx steer queue 0x%x left in service: its entry may still be linked\n",
+		q->fq.fqid);
+}
+
 /* Control mutex held, and the slot not CLAIMING. */
 static void vwd_wg_steer_clear(struct vwd_wg_steer *s)
 {
-	if (READ_ONCE(s->state) == VWD_WG_STEER_INSTALLED)
-		/* Owns the entry from here on, whichever way it goes. */
-		cdx_ehash_steer_del(s->ct);
+	struct vwd_wg_rxq *q = s->rxq;
+	int rc;
+
+	if (READ_ONCE(s->state) == VWD_WG_STEER_INSTALLED) {
+		/* The entry first, as it is what enqueues to the queue. Owns
+		 * the entry from here on, whichever way it goes. */
+		rc = cdx_ehash_steer_del(s->ct);
+		WRITE_ONCE(s->rxq, NULL);
+		/* Unsynced is out of every chain, parked until the next sync
+		 * proves the microcode has left it; it needs no queue, as the
+		 * IPsec SA release frees the FQIDs such an entry named
+		 * (cdx_ipsec_delete_fp_entry()). */
+		if (!rc || rc == EN_EHASH_DELETE_UNSYNCED)
+			vwd_wg_rxq_destroy(q);
+		else
+			vwd_wg_rxq_abandon(q);
+	}
 	s->ct = NULL;
 	WRITE_ONCE(s->wg, NULL);
 	WRITE_ONCE(s->port, NULL);
 	smp_store_release(&s->state, VWD_WG_STEER_EMPTY);
 }
 
-static int vwd_wg_steer_install(struct vwd_wg_steer *s)
+/* Control mutex held. The queue first, then the entry that feeds it; on
+ * success the slot's queue is published for statistics before the caller
+ * publishes INSTALLED. */
+static int vwd_wg_steer_install(struct vwd_wg_steer *s, struct vap_desc_s *vap,
+				u32 gen)
 {
 	const struct cpumask *cpus = qman_affine_cpus();
+	struct vwd_wg_rxq *q;
 	unsigned int cpu, n;
-	uint32_t fqid;
 	int rc;
 
 	/* An unproven delete is latched and not yet settled: the key may be
@@ -627,16 +985,21 @@ static int vwd_wg_steer_install(struct vwd_wg_steer *s)
 	if (!n)
 		return -ENODEV;
 	cpu = cpumask_nth(vwd_wg_steer_cpu++ % n, cpus);
-	rc = cdx_pcd_fq_for_cpu(s->port, cpu, &fqid);
-	if (rc)
-		return rc;
+	q = vwd_wg_rxq_create(s->port, s->wg, vap, gen, cpu);
+	if (IS_ERR(q))
+		return PTR_ERR(q);
 	rc = cdx_ehash_steer4_add(s->port, s->saddr, s->daddr, s->sport,
-				  s->dport, fqid, &s->ct);
-	if (rc)
+				  s->dport, q->fq.fqid, &s->ct);
+	if (rc) {
+		/* Nothing was linked (cdx_ehash_steer4_add()), so nothing ever
+		 * enqueued to the queue. */
+		vwd_wg_rxq_destroy(q);
 		return rc;
+	}
+	WRITE_ONCE(s->rxq, q);
 	pr_info("cdx: WireGuard rx steer %pI4:%u -> %pI4:%u on %s to fqid 0x%x (cpu %u)\n",
 		&s->saddr, ntohs(s->sport), &s->daddr, ntohs(s->dport),
-		netdev_name(s->port), fqid, cpu);
+		netdev_name(s->port), q->fq.fqid, cpu);
 	return 0;
 }
 
@@ -648,14 +1011,17 @@ static void vwd_wg_steer_work_fn(struct work_struct *work)
 	for (i = 0; i < VWD_WG_STEERS; i++) {
 		struct vwd_wg_steer *s = &vwd_wg_steers[i];
 		struct dpa_iface_info *iface;
+		struct vap_desc_s *vap;
+		u32 gen;
 		int rc;
 
 		if (smp_load_acquire(&s->state) != VWD_WG_STEER_PENDING)
 			continue;
 		/* Noted by a frame in flight as the VAP went: nothing to do. */
 		iface = dpa_get_ifinfo_by_netdev(s->wg);
+		vap = vwd_wg_open_vap(s->wg, &gen);
 		if (READ_ONCE(vwd_stopping) || !iface ||
-		    !(iface->if_flags & IF_TYPE_WLAN)) {
+		    !(iface->if_flags & IF_TYPE_WLAN) || !vap) {
 			vwd_wg_steer_clear(s);
 			continue;
 		}
@@ -671,7 +1037,7 @@ static void vwd_wg_steer_work_fn(struct work_struct *work)
 			vwd_wg_steer_clear(s);
 			continue;
 		}
-		rc = vwd_wg_steer_install(s);
+		rc = vwd_wg_steer_install(s, vap, gen);
 		if (rc) {
 			pr_warn_ratelimited("cdx: WireGuard rx steer %pI4:%u -> %pI4:%u not installed (%d)\n",
 					    &s->saddr, ntohs(s->sport), &s->daddr,
@@ -718,17 +1084,34 @@ static void vwd_wg_steers_exit(void)
 	cdx_ft_end();
 }
 
-static unsigned int vwd_wg_steers_installed(const struct net_device *wg)
+/* Racy reads for statistics. A slot's queue is freed only after its pointer is
+ * cleared and a grace period has passed (vwd_wg_rxq_destroy()), so the RCU
+ * read section keeps every queue it finds. */
+static void vwd_wg_steers_stats(const struct net_device *wg,
+				struct vwd_wg_rx_stats *st)
 {
-	unsigned int i, n = 0;
+	unsigned int i;
 
+	memset(st, 0, sizeof(*st));
 	if (!wg)
-		return 0;
-	for (i = 0; i < VWD_WG_STEERS; i++)
-		if (smp_load_acquire(&vwd_wg_steers[i].state) == VWD_WG_STEER_INSTALLED &&
-		    READ_ONCE(vwd_wg_steers[i].wg) == wg)
-			n++;
-	return n;
+		return;
+	rcu_read_lock();
+	for (i = 0; i < VWD_WG_STEERS; i++) {
+		struct vwd_wg_steer *s = &vwd_wg_steers[i];
+		const struct vwd_wg_rxq *q;
+
+		if (smp_load_acquire(&s->state) != VWD_WG_STEER_INSTALLED ||
+		    READ_ONCE(s->wg) != wg)
+			continue;
+		st->steers++;
+		q = READ_ONCE(s->rxq);
+		if (!q)
+			continue;
+		st->delivered += READ_ONCE(q->delivered);
+		st->to_stack += READ_ONCE(q->to_stack);
+		st->dropped += READ_ONCE(q->dropped);
+	}
+	rcu_read_unlock();
 }
 
 /* A WireGuard VAP's frame sealed where it lies and sent from the same buffer.

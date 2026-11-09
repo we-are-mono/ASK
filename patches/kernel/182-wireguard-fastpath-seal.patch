@@ -62,7 +62,7 @@ on another CPU.
  
 --- /dev/null
 +++ b/drivers/net/wireguard/fastpath.c
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,276 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Seal a forwarded IPv4 packet for its peer in place, in the buffer a NIC
@@ -332,6 +332,13 @@ on another CPU.
 +	return ret;
 +}
 +EXPORT_SYMBOL_GPL(wg_fastpath_seal);
++
++void wg_fastpath_receive(struct net_device *wg_dev, struct sk_buff *skb)
++{
++	skb_mark_not_on_list(skb);
++	wg_packet_receive(netdev_priv(wg_dev), skb);
++}
++EXPORT_SYMBOL_GPL(wg_fastpath_receive);
 --- a/drivers/net/wireguard/peer.c
 +++ b/drivers/net/wireguard/peer.c
 @@ -46,6 +46,8 @@
@@ -387,7 +394,7 @@ on another CPU.
  						   wg->packet_crypt_wq);
 --- /dev/null
 +++ b/include/net/wg_fastpath.h
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,31 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _NET_WG_FASTPATH_H
 +#define _NET_WG_FASTPATH_H
@@ -411,6 +418,12 @@ on another CPU.
 +int wg_fastpath_seal(struct net_device *wg_dev, wg_fastpath_can_tx_t can_tx,
 +		     u8 *buf, unsigned int off, unsigned int len, unsigned int size,
 +		     struct wg_fastpath_tx *tx);
++
++/* Hand @wg_dev an outer IPv4/UDP datagram addressed to its listen port, as
++ * its socket would: protocol, network and transport headers and skb_iif set,
++ * IP header and UDP checksum already validated. Consumes @skb. The caller
++ * holds rcu_read_lock() and keeps @wg_dev registered across the call. */
++void wg_fastpath_receive(struct net_device *wg_dev, struct sk_buff *skb);
 +
 +#endif /* _NET_WG_FASTPATH_H */
 -- 
