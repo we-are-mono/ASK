@@ -43,6 +43,7 @@ IMAGE_INSTALL = " \
     gdb \
     file \
     sysstat \
+    perf \
     \
     \
     cdx \

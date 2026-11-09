@@ -62,6 +62,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://defconfig \
            file://ask.cfg \
            file://ask-kasan.cfg \
+           file://ask-perf.cfg \
            file://mono-gateway-dk.dts \
            file://010-ask-fman-dpaa-ehash.patch \
            file://030-ipv6-addrconf-modified-prefix-route-expiry.patch \
@@ -246,6 +247,7 @@ do_configure:prepend() {
 # the `# CONFIG_KASAN is not set` markers in the base fragment.
 do_configure:append() {
     cat ${UNPACKDIR}/ask.cfg >> ${B}/.config
+    cat ${UNPACKDIR}/ask-perf.cfg >> ${B}/.config
     if [ "${KASAN}" = "1" ]; then
         cat ${UNPACKDIR}/ask-kasan.cfg >> ${B}/.config
     fi
