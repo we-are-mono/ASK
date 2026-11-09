@@ -736,6 +736,30 @@ static unsigned int vwd_wg_steers_installed(const struct net_device *wg)
  * transmission, as it does for a frame the classifier forwards; the pool's
  * per-CPU count is therefore left alone. Returns false, with the frame
  * untouched, for anything the seal declines. */
+/* wgdbg: where the WireGuard fast path's work lands, per CPU, dumped every
+ * 2 s. Diagnostic only; remove once the PoC's scaling is understood. */
+struct wgdbg_pc {
+	unsigned long in, sealed, bounce, decl;
+	int last_err;
+};
+static DEFINE_PER_CPU(struct wgdbg_pc, wgdbg_pc);
+static unsigned long wgdbg_next;
+
+static void wgdbg_dump(void)
+{
+	int c;
+
+	if (!time_after(jiffies, READ_ONCE(wgdbg_next)))
+		return;
+	WRITE_ONCE(wgdbg_next, jiffies + 2 * HZ);
+	for_each_online_cpu(c) {
+		const struct wgdbg_pc *p = per_cpu_ptr(&wgdbg_pc, c);
+
+		pr_info("wgdbg cpu%d in %lu sealed %lu bounce %lu decl %lu err %d\n",
+			c, p->in, p->sealed, p->bounce, p->decl, p->last_err);
+	}
+}
+
 static bool vwd_wg_fast(struct net_device *net_dev, struct vap_desc_s *vap,
 			struct dpa_bp *dpa_bp, const struct qm_fd *in)
 {
@@ -745,8 +769,18 @@ static bool vwd_wg_fast(struct net_device *net_dev, struct vap_desc_s *vap,
 	struct qm_fd fd = *in;
 	int i, err = -EBUSY;
 
+	this_cpu_inc(wgdbg_pc.in);
+	wgdbg_dump();
 	err = wg_fastpath_seal(net_dev, vwd_wg_can_tx, phys_to_virt(qm_fd_addr(in)),
 			       dpa_fd_offset(in), dpa_fd_length(in), dpa_bp->size, &tx);
+	if (err == -EXDEV)
+		this_cpu_inc(wgdbg_pc.bounce);
+	else if (err) {
+		this_cpu_inc(wgdbg_pc.decl);
+		this_cpu_write(wgdbg_pc.last_err, err);
+	} else {
+		this_cpu_inc(wgdbg_pc.sealed);
+	}
 	if (err == -EXDEV) {
 		/* This CPU receives the tunnel: hand the frame, untouched, to
 		 * the VAP's queue on the next CPU (queue i is on the i-th
