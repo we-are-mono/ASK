@@ -21,6 +21,7 @@
 #include <linux/udp.h>
 #include <net/ip.h>
 #include <net/wg_fastpath.h>
+#include <net/netfilter/nf_flow_table.h>
 #include <linux/if_ether.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
@@ -113,7 +114,7 @@ static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq
 /* A WireGuard VAP's receive steers, summed over its installed slots. */
 struct vwd_wg_rx_stats {
 	unsigned int steers;
-	unsigned long delivered, to_stack, dropped;
+	unsigned long delivered, to_stack, dropped, forwarded, opened;
 };
 static void vwd_wg_steers_stats(const struct net_device *wg,
 				struct vwd_wg_rx_stats *st);
@@ -159,6 +160,8 @@ static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *a
 	len += sprintf(buf + len, "  WireGuard rx delivered : %lu\n", wg_rx.delivered);
 	len += sprintf(buf + len, "  WireGuard rx to stack : %lu\n", wg_rx.to_stack);
 	len += sprintf(buf + len, "  WireGuard rx dropped : %lu\n", wg_rx.dropped);
+	len += sprintf(buf + len, "  WireGuard rx forwarded : %lu\n", wg_rx.forwarded);
+	len += sprintf(buf + len, "  WireGuard rx opened : %lu\n", wg_rx.opened);
 
 	return len;
 }
@@ -575,6 +578,9 @@ struct vwd_wg_rxq {
 	u32 gen;
 	unsigned int cpu;
 	unsigned long delivered, to_stack, dropped;
+	/* Of delivered: opened where they lay and sent out of a port from the
+	 * same buffer, or opened and handed to the device as an skb. */
+	unsigned long forwarded, opened;
 	/* delivered at the last vwd_wg_inline_update() tick. */
 	unsigned long seen;
 };
@@ -765,6 +771,162 @@ static int vwd_wg_rx_check(struct sk_buff *skb)
 	return VWD_WG_RX_DELIVER;
 }
 
+static struct eth_iface_info *vwd_wg_port(const struct net_device *dev);
+static bool vwd_wg_can_tx(const struct net_device *dev);
+
+/* The download fast path (vwd_wg_rx_raw()): 0 off, 1 on, 2 while the steered
+ * tunnels that delivered in the last second sit on two CPUs or more. One
+ * tunnel's packets are opened on its one receive CPU in arrival order, which
+ * a single tunnel's decryption workers outrun; two or more do not.
+ * ponytail: a knob while the trade-off is measured. */
+static unsigned int wg_rx_raw = 2;
+module_param(wg_rx_raw, uint, 0644);
+MODULE_PARM_DESC(wg_rx_raw, "WireGuard download fast path: 0 off, 1 on, 2 with two or more active tunnels");
+static bool vwd_wg_raw_auto;
+
+/* The parser's checksum verdict, as _dpa_process_parse_results() reads it. */
+#define VWD_WG_CSUM_VALID	0xFFFF
+
+/* A packet the open path decrypted but cannot send out of a port itself,
+ * handed to the WireGuard device as an skb over the same buffer, as its own
+ * receive path hands one on (wg_packet_consume_data_done()). Built from the
+ * frame as received, then cut to the plaintext. */
+static void vwd_wg_rx_open_stack(struct vwd_wg_rxq *q, struct net_device *wg,
+				 const struct qm_fd *fd, u8 *data, u8 *inner,
+				 unsigned int ilen)
+{
+	struct dpa_priv_s *priv = netdev_priv(q->port);
+	struct dpa_bp *dpa_bp = priv->dpa_bp;
+	int *count_ptr = raw_cpu_ptr(priv->percpu_count);
+	bool use_gro = false;
+	struct sk_buff *skb;
+
+	if (unlikely(dpaa_eth_refill_bpools(dpa_bp, count_ptr,
+					    CONFIG_FSL_DPAA_ETH_REFILL_THRESHOLD))) {
+		dpa_fd_release(q->port, fd);
+		vwd_wg_count(&q->dropped);
+		return;
+	}
+	dma_unmap_single(dpa_bp->dev, qm_fd_addr(fd), dpa_bp->size,
+			 DMA_BIDIRECTIONAL);
+	skb = contig_fd_to_skb(priv, fd, &use_gro, false);
+	(*count_ptr)--;
+	__skb_pull(skb, inner - data);
+	__skb_trim(skb, ilen);
+	skb->dev = wg;
+	skb->protocol = (inner[0] >> 4) == 4 ? htons(ETH_P_IP) : htons(ETH_P_IPV6);
+	skb_reset_mac_header(skb);
+	skb_reset_network_header(skb);
+	skb->pkt_type = PACKET_HOST;
+	/* Authenticated by its tag, so every checksum inside is as received. */
+	skb->ip_summed = CHECKSUM_UNNECESSARY;
+	skb->csum_level = ~0;
+	netif_receive_skb(skb);
+	vwd_wg_count(&q->opened);
+}
+
+/* A steered frame opened where it lies (wg_fastpath_open()) and, when the
+ * flowtable already holds its flow -- one the forward chain admitted -- sent
+ * out of a DPAA port from the same buffer: the buffer keeps its pool, so the
+ * port returns it on transmission and the pool's count is left alone, as for
+ * a frame the classifier forwards. Returns false, with the frame untouched,
+ * for the skb path; true once the frame is forwarded, delivered or dropped. */
+static bool vwd_wg_rx_raw(struct vwd_wg_rxq *q, const struct qm_fd *fd)
+{
+	struct net_device *port = q->port, *wg;
+	struct dpa_priv_s *priv = netdev_priv(port);
+	struct dpa_percpu_priv_s *percpu_priv = raw_cpu_ptr(priv->percpu_priv);
+	unsigned int len, tot, ulen, ilen;
+	struct nf_flow_raw_xmit x;
+	struct eth_iface_info *eth;
+	struct nf_flowtable *ft;
+	u8 *vaddr, *data, *inner;
+	struct udphdr *uh;
+	struct iphdr *iph;
+	struct qm_fd tfd;
+	int i, err;
+
+	if (fd->format != qm_fd_contig || !READ_ONCE(wg_rx_raw) ||
+	    (READ_ONCE(wg_rx_raw) == 2 && !READ_ONCE(vwd_wg_raw_auto)))
+		return false;
+	wg = vwd_wg_rxq_dev(q);
+	if (!wg)
+		return false;
+	vaddr = phys_to_virt(qm_fd_addr(fd));
+	data = vaddr + dpa_fd_offset(fd);
+	len = dpa_fd_length(fd);
+	if (len < ETH_HLEN + sizeof(*iph) + sizeof(*uh) ||
+	    ((struct ethhdr *)data)->h_proto != htons(ETH_P_IP))
+		return false;
+	iph = (struct iphdr *)(data + ETH_HLEN);
+	if (iph->version != 4 || iph->ihl != 5 || ip_fast_csum((u8 *)iph, 5) ||
+	    ip_is_fragment(iph) || iph->protocol != IPPROTO_UDP)
+		return false;
+	tot = ntohs(iph->tot_len);
+	if (tot < sizeof(*iph) + sizeof(*uh) || tot > len - ETH_HLEN)
+		return false;
+	uh = (struct udphdr *)(iph + 1);
+	ulen = ntohs(uh->len);
+	if (ulen < sizeof(*uh) || ulen > tot - sizeof(*iph))
+		return false;
+	/* The parser's verdict when the port asked for it, else checked here;
+	 * a bad one is the skb path's to drop and count. */
+	if (uh->check) {
+		const fm_prs_result_t *pr =
+			(const fm_prs_result_t *)(vaddr + DPA_RX_PRIV_DATA_SIZE);
+
+		if (!((READ_ONCE(port->features) & NETIF_F_RXCSUM) &&
+		      (fd->status & FM_FD_STAT_L4CV) && pr->cksum == VWD_WG_CSUM_VALID) &&
+		    csum_tcpudp_magic(iph->saddr, iph->daddr, ulen, IPPROTO_UDP,
+				      csum_partial(uh, ulen, 0)))
+			return false;
+	}
+
+	switch (wg_fastpath_open(wg, iph, uh, port->ifindex, (u8 *)(uh + 1),
+				 ulen - sizeof(*uh), &inner, &ilen)) {
+	case WG_FP_PASS:
+		return false;
+	case WG_FP_CONSUMED:
+		percpu_priv->stats.rx_packets++;
+		percpu_priv->stats.rx_bytes += len;
+		dpa_fd_release(port, fd);
+		vwd_wg_count(&q->dropped);
+		return true;
+	}
+	percpu_priv->stats.rx_packets++;
+	percpu_priv->stats.rx_bytes += len;
+	vwd_wg_count(&q->delivered);
+
+	if ((inner[0] >> 4) != 4 || !(ft = nf_flow_table_ingress(wg)) ||
+	    nf_flow_offload_ip_raw(ft, wg, (struct iphdr *)inner, ilen,
+				   vwd_wg_can_tx, &x)) {
+		vwd_wg_rx_open_stack(q, wg, fd, data, inner, ilen);
+		return true;
+	}
+	/* vwd_wg_can_tx() passed it, so the port is in the table. */
+	eth = vwd_wg_port(x.dev);
+	data = inner - ETH_HLEN;
+	ether_addr_copy(data, x.h_dest);
+	ether_addr_copy(data + ETH_ALEN, x.h_source);
+	((struct ethhdr *)data)->h_proto = htons(ETH_P_IP);
+	tfd = *fd;
+	tfd.offset = data - vaddr;
+	tfd.length20 = ilen + ETH_HLEN;
+	tfd.cmd = 0;
+	err = -EBUSY;
+	for (i = 0; i < 1000 && err == -EBUSY; i++)
+		err = qman_enqueue(&eth->fwd_tx_fqinfo[smp_processor_id() &
+						       (DPAA_FWD_TX_QUEUES - 1)],
+				   &tfd, 0);
+	if (unlikely(err)) {
+		dpa_fd_release(port, &tfd);
+		vwd_wg_count(&q->dropped);
+	} else {
+		vwd_wg_count(&q->forwarded);
+	}
+	return true;
+}
+
 /* One steered frame, under rcu_read_lock(). It was received by `port` and
  * enqueued as it arrived, so it is taken exactly as the port's own receive
  * would take it (priv_rx_default_dqrr(), _dpa_rx()): the port's pool refilled
@@ -791,6 +953,8 @@ static void vwd_wg_rxq_rx(struct vwd_wg_rxq *q, const struct qm_fd *fd)
 	if (unlikely(dpa_bpid2pool(fd->bpid) != dpa_bp ||
 		     (fd->format != qm_fd_contig && fd->format != qm_fd_sg)))
 		goto release;
+	if (vwd_wg_rx_raw(q, fd))
+		return;
 	count_ptr = raw_cpu_ptr(priv->percpu_count);
 	if (unlikely(dpaa_eth_refill_bpools(dpa_bp, count_ptr,
 					    CONFIG_FSL_DPAA_ETH_REFILL_THRESHOLD)))
@@ -1040,6 +1204,7 @@ static void vwd_wg_inline_fn(struct work_struct *work)
 	}
 	rcu_read_unlock();
 	wg_fastpath_rx_inline(cpumask_weight(&cpus) >= num_online_cpus());
+	WRITE_ONCE(vwd_wg_raw_auto, cpumask_weight(&cpus) >= 2);
 	if (installed && !READ_ONCE(vwd_stopping))
 		schedule_delayed_work(&vwd_wg_inline_work, HZ);
 }
@@ -1157,6 +1322,8 @@ static void vwd_wg_steers_stats(const struct net_device *wg,
 		st->delivered += READ_ONCE(q->delivered);
 		st->to_stack += READ_ONCE(q->to_stack);
 		st->dropped += READ_ONCE(q->dropped);
+		st->forwarded += READ_ONCE(q->forwarded);
+		st->opened += READ_ONCE(q->opened);
 	}
 	rcu_read_unlock();
 }

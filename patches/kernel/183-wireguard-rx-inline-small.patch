@@ -42,7 +42,15 @@ poll delivers in that order.
  	queue_work_on(cpu, wq, &per_cpu_ptr(device_queue->worker, cpu)->work);
 --- a/drivers/net/wireguard/receive.c
 +++ b/drivers/net/wireguard/receive.c
-@@ -25,6 +25,20 @@
+@@ -15,6 +15,7 @@
+ #include <linux/ipv6.h>
+ #include <linux/udp.h>
+ #include <net/ip_tunnels.h>
++#include <net/wg_fastpath.h>
+ 
+ /* Must be called with bh disabled. */
+ static void update_rx_stats(struct wg_peer *peer, size_t len)
+@@ -25,6 +26,20 @@
  
  #define SKB_TYPE_LE32(skb) (((struct message_header *)(skb)->data)->type)
  
@@ -63,7 +71,7 @@ poll delivers in that order.
  static size_t validate_header_len(struct sk_buff *skb)
  {
  	if (unlikely(skb->len < sizeof(struct message_header)))
-@@ -526,8 +540,22 @@
+@@ -526,8 +541,22 @@
  	if (READ_ONCE(peer->fp_rx_cpu) != raw_smp_processor_id())
  		WRITE_ONCE(peer->fp_rx_cpu, raw_smp_processor_id());
  

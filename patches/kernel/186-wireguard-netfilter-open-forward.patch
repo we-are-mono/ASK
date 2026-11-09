@@ -1,0 +1,424 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Tue, 10 Nov 2026 01:00:00 +0100
+Subject: [PATCH] wireguard, netfilter: open and forward a tunnel's packets
+ without an skb
+
+A tunnel's download still costs an skb, the peer queue, a NAPI pass, GRO,
+the receive path, the flowtable hook and a qdisc per packet, after the
+cipher -- the mirror image of what the upload's in-place seal removed.
+
+- wg_fastpath_open() opens a data message in the buffer the NIC received
+  it into, doing what the device's receive path would: the current
+  keypair by index, authentication before a byte is written (the
+  library checks the tag first), the replay window, roaming, timers and
+  the rekey test (paced), AllowedIPs on the inner source, statistics.
+  Handshakes, keepalives, the next keypair and outer CE marks are left
+  untouched for the ordinary path.
+- nf_flow_offload_ip_raw() is nf_flow_offload_ip_hook()'s forward
+  decision for an IPv4 packet held outside an skb: lookup, MTU, TCP
+  teardown, dst check, TTL, refresh, accounting, the neighbour to send
+  to. NAT, encapsulation, sessions, tunnels and XFRM are refused for
+  the stack, untouched.
+- nf_flow_table_ingress() finds the flowtable hooked on a device's
+  ingress (its hook's priv).
+
+Only a flow the flowtable already holds -- one the forward chain
+admitted -- is forwarded this way; anything else is handed to the
+WireGuard device as its receive path would.
+---
+--- a/drivers/net/wireguard/allowedips.c
++++ b/drivers/net/wireguard/allowedips.c
+@@ -371,6 +371,17 @@
+ }
+ 
+ /* Returns a strong reference to a peer */
++struct wg_peer *wg_allowedips_lookup_src_ip(struct allowedips *table,
++					    u8 version, const void *saddr)
++{
++	if (version == 4)
++		return lookup(table->root4, 32, saddr);
++	if (version == 6)
++		return lookup(table->root6, 128, saddr);
++	return NULL;
++}
++
++/* Returns a strong reference to a peer */
+ struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
+ 					 struct sk_buff *skb)
+ {
+--- a/drivers/net/wireguard/allowedips.h
++++ b/drivers/net/wireguard/allowedips.h
+@@ -48,6 +48,8 @@
+ 					 struct sk_buff *skb);
+ struct wg_peer *wg_allowedips_lookup_dst4(struct allowedips *table,
+ 					  const __be32 *daddr);
++struct wg_peer *wg_allowedips_lookup_src_ip(struct allowedips *table,
++					    u8 version, const void *saddr);
+ struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
+ 					 struct sk_buff *skb);
+ 
+--- a/drivers/net/wireguard/fastpath.c
++++ b/drivers/net/wireguard/fastpath.c
+@@ -16,6 +16,10 @@
+ #include "timers.h"
+ #include "allowedips.h"
+ #include "noise.h"
++#include "peerlookup.h"
++#include "socket.h"
++
++#include <linux/ipv6.h>
+ 
+ #include <crypto/chacha20poly1305.h>
+ #include <crypto/poly1305.h>
+@@ -274,3 +278,120 @@
+ 	wg_packet_receive(netdev_priv(wg_dev), skb);
+ }
+ EXPORT_SYMBOL_GPL(wg_fastpath_receive);
++
++int wg_fastpath_open(struct net_device *wg_dev, const struct iphdr *oip,
++		     const struct udphdr *oudp, int iif, u8 *msg,
++		     unsigned int len, u8 **inner, unsigned int *inner_len)
++{
++	struct message_data *md = (struct message_data *)msg;
++	struct wg_device *wg = netdev_priv(wg_dev);
++	struct wg_peer *peer = NULL, *routed;
++	unsigned int plain, ilen;
++	struct noise_keypair *kp;
++	struct endpoint ep;
++	const void *saddr;
++	int ret = WG_FP_PASS;
++	u8 *ip, version;
++	u64 nonce;
++
++	/* Data messages with a packet in them only. Handshakes, cookies and
++	 * keepalives take the ordinary path, and so does an outer CE mark,
++	 * which the inner header would have to inherit (INET_ECN_decapsulate()). */
++	if (len < sizeof(*md) + noise_encrypted_len(sizeof(struct iphdr)) ||
++	    md->header.type != cpu_to_le32(MESSAGE_DATA) ||
++	    INET_ECN_is_ce(oip->tos))
++		return WG_FP_PASS;
++	plain = len - sizeof(*md) - noise_encrypted_len(0);
++	nonce = le64_to_cpu(md->counter);
++
++	rcu_read_lock_bh();
++	kp = (struct noise_keypair *)wg_index_hashtable_lookup(wg->index_hashtable,
++			INDEX_HASHTABLE_KEYPAIR, md->key_idx, &peer);
++	if (unlikely(!kp))
++		goto out;
++	/* The current keypair only: the first message on the next one confirms
++	 * a handshake (wg_noise_received_with_keypair()), which the ordinary
++	 * path does. The rest is decrypt_packet()'s validity test. */
++	if (unlikely(READ_ONCE(peer->is_dead) ||
++		     kp != rcu_dereference_bh(peer->keypairs.current_keypair) ||
++		     !READ_ONCE(kp->receiving.is_valid) ||
++		     wg_birthdate_has_expired(kp->receiving.birthdate, REJECT_AFTER_TIME) ||
++		     READ_ONCE(kp->receiving_counter.counter) >= REJECT_AFTER_MESSAGES))
++		goto out;
++
++	/* Authenticated before a byte is written: a forgery leaves the buffer
++	 * as it was, but is not worth the ordinary path's second attempt. */
++	ret = WG_FP_CONSUMED;
++	if (unlikely(!chacha20poly1305_decrypt(msg + sizeof(*md), msg + sizeof(*md),
++					       noise_encrypted_len(plain), NULL, 0,
++					       nonce, kp->receiving.key)))
++		goto out;
++	if (unlikely(!wg_fastpath_counter_ok(kp, nonce)))
++		goto out;
++
++	/* Roaming, as wg_socket_endpoint_from_skb() and
++	 * wg_socket_set_peer_endpoint() have it; an unlocked compare first, as
++	 * the latter's own does, so a steady peer costs no lock. */
++	if (unlikely(peer->endpoint.addr4.sin_family != AF_INET ||
++		     peer->endpoint.addr4.sin_addr.s_addr != oip->saddr ||
++		     peer->endpoint.addr4.sin_port != oudp->source ||
++		     peer->endpoint.src4.s_addr != oip->daddr)) {
++		memset(&ep, 0, sizeof(ep));
++		ep.addr4.sin_family = AF_INET;
++		ep.addr4.sin_port = oudp->source;
++		ep.addr4.sin_addr.s_addr = oip->saddr;
++		ep.src4.s_addr = oip->daddr;
++		ep.src_if4 = iif;
++		wg_socket_set_peer_endpoint(peer, &ep);
++	}
++
++	/* wg_packet_consume_data_done()'s timers and rekey test, a few times a
++	 * second rather than per packet, as the seal path paces its own. */
++	if (time_after(jiffies, READ_ONCE(peer->fp_rx_timers))) {
++		WRITE_ONCE(peer->fp_rx_timers, jiffies + HZ / 50);
++		wg_fastpath_keep_key_fresh(peer);
++		wg_timers_any_authenticated_packet_received(peer);
++		wg_timers_any_authenticated_packet_traversal(peer);
++		wg_timers_data_received(peer);
++	}
++
++	ip = msg + sizeof(*md);
++	version = ip[0] >> 4;
++	if (version == 4) {
++		ilen = ntohs(((struct iphdr *)ip)->tot_len);
++		if (unlikely(ilen < sizeof(struct iphdr)))
++			goto bad_size;
++		saddr = &((struct iphdr *)ip)->saddr;
++	} else if (version == 6 && plain >= sizeof(struct ipv6hdr)) {
++		ilen = ntohs(((struct ipv6hdr *)ip)->payload_len) + sizeof(struct ipv6hdr);
++		saddr = &((struct ipv6hdr *)ip)->saddr;
++	} else {
++		DEV_STATS_INC(wg_dev, rx_errors);
++		DEV_STATS_INC(wg_dev, rx_frame_errors);
++		goto out;
++	}
++	if (unlikely(ilen > plain))
++		goto bad_size;
++	routed = wg_allowedips_lookup_src_ip(&wg->peer_allowedips, version, saddr);
++	wg_peer_put(routed); /* only compared */
++	if (unlikely(routed != peer)) {
++		DEV_STATS_INC(wg_dev, rx_errors);
++		DEV_STATS_INC(wg_dev, rx_frame_errors);
++		goto out;
++	}
++	dev_sw_netstats_rx_add(wg_dev, message_data_len(plain));
++	peer->rx_bytes += message_data_len(plain);
++	*inner = ip;
++	*inner_len = ilen;
++	ret = WG_FP_OPENED;
++	goto out;
++
++bad_size:
++	DEV_STATS_INC(wg_dev, rx_errors);
++	DEV_STATS_INC(wg_dev, rx_length_errors);
++out:
++	wg_peer_put(peer);
++	rcu_read_unlock_bh();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(wg_fastpath_open);
+--- a/drivers/net/wireguard/peer.h
++++ b/drivers/net/wireguard/peer.h
+@@ -83,6 +83,8 @@
+ 	spinlock_t fp_lock;
+ 	unsigned long fp_timers;
+ 	int fp_rx_cpu;
++	/* wg_fastpath_open()'s receive-timer pacing. */
++	unsigned long fp_rx_timers;
+ };
+ 
+ struct wg_peer *wg_peer_create(struct wg_device *wg,
+--- a/drivers/net/wireguard/queueing.h
++++ b/drivers/net/wireguard/queueing.h
+@@ -32,6 +32,8 @@
+ void wg_packet_handshake_receive_worker(struct work_struct *work);
+ /* NAPI poll function: */
+ int wg_packet_rx_poll(struct napi_struct *napi, int budget);
++bool wg_fastpath_counter_ok(struct noise_keypair *keypair, u64 nonce);
++void wg_fastpath_keep_key_fresh(struct wg_peer *peer);
+ /* Workqueue worker: */
+ void wg_packet_decrypt_worker(struct work_struct *work);
+ 
+--- a/drivers/net/wireguard/receive.c
++++ b/drivers/net/wireguard/receive.c
+@@ -616,3 +616,15 @@
+ err:
+ 	dev_kfree_skb(skb);
+ }
++
++/* For wg_fastpath_open(), which opens a data message in its receive buffer
++ * and must apply the same replay window and rekey check as the paths above. */
++bool wg_fastpath_counter_ok(struct noise_keypair *keypair, u64 nonce)
++{
++	return counter_validate(&keypair->receiving_counter, nonce);
++}
++
++void wg_fastpath_keep_key_fresh(struct wg_peer *peer)
++{
++	keep_key_fresh(peer);
++}
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -467,6 +467,22 @@
+ unsigned int nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
+ 				       const struct nf_hook_state *state);
+ 
++/* Where nf_flow_offload_ip_raw() sends a packet: the device and the
++ * Ethernet header to put on it. */
++struct nf_flow_raw_xmit {
++	struct net_device	*dev;
++	u8			h_dest[ETH_ALEN];
++	u8			h_source[ETH_ALEN];
++};
++
++int nf_flow_offload_ip_raw(struct nf_flowtable *flow_table,
++			   const struct net_device *in, struct iphdr *iph,
++			   unsigned int len,
++			   bool (*can_xmit)(const struct net_device *dev),
++			   struct nf_flow_raw_xmit *xmit);
++/* The flowtable hooked on @dev's ingress, if any; under rcu_read_lock(). */
++struct nf_flowtable *nf_flow_table_ingress(const struct net_device *dev);
++
+ #if (IS_BUILTIN(CONFIG_NF_FLOW_TABLE) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) || \
+     (IS_MODULE(CONFIG_NF_FLOW_TABLE) && IS_ENABLED(CONFIG_DEBUG_INFO_BTF_MODULES))
+ extern int nf_flow_register_bpf(void);
+--- a/include/net/wg_fastpath.h
++++ b/include/net/wg_fastpath.h
+@@ -31,4 +31,25 @@
+ /* Decrypt every data message on the receiving CPU (true) or only small ones. */
+ void wg_fastpath_rx_inline(bool all);
+ 
++enum wg_fastpath_open_result {
++	/* Untouched: hand the datagram to wg_fastpath_receive(). */
++	WG_FP_PASS,
++	/* Decrypted in place: *inner is an authenticated packet whose source
++	 * its peer is allowed to send from. */
++	WG_FP_OPENED,
++	/* Written or refused after authentication: drop the buffer. */
++	WG_FP_CONSUMED,
++};
++
++/* Open a WireGuard data message in the buffer it was received into, doing
++ * what the device's receive path would: keypair, authentication, replay
++ * window, endpoint, timers, AllowedIPs, statistics. @oip and @oudp are the
++ * validated outer IPv4 and UDP headers it arrived with on @iif, @msg and
++ * @len its UDP payload. On WG_FP_OPENED, *@inner and *@inner_len give the
++ * inner IPv4 or IPv6 packet (padding trimmed). The caller holds
++ * rcu_read_lock() and keeps @wg_dev registered across the call. */
++int wg_fastpath_open(struct net_device *wg_dev, const struct iphdr *oip,
++		     const struct udphdr *oudp, int iif, u8 *msg,
++		     unsigned int len, u8 **inner, unsigned int *inner_len);
++
+ #endif /* _NET_WG_FASTPATH_H */
+--- a/net/netfilter/nf_flow_table_inet.c
++++ b/net/netfilter/nf_flow_table_inet.c
+@@ -98,6 +98,24 @@
+ 	.owner		= THIS_MODULE,
+ };
+ 
++/* The flowtable whose hook runs on @dev's ingress, for a driver that forwards
++ * a packet it holds outside an skb (nf_flow_offload_ip_raw()). A table's
++ * hook carries its nf_flowtable as priv. Caller holds rcu_read_lock(). */
++struct nf_flowtable *nf_flow_table_ingress(const struct net_device *dev)
++{
++#ifdef CONFIG_NETFILTER_INGRESS
++	const struct nf_hook_entries *e = rcu_dereference(dev->nf_hooks_ingress);
++	unsigned int i;
++
++	for (i = 0; e && i < e->num_hook_entries; i++)
++		if (e->hooks[i].hook == nf_flow_offload_inet_hook ||
++		    e->hooks[i].hook == nf_flow_offload_ip_hook)
++			return e->hooks[i].priv;
++#endif
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(nf_flow_table_ingress);
++
+ static int __init nf_flow_inet_module_init(void)
+ {
+ 	nft_register_flowtable_type(&flowtable_ipv4);
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -14,6 +14,7 @@
+ #include <net/ipv6.h>
+ #include <net/ip6_route.h>
+ #include <net/neighbour.h>
++#include <net/arp.h>
+ #include <net/xfrm.h>
+ #include <net/netfilter/nf_flow_table.h>
+ #include <net/netfilter/nf_conntrack.h>
+@@ -557,6 +558,97 @@
+ }
+ EXPORT_SYMBOL_GPL(nf_flow_offload_ip_hook);
+ 
++/* nf_flow_offload_ip_hook()'s forward decision for an IPv4 packet a driver
++ * holds in its own buffer rather than an skb -- WireGuard opening a tunnel's
++ * packets where they were received -- arriving on @in. On success the TTL is
++ * decremented, the flow refreshed and counted as the hook would, and @xmit
++ * names the device and Ethernet header to send it with. Anything the hook
++ * would give back to the stack, and what this does without an skb (NAT,
++ * encapsulation, a session or tunnel, XFRM, a neighbour still resolving, an
++ * egress @can_xmit refuses), is refused with the packet untouched. Caller
++ * holds rcu_read_lock(). */
++int nf_flow_offload_ip_raw(struct nf_flowtable *flow_table,
++			   const struct net_device *in, struct iphdr *iph,
++			   unsigned int len,
++			   bool (*can_xmit)(const struct net_device *dev),
++			   struct nf_flow_raw_xmit *xmit)
++{
++	struct flow_offload_tuple_rhash *tuplehash;
++	struct flow_offload_tuple tuple = {};
++	enum flow_offload_tuple_dir dir;
++	struct flow_offload *flow;
++	struct flow_ports *ports;
++	struct neighbour *neigh;
++	unsigned int thoff;
++	struct rtable *rt;
++	__be32 nexthop;
++
++	if (len < sizeof(*iph))
++		return -EINVAL;
++	thoff = iph->ihl * 4;
++	if (ip_is_fragment(iph) || unlikely(ip_has_options(thoff)) ||
++	    (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP) ||
++	    len < thoff + (iph->protocol == IPPROTO_TCP ? sizeof(struct tcphdr) :
++							  sizeof(struct udphdr)) ||
++	    iph->ttl <= 1)
++		return -EOPNOTSUPP;
++	ports = (struct flow_ports *)((u8 *)iph + thoff);
++	tuple.src_v4.s_addr = iph->saddr;
++	tuple.dst_v4.s_addr = iph->daddr;
++	tuple.src_port = ports->source;
++	tuple.dst_port = ports->dest;
++	tuple.l3proto = AF_INET;
++	tuple.l4proto = iph->protocol;
++	tuple.iifidx = in->ifindex;
++
++	tuplehash = flow_offload_lookup(flow_table, &tuple);
++	if (!tuplehash)
++		return -ENOENT;
++	if (READ_ONCE(flow_table->use_hw_handles) &&
++	    !xfrm_flowtable_enabled(dev_net(in)))
++		return -EOPNOTSUPP;
++	dir = tuplehash->tuple.dir;
++	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
++	if (test_bit(NF_FLOW_SNAT, &flow->flags) ||
++	    test_bit(NF_FLOW_DNAT, &flow->flags) ||
++	    tuplehash->tuple.xmit_type != FLOW_OFFLOAD_XMIT_NEIGH ||
++	    tuplehash->tuple.encap_num || flow->tuplehash[!dir].tuple.encap_num ||
++	    tuplehash->tuple.session.lower_ifindex ||
++	    tuplehash->tuple.tunnel.lower_ifindex)
++		return -EOPNOTSUPP;
++	if (len > tuplehash->tuple.mtu)
++		return -EMSGSIZE;
++	if (iph->protocol == IPPROTO_TCP &&
++	    unlikely(((struct tcphdr *)ports)->fin || ((struct tcphdr *)ports)->rst)) {
++		flow_offload_teardown(flow);
++		return -ECONNRESET;
++	}
++	if (!nf_flow_dst_check(flow_table, &tuplehash->tuple)) {
++		flow_offload_teardown(flow);
++		return -ESTALE;
++	}
++
++	rt = dst_rtable(tuplehash->tuple.dst_cache);
++	if (!can_xmit(rt->dst.dev))
++		return -EOPNOTSUPP;
++	nexthop = rt_nexthop(rt, flow->tuplehash[!dir].tuple.src_v4.s_addr);
++	neigh = __ipv4_neigh_lookup_noref(rt->dst.dev, (__force u32)nexthop);
++	if (!neigh || !(READ_ONCE(neigh->nud_state) & NUD_VALID))
++		return -EHOSTUNREACH;
++	neigh_ha_snapshot(xmit->h_dest, neigh, rt->dst.dev);
++	ether_addr_copy(xmit->h_source, rt->dst.dev->dev_addr);
++	xmit->dev = rt->dst.dev;
++
++	flow_offload_refresh(flow_table, flow, false);
++	ip_decrease_ttl(iph);
++	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
++		nf_ct_acct_update(flow->ct, dir, len);
++	if (dir == FLOW_OFFLOAD_DIR_REPLY)
++		nf_flow_ct_seen_reply(flow->ct);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nf_flow_offload_ip_raw);
++
+ static void nf_flow_nat_ipv6_tcp(struct sk_buff *skb, unsigned int thoff,
+ 				 struct in6_addr *addr,
+ 				 struct in6_addr *new_addr,
+-- 
+2.47.3
