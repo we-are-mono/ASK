@@ -235,6 +235,11 @@ void cdx_wifi_vap_del(struct cdx_wifi_vap **vap)
 		return;
 	*vap = NULL;
 
+	/* A WireGuard VAP's receive steers first, by the device's address,
+	 * compared only: they name the device and must not outlive its VAP
+	 * (dpa_wifi.c). Nothing matches a Wi-Fi VAP. */
+	vwd_wg_steers_drop(v->dev);
+
 	/* Only cached fields: this runs after the device may have unregistered,
 	 * and nothing here is allowed to follow that pointer. */
 	memset(&cmd, 0, sizeof(cmd));

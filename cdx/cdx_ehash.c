@@ -40,6 +40,7 @@
 #include "dpa_wifi.h"
 #include "module_qm.h"
 #include "control_tx.h"
+#include "cdx_flowtable_backend.h"
 
 //#define CDX_DPA_DEBUG 1
 
@@ -1404,11 +1405,10 @@ static int apply_l2_encap(struct ins_entry_info *info, const struct cdx_l2_encap
 
 /* Mirrors cdx_pcd_tunnel_key()'s generic first-header extraction, after the known inner
  * tuple fields. SEC's private tables retain their existing keys. */
-static unsigned int fill_tunnel_key(PCtEntry entry, const struct cdx_l2_encap *encap,
-				   uint8_t *key)
+static unsigned int fill_tunnel_key_proto(bool ipv6, uint8_t proto,
+					  const struct cdx_l2_encap *encap, uint8_t *key)
 {
 	const struct cdx_tunnel_encap *tunnel = encap ? &encap->ingress_tunnel : NULL;
-	bool ipv6 = IS_IPV6_FLOW(entry);
 	unsigned int size = ipv6 ? 10 : 35;
 
 	memset(key, 0, size);
@@ -1418,7 +1418,7 @@ static unsigned int fill_tunnel_key(PCtEntry entry, const struct cdx_l2_encap *e
 		if (!ipv6)
 			key[34] = key[1] == IPPROTO_DSTOPTS ? IPPROTO_IPIP : 0x45;
 	} else {
-		key[0] = entry->proto;
+		key[0] = proto;
 	}
 	memset(key + size, 0, 8);
 	if (encap && encap->ingress_pppoe) {
@@ -1428,6 +1428,12 @@ static unsigned int fill_tunnel_key(PCtEntry entry, const struct cdx_l2_encap *e
 		memcpy(key + size + ETHER_ADDR_LEN, &session, sizeof(session));
 	}
 	return size + 8;
+}
+
+static unsigned int fill_tunnel_key(PCtEntry entry, const struct cdx_l2_encap *encap,
+				   uint8_t *key)
+{
+	return fill_tunnel_key_proto(IS_IPV6_FLOW(entry), entry->proto, encap, key);
 }
 
 /* Mirrors cdx_pcd_session_key(): a routed three-tuple key ends with the first
@@ -1793,6 +1799,141 @@ err_ret:
 err_ret1:
 	kfree(info);
 	return retval == EHASH_ADD_BUCKET_FULL ? -ENOSPC : FAILURE;
+}
+
+/* A receive steer: one exact IPv4 UDP five-tuple on the ingress port's UDP
+ * table, whose only action is to enqueue the frame as it arrived to `fqid` --
+ * one of the port's own distribution queues (cdx_pcd_fq_for_cpu()), so it is
+ * received exactly as a classifier miss would be, only on the CPU that queue's
+ * portal serves rather than the one the port's Ethernet distribution hashes
+ * every frame of one L2 pair to. The key is the one the inbound NAT-T root
+ * builds (fill_natt_key_info()): the port, the pair, the ports moved before
+ * the first-header guard, which names a native UDP header. No preemptive
+ * checks, TTL, NAT, rx statistics or header change: the frame is not
+ * forwarded, only queued. The MTU is the unlimited one, so nothing is
+ * fragmented.
+ *
+ * A steered frame skips everything the miss chain would have done to it --
+ * the exception policer CDX_EXPT_ETH_RATELIMIT among them -- so only an
+ * established peer's exact tuple is ever steered.
+ *
+ * 0 with *out the entry, owned by the caller and deleted only through
+ * cdx_ehash_steer_del(); -ENOSPC when the key's bucket is full, as the
+ * flowtable's insert reports it; another negative errno otherwise. Caller
+ * holds the control mutex. */
+int cdx_ehash_steer4_add(struct net_device *in, __be32 saddr, __be32 daddr,
+			 __be16 sport, __be16 dport, uint32_t fqid, struct hw_ct **out)
+{
+	struct en_exthash_tbl_entry *tbl_entry = NULL;
+	struct dpa_iface_info *iface;
+	struct ins_entry_info *info;
+	struct hw_ct *ct = NULL;
+	union dpa_key *key;
+	uint32_t key_size;
+	uint16_t flags = 0;
+	uint8_t *ptr;
+	int rc = -EIO;
+
+	cdx_ehash_quarantine_assert_held();
+	*out = NULL;
+	iface = dpa_get_ifinfo_by_netdev(in);
+	if (!iface || !(iface->if_flags & IF_TYPE_ETHERNET))
+		return -ENODEV;
+	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	if (!info)
+		return -ENOMEM;
+	info->fm_idx = iface->eth_info.fman_idx;
+	info->port_idx = iface->eth_info.port_idx;
+	info->port_id = iface->eth_info.portid;
+	info->tbl_type = IPV4_UDP_TABLE;
+	info->td = dpa_get_tdinfo(info->fm_idx, info->port_id, IPV4_UDP_TABLE);
+	if (!info->td) {
+		rc = -ENOENT;
+		goto err;
+	}
+	ct = kzalloc(sizeof(*ct), GFP_KERNEL);
+	if (!ct) {
+		rc = -ENOMEM;
+		goto err;
+	}
+	ct->td = info->td;
+	ct->fm_ctx = dpa_get_fm_ctx(info->fm_idx);
+	if (!ct->fm_ctx)
+		goto err;
+	tbl_entry = ExternalHashTableAllocEntry(info->td);
+	if (!tbl_entry) {
+		rc = -ENOMEM;
+		goto err;
+	}
+
+	key = (union dpa_key *)&tbl_entry->hashentry.key[0];
+	key->portid = info->port_id;
+	key->ipv4_tcpudp_key.ipv4_saddr = saddr;
+	key->ipv4_tcpudp_key.ipv4_daddr = daddr;
+	key->ipv4_tcpudp_key.ipv4_protocol = IPPROTO_UDP;
+	key->ipv4_tcpudp_key.ipv4_sport = sport;
+	key->ipv4_tcpudp_key.ipv4_dport = dport;
+	key_size = sizeof(struct ipv4_tcpudp_key) + 1;
+	/* KeyGen extracts the ports before the first-header guard, as for
+	 * every UDP table entry (insert_entry_in_classif_table_encap()). */
+	memmove(tbl_entry->hashentry.key + 9, tbl_entry->hashentry.key + 10, 4);
+	key_size--;
+	key_size += fill_tunnel_key_proto(false, IPPROTO_UDP, NULL,
+					  tbl_entry->hashentry.key + key_size);
+
+	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];
+	ptr += ALIGN(key_size, TBLENTRY_OPC_ALIGN);
+	info->opcptr = ptr;
+	ptr += MAX_OPCODES;
+	SET_OPC_OFFSET(flags, (uint32_t)(info->opcptr - (uint8_t *)tbl_entry));
+	SET_PARAM_OFFSET(flags, (uint32_t)(ptr - (uint8_t *)tbl_entry));
+	tbl_entry->hashentry.flags = cpu_to_be16(flags);
+	info->paramptr = ptr;
+	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - GET_PARAM_OFFSET(flags));
+
+	/* Counted by nothing: the port's receive counters already see the
+	 * frame, and the stack that takes it counts it again. With no
+	 * preemptive checks the enqueue has none to seal. */
+	info->l2_info.fqid = fqid;
+	info->l2_info.mtu = 0xffff;
+	info->l2_info.no_tx_stats = 1;
+	if (create_enque_hm(info))
+		goto err;
+	tbl_entry->enqueue_params = info->enqueue_params;
+	ct->handle = tbl_entry;
+	rc = ExternalHashTableAddKey(info->td, key_size, tbl_entry);
+	if (rc < 0) {
+		rc = rc == EHASH_ADD_BUCKET_FULL ? -ENOSPC : -EIO;
+		goto err;
+	}
+	ct->index = (uint16_t)rc;
+	kfree(info);
+	*out = ct;
+	return 0;
+err:
+	/* Nothing was linked: AddKey links last and reports any failure before
+	 * it does. */
+	kfree(ct);
+	if (tbl_entry)
+		ExternalHashTableEntryFree(tbl_entry);
+	kfree(info);
+	return rc;
+}
+
+/* Delete a receive steer, per cdx_ehash_delete_entry()'s contract, which owns
+ * `ct` on every arm. A key not provably unlinked may still steer, and is
+ * recorded for the datapath restart that settles it; the failure is latched
+ * here, as the multicast and IPsec deletes latch theirs, and the latch
+ * (cdx_ft_failed()) refuses every insert -- the same key's among them -- until
+ * that restart has settled it. Returns the raw rc. Caller holds the control
+ * mutex. */
+int cdx_ehash_steer_del(struct hw_ct *ct)
+{
+	int rc = cdx_ehash_delete_entry(ct);
+
+	if (rc && rc != EN_EHASH_DELETE_UNSYNCED)
+		cdx_ft_fatal();
+	return rc;
 }
 
 /* A multicast group's root entry: the classifier key, the ingress validation,

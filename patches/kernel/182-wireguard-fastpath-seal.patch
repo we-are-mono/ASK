@@ -62,7 +62,7 @@ on another CPU.
  
 --- /dev/null
 +++ b/drivers/net/wireguard/fastpath.c
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,269 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Seal a forwarded IPv4 packet for its peer in place, in the buffer a NIC
@@ -318,6 +318,10 @@ on another CPU.
 +	}
 +
 +	tx->dev = t->dev;
++	tx->saddr = oip->saddr;
++	tx->daddr = oip->daddr;
++	tx->sport = udp->source;
++	tx->dport = udp->dest;
 +	tx->off = hdr - buf;
 +	tx->len = hlen + plain + POLY1305_DIGEST_SIZE;
 +	peer->tx_bytes += tx->len;
@@ -383,7 +387,7 @@ on another CPU.
  						   wg->packet_crypt_wq);
 --- /dev/null
 +++ b/include/net/wg_fastpath.h
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,25 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _NET_WG_FASTPATH_H
 +#define _NET_WG_FASTPATH_H
@@ -395,6 +399,10 @@ on another CPU.
 +struct wg_fastpath_tx {
 +	struct net_device *dev;
 +	unsigned int off, len;
++	/* The outer IPv4/UDP pair the frame was sealed with: the peer's
++	 * packets come back on its reverse. */
++	__be32 saddr, daddr;
++	__be16 sport, dport;
 +};
 +
 +/* Whether the caller can transmit a sealed frame on @dev; called in softirq. */

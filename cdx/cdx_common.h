@@ -466,6 +466,12 @@ int hw_ct_get_active(struct hw_ct *ct);
  * callable under a spinlock: the barriers busy-wait on host-command
  * completion. */
 int cdx_ehash_delete_entry(struct hw_ct *ct);
+/* Receive steers: an exact IPv4 UDP tuple enqueued unmodified to one of the
+ * ingress port's distribution queues (cdx_ehash.c). Control mutex held. */
+struct net_device;
+int cdx_ehash_steer4_add(struct net_device *in, __be32 saddr, __be32 daddr,
+			 __be16 sport, __be16 dport, uint32_t fqid, struct hw_ct **out);
+int cdx_ehash_steer_del(struct hw_ct *ct);
 void cdx_ehash_quarantine_entry(void *td, void *tbl_entry);
 void cdx_ehash_quarantine_free_all(void);
 void cdx_ehash_quarantine_drain(void *td);

@@ -229,6 +229,7 @@ struct dpa_iface_info {
 #define PORT_TYPE_MASK          (3 << 12)
 
 int find_pcd_fq_info(uint32_t fqid);
+int cdx_pcd_fq_for_cpu(struct net_device *dev, unsigned int cpu, uint32_t *fqid);
 void add_pcd_fq_info(struct dpa_fq *fq_info);
 void cdx_destroy_fq(struct qman_fq *fq);
 /* A parked, tail-dropping queue an entry enqueues to in order to drop what it

@@ -105,6 +105,8 @@ struct vwd_global_stats_s {
 
 int dpaa_vwd_vap_cmd(struct vap_cmd_s *cmd);
 void vwd_wg_ports_update(void);
+/* Delete a WireGuard device's receive steers (NULL: all); control mutex held. */
+void vwd_wg_steers_drop(const struct net_device *wg);
 bool dpaa_vwd_ready(void);
 bool dpaa_vwd_vap_is_open(const struct net_device *dev);
 bool dpaa_vwd_vap_owns(uint16_t vap_id, const struct net_device *dev);
