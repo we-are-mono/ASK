@@ -61,6 +61,8 @@ struct vap_desc_s {
 struct vap_stats_s {
 	u32                                pkts_rx_fast_forwarded;
 	u32                                pkts_rx_ipsec;
+	u32                                pkts_wg_sealed;
+	u32                                pkts_wg_tx_fail;
 };
 
 //action values in vap_cmd_s
@@ -102,6 +104,7 @@ struct vwd_global_stats_s {
 };
 
 int dpaa_vwd_vap_cmd(struct vap_cmd_s *cmd);
+void vwd_wg_ports_update(void);
 bool dpaa_vwd_ready(void);
 bool dpaa_vwd_vap_is_open(const struct net_device *dev);
 bool dpaa_vwd_vap_owns(uint16_t vap_id, const struct net_device *dev);

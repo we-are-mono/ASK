@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Mon, 9 Nov 2026 18:30:00 +0100
+Subject: [PATCH] wireguard: decrypt small data messages where they arrive
+
+Every data message is queued to a decryption worker on another CPU and
+handed back to the peer's NAPI, whatever its size. For a TCP ACK or a
+keepalive the queueing, the cross-CPU wakeup and the context switches
+cost far more than the cipher, and a tunnel carrying a fast upload
+receives one such message for every two it sends.
+
+A message of up to 256 bytes is now decrypted on the receiving CPU. It
+still enters the peer's receive queue first and is marked crypted or
+dead there, so the NAPI poll delivers it in order with the messages the
+workers are still decrypting.
+---
+--- a/drivers/net/wireguard/receive.c
++++ b/drivers/net/wireguard/receive.c
+@@ -25,6 +25,9 @@
+ 
+ #define SKB_TYPE_LE32(skb) (((struct message_header *)(skb)->data)->type)
+ 
++/* Data messages up to this size are decrypted where they arrive. */
++#define WG_RX_INLINE_MAX 256
++
+ static size_t validate_header_len(struct sk_buff *skb)
+ {
+ 	if (unlikely(skb->len < sizeof(struct message_header)))
+@@ -526,6 +529,20 @@
+ 	if (READ_ONCE(peer->fp_rx_cpu) != raw_smp_processor_id())
+ 		WRITE_ONCE(peer->fp_rx_cpu, raw_smp_processor_id());
+ 
++	/* A packet this small -- an ACK, a keepalive -- costs less to decrypt
++	 * here than to hand to a worker on another CPU and back. It still takes
++	 * its place in the peer's queue first, so delivery stays in order. */
++	if (skb->len <= WG_RX_INLINE_MAX) {
++		atomic_set_release(&PACKET_CB(skb)->state, PACKET_STATE_UNCRYPTED);
++		if (unlikely(!wg_prev_queue_enqueue(&peer->rx_queue, skb)))
++			goto err;
++		wg_queue_enqueue_per_peer_rx(skb, likely(decrypt_packet(skb,
++				PACKET_CB(skb)->keypair)) ? PACKET_STATE_CRYPTED :
++				PACKET_STATE_DEAD);
++		rcu_read_unlock_bh();
++		return;
++	}
++
+ 	ret = wg_queue_enqueue_per_device_and_peer(&wg->decrypt_queue, &peer->rx_queue, skb,
+ 						   wg->packet_crypt_wq);
+ 	if (unlikely(ret == -EPIPE))
+-- 
+2.47.3

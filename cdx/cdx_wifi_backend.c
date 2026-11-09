@@ -154,9 +154,11 @@ int cdx_wifi_vap_add(struct net_device *dev, struct cdx_wifi_vap **result)
 		return -ENOMEM;
 
 	port = phy_port_get(PORT_WIFI_IDX + vapid);
-	if (cdx_l3_vap_dev(dev))
+	if (cdx_l3_vap_dev(dev)) {
 		cdx_l3_vap_mac(dev, mac);
-	else
+		/* The ports its sealed frames may leave by (dpa_wifi.c). */
+		vwd_wg_ports_update();
+	} else
 		ether_addr_copy(mac, dev->dev_addr);
 
 	/* The order is the one the failure handling below unwinds: the

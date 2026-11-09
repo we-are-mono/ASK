@@ -18,6 +18,7 @@
 #include <linux/if_vlan.h>
 #include <linux/etherdevice.h>
 #include <linux/if_arp.h>
+#include <net/wg_fastpath.h>
 #include <linux/if_ether.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
@@ -131,12 +132,16 @@ static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *a
 		per_cpu_stats = per_cpu_ptr(priv->vaps[ii].vap_stats, i);
 		total_stats.pkts_rx_fast_forwarded += per_cpu_stats->pkts_rx_fast_forwarded;
 		total_stats.pkts_rx_ipsec += per_cpu_stats->pkts_rx_ipsec;
+		total_stats.pkts_wg_sealed += per_cpu_stats->pkts_wg_sealed;
+		total_stats.pkts_wg_tx_fail += per_cpu_stats->pkts_wg_tx_fail;
 	}
 
 	len += sprintf(buf, "VAP (id : %d  name : %s)\n",ii,priv->vaps[ii].ifname);
 	len += sprintf(buf + len, "From DPAA\n");
 	len += sprintf(buf + len, "  WiFi Tx pkts : %u \n", total_stats.pkts_rx_fast_forwarded);
 	len += sprintf(buf + len, "  WiFi Tx ipsec pkts : %u\n", total_stats.pkts_rx_ipsec);
+	len += sprintf(buf + len, "  WireGuard sealed : %u\n", total_stats.pkts_wg_sealed);
+	len += sprintf(buf + len, "  WireGuard tx fail : %u\n", total_stats.pkts_wg_tx_fail);
 
 	return len;
 }
@@ -421,6 +426,129 @@ static void vwd_send_to_vap(struct sk_buff* skb)
 	return;
 }
 
+static void vap_fwd_ern(struct qman_portal *portal, struct qman_fq *fq,
+			const struct qm_mr_entry *msg)
+{
+	dpa_fd_release(NULL, &msg->ern.fd);
+}
+
+/* The DPAA ports a WireGuard VAP's sealed frames may leave by, with cdx's
+ * forwarding queues to each: the queues the classifier itself sends on, which
+ * return a buffer to its pool instead of confirming it to the driver (the
+ * driver's own egress queues confirm every frame, and its confirmation path
+ * would look for an skb). Ports are load-once, so the table is filled under
+ * the control mutex and RTNL and read without a lock. */
+#define VWD_WG_PORTS 16
+static struct {
+	struct net_device *dev;
+	struct eth_iface_info *eth;
+} vwd_wg_ports[VWD_WG_PORTS];
+static unsigned int vwd_wg_nports;
+
+void vwd_wg_ports_update(void)
+{
+	struct dpa_iface_info *iface;
+	struct net_device *dev;
+	unsigned int n = 0;
+
+	ASSERT_RTNL();
+	for_each_netdev(&init_net, dev) {
+		if (n == VWD_WG_PORTS)
+			break;
+		if (!dpa_netdev_is_dpaa(dev))
+			continue;
+		iface = dpa_get_ifinfo_by_netdev(dev);
+		if (!iface || !(iface->if_flags & IF_TYPE_ETHERNET))
+			continue;
+		WRITE_ONCE(vwd_wg_ports[n].eth, &iface->eth_info);
+		WRITE_ONCE(vwd_wg_ports[n].dev, dev);
+		n++;
+	}
+	smp_store_release(&vwd_wg_nports, n);
+}
+
+static struct eth_iface_info *vwd_wg_port(const struct net_device *dev)
+{
+	unsigned int i, n = smp_load_acquire(&vwd_wg_nports);
+
+	for (i = 0; i < n; i++)
+		if (READ_ONCE(vwd_wg_ports[i].dev) == dev)
+			return READ_ONCE(vwd_wg_ports[i].eth);
+	return NULL;
+}
+
+static bool vwd_wg_can_tx(const struct net_device *dev)
+{
+	if (!vwd_wg_port(dev))
+		return false;
+#ifdef CONFIG_FSL_DPAA_CEETM
+	/* ponytail: a port a hardware qdisc owns shapes through its class
+	 * queues, which this does not pick; such a port keeps the slow path. */
+	if (((struct dpa_priv_s *)netdev_priv(dev))->ceetm_en)
+		return false;
+#endif
+	return true;
+}
+
+/* A WireGuard VAP's frame sealed where it lies and sent from the same buffer.
+ * The FD keeps its pool, so the egress port returns the buffer to it after
+ * transmission, as it does for a frame the classifier forwards; the pool's
+ * per-CPU count is therefore left alone. Returns false, with the frame
+ * untouched, for anything the seal declines. */
+static bool vwd_wg_fast(struct net_device *net_dev, struct vap_desc_s *vap,
+			struct dpa_bp *dpa_bp, const struct qm_fd *in)
+{
+	struct eth_iface_info *eth;
+	struct wg_fastpath_tx tx;
+	struct qman_fq *fq;
+	struct qm_fd fd = *in;
+	int i, err = -EBUSY;
+
+	err = wg_fastpath_seal(net_dev, vwd_wg_can_tx, phys_to_virt(qm_fd_addr(in)),
+			       dpa_fd_offset(in), dpa_fd_length(in), dpa_bp->size, &tx);
+	if (err == -EXDEV) {
+		/* This CPU receives the tunnel: hand the frame, untouched, to
+		 * the VAP's queue on the next CPU (queue i is on the i-th
+		 * affine CPU's portal). A flow's frames all take the same
+		 * turn, so they stay in order. */
+		struct dpa_fq *next = vap->wlan_fq_from_fman[(smp_processor_id() + 1) %
+							     num_online_cpus()];
+
+		for (i = 0; i < 1000 && (err = qman_enqueue(&next->fq_base, &fd, 0)) == -EBUSY; i++)
+			;
+		if (unlikely(err)) {
+			INCR_PER_CPU_STAT(vap->vap_stats, pkts_wg_tx_fail);
+			dpa_fd_release(NULL, &fd);
+		}
+		return true;
+	}
+	if (err)
+		return false;
+	err = -EBUSY;
+	fd.offset = tx.off;
+	fd.length20 = tx.len;
+	fd.cmd = 0;
+	eth = vwd_wg_port(tx.dev);
+	if (unlikely(!eth)) {
+		/* Sealed for a port that left the table since: none do. */
+		err = -ENODEV;
+		goto out;
+	}
+	/* One flow's frames arrive on one VAP queue, so on one CPU: a queue
+	 * per CPU keeps them in order. */
+	fq = &eth->fwd_tx_fqinfo[smp_processor_id() & (DPAA_FWD_TX_QUEUES - 1)];
+	for (i = 0; i < 1000 && err == -EBUSY; i++)
+		err = qman_enqueue(fq, &fd, 0);
+out:
+	if (unlikely(err)) {
+		INCR_PER_CPU_STAT(vap->vap_stats, pkts_wg_tx_fail);
+		dpa_fd_release(NULL, &fd);
+	} else {
+		INCR_PER_CPU_STAT(vap->vap_stats, pkts_wg_sealed);
+	}
+	return true;
+}
+
 static enum qman_cb_dqrr_result vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq)
 {
@@ -501,6 +629,11 @@ static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq
 			goto rel_fd;
 		goto process_skb;
 	}
+	if (net_dev->type != ARPHRD_ETHER &&
+	    vwd_wg_fast(net_dev, vap, dpa_bp, &dq->fd)) {
+		INCR_PER_CPU_STAT(vap->vap_stats, pkts_rx_fast_forwarded);
+		goto done;
+	}
 	/* The buffer is from an Ethernet pool: refill that pool for the
 	   frame the Wi-Fi driver takes, as its buffers are skb buffers that
 	   will be freed to the kernel */
@@ -554,7 +687,9 @@ rel_fd:
  * flow's queue is drained by one CPU: a share per portal would multiply the
  * pool's commitment, and a CPU that falls behind holds the group at its
  * threshold for every VAP until it catches up. */
-#define VWD_FWD_FRAMES	IPSEC_SHARE_FRAMES
+/* ponytail: raised for the WireGuard fast path experiment, whose frames are
+ * Ethernet-pool frames; a WireGuard VAP needs its own group before this ships. */
+#define VWD_FWD_FRAMES	2048
 
 /* No state-change notifications, so no portal owns the group; the egress
  * groups set theirs up the same way (devman.c). */
@@ -629,6 +764,9 @@ static int create_vap_fwd_from_fman_fqs(struct vap_desc_s *vap, void *proc_entry
 
 		/* fwd fq */
 		fq->cb.dqrr = vap_rx_fwd_pkt;
+		/* Software enqueues here too (vwd_wg_fast()); a rejected one
+		 * goes back to its pool. */
+		fq->cb.ern = vap_fwd_ern;
 		if (cdx_copy_eth_rx_channel_info(FMAN_IDX, dpa_fq)) {
 			DPAWIFI_ERROR("%s::unable to get cpu channel info\n", __func__) ;
 			kfree(dpa_fq);
@@ -752,6 +890,15 @@ int dpaa_get_vap_fwd_fq(uint16_t vap_id, uint32_t* fqid, uint32_t hash)
 	 * can ask about a slot that has none; answer failure, not a NULL. */
 	if (vap_id >= MAX_WIFI_VAPS)
 		return -1;
+	/* A WireGuard VAP's queue is where its frames are sealed, a CPU's worth
+	 * of work per flow, and the queues are dealt round-robin over the CPU
+	 * portals. By hash, four flows land on four CPUs one time in eleven;
+	 * dealt in turn, consecutive entries always do. */
+	if (vwd.vaps[vap_id].wifi_dev && vwd.vaps[vap_id].wifi_dev->type != ARPHRD_ETHER) {
+		static atomic_t wg_turn;
+
+		hash = atomic_inc_return(&wg_turn);
+	}
 	dpa_fq = vwd.vaps[vap_id].wlan_fq_from_fman[hash & (CDX_VWD_FWD_FQ_MAX - 1)];
 	if (!dpa_fq)
 		return -1;
