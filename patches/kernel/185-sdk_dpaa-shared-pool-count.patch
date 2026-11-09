@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Mon, 9 Nov 2026 23:30:00 +0100
+Subject: [PATCH] sdk_dpaa: count the common private pool's fill once
+
+Every private port receives into one common buffer pool
+(dpa_priv_common_bpid), but each counted its own per-CPU fill. A frame
+received on one port and sent out of another therefore found the
+sender's count already at target and was Tx-confirmed and freed, while
+the receiver's count fell and it refilled with newly allocated buffers:
+an allocation and a free per forwarded frame. On a WireGuard tunnel's
+receive CPU, the ACKs forwarded to the LAN spent 11% of it so.
+
+The common pool's fill is now one per-CPU counter shared by every
+private port. Each port adds its share (CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT)
+to what the pool is kept at, so the pool holds as many buffers as
+before; a forwarded frame now returns to the pool on transmit while the
+receiving port's consumption keeps the count below target.
+---
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
+@@ -118,6 +118,10 @@
+ #define DPAA_ETH_MAX_PAD (L1_CACHE_BYTES * 8)
+ 
+ static uint8_t dpa_priv_common_bpid;
++/* The per-CPU fill of that common pool, counted once for every private port
++ * (dpaa_eth_priv_probe()). Allocated with the first port and kept: private
++ * ports are not removed. */
++static int __percpu *dpa_priv_common_count;
+ 
+ #ifdef CONFIG_FSL_DPAA_DBG_LOOP
+ struct net_device *dpa_loop_netdevs[20];
+@@ -1371,17 +1375,24 @@
+ 		memset(percpu_priv, 0, sizeof(*percpu_priv));
+ 	}
+ 
+-	priv->percpu_count = devm_alloc_percpu(dev, *priv->percpu_count);
+-	if (!priv->percpu_count) {
+-		dev_err(dev, "devm_alloc_percpu() failed\n");
+-		err = -ENOMEM;
+-		goto alloc_percpu_failed;
+-	}
+-
+-	for_each_possible_cpu(i) {
+-		int *percpu_count = per_cpu_ptr(priv->percpu_count, i);
+-		*percpu_count = 0;
++	/* Every private port receives into the one common pool, so its fill is
++	 * counted once. Counted per port, a frame received on one port and
++	 * sent out of another found the sender's count already full and was
++	 * confirmed and freed, while the receiver refilled with new buffers --
++	 * an allocation and a free per forwarded frame. Each port still adds
++	 * its own share to what the pool is kept at, so the pool holds what
++	 * it did. */
++	if (!dpa_priv_common_count) {
++		dpa_priv_common_count = alloc_percpu(int);
++		if (!dpa_priv_common_count) {
++			dev_err(dev, "alloc_percpu() failed\n");
++			err = -ENOMEM;
++			goto alloc_percpu_failed;
++		}
++	} else {
++		dpa_bp->config_count += CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT;
+ 	}
++	priv->percpu_count = dpa_priv_common_count;
+ 
+ 	/* Initialize NAPI */
+ 	err = dpa_private_napi_add(net_dev);
+-- 
+2.47.3
