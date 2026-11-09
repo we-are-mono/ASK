@@ -198,8 +198,11 @@ static void ft_encap_stats(struct cdx_ft_stats_slot *const *slots, u8 count,
  */
 static bool ft_hw_egress_onif(U8 type)
 {
+	/* And a WireGuard device, whose arm (dpa_l2_wg_egress()) resolves
+	 * one of its seal queues the same way. */
 	return type == (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL) ||
-	       type == (IF_TYPE_WLAN | IF_TYPE_PHYSICAL);
+	       type == (IF_TYPE_WLAN | IF_TYPE_PHYSICAL) ||
+	       type == (IF_TYPE_WG | IF_TYPE_PHYSICAL);
 }
 
 static int ft_hw_add_one(const struct cdx_ft_rule *rule,

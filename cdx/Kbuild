@@ -21,7 +21,7 @@ obj-$(CONFIG_ASK_CDX) += cdx.o ask_flowtable.o
 ask_flowtable-y += ask_flowtable_core.o ask_flowtable_watch.o \
 	ask_flowtable_ipsec.o ask_flowtable_mc.o ask_flowtable_mc_hook.o ask_flowtable_l2.o \
 	ask_flowtable_mr.o ask_flowtable_mr_probe.o ask_flowtable_tc.o ask_flowtable_wifi.o \
-	ask_flowtable_main.o
+	ask_flowtable_wg.o ask_flowtable_main.o
 
 cdx-y += cdx_main.o cdx_hal.o cdx_timer.o layer2.o \
 	control_tx.o control_ipsec.o control_tunnel.o control_qm.o \
@@ -31,7 +31,7 @@ cdx-y += cdx_main.o cdx_hal.o cdx_timer.o layer2.o \
 	cdx_ifstats.o \
 	dpa_wifi.o cdx_qos.o vsp_cfg.o procfs.o \
 	cdx_flowtable_backend.o cdx_flowtable_hw.o \
-	cdx_ipsec_backend.o cdx_wifi_backend.o \
+	cdx_ipsec_backend.o cdx_wifi_backend.o cdx_wg.o \
 	cdx_htb.o cdx_police.o cdx_dscp.o cdx_devlink.o \
 	cdx_pcd_desc.o cdx_pcd_ports.o cdx_pcd.o cdx_detour.o \
 	cdx_portal_faults.o

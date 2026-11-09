@@ -113,8 +113,8 @@ int ft_neigh_attach(struct cdx_ft_entry *entry)
 	 * every device and route notifier scans, and an entry missing from it
 	 * is retired by nothing at all. */
 	/* A WireGuard egress resolves no neighbour either: its address is made
-	 * up (cdx_l3_vap_mac()) and the device itself is the dependency. */
-	if (entry->rule.out_session.present || cdx_l3_vap_dev(entry->rule.out)) {
+	 * up (cdx_ft_wg_mac()) and the device itself is the dependency. */
+	if (entry->rule.out_session.present || cdx_ft_wg_dev(entry->rule.out)) {
 		spin_lock_bh(&ft_watch_lock);
 		ft_watch_publish(entry);
 		spin_unlock_bh(&ft_watch_lock);
@@ -550,6 +550,8 @@ int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		/* And the same replay is how an AP interface that already
 		 * exists at load is found. */
 		ft_wifi_reconsider(dev);
+		/* And a WireGuard device that already exists. */
+		ft_wg_reconsider(dev);
 		break;
 	case NETDEV_UP:
 	case NETDEV_DOWN:
@@ -561,6 +563,8 @@ int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		 * what keeps a device that comes back as a station from
 		 * keeping the VAP it held as an AP. */
 		ft_wifi_reconsider(dev);
+		/* A WireGuard device is an egress while it runs. */
+		ft_wg_reconsider(dev);
 		/* A routed group refused because one of its ports had no
 		 * carrier has nothing else that would ever reconsider it: the
 		 * MFC entry does not change when a link returns, and no frame
@@ -691,6 +695,7 @@ int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		 * so nothing can follow the pointer, and the worker releases
 		 * what is left using only what it copied. */
 		ft_wifi_device_gone(dev);
+		ft_wg_device_gone(dev);
 		/* And a VLAN device's counter record, which outlives its flows
 		 * and so has nothing but this event to end it. */
 		ft_dev_stats_gone(dev);

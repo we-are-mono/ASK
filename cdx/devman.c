@@ -43,6 +43,7 @@
 #include "mac.h"
 #include "cdx.h"
 #include "cdx_common.h"
+#include "cdx_wg.h"
 #include "module_qm.h"
 #include "fe.h"
 #include "control_tunnel.h"
@@ -747,9 +748,9 @@ struct dpa_iface_info *dpa_get_ifinfo_by_netdev(const struct net_device *dev)
 	struct dpa_iface_info *iface;
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
-	/* Both arms that carry a device, because both can be named as a flow's
-	 * egress. The union means the field has to be chosen by if_flags
-	 * rather than read blindly. */
+	/* Every arm that carries a device, because each can be named as a
+	 * flow's egress. The union means the field has to be chosen by
+	 * if_flags rather than read blindly. */
 	for (iface = dpa_interface_info; iface; iface = iface->next) {
 		if ((iface->if_flags & IF_TYPE_ETHERNET) &&
 		    iface->eth_info.net_dev == dev)
@@ -762,6 +763,12 @@ struct dpa_iface_info *dpa_get_ifinfo_by_netdev(const struct net_device *dev)
 		if ((iface->if_flags & IF_TYPE_WLAN) &&
 		    iface->wlan_info.net_dev == dev &&
 		    dpaa_vwd_vap_owns(iface->wlan_info.vap_id, dev))
+			return iface;
+		/* The same hop for a WireGuard egress, whose registration is
+		 * let go of inside the device's unregistration. */
+		if ((iface->if_flags & IF_TYPE_WG) &&
+		    iface->wg_info.net_dev == dev &&
+		    cdx_wg_owns(iface->wg_info.wg_id, dev))
 			return iface;
 	}
 	return NULL;
@@ -1066,6 +1073,25 @@ out:
 	return retval;
 }
 
+/* The WireGuard arm of the two egress lookups: what the WLAN arm does for a
+ * VAP, against WireGuard's own record -- the device's made-up source address
+ * and one of its seal queues, as a CPU egress (is_wlan_iface: the frame is
+ * enqueued to the queue named, with no transmit validation and no port
+ * counters). Device list spinlock held. */
+static int dpa_l2_wg_egress(struct dpa_iface_info *iface_info,
+			    PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
+			    unsigned char **src_mac)
+{
+	if (!(NULL_MAC_ADDR(l2_info->l2hdr)))
+		memcpy(&l2_info->l2hdr[0], rt_entry->dstmac, ETHER_ADDR_LEN);
+	if (!*src_mac)
+		*src_mac = iface_info->wg_info.mac_addr;
+	if (cdx_wg_get_seal_fq(iface_info->wg_info.wg_id, &l2_info->fqid))
+		return -1;
+	l2_info->is_wlan_iface = 1;
+	return 0;
+}
+
 int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 		struct dpa_l2hdr_info *l2_info,
 		struct dpa_l3hdr_info *l3_info, uint32_t hash)
@@ -1124,6 +1150,13 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 				break;
 
 			l2_info->is_wlan_iface = 1;
+			retval = SUCCESS;
+			break;
+		}
+
+		if (iface_info->if_flags & IF_TYPE_WG) {
+			if (dpa_l2_wg_egress(iface_info, rt_entry, l2_info, &src_mac))
+				break;
 			retval = SUCCESS;
 			break;
 		}
@@ -1259,6 +1292,13 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 				break;
 
 			l2_info->is_wlan_iface = 1;
+			retval = SUCCESS;
+			break;
+		}
+
+		if (iface_info->if_flags & IF_TYPE_WG) {
+			if (dpa_l2_wg_egress(iface_info, rt_entry, l2_info, &src_mac))
+				break;
 			retval = SUCCESS;
 			break;
 		}
@@ -1885,6 +1925,37 @@ int dpa_add_wlan_if(char *name, struct _itf *itf, uint32_t vap_id, unsigned char
 err_ret:
 	kfree(iface_info);
 	return FAILURE;
+}
+
+/* A WireGuard device's record (cdx_wg_dev_add()). No port behind it and so
+ * nothing to look up: the device and the address are the caller's, and the
+ * seal queues are named by id at encode time (dpa_l2_wg_egress()). */
+int dpa_add_wg_if(char *name, struct _itf *itf, uint16_t wg_id,
+		  const unsigned char *mac, struct net_device *dev)
+{
+	struct dpa_iface_info *iface_info;
+
+	if (iface_count >= (MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES)) {
+		DPA_ERROR("%s::Number of interfaces support in fast path is only %d\n",
+			  __func__, (MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES));
+		return FAILURE;
+	}
+	iface_info = kzalloc(sizeof(*iface_info), GFP_KERNEL);
+	if (!iface_info)
+		return FAILURE;
+	iface_info->itf_id = itf->index;
+	iface_info->if_flags = itf->type;
+	strscpy(iface_info->name, name, sizeof(iface_info->name));
+	iface_info->wg_info.net_dev = dev;
+	iface_info->wg_info.wg_id = wg_id;
+	memcpy(iface_info->wg_info.mac_addr, mac, ETH_ALEN);
+	if (dpa_add_port_to_list(iface_info)) {
+		kfree(iface_info);
+		return FAILURE;
+	}
+	/* dpa_release_interface() decrements it for every record. */
+	iface_count++;
+	return SUCCESS;
 }
 
 //get fm and port index from itf_index

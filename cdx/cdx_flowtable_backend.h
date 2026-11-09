@@ -441,17 +441,18 @@ static inline bool cdx_ft_portless(u8 family, u8 proto)
 	}
 }
 
-/* A WireGuard device as a VAP egress. It has no link layer, so the entry is
- * given a made-up, locally administered address to write, and the VAP consumer
- * strips the Ethernet header again before handing the packet to the device.
+/* A WireGuard device as an egress (cdx_wg.c). It has no link layer, so the
+ * entry is given a made-up, locally administered address to write, which the
+ * seal consumer seals over (or strips before handing the packet to the
+ * device).
  * ponytail: matched by link kind; a cleaner contract is a netdev feature bit. */
-static inline bool cdx_l3_vap_dev(const struct net_device *dev)
+static inline bool cdx_ft_wg_dev(const struct net_device *dev)
 {
 	return dev && dev->type == ARPHRD_NONE && dev->rtnl_link_ops &&
 	       !strcmp(dev->rtnl_link_ops->kind, "wireguard");
 }
 
-static inline void cdx_l3_vap_mac(const struct net_device *dev, u8 *mac)
+static inline void cdx_ft_wg_mac(const struct net_device *dev, u8 *mac)
 {
 	mac[0] = 0x02;
 	mac[1] = 'w';

@@ -740,6 +740,9 @@ static int ft_status_show(struct seq_file *seq, void *v)
 	 * otherwise the same absence: the per-VAP sysfs file under
 	 * /sys/class/vwd/ appears only on success. */
 	ft_kv(seq, "wifi_vaps", READ_ONCE(ft_wifi_registered));
+	/* The same pair for WireGuard egresses (ask_flowtable_wg.c), whose
+	 * counters are /proc/cdx_wireguard's. */
+	ft_kv(seq, "wg_devs", READ_ONCE(ft_wg_registered));
 	cdx_ft_end();
 	ft_qos_status(seq);
 	return 0;
@@ -850,6 +853,7 @@ static int ft_stats_show(struct seq_file *seq, void *v)
 	ft_kv(seq, "mroute_xtables_changes", READ_ONCE(ft_mr_xtables_changes));
 	ft_l2_stats(seq);
 	ft_kv(seq, "wifi_refused", atomic64_read(&ft_wifi_refusals));
+	ft_kv(seq, "wg_refused", atomic64_read(&ft_wg_refusals));
 	return 0;
 }
 
@@ -1249,6 +1253,8 @@ netdev:
 	/* The same replay could have registered a VAP for an AP interface that
 	 * already existed, so this failure path owes them back too. */
 	ft_wifi_exit();
+	/* And a WireGuard device that already existed. */
+	ft_wg_exit();
 	/* Idle for that reason, and drained anyway: each costs nothing when
 	 * there is nothing queued, and none may outlive this text. */
 	flush_work(&ft_ipsec_retire);
@@ -1336,6 +1342,7 @@ static void __exit ask_flowtable_exit(void)
 	/* Likewise for the VAPs, and before the module's text goes: the
 	 * reconciling worker holds a pointer into it. */
 	ft_wifi_exit();
+	ft_wg_exit();
 	/* Unregistration replays nothing, so the ops this module planted on
 	 * each port have to be taken back by hand -- they point into text
 	 * that is about to go away. */

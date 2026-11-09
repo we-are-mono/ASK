@@ -181,6 +181,17 @@ struct wlan_iface_info {
 	uint32_t portid;
 };
 
+/* A WireGuard device as an egress (cdx_wg.c): no port behind it, only the
+ * seal queues its id names. */
+struct wg_iface_info {
+	/* Borrowed and only compared, as the WLAN arm's is; resolved together
+	 * with cdx_wg_owns(), which is cleared as the device unregisters. */
+	struct net_device *net_dev;
+	uint16_t wg_id;
+	/* The made-up address the encoder writes as the source (cdx_ft_wg_mac()). */
+	uint8_t mac_addr[ETH_ALEN];
+};
+
 struct iface_stats {
 	uint32_t tx_packets;
 	uint32_t rx_packets;
@@ -202,6 +213,7 @@ struct dpa_iface_info {
 	union {
 		struct eth_iface_info eth_info; //info if iface type is eth
 		struct wlan_iface_info wlan_info; //internal wlan  info
+		struct wg_iface_info wg_info; //WireGuard egress
 		struct oh_iface_info oh_info; //internal oh parsing port info
 
 	};

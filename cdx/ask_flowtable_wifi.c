@@ -78,8 +78,6 @@ static bool ft_wifi_is_vap(struct net_device *dev)
 	ASSERT_RTNL();
 	if (!netif_running(dev))
 		return false;
-	if (cdx_l3_vap_dev(dev))
-		return true;
 	wdev = dev->ieee80211_ptr;
 	return wdev && (wdev->iftype == NL80211_IFTYPE_AP ||
 			wdev->iftype == NL80211_IFTYPE_AP_VLAN);

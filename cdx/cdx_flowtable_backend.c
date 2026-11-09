@@ -17,6 +17,7 @@
 #include "devman.h"
 #include "dpa_ipsec.h"
 #include "dpa_wifi.h"
+#include "cdx_wg.h"
 #include "fm_ehash.h"
 
 static bool ft_observe;
@@ -885,7 +886,7 @@ static U8 cdx_ft_onif_type(struct net_device *dev)
 	 * not follow. */
 	if (!dev || !net_eq(dev_net(dev), &init_net) ||
 	    ((dev->type != ARPHRD_ETHER || dev->addr_len != ETH_ALEN) &&
-	     !cdx_l3_vap_dev(dev)) ||
+	     !cdx_ft_wg_dev(dev)) ||
 	    dev->reg_state != NETREG_REGISTERED ||
 	    netif_is_l3_slave(dev) || cdx_ft_switch_port(dev) ||
 	    !netif_running(dev) || !netif_carrier_ok(dev))
@@ -934,6 +935,10 @@ bool cdx_ft_egress_supported(struct net_device *dev)
 	ask_dbg(ASK_DBG_DEVICE, "egress %s onif_type=0x%x vap_open=%d\n",
 		dev ? netdev_name(dev) : "(null)", type,
 		dev ? dpaa_vwd_vap_is_open(dev) : -1);
+	/* A WireGuard device is an egress on the same terms, against its own
+	 * registration (cdx_wg.c). */
+	if (type == (IF_TYPE_WG | IF_TYPE_PHYSICAL))
+		return cdx_wg_dev_is_open(dev);
 	return type == (IF_TYPE_WLAN | IF_TYPE_PHYSICAL) &&
 	       dpaa_vwd_vap_is_open(dev);
 }

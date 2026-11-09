@@ -66,6 +66,7 @@
 #include "cdx_flowtable.h"
 #include "cdx_ipsec_backend.h"
 #include "cdx_wifi_backend.h"
+#include "cdx_wg.h"
 #include "cdx_police.h"
 
 #if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 16
@@ -1095,6 +1096,13 @@ void ft_wifi_reconsider(struct net_device *dev);
 void ft_wifi_address_changed(struct net_device *dev);
 void ft_wifi_device_gone(struct net_device *dev);
 void ft_wifi_exit(void);
+
+/* ask_flowtable_wg.c */
+extern unsigned int ft_wg_registered;
+extern atomic64_t ft_wg_refusals;
+void ft_wg_reconsider(struct net_device *dev);
+void ft_wg_device_gone(struct net_device *dev);
+void ft_wg_exit(void);
 
 /* ask_flowtable_main.c */
 extern unsigned int ft_qos_mark_mask;

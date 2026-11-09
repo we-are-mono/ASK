@@ -2330,9 +2330,11 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * from it, and software sends with the bridge's. The encoder writes the
 	 * entry's own source, so nothing about the port has to agree; only an
 	 * address no frame may carry is declined. */
-	l3 = cdx_l3_vap_dev(out->out);
+	/* A WireGuard egress has no link layer: it writes its own made-up
+	 * address (cdx_ft_wg_mac()), which the seal overwrites. */
+	l3 = cdx_ft_wg_dev(out->out);
 	if (l3)
-		cdx_l3_vap_mac(out->out, l3_mac);
+		cdx_ft_wg_mac(out->out, l3_mac);
 	src_mac = l3 ? l3_mac : source ? source->dev_addr : NULL;
 	if (!src_mac || !is_valid_ether_addr(src_mac))
 		return ask_refuse(-EOPNOTSUPP);
@@ -2514,7 +2516,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 					  -ESTALE : -EOPNOTSUPP);
 		ether_addr_copy(out->dst_mac, out->out_tunnel.mac);
 	} else if (l3) {
-		/* No neighbour: the consumer strips what the entry writes. */
+		/* No neighbour: the seal overwrites what the entry writes. */
 		ether_addr_copy(out->dst_mac, l3_mac);
 	} else {
 		if (!is_valid_ether_addr(ethernet) ||

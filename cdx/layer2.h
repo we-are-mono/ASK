@@ -38,6 +38,8 @@
 #define	IF_TYPE_PPPOE		(1 << 2)
 #define	IF_TYPE_TUNNEL		(1 << 3)
 #define IF_TYPE_WLAN		(1 << 5)
+/* A WireGuard device as an egress (cdx_wg.c). */
+#define IF_TYPE_WG		(1 << 6)
 #define IF_TYPE_PHYSICAL	(1 << 7)
 //The following definition will not be used in if structures
 //defined here as others are also used in the dpaoffload layers.

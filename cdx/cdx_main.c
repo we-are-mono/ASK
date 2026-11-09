@@ -48,6 +48,7 @@
 #include "dpa_control_mc.h"
 #include "dpa_ipsec.h"
 #include "cdx_detour.h"
+#include "cdx_wg.h"
 
 #ifdef CDX_DEBUG_KEY_ZEROING
 /* H2 regression tripwire — see cdx_dpa_ipsec.c for design rationale.
@@ -452,6 +453,14 @@ static int __init cdx_module_init(void)
 		rc = 0;
 	}
 #endif
+	/* WireGuard offload: its own queues and congestion group. Not fatal,
+	 * for the Wi-Fi reason: a gateway without it is one whose WireGuard
+	 * traffic stays in software. */
+	rc = cdx_wg_init();
+	if (rc != 0) {
+		pr_warn("%s: WireGuard offload unavailable (%d)\n", __func__, rc);
+		rc = 0;
+	}
 	// initialize global fragmentation params
 	if (cdx_init_frag_module()) { 
 		printk("%s::cdx_init_frag_module failed\n", __func__);

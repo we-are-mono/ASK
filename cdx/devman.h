@@ -28,6 +28,8 @@ uint32_t dpa_get_timestamp_addr(uint32_t id);
 
 int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf);
 int dpa_add_wlan_if(char *name, struct _itf *itf, uint32_t vap_id, unsigned char* mac);
+int dpa_add_wg_if(char *name, struct _itf *itf, uint16_t wg_id,
+		  const unsigned char *mac, struct net_device *dev);
 void dpa_release_interface(uint32_t itf_id);
 
 int cdx_create_port_fqs(void);
