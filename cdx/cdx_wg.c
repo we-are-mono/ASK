@@ -24,6 +24,11 @@
  * Every dequeue callback runs in softirq: the portal's own NAPI drains it
  * (CONFIG_FSL_ASK_QMAN_PORTAL_NAPI, which registration requires), a volatile
  * dequeue included.
+ *
+ * WireGuard is optional. Its fast path and the flowtable's raw forward are
+ * bound by name when the first device registers (cdx_wg_bind()), never
+ * linked, so cdx loads without either module, and without WireGuard no device
+ * ever registers: the offload simply is not there.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -126,6 +131,96 @@ static bool cdx_wg_ready;
 /* Set first at exit: no frame notes a steer after it (every note is made in a
  * dequeue's RCU read section), and no work re-arms. */
 static bool cdx_wg_stopping;
+
+/* WireGuard's fast path and the flowtable's raw forward, bound by name while
+ * any device is registered (cdx_wg_bind()) instead of linked: neither
+ * wireguard nor nf_flow_table is a dependency of cdx, so a kernel or an image
+ * without them loads cdx as before and simply never registers a WireGuard
+ * device, and either module can be unloaded once no device is registered.
+ * Read under RCU. The datapath runs only while a device is registered, so it
+ * always finds them; the inline tick may outlive the last one, and is why
+ * the release waits out a grace period. */
+struct cdx_wg_ops {
+	typeof(wg_fastpath_seal) *seal;
+	typeof(wg_fastpath_open) *open;
+	typeof(wg_fastpath_receive) *receive;
+	typeof(wg_fastpath_rx_inline) *rx_inline;
+	typeof(nf_flow_offload_ip_raw) *ft_raw;
+	typeof(nf_flow_table_ingress) *ft_ingress;
+};
+static struct cdx_wg_ops cdx_wg_ops_store;
+static const struct cdx_wg_ops __rcu *cdx_wg_ops;
+/* Registered devices, each holding the binding; under the transaction. */
+static unsigned int cdx_wg_users;
+
+static void cdx_wg_put_syms(struct cdx_wg_ops *o)
+{
+	if (o->seal)
+		symbol_put(wg_fastpath_seal);
+	if (o->open)
+		symbol_put(wg_fastpath_open);
+	if (o->receive)
+		symbol_put(wg_fastpath_receive);
+	if (o->rx_inline)
+		symbol_put(wg_fastpath_rx_inline);
+	if (o->ft_raw)
+		symbol_put(nf_flow_offload_ip_raw);
+	if (o->ft_ingress)
+		symbol_put(nf_flow_table_ingress);
+	memset(o, 0, sizeof(*o));
+}
+
+/* Take the binding for one more device. -ENOENT: WireGuard (with its fast
+ * path) or the flowtable is not in this kernel or not loaded; nothing is
+ * held. Transaction held. */
+static int cdx_wg_bind(void)
+{
+	struct cdx_wg_ops *o = &cdx_wg_ops_store;
+
+	if (cdx_wg_users) {
+		cdx_wg_users++;
+		return 0;
+	}
+	o->seal = symbol_get(wg_fastpath_seal);
+	o->open = symbol_get(wg_fastpath_open);
+	o->receive = symbol_get(wg_fastpath_receive);
+	o->rx_inline = symbol_get(wg_fastpath_rx_inline);
+	o->ft_raw = symbol_get(nf_flow_offload_ip_raw);
+	o->ft_ingress = symbol_get(nf_flow_table_ingress);
+	if (!o->seal || !o->open || !o->receive || !o->rx_inline ||
+	    !o->ft_raw || !o->ft_ingress) {
+		cdx_wg_put_syms(o);
+		return -ENOENT;
+	}
+	cdx_wg_users = 1;
+	rcu_assign_pointer(cdx_wg_ops, o);
+	return 0;
+}
+
+/* Give one device's hold back; the last releases the modules, WireGuard
+ * decrypting as it did before (wg_fastpath_rx_inline()). Transaction held,
+ * and that device's queues gone, so only the inline tick can still be using
+ * a function. */
+static void cdx_wg_unbind(void)
+{
+	if (WARN_ON_ONCE(!cdx_wg_users) || --cdx_wg_users)
+		return;
+	RCU_INIT_POINTER(cdx_wg_ops, NULL);
+	synchronize_rcu();
+	cdx_wg_ops_store.rx_inline(false);
+	cdx_wg_put_syms(&cdx_wg_ops_store);
+}
+
+static void cdx_wg_rx_inline(bool all)
+{
+	const struct cdx_wg_ops *o;
+
+	rcu_read_lock();
+	o = rcu_dereference(cdx_wg_ops);
+	if (o)
+		o->rx_inline(all);
+	rcu_read_unlock();
+}
 
 /* The device a queue of registration `gen` may use, or NULL. Under RCU. */
 static struct net_device *cdx_wg_live(const struct cdx_wg_dev *w, u32 gen)
@@ -623,6 +718,7 @@ static bool cdx_wg_rx_raw(struct cdx_wg_rxq *q, const struct qm_fd *fd,
 	struct net_device *port = q->port, *wg;
 	struct dpa_priv_s *priv = netdev_priv(port);
 	struct dpa_percpu_priv_s *percpu_priv = raw_cpu_ptr(priv->percpu_priv);
+	const struct cdx_wg_ops *o = rcu_dereference(cdx_wg_ops);
 	unsigned int len, tot, ulen, ilen;
 	struct nf_flow_raw_xmit x;
 	struct eth_iface_info *eth;
@@ -638,7 +734,7 @@ static bool cdx_wg_rx_raw(struct cdx_wg_rxq *q, const struct qm_fd *fd,
 	    (READ_ONCE(wg_rx_raw) == 2 && !READ_ONCE(cdx_wg_raw_auto) && !q->ordered))
 		return false;
 	wg = cdx_wg_rxq_dev(q);
-	if (!wg)
+	if (!wg || unlikely(!o))
 		return false;
 	vaddr = phys_to_virt(qm_fd_addr(fd));
 	data = vaddr + dpa_fd_offset(fd);
@@ -670,8 +766,8 @@ static bool cdx_wg_rx_raw(struct cdx_wg_rxq *q, const struct qm_fd *fd,
 			return false;
 	}
 
-	switch (wg_fastpath_open(wg, iph, uh, port->ifindex, (u8 *)(uh + 1),
-				 ulen - sizeof(*uh), &inner, &ilen)) {
+	switch (o->open(wg, iph, uh, port->ifindex, (u8 *)(uh + 1),
+			ulen - sizeof(*uh), &inner, &ilen)) {
 	case WG_FP_PASS:
 		return false;
 	case WG_FP_CONSUMED:
@@ -685,9 +781,8 @@ static bool cdx_wg_rx_raw(struct cdx_wg_rxq *q, const struct qm_fd *fd,
 	percpu_priv->stats.rx_bytes += len;
 	cdx_wg_count(q, delivered);
 
-	if ((inner[0] >> 4) != 4 || !(ft = nf_flow_table_ingress(wg)) ||
-	    nf_flow_offload_ip_raw(ft, wg, (struct iphdr *)inner, ilen,
-				   cdx_wg_can_tx, &x)) {
+	if ((inner[0] >> 4) != 4 || !(ft = o->ft_ingress(wg)) ||
+	    o->ft_raw(ft, wg, (struct iphdr *)inner, ilen, cdx_wg_can_tx, &x)) {
 		cdx_wg_skip(q, s);
 		cdx_wg_rx_open_stack(q, wg, fd, data, inner, ilen);
 		return true;
@@ -787,14 +882,17 @@ static void cdx_wg_rxq_rx(struct cdx_wg_rxq *q, const struct qm_fd *fd,
 		kfree_skb(skb);
 		cdx_wg_count(q, dropped);
 		return;
-	case CDX_WG_RX_DELIVER:
+	case CDX_WG_RX_DELIVER: {
+		const struct cdx_wg_ops *o = rcu_dereference(cdx_wg_ops);
+
 		wg = cdx_wg_rxq_dev(q);
-		if (likely(wg)) {
-			wg_fastpath_receive(wg, skb);
+		if (likely(wg && o)) {
+			o->receive(wg, skb);
 			cdx_wg_count(q, delivered);
 			return;
 		}
 		fallthrough;
+	}
 	default:
 		/* A well-formed frame with its network header set: the stack
 		 * receives it as the port would have. */
@@ -1036,7 +1134,7 @@ static void cdx_wg_inline_fn(struct work_struct *work)
 		q->seen = d;
 	}
 	rcu_read_unlock();
-	wg_fastpath_rx_inline(cpumask_weight(&cpus) >= num_online_cpus());
+	cdx_wg_rx_inline(cpumask_weight(&cpus) >= num_online_cpus());
 	WRITE_ONCE(cdx_wg_raw_auto, cpumask_weight(&cpus) >= 2);
 	if (installed && !READ_ONCE(cdx_wg_stopping))
 		schedule_delayed_work(&cdx_wg_inline_work, HZ);
@@ -1121,7 +1219,7 @@ static void cdx_wg_steers_exit(void)
 	/* After the steer worker, which arms it; it re-arms only while not
 	 * stopping. */
 	cancel_delayed_work_sync(&cdx_wg_inline_work);
-	wg_fastpath_rx_inline(false);
+	cdx_wg_rx_inline(false);
 	cdx_ft_begin();
 	cdx_wg_steers_drop(NULL);
 	cdx_ft_end();
@@ -1179,6 +1277,7 @@ static void cdx_wg_steers_stats(const struct net_device *wg,
 static bool cdx_wg_seal(struct cdx_wg_sealq *sq, struct net_device *dev,
 			struct dpa_bp *dpa_bp, const struct qm_fd *in)
 {
+	const struct cdx_wg_ops *o = rcu_dereference(cdx_wg_ops);
 	struct cdx_wg_dev *w = sq->w;
 	struct eth_iface_info *eth;
 	struct wg_fastpath_tx tx;
@@ -1186,8 +1285,10 @@ static bool cdx_wg_seal(struct cdx_wg_sealq *sq, struct net_device *dev,
 	struct qman_fq *fq;
 	int i, err;
 
-	err = wg_fastpath_seal(dev, cdx_wg_can_tx, phys_to_virt(qm_fd_addr(in)),
-			       dpa_fd_offset(in), dpa_fd_length(in), dpa_bp->size, &tx);
+	if (unlikely(!o))
+		return false;
+	err = o->seal(dev, cdx_wg_can_tx, phys_to_virt(qm_fd_addr(in)),
+		      dpa_fd_offset(in), dpa_fd_length(in), dpa_bp->size, &tx);
 	if (err == -EXDEV && w->nq > 1) {
 		/* This CPU receives the tunnel: hand the frame, untouched, to
 		 * the device's seal queue on the next CPU. A flow's frames all
@@ -1380,10 +1481,15 @@ int cdx_wg_dev_add(struct net_device *dev, struct cdx_wg_dev **result)
 	}
 	if (!w)
 		return -ENOSPC;
+	/* WireGuard's fast path first: without it there is nothing to build. */
+	rc = cdx_wg_bind();
+	if (rc)
+		return rc;
 	w->id = w - cdx_wg_devs;
+	rc = -ENOMEM;
 	w->pc = alloc_percpu(struct cdx_wg_dev_pc);
 	if (!w->pc)
-		return -ENOMEM;
+		goto err_bind;
 	rc = cdx_wg_sealqs_create(w);
 	if (rc)
 		goto err_pc;
@@ -1417,6 +1523,8 @@ err_q:
 err_pc:
 	free_percpu(w->pc);
 	w->pc = NULL;
+err_bind:
+	cdx_wg_unbind();
 	return rc;
 }
 EXPORT_SYMBOL_NS_GPL(cdx_wg_dev_add, ASK_CDX_FLOWTABLE);
@@ -1444,6 +1552,8 @@ void cdx_wg_dev_del(struct cdx_wg_dev **wdev)
 	free_percpu(w->pc);
 	w->pc = NULL;
 	WRITE_ONCE(w->dev, NULL);
+	/* Last: nothing of this device's calls into WireGuard any more. */
+	cdx_wg_unbind();
 }
 EXPORT_SYMBOL_NS_GPL(cdx_wg_dev_del, ASK_CDX_FLOWTABLE);
 
