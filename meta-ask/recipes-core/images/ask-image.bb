@@ -32,6 +32,7 @@ IMAGE_INSTALL = " \
     traceroute \
     dropbear \
     strongswan \
+    wireguard-tools \
     \
     \
     vim \

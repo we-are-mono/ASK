@@ -113,6 +113,8 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://173-netfilter-nft_flow_offload-skip-br_netfilter-frames.patch \
            file://174-netfilter-flowtable-carry-transit-esp-and-ip-in-ip.patch \
            file://175-netfilter-flowtable-conntrack-sees-carried-replies.patch \
+           file://180-wireguard-serial-cpu-mask.patch \
+           file://181-wireguard-tx-lanes.patch \
           "
 
 SRCREV_kernel = "${KERNEL_SRCREV}"

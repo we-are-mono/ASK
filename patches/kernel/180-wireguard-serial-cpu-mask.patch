@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Mon, 9 Nov 2026 12:20:00 +0100
+Subject: [PATCH] wireguard: let a parameter restrict the serial work CPUs
+
+A peer's in-order transmit work runs on one CPU chosen as
+internal_id % online CPUs. On a four-core gateway a quarter of all
+peers land it on the CPU that also takes the NIC's receive interrupts,
+and the serial stage then shares a core with packet reception.
+
+wireguard.serial_cpus is a bitmask of CPUs that may host that work.
+0, the default, keeps the stock choice; so does a mask naming no online
+CPU. It is read when a peer picks its CPU, so set it before creating
+the peer.
+---
+--- a/drivers/net/wireguard/device.c
++++ b/drivers/net/wireguard/device.c
+@@ -233,6 +233,10 @@
+ 	return ret;
+ }
+
++unsigned long wg_serial_cpus;
++module_param_named(serial_cpus, wg_serial_cpus, ulong, 0644);
++MODULE_PARM_DESC(serial_cpus, "Bitmask of CPUs a peer's serial work may run on (0 = any online CPU)");
++
+ static const struct net_device_ops netdev_ops = {
+ 	.ndo_open		= wg_open,
+ 	.ndo_stop		= wg_stop,
+--- a/drivers/net/wireguard/queueing.h
++++ b/drivers/net/wireguard/queueing.h
+@@ -102,16 +102,26 @@
+ 	skb_reset_inner_headers(skb);
+ }
+
++/* Read only when a peer picks its serial CPU, so a change applies to peers
++ * created afterwards.
++ */
++extern unsigned long wg_serial_cpus;
++
+ static inline int wg_cpumask_choose_online(int *stored_cpu, unsigned int id)
+ {
+-	unsigned int cpu = *stored_cpu, cpu_index, i;
++	unsigned int cpu = *stored_cpu;
+
+ 	if (unlikely(cpu >= nr_cpu_ids ||
+ 		     !cpumask_test_cpu(cpu, cpu_online_mask))) {
+-		cpu_index = id % cpumask_weight(cpu_online_mask);
+-		cpu = cpumask_first(cpu_online_mask);
+-		for (i = 0; i < cpu_index; ++i)
+-			cpu = cpumask_next(cpu, cpu_online_mask);
++		const struct cpumask *mask = cpu_online_mask;
++		struct cpumask allowed;
++
++		cpumask_clear(&allowed);
++		cpumask_bits(&allowed)[0] = READ_ONCE(wg_serial_cpus);
++		/* An empty or offline-only mask keeps the stock choice. */
++		if (cpumask_and(&allowed, &allowed, cpu_online_mask))
++			mask = &allowed;
++		cpu = cpumask_nth(id % cpumask_weight(mask), mask);
+ 		*stored_cpu = cpu;
+ 	}
+ 	return cpu;
+--
+2.47.3
