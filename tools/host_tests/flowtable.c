@@ -8489,9 +8489,9 @@ static void upper_event(struct net_device *dev, unsigned devices)
 }
 
 /* A flow routed into a WireGuard device (cdx_wg.c), which has no link layer:
- * Netfilter describes it with zero Ethernet words -- the NOARP neighbour
- * arp_constructor() builds on a device with no header ops has a zero address,
- * and so has the device -- and the direction writes a made-up, locally
+ * Netfilter describes it with zero Ethernet words -- the device is NOARP with
+ * an address of no length, which arp_constructor() and ndisc_constructor()
+ * copy into its neighbour, leaving zero -- and the direction writes a made-up, locally
  * administered address as its source and destination (cdx_ft_wg_mac()), which
  * the seal overwrites. No neighbour is consulted, at admission or after it;
  * the entry is published on the watch list all the same, so the device's own
@@ -8546,6 +8546,11 @@ static void test_wireguard_egress(void)
      * built before an address change, as for any egress. */
     wg_fixture(); source_mac(&in);
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -ESTALE);
+    /* Destination words are required as Netfilter writes them, zero, as a ppp
+     * device's are, not ignored: a kernel that resolved something there is
+     * not silently overridden by the made-up address (A435). */
+    wg_fixture(); ethernet_dest(made_up);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
     /* Installed with no neighbour held, and on the watch list: the device's
      * retirement reaches the entry. */
     wg_fixture(); neigh_ok = false;

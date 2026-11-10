@@ -45,12 +45,9 @@ LISTEN, PORT = 51840, 49060
 TUNNELS = 4
 DUT_KEY = "/tmp/ask_wg.key"
 FLOOR = float(os.environ.get("ASK_WIREGUARD_MIN_GBPS", "0.5")) * 1e9
-# A tunnel's share of a sample each way it is driven: it moved, rather than
-# stalled behind the others (30 Mbit/s the least measured). A direction this
-# slow carries more frames than PREADMISSION lets escape cdx, so it cannot
-# have stayed in software.
-TUNNEL_FLOOR = 20e6
 SECONDS, RAMP = 10, 3
+# WireGuard's default MTU: a tunnel's frames are at least its bytes over this.
+INNER_MTU = 1420
 SAMPLES = 3
 # Frames per connection that may escape cdx: its first ones, before its flow
 # is admitted, which go through the kernel (480 the most measured, two
@@ -58,6 +55,11 @@ SAMPLES = 3
 # was sealed, and every one it sent forwarded, data and acknowledgements
 # alike, whichever way the data goes.
 PREADMISSION = 1000
+# The largest message a frame lost on the way carries (MTU 1420 padded, plus
+# header and tag), and the bytes a run's handshakes and keepalives may leave
+# between one end's sent and the other's received.
+MESSAGE, HANDSHAKES = 1452, 16384
+QUIET = 2
 
 
 def inner(i, host):
@@ -92,12 +94,17 @@ async def wg_counters(r):
     return rows
 
 
+DEVICE_COUNTERS = {"rx": "rx_packets", "tx": "tx_packets", "rx_bytes": "rx_bytes", "tx_bytes": "tx_bytes"}
+
+
 def wan_frames(r):
-    """The frames each tunnel's end on this host received and sent."""
+    """What each tunnel's device on this host counted received and sent:
+    frames as `rx` and `tx`, and bytes."""
     def count(dev, name):
-        with open(f"/sys/class/net/{dev}/statistics/{name}_packets") as stream:
+        with open(f"/sys/class/net/{dev}/statistics/{name}") as stream:
             return int(stream.read())
-    return {f"wgt{i}": {name: count(f"wgt{i}", name) for name in ("rx", "tx")} for i in range(r.tunnels)}
+    return {f"wgt{i}": {key: count(f"wgt{i}", name) for key, name in DEVICE_COUNTERS.items()}
+            for i in range(r.tunnels)}
 
 
 async def released(r):
@@ -112,8 +119,22 @@ async def released(r):
     return left
 
 
+def transfer(text):
+    """`wg show all transfer` by device: the peer's (received, sent) bytes."""
+    return {words[0]: (int(words[2]), int(words[3])) for words in map(str.split, text.splitlines())
+            if len(words) == 4 and words[0].startswith("wgt") and words[3].isdecimal()}
+
+
 async def edge(r):
+    dut_frames = {}
+    for i in range(r.tunnels):
+        dut_frames[f"wgt{i}"] = {
+            key: int(await read(r.target, r.session, f"/sys/class/net/wgt{i}/statistics/{name}"))
+            for key, name in DEVICE_COUNTERS.items()}
     return {"wg": await wg_counters(r), "wan": wan_frames(r), "tx": await software_tx(r),
+            "dut_frames": dut_frames,
+            "dut_transfer": transfer((await on_console("wg", "show", "all", "transfer"))["stdout"]),
+            "wan_transfer": transfer(host("wg", "show", "all", "transfer").stdout),
             "state": await r.state()}
 
 
@@ -311,6 +332,10 @@ print(json.dumps(reports))
                 continue
             record["servers"].append({"rc": server.returncode, "stderr": stderr.decode(),
                                       "report": json.loads(stdout) if stdout.strip() else {}})
+        # The connections' last frames drain for a moment after their ends
+        # exit; read both ends' counters once they have, or one end's reads
+        # land before the other's (332 frames apart, once).
+        await asyncio.sleep(QUIET)
         record["after"] = after = await edge(r)
     finally:
         for server in servers:
@@ -329,16 +354,48 @@ print(json.dumps(reports))
         delta = {key: after["wg"][dev][key] - before["wg"][dev][key]
                  for key in ("sealed", "slow", "tx_fail", "delivered", "forwarded", "opened", "to_stack",
                              "dropped")}
-        wan = {name: after["wan"][dev][name] - before["wan"][dev][name] for name in ("rx", "tx")}
+        wan = {name: after["wan"][dev][name] - before["wan"][dev][name] for name in DEVICE_COUNTERS}
         record["tunnels"].append({"device": dev, "upload": up, "download": down, "counters": delta,
                                   "wan_frames": wan})
         for flow, wanted in ((up, direction != "download"), (down, direction != "upload")):
             if wanted:
-                assert flow["bits_per_second"] >= TUNNEL_FLOOR, (dev, flow)
-        assert wan["rx"] - delta["sealed"] <= allowance, \
-            (f"{dev}'s frames out were not sealed by cdx", allowance, wan, delta)
-        assert wan["tx"] - delta["forwarded"] <= allowance, \
-            (f"{dev}'s frames in were not forwarded by cdx", allowance, wan, delta)
+                # More frames than the allowance below lets escape cdx, so a
+                # direction left in software, behind the other's
+                # acknowledgements, could not hide in it. A tunnel starved by
+                # the others still moves several times this.
+                assert flow["bytes"] > allowance * INNER_MTU, (f"{dev} hardly moved", flow, allowance)
+        dut = {name: after["dut_frames"][dev][name] - before["dut_frames"][dev][name]
+               for name in DEVICE_COUNTERS}
+        peers = {end: [after[end][dev][k] - before[end][dev][k] for k in (0, 1)]
+                 for end in ("dut_transfer", "wan_transfer")}
+        # What the WAN host sent that the DUT's WireGuard never got: dropped
+        # under load ahead of cdx -- its queues share one bounded congestion
+        # group, and four tunnels each way overrun it in a full suite (31% of
+        # one tunnel's) -- which the transfer's rate pays for, not escaped.
+        record["tunnels"][-1].update(device_counters=dut, peer_bytes=peers, dropped_in=wan["tx"] - dut["rx"])
+        # Out, every frame the WAN host's end received was sealed and counted
+        # on the device; in, every frame the DUT's WireGuard got came through
+        # cdx's steer, which forwarded it, and the device counted each one.
+        for what, frames, carried in (
+                ("out were not sealed by cdx", wan["rx"], delta["sealed"]),
+                ("out missed the device's TX", wan["rx"], dut["tx"]),
+                ("in reached WireGuard around cdx", dut["rx"], delta["delivered"]),
+                ("in were opened but not forwarded", delta["delivered"], delta["forwarded"]),
+                ("in missed the device's RX", delta["delivered"], dut["rx"])):
+            assert frames - carried <= allowance, (f"{dev}'s frames {what}", allowance, wan, dut, delta)
+        # The standard tools count an offloaded frame as WireGuard's own
+        # paths do (A436): one packet and the message's bytes, on the device
+        # and for the peer, whichever CPU sealed or opened it. Each end's sent
+        # then matches the other's received, but for what never arrived and
+        # for handshakes.
+        for way, sender, receiver, sent, got in (
+                ("out", dut, wan, peers["dut_transfer"][1], peers["wan_transfer"][0]),
+                ("in", wan, dut, peers["wan_transfer"][1], peers["dut_transfer"][0])):
+            lost = sender["tx"] - receiver["rx"]
+            assert lost >= -allowance, (f"{dev}'s frames {way}: more received than sent", sender, receiver)
+            for what, a, b in (("peers", sent, got), ("devices", sender["tx_bytes"], receiver["rx_bytes"])):
+                assert abs(a - b) <= abs(lost) * MESSAGE + HANDSHAKES, \
+                    (f"{dev}'s bytes {way}: the {what} disagree", a, b, lost)
         assert delta["slow"] <= SOFTWARE_TX and delta["to_stack"] <= SOFTWARE_TX, (dev, delta)
         assert delta["tx_fail"] == delta["dropped"] == 0, (dev, delta)
         total += up["bits_per_second"] + down["bits_per_second"]

@@ -2516,7 +2516,12 @@ static int ft_parse(struct cdx_ft_binding *binding,
 					  -ESTALE : -EOPNOTSUPP);
 		ether_addr_copy(out->dst_mac, out->out_tunnel.mac);
 	} else if (l3) {
-		/* No neighbour: the seal overwrites what the entry writes. */
+		/* No neighbour: the seal overwrites what the entry writes. The
+		 * device is NOARP with an address of no length, so its
+		 * neighbour's address -- copied from the device's own -- is
+		 * zero, as a ppp device's is. */
+		if (!is_zero_ether_addr(ethernet))
+			return ask_refuse(-EOPNOTSUPP);
 		ether_addr_copy(out->dst_mac, l3_mac);
 	} else {
 		if (!is_valid_ether_addr(ethernet) ||

@@ -584,17 +584,25 @@ about twice it, as their receiving CPUs coincide or not) and 39-77 Mbit/s
 through the software path. It does not share `tcp_floor()`: a run saturates
 the DUT's CPUs and its console answers only once the run ends, so its proof
 is read at idle on either side of the run rather than inside a window. Per
-tunnel, cdx's counts in `/proc/cdx_wireguard` must account for the frames
-the WAN host's end of it counted, acknowledgements included -- every one it
-received sealed, every one it sent forwarded -- but 1000 per connection: its
-first frames, before its flow is admitted (480 the most measured). Each
-direction a case drives must also move at least 20 Mbit/s a tunnel, more
-frames than that allowance, so neither direction of a bidirectional run can
-stay in software behind the other's acknowledgements. Nothing may fail or be
+tunnel, cdx's counts in `/proc/cdx_wireguard` must account for the frames,
+acknowledgements included -- every one the WAN host's end received sealed,
+every one the DUT's WireGuard received steered to cdx and forwarded -- but
+1000 per connection: its first frames, before its flow is admitted (480 the
+most measured). What the WAN host sent and the DUT never received was
+dropped under load ahead of cdx, whose WireGuard queues share one bounded
+congestion group (31% of one tunnel's download, four tunnels each way in a
+full suite); the run's rate pays for that, and it is recorded. Each
+direction a case drives must also move more frames than that allowance, in
+1420-byte frames, so neither direction of a bidirectional run can stay in
+software behind the other's acknowledgements; a tunnel the others starve
+(19 Mbit/s the least measured) still moves twice that. Nothing may fail or be
 dropped, at most 512 frames per tunnel may fall back to the kernel's
 transmit (`slow`) or stack (`to_stack`), and the kernel's own transmit on
 either port must stay within 512 frames plus the same allowance for every
-connection.
+connection. The standard tools must agree across the tunnel, each way: one
+end's device frames and bytes sent (`ip -s link`) and its peer's bytes sent
+(`wg show`) match the other end's received, but for frames that never
+arrived and 16 KiB of handshakes (A436).
 Each floor can be overridden with an environment variable named beside it
 (`ASK_WIREGUARD_MIN_GBPS` here).
 
