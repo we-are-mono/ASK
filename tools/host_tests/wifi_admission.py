@@ -9,18 +9,24 @@ the wide one, which no assertion about behaviour on the rig would catch.
 from ask_orch.process import run_process
 
 import os
+import re
 from pathlib import Path
 
 from _host_qos_lifecycle import (function)
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "cdx/cdx_flowtable_backend.c"
+HEADER = ROOT / "cdx/cdx_flowtable_backend.h"
 
 
 def test_wifi_admission(tmp_path):
     source = SOURCE.read_text()
     (tmp_path / "wifi_admission_production.inc").write_text(
-        "\n".join(function(source, name) for name in [
+        # What lets a WireGuard device, which has no Ethernet header, past
+        # the gate both predicates share: compiled, so the gate is judged
+        # against the real recognition rather than a stand-in for it.
+        function(HEADER.read_text(), "cdx_ft_wg_dev")
+        + "\n".join(function(source, name) for name in [
             "cdx_ft_onif_type",
             "cdx_ft_port_supported",
             "cdx_ft_egress_supported",
@@ -46,10 +52,18 @@ def test_hardware_path_agrees_with_admission():
     was opened -- so assert the two sets are still the same set."""
     hw = (ROOT / "cdx/cdx_flowtable_hw.c").read_text()
     egress = function(hw, "ft_hw_egress_onif")
-    # The whole body, not two substrings: a third accepted type, or one of
-    # these two dropped, would still contain both names.
-    body = " ".join(egress.split("{", 1)[1].rsplit("}", 1)[0].split())
+    # The whole body, not substrings: a fourth accepted type, or one of
+    # these three dropped, would still contain the others. Comments say why
+    # and are not the set.
+    body = re.sub(r"/\*.*?\*/", " ", egress.split("{", 1)[1].rsplit("}", 1)[0], flags=re.S)
+    body = " ".join(body.split())
     assert body == ("return type == (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL) || "
-                    "type == (IF_TYPE_WLAN | IF_TYPE_PHYSICAL);"), body
+                    "type == (IF_TYPE_WLAN | IF_TYPE_PHYSICAL) || "
+                    "type == (IF_TYPE_WG | IF_TYPE_PHYSICAL);"), body
+    # And they are the set the admission predicate accepts as an egress,
+    # which names each of them.
+    admission = function(SOURCE.read_text(), "cdx_ft_egress_supported")
+    for onif in ("IF_TYPE_ETHERNET", "IF_TYPE_WLAN", "IF_TYPE_WG"):
+        assert f"type == ({onif} | IF_TYPE_PHYSICAL)" in admission, onif
     # The ingress beside it must not have been widened by the same edit.
     assert "in->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL)" in hw

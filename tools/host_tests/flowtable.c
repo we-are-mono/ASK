@@ -277,6 +277,11 @@ struct bridge_vlan_info { u16 vid, flags; };
  * mode an IPv6 one around an IPv4 packet. */
 #define ARPHRD_TUNNEL6 769
 #define ARPHRD_SIT 776
+/* And a WireGuard device, which has no link layer at all and is told apart by
+ * that and its link kind (cdx_ft_wg_dev(), compiled from the backend's
+ * header). Only the kind is modelled of a device's link ops. */
+#define ARPHRD_NONE 0xFFFE
+struct rtnl_link_ops { const char *kind; };
 /* addr_len and priv exist for those two alone. Both are NOARP but both have
  * header ops, so arp_constructor() and ndisc_constructor() copy dev_addr --
  * the tunnel's local endpoint, four bytes or sixteen -- into every neighbour
@@ -299,6 +304,7 @@ struct net_device_ops {
 struct net_device { int ifindex, refs, mtu, ip6_mtu; u8 dev_addr[6]; struct net *net; bool carrier_lost, down;
                     unsigned short type; unsigned char addr_len; void *priv;
                     const struct net_device_ops *netdev_ops;
+                    const struct rtnl_link_ops *rtnl_link_ops;
                     struct net_device *real_dev; u16 vlan_id; __be16 vlan_proto;
                     bool bridge, vlan_filtering, stp_blocked, mst; struct net_device *master;
                     u16 br_proto, pvid; struct br_vlan_entry br_vlans[BR_MAX_VLANS];
@@ -593,6 +599,13 @@ static void ft_wifi_reconsider(struct net_device *dev) { (void)dev; wifi_reconsi
 static void ft_wifi_address_changed(struct net_device *dev) { (void)dev; wifi_address_changes++; }
 static void ft_wifi_device_gone(struct net_device *dev) { (void)dev; wifi_devices_gone++; }
 static void ft_wifi_exit(void) { }
+/* The WireGuard egress registration (ask_flowtable_wg.c) likewise: the same
+ * worker machinery as the Wi-Fi one, and the same calls from the notifier,
+ * counted. */
+static unsigned wg_reconsiders, wg_devices_gone;
+static void ft_wg_reconsider(struct net_device *dev) { (void)dev; wg_reconsiders++; }
+static void ft_wg_device_gone(struct net_device *dev) { (void)dev; wg_devices_gone++; }
+static void ft_wg_exit(void) { }
 #define switchdev_notifier_info_to_dev(p) (((struct switchdev_notifier_info *)(p))->dev)
 struct dst_ops { unsigned family; };
 /* Only the field the adapter reads off a transform: what leaves the port is
@@ -8475,6 +8488,75 @@ static void upper_event(struct net_device *dev, unsigned devices)
     assert(!devices || swept[0] == dev);
 }
 
+/* A flow routed into a WireGuard device (cdx_wg.c), which has no link layer:
+ * Netfilter describes it with zero Ethernet words -- the NOARP neighbour
+ * arp_constructor() builds on a device with no header ops has a zero address,
+ * and so has the device -- and the direction writes a made-up, locally
+ * administered address as its source and destination (cdx_ft_wg_mac()), which
+ * the seal overwrites. No neighbour is consulted, at admission or after it;
+ * the entry is published on the watch list all the same, so the device's own
+ * events retire it. The fixture's egress port stands in for the device, an
+ * egress only as the VAP is (vap_dev). TCP, because the device's MTU is below
+ * the LAN's. */
+static const struct rtnl_link_ops wireguard_link = { .kind = "wireguard" };
+static void wg_fixture(void)
+{
+    tcp_fixture();
+    vap_dev = &out;
+    out.type = ARPHRD_NONE;
+    out.rtnl_link_ops = &wireguard_link;
+    memset(out.dev_addr, 0, ETH_ALEN);
+    out.mtu = cls.nf_mtu = 1420;
+    source_mac(&out);
+    zero_ethernet_dest();
+}
+
+static void wg_unfixture(void)
+{
+    vap_dev = NULL;
+    out.type = ARPHRD_ETHER;
+    out.rtnl_link_ops = NULL;
+    memcpy(out.dev_addr, (u8[]){2, 0, 0, 0, 0, 2}, ETH_ALEN);
+    out.mtu = 1500;
+    neigh_ok = true;
+}
+
+static void test_wireguard_egress(void)
+{
+    static const struct rtnl_link_ops dummy = { .kind = "dummy" };
+    struct cdx_ft_rule decoded;
+    u8 made_up[ETH_ALEN];
+
+    wg_fixture();
+    cdx_ft_wg_mac(&out, made_up);
+    assert(is_valid_ether_addr(made_up));
+    /* Admitted with every neighbour lookup failing, and none attempted. */
+    neigh_ok = false;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && !neigh_lookups);
+    assert(decoded.out == &out && decoded.out_logical == &out && !decoded.out_vlans &&
+           !decoded.out_session.present && !decoded.out_tunnel.present);
+    assert(ether_addr_equal(decoded.src_mac, made_up) &&
+           ether_addr_equal(decoded.dst_mac, made_up));
+    assert(decoded.mtu == 1420);
+    /* The made-up address is what admits it: the same device by another kind
+     * has only its own, zero, address to write. */
+    wg_fixture(); out.rtnl_link_ops = &dummy;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    /* Source words naming an address the device does not have are an offer
+     * built before an address change, as for any egress. */
+    wg_fixture(); source_mac(&in);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -ESTALE);
+    /* Installed with no neighbour held, and on the watch list: the device's
+     * retirement reaches the entry. */
+    wg_fixture(); neigh_ok = false;
+    admitted();
+    assert(!ft_neighbour_refs && !neighbour.refs && !gateway.refs && out.refs == 1);
+    ft_device_retire(&out, &ft_link_invalidations);
+    assert(handle.invalid);
+    retired(&out);
+    wg_unfixture();
+}
+
 static void test_device_dependencies(void)
 {
     struct net other_net;
@@ -10213,6 +10295,7 @@ int main(void)
     test_pppoe();
     test_pppoe_stats();
     test_pppoe_session_ended();
+    test_wireguard_egress();
     test_tunnel();
     test_tunnel_stats();
     test_snat();

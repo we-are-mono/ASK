@@ -24,6 +24,7 @@ typedef u32 U32;
 #define ETH_ALEN 6
 #define IF_TYPE_ETHERNET 1
 #define IF_TYPE_WLAN 32
+#define IF_TYPE_WG 64
 #define IF_TYPE_PHYSICAL 128
 /* ASK-DEBUG tracing is a printk in production; nothing to observe here. */
 #define ASK_DBG_REFUSE 1
@@ -158,6 +159,9 @@ static void host_log(const char *format, ...)
 #define WRITE_ONCE(x, value) ((x) = (value))
 #define ASSERT_RTNL() assert(rtnl)
 #define ARPHRD_ETHER 1
+/* What a WireGuard device is, with no link layer. The backend tells one apart
+ * by that and its link kind (cdx_ft_wg_dev(), compiled from the header). */
+#define ARPHRD_NONE 0xFFFE
 #define ether_addr_equal(a,b) (!memcmp(a,b,6))
 #define is_valid_ether_addr(a) (!((a)[0] & 1) && memcmp(a, (u8[6]){0}, 6))
 #define CDX_DEBUG_FLOWTABLE 1
@@ -177,6 +181,8 @@ static void host_log(const char *format, ...)
 #define struct_size(p, member, count) (sizeof(*(p)) + sizeof(*(p)->member) * (count))
 struct net { int unused; };
 static struct net init_net, other_net;
+/* Only the kind, which is all the backend asks of a device's link ops. */
+struct rtnl_link_ops { const char *kind; };
 struct net_device {
     char name[8];
     struct net *net;
@@ -184,6 +190,7 @@ struct net_device {
     bool l3_slave, running, carrier, switch_port;
     u8 dev_addr[6], perm_addr[6];
     int ifindex;
+    const struct rtnl_link_ops *rtnl_link_ops;
 };
 /* A DPAA MAC reports no switch parent, which is what dev_get_port_parent_id()
  * signals by leaving -EOPNOTSUPP as the answer. A port that does report one
@@ -223,6 +230,7 @@ struct dpa_iface_info {
      * netdev's, read where the header is encoded. */
     struct { struct net_device *net_dev; } eth_info;
     struct { struct net_device *net_dev; uint16_t vap_id; } wlan_info;
+    struct { struct net_device *net_dev; uint16_t wg_id; } wg_info;
 };
 static struct dpa_iface_info out_iface = { .if_flags=129, .itf_id=2 };
 static struct dpa_iface_info in_iface = { .next=&out_iface, .if_flags=129, .itf_id=1 };
@@ -232,6 +240,14 @@ static struct dpa_iface_info *dpa_interface_info = &in_iface;
 static bool vap_open;
 static bool dpaa_vwd_vap_is_open(const struct net_device *d) { return d && vap_open; }
 static bool dpaa_vwd_vap_owns(uint16_t vap_id, const struct net_device *d) { (void)vap_id; return d && vap_open; }
+/* cdx_wg.c's answers about a WireGuard device, the same pair: the device has
+ * an open registration, and registration `id` is the device's. Both say "not
+ * registered" unless the WireGuard case in test_backend() registers `wg_dev`
+ * as `wg_id`. */
+static const struct net_device *wg_dev;
+static uint16_t wg_id;
+static bool cdx_wg_dev_is_open(const struct net_device *d) { return d && d == wg_dev; }
+static bool cdx_wg_owns(uint16_t id, const struct net_device *d) { return d && d == wg_dev && id == wg_id; }
 static bool dpa_devlist_lock;
 static void spin_lock(bool *l) { assert(!*l); *l=true; }
 static void spin_unlock(bool *l) { assert(*l); *l=false; }
@@ -1728,6 +1744,67 @@ static void test_backend(void)
     out_onif.flags=0; assert(!cdx_ft_port_supported(&out)); out_onif.flags=ENTRY_VALID;
     out_iface.itf_id=L2_MAX_ONIF; assert(!cdx_ft_port_supported(&out)); out_iface.itf_id=2;
     out_iface.eth_info.net_dev=&in; assert(!cdx_ft_port_supported(&out)); out_iface.eth_info.net_dev=&out;
+    /* A WireGuard device (cdx_wg.c) is an egress, never an ingress: it has no
+     * link layer and passes the header gate only by its link kind; it is
+     * found through its own arm of the interface lookup only while the
+     * registration the record names is the device's; and both the admission
+     * gate and the encoder's take its onif type. The record and onif are
+     * out's, retyped, so the encoder stub's expectations still hold. */
+    {
+        static const struct rtnl_link_ops wireguard = { .kind = "wireguard" };
+        static const struct rtnl_link_ops dummy = { .kind = "dummy" };
+        struct net_device wg = out;
+        u8 port_mac[ETH_ALEN];
+
+        strcpy(wg.name, "wg0");
+        wg.type = ARPHRD_NONE; wg.addr_len = 0; memset(wg.dev_addr, 0, ETH_ALEN);
+        wg.rtnl_link_ops = &wireguard;
+        out_iface.if_flags = out_itf.type = IF_TYPE_WG | IF_TYPE_PHYSICAL;
+        out_iface.wg_info.net_dev = &wg; out_iface.wg_info.wg_id = 3;
+        rule.out = rule.out_logical = &wg;
+        /* The source the entry writes is the made-up one (cdx_ft_wg_mac()),
+         * which the backend's own source check has to take. */
+        ether_addr_copy(port_mac, rule.src_mac);
+        cdx_ft_wg_mac(&wg, rule.src_mac);
+        ether_addr_copy(expected_src_mac, rule.src_mac);
+        /* No registration, or the record naming an earlier one: the lookup
+         * finds nothing, so there is no onif to judge. */
+        assert(!cdx_ft_egress_supported(&wg) && !cdx_ft_port_supported(&wg));
+        assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw);
+        wg_dev = &wg; wg_id = 4;
+        assert(!cdx_ft_egress_supported(&wg));
+        assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw);
+        wg_id = 3;
+        assert(cdx_ft_egress_supported(&wg) && !cdx_ft_port_supported(&wg));
+        assert(cdx_ft_add(&rule,&stats,&hw) == 0 && hw); assert(cdx_ft_del(&hw) == 0 && !hw);
+        /* The encoder's gate on its own, past admission. */
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0 && hw); assert(cdx_ft_hw_del(&hw) == 0 && !hw);
+        /* Not an ingress, whatever it is as an egress. */
+        rule.in = &wg; assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw); rule.in = &in;
+        /* Without PHYSICAL the type is neither gate's. */
+        out_itf.type = IF_TYPE_WG;
+        assert(!cdx_ft_egress_supported(&wg));
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw);
+        out_itf.type = IF_TYPE_WG | IF_TYPE_PHYSICAL;
+        /* A device with no link layer that is not WireGuard is refused at the
+         * header gate, registration or not; so is a device that only claims
+         * the kind over an Ethernet header it does not have. */
+        wg.rtnl_link_ops = &dummy; assert(!cdx_ft_egress_supported(&wg));
+        wg.rtnl_link_ops = NULL; assert(!cdx_ft_egress_supported(&wg));
+        wg.rtnl_link_ops = &wireguard;
+        wg.type = ARPHRD_ETHER; assert(!cdx_ft_egress_supported(&wg)); wg.type = ARPHRD_NONE;
+        /* The gates every egress shares still apply to it. */
+        wg.running = false; assert(!cdx_ft_egress_supported(&wg)); wg.running = true;
+        wg.carrier = false; assert(!cdx_ft_egress_supported(&wg)); wg.carrier = true;
+        wg.net = &other_net; assert(!cdx_ft_egress_supported(&wg)); wg.net = &init_net;
+        assert(cdx_ft_egress_supported(&wg));
+        wg_dev = NULL;
+        ether_addr_copy(rule.src_mac, port_mac);
+        ether_addr_copy(expected_src_mac, port_mac);
+        rule.out = rule.out_logical = &out;
+        out_iface.if_flags = out_itf.type = IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL;
+        out_iface.wg_info.net_dev = NULL;
+    }
     ft_observe=true; assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw); ft_observe=false;
     /* The same backlog refuses admission, and admission is what retries its
      * barrier in steady state -- at most once a second, not once per flow. */

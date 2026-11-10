@@ -63,9 +63,9 @@ unloads.
    `/proc/net/` entry would show that namespace's view.
 6. **Unprefixed keys belong to routed unicast**, the flowtable proper. Every
    other feature's keys carry its prefix: `ipsec_`, `mcast_`, `mroute_`,
-   `l2_`, `detour_`, `qos_`, `wifi_`, and the per-kind `session_`, `vlan_`
-   and `tunnel_`. The old header already followed this rule, so no key is
-   renamed.
+   `l2_`, `detour_`, `qos_`, `wifi_`, `wg_`, and the per-kind `session_`,
+   `vlan_` and `tunnel_`. The old header already followed this rule, so no
+   key is renamed.
 
 ## Format
 
@@ -119,6 +119,7 @@ pasted on its own.
 | Routed multicast (MFC) | the same encoder | `ip mroute show` (`offload`), `ip -s mroute` (folded on every read of `mroute`) | `mroute` rows; `mroute_*` |
 | IPsec ESP packet offload | SEC descriptor and classifier entry per SA | `ip -s xfrm state` (`curlft` folded); `/proc/net/xfrm_stat` on kernels with `CONFIG_XFRM_STATISTICS` | `ipsec_sas`/`ipsec_sa_cache` in `status`; `ipsec_*` refusal counts in `stats`; `sa=`/`in_sa=` on `flows` |
 | Wi-Fi VAP | VWD registration on an offline port | `/sys/class/vwd/vwd0/<ifname>` (cdx) | `wifi_vaps` in `status`; `wifi_refused` in `stats` |
+| WireGuard device | a logical interface, its device record and one seal queue per QMan-affine CPU; for its download, a classifier entry per peer's outer tuple (up to 16) steering it to an ordered queue of its own; one congestion group for every device | `/proc/cdx_wireguard` (cdx), one line per registered device with its counters | `wg_devs` in `status`; `wg_refused` in `stats` |
 | Offline-port detour (IPv4 UDP larger than the path) | offline port | none | `detour`, `detour_flows` in `status`; `detour_*` in `stats`; `detour=` on `flows` |
 | QoS: mark to class, DSCP remark, HTB/CEETM, policers | a class field on the entry, the CEETM tree, the ingress policer pool | `tc -s class show`, `tc -s filter show`, `ethtool -S` | `qos=` on `flows`; `qos_*` in `status` and `stats`; `qos_ports` and `qos_classes` rows |
 
@@ -172,6 +173,7 @@ read under the QoS mutex, one port at a time.
 | `mroute_groups`, `mroute_installed`, `mroute_policy_rules`, `mroute_ruleset_settled` | the routed learner's groups, what is in hardware, and the policy rules and ruleset state that hold groups back |
 | `l2_enabled`, `l2_entries`, `l2_hook_kinds`, `l2_confirming` | bridged unicast switching: active, pairs in hardware, the other bridge hooks present, whether frames confirm pairs |
 | `wifi_vaps` | VAPs registered |
+| `wg_devs` | WireGuard devices registered with cdx: every running one in the initial namespace cdx can offload, whether or not a flowtable lists it. One being retired leaves the count when its retirement starts, and `/proc/cdx_wireguard` lists it until cdx has let it go |
 | `qos_channels`, `qos_channels_used`, `qos_channels_held`, `qos_channels_free` | the SoC's CEETM channels: how many the device tree gives (`fsl,ceetm-channel-range`, at most 32), how many are mapped to a port's tree, how many no tree may claim yet -- quarantined for a port whose tree went until its flowtable entries are retired or rebuilt, or out of service after a drain failed -- and the rest |
 | `qos_policers`, `qos_policers_used`, `qos_policers_free` | the FMan-wide pool of ingress policer profiles a flower filter on any port draws from (63; profile 0 is the default and not the pool's); a profile still held for the flows of a filter that went counts as used |
 | `qos_leaves_per_port` | the leaf classes a port's tree may have (64) |
@@ -223,6 +225,7 @@ the module is loaded. The reader loads each one with `READ_ONCE()` or
 | routed multicast | `mroute_refused`, `mroute_install_errors`, `mroute_lost`, `mroute_capped`, `mroute_xfrm_changes`, `mroute_ruleset_changes`, `mroute_confirm_errors`, `mroute_port_probe_errors`, `mroute_xtables_changes` |
 | bridged unicast | `l2_installs`, `l2_refused`, `l2_held`, `l2_retired`, `l2_dropped`, `l2_deferred`, `l2_unconfirmed`, `l2_ruleset_changes` |
 | Wi-Fi | `wifi_refused` |
+| WireGuard | `wg_refused` (running WireGuard devices cdx could offload that were not registered: cdx refused or could not build the registration, the device had stopped or was unregistering by the time it was tried, or there was no memory to track it; each is tried again only on the device's next event) |
 
 ## Row files
 

@@ -279,11 +279,18 @@ static bool ipv6_prefix_equal(const void *a, const void *b, unsigned int len)
 typedef u64 netdev_features_t;
 #define NETIF_F_HW_ESP ((netdev_features_t)1 << 40)
 struct xfrmdev_ops;
+/* What the rule header's WireGuard predicate (cdx_ft_wg_dev()) reads: the
+ * device type and link kind. Nothing IPsec decides asks it, and no device
+ * here is WireGuard; the fields exist for the header to compile as written. */
+#define ARPHRD_NONE 0xFFFE
+struct rtnl_link_ops { const char *kind; };
 struct net_device {
 	const char *name;
 	int ifindex;
 	unsigned int mtu;
 	u8 dev_addr[ETH_ALEN];
+	unsigned short type;
+	const struct rtnl_link_ops *rtnl_link_ops;
 	bool physical;
 	unsigned refs;
 	/* What the attachment writes: the ops, and the capability in all

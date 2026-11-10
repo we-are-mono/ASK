@@ -138,7 +138,11 @@ def test_hardware_ownership(tmp_path):
                          (ROOT / "cdx/cdx_pcd.h").read_text())[1])
     assert f"memset(key, 0, {size});" in session and f"return {size};" in session, session
     (tmp_path / "hardware_production.inc").write_text(
-        function((ROOT / "cdx/cdx_ehash.c").read_text(), "fill_tunnel_key")
+        # The key body is shared with the receive steer, which has no entry
+        # to read the family and protocol from; fill_tunnel_key() only
+        # unpacks an entry's into it.
+        function((ROOT / "cdx/cdx_ehash.c").read_text(), "fill_tunnel_key_proto")
+        + function((ROOT / "cdx/cdx_ehash.c").read_text(), "fill_tunnel_key")
         + session
         + source[source.index("struct cdx_ft_hw {"):])
     backend = (ROOT / "cdx/cdx_flowtable_backend.c").read_text()

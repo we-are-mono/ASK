@@ -35,6 +35,8 @@ typedef uint32_t u32;
 #define ETH_ALEN 6
 #define ARPHRD_ETHER 1
 #define ARPHRD_PPP 512
+/* A WireGuard device's: no link layer at all. */
+#define ARPHRD_NONE 0xFFFE
 #define L2_MAX_ONIF 64
 #define ENTRY_VALID 1
 
@@ -44,9 +46,14 @@ typedef uint32_t u32;
  * the adapter uses, not merely against each other. */
 #define IF_TYPE_ETHERNET (1 << 0)
 #define IF_TYPE_WLAN     (1 << 5)
+#define IF_TYPE_WG       (1 << 6)
 #define IF_TYPE_PHYSICAL (1 << 7)
 
 enum { NETREG_REGISTERED = 0, NETREG_UNREGISTERING = 1 };
+
+/* Only the kind, which is how the backend tells a WireGuard device apart
+ * (cdx_ft_wg_dev(), compiled from its header). */
+struct rtnl_link_ops { const char *kind; };
 
 struct net_device {
 	char name[16];
@@ -58,6 +65,7 @@ struct net_device {
 	bool l3_slave;
 	bool switch_port;
 	bool in_init_net;
+	const struct rtnl_link_ops *rtnl_link_ops;
 };
 
 struct _itf { u32 index; U8 type; };
@@ -72,6 +80,7 @@ static struct _itf itf_table[L2_MAX_ONIF];
  * is how an unresolvable device presents. */
 static struct net_device *owner[L2_MAX_ONIF];
 static bool vap_open_answer;
+static bool wg_open_answer;
 
 static bool net_eq_init(const struct net_device *d) { return d->in_init_net; }
 static bool netif_is_l3_slave(const struct net_device *d) { return d->l3_slave; }
@@ -94,6 +103,13 @@ static bool dpaa_vwd_vap_is_open(const struct net_device *dev)
 {
 	(void)dev;
 	return vap_open_answer;
+}
+/* cdx_wg.c's answer for a WireGuard egress, which plays the VAP's part: its
+ * seal queues are built during registration. */
+static bool cdx_wg_dev_is_open(const struct net_device *dev)
+{
+	(void)dev;
+	return wg_open_answer;
 }
 
 /* The production predicates read this through dev_get_port_parent_id(); the
@@ -139,11 +155,25 @@ static struct net_device *mkdev(const char *name, U8 onif_type)
 	return d;
 }
 
+/* A WireGuard device on a WireGuard onif: no link layer, recognised by its
+ * link kind, registered as cdx_wg_dev_add() registers one. */
+static const struct rtnl_link_ops wireguard = { .kind = "wireguard" };
+static struct net_device *mkwg(const char *name)
+{
+	struct net_device *d = mkdev(name, IF_TYPE_WG | IF_TYPE_PHYSICAL);
+
+	d->type = ARPHRD_NONE;
+	d->addr_len = 0;
+	d->rtnl_link_ops = &wireguard;
+	return d;
+}
+
 static void reset(void)
 {
 	memset(owner, 0, sizeof(owner));
 	ndevs = 0;
 	vap_open_answer = true;
+	wg_open_answer = true;
 }
 
 /* The contract itself: ethernet is both, a VAP is egress only. */
@@ -270,6 +300,86 @@ static void test_onif_consistency(void)
 	reset();
 }
 
+/* A WireGuard device takes the VAP's side of the same asymmetry: an egress
+ * while its registration is open, never an ingress -- its frames are sealed
+ * by WireGuard, not sent by a port. */
+static void test_wireguard_egress(void)
+{
+	struct net_device *wg = mkwg("wg0");
+	struct net_device *vap = mkdev("uap0", IF_TYPE_WLAN | IF_TYPE_PHYSICAL);
+
+	assert(cdx_ft_egress_supported(wg));
+	assert(!cdx_ft_port_supported(wg));
+	/* The seal queues an entry would name are built as it registers. */
+	wg_open_answer = false;
+	assert(!cdx_ft_egress_supported(wg));
+	/* Its own answer, not the VAP's, and the VAP's not its. */
+	assert(cdx_ft_egress_supported(vap));
+	wg_open_answer = true;
+	vap_open_answer = false;
+	assert(cdx_ft_egress_supported(wg) && !cdx_ft_egress_supported(vap));
+	reset();
+
+	/* WireGuard's type without PHYSICAL is neither predicate's. */
+	wg = mkwg("wg0");
+	itf_table[0].type = IF_TYPE_WG;
+	assert(!cdx_ft_egress_supported(wg) && !cdx_ft_port_supported(wg));
+	reset();
+}
+
+/* A device with no Ethernet header passes the gate both predicates share only
+ * as WireGuard, which is told by its link kind; and a WireGuard device still
+ * meets every other requirement of that gate. */
+static void test_wireguard_gate(void)
+{
+	static const struct rtnl_link_ops dummy = { .kind = "dummy" };
+	struct net_device *wg;
+
+	wg = mkwg("wg0");
+	wg->rtnl_link_ops = &dummy;
+	assert(!cdx_ft_egress_supported(wg));
+	wg->rtnl_link_ops = NULL;
+	assert(!cdx_ft_egress_supported(wg));
+	reset();
+
+	/* The kind on a device claiming an Ethernet header with no address. */
+	wg = mkwg("wg0");
+	wg->type = ARPHRD_ETHER;
+	assert(!cdx_ft_egress_supported(wg));
+	reset();
+
+	wg = mkwg("wg0");
+	wg->running = false;
+	assert(!cdx_ft_egress_supported(wg));
+	reset();
+
+	wg = mkwg("wg0");
+	wg->carrier = false;
+	assert(!cdx_ft_egress_supported(wg));
+	reset();
+
+	wg = mkwg("wg0");
+	wg->reg_state = NETREG_UNREGISTERING;
+	assert(!cdx_ft_egress_supported(wg));
+	reset();
+
+	wg = mkwg("wg0");
+	wg->l3_slave = true;
+	assert(!cdx_ft_egress_supported(wg));
+	reset();
+
+	wg = mkwg("wg0");
+	wg->in_init_net = false;
+	assert(!cdx_ft_egress_supported(wg));
+	reset();
+
+	/* And registered: a device the lookup cannot resolve is nothing. */
+	wg = mkwg("wg0");
+	owner[0] = NULL;
+	assert(!cdx_ft_egress_supported(wg));
+	reset();
+}
+
 int main(void)
 {
 	reset();
@@ -279,6 +389,8 @@ int main(void)
 	test_common_requirements();
 	test_unnamed_types();
 	test_onif_consistency();
+	test_wireguard_egress();
+	test_wireguard_gate();
 	printf("wifi_admission: ok\n");
 	return 0;
 }
