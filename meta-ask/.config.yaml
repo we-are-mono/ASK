@@ -45,8 +45,11 @@ target:
 # *and* add it to BB_ENV_PASSTHROUGH_ADDITIONS before bitbake starts.
 # Default value "" so unset → recipe sees "" → falsy → image stays
 # non-instrumented; `KASAN=1 kas build .config.yaml` flips it on.
+# PERF the same way: `PERF=1` drops the costly debug options for
+# throughput measurement (ask-perf.cfg); never for the test suite.
 env:
   KASAN: ""
+  PERF: ""
 
 local_conf_header:
   site: |

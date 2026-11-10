@@ -222,6 +222,14 @@ KASAN ??= "0"
 # whenever the value changes.
 do_configure[vardeps] += "KASAN"
 
+# Optional throughput overlay, `PERF=1 kas build .config.yaml`: ask-perf.cfg
+# drops the runtime-costly debug options ask.cfg turns on, so CPU-bound
+# paths measure close to a production kernel. Off by default, KASAN builds
+# included: the suite relies on kmemleak, failslab and the production DPAA
+# timestamping config it turns off. Passed in and hashed as KASAN is.
+PERF ??= "0"
+do_configure[vardeps] += "PERF"
+
 S = "${WORKDIR}/git"
 
 # The ASK kernel patches are shared verbatim with the Armbian and OpenWrt
@@ -247,7 +255,9 @@ do_configure:prepend() {
 # the `# CONFIG_KASAN is not set` markers in the base fragment.
 do_configure:append() {
     cat ${UNPACKDIR}/ask.cfg >> ${B}/.config
-    cat ${UNPACKDIR}/ask-perf.cfg >> ${B}/.config
+    if [ "${PERF}" = "1" ]; then
+        cat ${UNPACKDIR}/ask-perf.cfg >> ${B}/.config
+    fi
     if [ "${KASAN}" = "1" ]; then
         cat ${UNPACKDIR}/ask-kasan.cfg >> ${B}/.config
     fi
