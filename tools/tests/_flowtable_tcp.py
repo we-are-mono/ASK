@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
-from _flowtable_rig import DPORT, SPORT, TABLE, WAN_IP, artifact_dir, command, read
+from _flowtable_rig import DPORT, SPORT, TABLE, WAN_IP, artifact_dir, command, drive, read
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from ask_orch.client import Agent
 from ask_orch.counters import kernel_tx_packets
@@ -134,17 +134,14 @@ async def control_counters(r):
 
 
 async def installed(r, conn):
-    # Several application exchanges let the asynchronous hardware worker
-    # install both rules without assuming a particular scheduling delay.
-    for _ in range(10):
-        await conn.transfer("upload", size=len(BLOCK))
-        state = await r.state()
-        if state["entries"] == 2:
-            assert all(f["proto"] == "6" for f in state["flows"]), state
-            assert not state["fatal"] and not state["quarantine"], state
-            return state
-        await asyncio.sleep(0.1)
-    pytest.fail(f"TCP did not install: {state}")
+    # Application exchanges until the asynchronous hardware worker has
+    # installed both rules. A direction declined in passing -- a lost
+    # rtnl_trylock -- is offered again only by a later packet (drive()):
+    # ten quick exchanges, about a second, once stranded the acknowledgements.
+    state = await drive(r, lambda: conn.transfer("upload", size=len(BLOCK)), lambda s: s["entries"] == 2)
+    assert all(f["proto"] == "6" for f in state["flows"]), state
+    assert not state["fatal"] and not state["quarantine"], state
+    return state
 
 
 async def cpu(r):
