@@ -227,13 +227,20 @@ async def test_tunnelled_flow_is_steered_to_sec(
             # The first reply is forwarded, offered and queued behind an ARP
             # request that never leaves, so its offer cannot be built. ARP
             # retries every second; the next one after the drop goes resolves.
-            await dut("ip", "neigh", "flush", "dev", TARGET_WAN_IF)
+            # The DUT learns nothing of the host from the flush on: none of its
+            # own requests leave and none of the host's ARP arrives, either of
+            # which resolves the entry again -- a request of the DUT's left
+            # between a flush and the drop once, and one test in five failed.
             await dut("nft", f'''table arp {ARP_TABLE} {{
  chain out {{ type filter hook output priority 0; policy accept;
  oifname "{TARGET_WAN_IF}" arp operation request drop
  }}
+ chain in {{ type filter hook input priority 0; policy accept;
+ iifname "{TARGET_WAN_IF}" drop
+ }}
 }}''')
             cleanup.append(lambda: dut("nft", "delete", "table", "arp", ARP_TABLE, check=False))
+            await dut("ip", "neigh", "flush", "dev", TARGET_WAN_IF)
             assert exchange(sock, 1) == 0, (
                 "the first reply reached the host, so its neighbour was not "
                 "resolving when the connection was offered")
