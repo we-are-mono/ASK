@@ -25,7 +25,7 @@ both in /proc/ask_flowtable/stats: `tc_refused` for an admission refused,
 The cap, SQM_MBIT, is below what one core forwards in software on the test
 image, so a direction in software is held at it by cake rather than by the
 CPU; the offered load is five times the cap, which a direction in hardware
-carries whole and the CPU cannot. Three oracles, then: the rate the receiver
+carries whole and cake does not. Three oracles, then: the rate the receiver
 counts, the shaper's own `tc -s` count, which has to cover what arrived, and
 the adapter's rows.
 
@@ -82,13 +82,18 @@ from ask_orch.commands import remove_qdisc
 from ask_orch.counters import kernel_tx_packets
 from ask_orch.lifecycle import CleanupStack
 
-# The shaper's rate: about 2,600 full-size frames a second, well below what one
+# The shaper's rate: about 1,700 full-size frames a second, well below what one
 # core forwards in software on the test image (KASAN, lockdep) -- the PPPoE QoS
 # case finds a core saturating near 6,000 a second through a session, the
 # costlier path -- so a direction in software is held here by cake, not by the
 # CPU. 50 Mbit/s sat too close: an upload retired under it once fell to 30 as
-# the CPU took the whole offered load, where reruns held 48.5.
-SQM_MBIT = int(os.environ.get("ASK_FLOWTABLE_SQM_MBIT", "30"))
+# the CPU took the whole offered load, where reruns held 48.5. The offered
+# load, five times this, must fit through that core with cake in the path as
+# well: at 30 Mbit/s its 150 overflowed the LAN port's CPU queue, FMan
+# discarded ~29% of the upload ahead of cake, and iperf3's control connection
+# beside it lost the state change that ends a run, so a third of the runs
+# never finished. At 20, the 100 Mbit/s offered was discarded nowhere.
+SQM_MBIT = int(os.environ.get("ASK_FLOWTABLE_SQM_MBIT", "20"))
 # What a direction in hardware carries whole, and more than the CPU forwards.
 SQM_OFFERED_MBIT = 5 * SQM_MBIT
 # Payload bits a second through cake at the cap. With no overhead configured
