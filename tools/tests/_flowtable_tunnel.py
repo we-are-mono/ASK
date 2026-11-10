@@ -694,8 +694,11 @@ async def _insert_phases(r, name, changes=(None,), *, tos=0):
     connection's two rows, the upload's, how many packets it carried, and the
     captured frames."""
     shape = r.shape
+    # Two readmitting phases per change: an offer that lost rtnl_trylock late
+    # in the first comes back only on the second's packets (flowtable_tunnel's
+    # _follows() found no flow at all once without one).
     readmit = 1024
-    more = tuple(n for _ in changes[1:] for n in (readmit, 128))
+    more = tuple(n for _ in changes[1:] for n in (readmit, readmit, 128))
 
     async def run(script, **kwargs):
         return await lan_run_python(r.lan, script, **kwargs)
@@ -712,6 +715,7 @@ async def _insert_phases(r, name, changes=(None,), *, tos=0):
         for index, change in enumerate(changes):
             if change:
                 await _retired(r, state, change)
+                await transfer.measure()
                 await transfer.measure()
                 old = set(tcp(state))
                 state = await r.wait(lambda s: len(tcp(s)) == 2 and not old & set(tcp(s)))

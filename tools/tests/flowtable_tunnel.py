@@ -543,12 +543,15 @@ async def _follows(r, label, move, back, counter):
     # A retired flow is re-added by its next packet only once Netfilter's
     # garbage collection, a second or so later, has finished tearing the old
     # one down, and an admission that loses RTNL is offered again a second
-    # after that. The phase that readmits runs for several seconds of both.
+    # after that. The phase that readmits runs for several seconds of both,
+    # twice over: a decline late in the first is offered again only by the
+    # second's packets, and with none the wait after it found no flow at all
+    # (4o6, once in a full suite).
     readmit = 1024
     records = {}
     async with GatedTcp(run, source=r.lan_address, sport=shape.sport, peer=shape.inner_orch,
                         dport=shape.dport, label=f"flowtable_tunnel_{label}",
-                        more=(readmit, 128, readmit, 128)) as transfer:
+                        more=(readmit, readmit, 128, readmit, readmit, 128)) as transfer:
         await transfer.warmed()
         state = await r.wait(lambda s: len(s["flows"]) == _expected(r, "tcp"))
         for name, change, mac in (("own", None, r.wan_mac), ("moved", move, MOVED_MAC),
@@ -558,7 +561,8 @@ async def _follows(r, label, move, back, counter):
                 await change()
                 retired = await r.wait(lambda s: not old & cookies(s) and s[counter] > counted)
                 assert retired["invalidated"] == 0 and retired["bindings"] == 2, retired
-                # The next phase is what offers the connection again.
+                # The next phases are what offer the connection again.
+                await transfer.measure()
                 await transfer.measure()
                 state = await r.wait(lambda s: len(s["flows"]) == _expected(r, "tcp")
                                      and not old & cookies(s))
