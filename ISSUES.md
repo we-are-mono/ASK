@@ -152,6 +152,24 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A434 — a QMan portal's interrupt can be moved off its CPU.** Where: the portal IRQs in
+  `drivers/staging/fsl_qbman/qman_high.c` are requested without `IRQF_NOBALANCING`. Root or irqbalance can retarget
+  one; the portal's NAPI then drains that portal from another CPU, without the stash-destination (SDEST) update the
+  CPU-hotplug path makes, and the portal's cache-enabled region is mapped non-shareable, so DQRR reads can be stale.
+  Why it matters: lost or corrupted dequeues on any box running irqbalance (an OpenWrt package). From review only, not
+  reproduced. Fix direction: request portal IRQs with `IRQF_NOBALANCING`, and confirm on the rig that writing a
+  portal IRQ's `smp_affinity` is refused.
+
+- [ ] **A433 — netpoll polls a DPAA port's per-port NAPIs, whose portal is NULL.** Where: `dpaa_eth_poll()` and
+  `dpaa_eth_poll_controller()` in `sdk_dpaa/dpaa_eth.c`, reached from netpoll's `poll_napi()`. With
+  CONFIG_FSL_ASK_QMAN_PORTAL_NAPI the per-port NAPIs are never scheduled, so their `np->p` is never set (the only
+  setter's callers are compiled out); `poll_napi()` still calls each one's poll with budget 0 on whatever CPU, which
+  runs `qman_p_poll_dqrr(NULL)`, and the poll controller uses the same `np->p`. Why it matters: an oops whenever
+  netconsole's transmit path is busy; needs root and netconsole (not in the meta-ask defconfig or OpenWrt's generic
+  config; kmod-netconsole is installable). Predates the flowtable port; found reviewing the busy-poll fix. Fix
+  direction: return 0 for netpoll's budget-0 pass, and have the poll controller drain the CPU's affine portal with
+  DQRI masked.
+
 - [x] **A432 — the cdx timer thread held an idle router's load average at 1.0.** Its 100 ms tick slept
   uninterruptibly; it now waits in TASK_IDLE (_:/^cdx: wait out the timer tick outside the load average_).
 

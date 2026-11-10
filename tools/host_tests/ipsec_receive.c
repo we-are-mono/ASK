@@ -15,7 +15,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
 
-typedef int gro_result_t;
 typedef uintptr_t dma_addr_t;
 #define likely(x) (x)
 #define unlikely(x) (x)
@@ -68,9 +67,7 @@ struct qman_portal { int unused; };
 struct qman_fq { int unused; };
 struct qm_fd { uintptr_t addr; unsigned offset, length20, bpid, status, format; };
 struct qm_dqrr_entry { struct qm_fd fd; unsigned stat, fqid; };
-struct qman_portal_config { unsigned index; };
-struct dpa_napi_portal { struct qman_portal *p; int napi; };
-struct dpa_percpu_priv_s { unsigned rx_sg; struct dpa_napi_portal np[1]; };
+struct dpa_percpu_priv_s { unsigned rx_sg; };
 struct dpa_priv_s { struct dpa_percpu_priv_s *percpu_priv; int *percpu_count; };
 struct net_device;
 struct net_device_ops { int (*ndo_init)(struct net_device *dev); };
@@ -198,8 +195,6 @@ static struct sk_buff *sg_fd_to_skb(struct dpa_priv_s *p, const struct qm_fd *fd
 static unsigned eth_type_trans(struct sk_buff *skb, struct net_device *dev)
 { unsigned short type; (void)dev; memcpy(&type, skb->data + 12, 2); return type; }
 static long long ktime_get_real_seconds(void) { return 1; }
-static const struct qman_portal_config *qman_p_get_portal_config(struct qman_portal *q)
-{ static struct qman_portal_config pc; (void)q; return &pc; }
 static void dev_kfree_skb(struct sk_buff *skb)
 {
     /* A converted frame's buffer goes with the skb; a copy's went back first. */
@@ -221,8 +216,6 @@ static void netif_receive_skb(struct sk_buff *skb)
     delivered++;
     dev_kfree_skb(skb);
 }
-static int napi_gro_receive(int *napi, struct sk_buff *skb)
-{ (void)napi; netif_receive_skb(skb); return 0; }
 static void dpa_fd_release(struct net_device *dev, const struct qm_fd *fd)
 {
     (void)dev;
@@ -304,6 +297,7 @@ int main(void)
     struct qman_portal portal;
     struct qman_fq fq;
     setup_devices();
+    /* The port's GRO feature never changes delivery: no decrypted frame is GRO'd. */
     for (unsigned sg = 0; sg < 2; sg++) for (unsigned gro = 0; gro < 2; gro++) {
         dq.fd.format = sg;
         dq.fd.addr = fd_buffer = (uintptr_t)(sg ? table : frame);

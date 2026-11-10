@@ -371,6 +371,11 @@ static int vwd_napi_add(void)
 		if (!vn->np)
 			goto err;
 		for (i = 0; i < qman_portal_max; i++) {
+			/* Drains a CPU's portal, so never from a busy-polling
+			 * socket's task: out of the NAPI hash, and GRO, which
+			 * dpaa_eth_poll() hands what it receives to, has no id
+			 * of it to stamp (as the driver's own NAPIs). */
+			set_bit(NAPI_STATE_NO_BUSY_POLL, &vn->np[i].napi.state);
 			netif_napi_add(vwd_napi_dev, &vn->np[i].napi, dpaa_eth_poll);
 			napi_enable(&vn->np[i].napi);
 		}

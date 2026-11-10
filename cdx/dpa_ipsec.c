@@ -394,11 +394,10 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	uint16_t tag;
 	struct sec_path *sp;
 	struct xfrm_state *x;
+	/* The conversion's GRO verdict, which a decrypted frame never earns:
+	 * its checksums are SEC's output, not the parser's (dcl4c false). */
 	bool use_gro;
 	int pool_balance = 0;
-	gro_result_t gro_result;
-	const struct qman_portal_config *pc;
-	struct dpa_napi_portal *np;
 
 	/* A volatile dequeue may finish without a frame descriptor. */
 	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
@@ -441,7 +440,6 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		goto rel_fd;
 	}
 
-	use_gro = !!(net_dev->features & NETIF_F_GRO);
 	if ((x = xfrm_state_lookup_byhandle(dev_net(net_dev), sagd_pkt )) == NULL)
 	{
 #ifdef DPA_IPSEC_DEBUG
@@ -492,8 +490,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 			return qman_cb_dqrr_consume;
 		}
 		/* As contig_fd_to_skb() leaves a frame whose L4 checksum FMan
-		 * did not vouch for: CHECKSUM_NONE, and no GRO. */
-		use_gro = false;
+		 * did not vouch for: CHECKSUM_NONE. */
 	} else {
 		/* Conversion owns the buffers from here. SG conversion also
 		 * returns the table to BMan after remapping it, so unmap its
@@ -559,28 +556,19 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 #ifdef DPA_IPSEC_DEBUG
 	DPAIPSEC_INFO("%s::len %d\n", __func__, skb->len);
 #endif
-	/* netif_receive_skb(skb); */
-	if (use_gro)
-	{
-		pc = qman_p_get_portal_config(qm);
-		np = &percpu_priv->np[pc->index];
-
-		np->p = qm;
-		gro_result = napi_gro_receive(&np->napi, skb);
-		(void)gro_result; /* Result no longer checked - GRO_DROP removed in kernel 6.12 */
-
-	}
-	else
-		/* NET_RX_DROP here does not mean the frame was dropped, so it
-		 * is deliberately not reported. __netif_receive_skb_core()
-		 * leaves its return at NET_RX_DROP whenever an ingress hook
-		 * takes the frame, and the flowtable's is exactly such a hook:
-		 * every decrypted frame it forwards in software comes back
-		 * through here looking like a loss. Measured on the bench:
-		 * fifty-nine of sixty "dropped" frames were delivered. A
-		 * counter that cannot tell a loss from a steal is worse than
-		 * none, and at line rate it is also a log flood. */
-		netif_receive_skb(skb);
+	/* Never GRO (use_gro above): there is no NAPI here to hand it to that
+	 * would flush it, the port's own NAPIs being unscheduled with the
+	 * portal's NAPI draining the portal.
+	 *
+	 * NET_RX_DROP here does not mean the frame was dropped, so it is
+	 * deliberately not reported. __netif_receive_skb_core() leaves its
+	 * return at NET_RX_DROP whenever an ingress hook takes the frame, and
+	 * the flowtable's is exactly such a hook: every decrypted frame it
+	 * forwards in software comes back through here looking like a loss.
+	 * Measured on the bench: fifty-nine of sixty "dropped" frames were
+	 * delivered. A counter that cannot tell a loss from a steal is worse
+	 * than none, and at line rate it is also a log flood. */
+	netif_receive_skb(skb);
 	return qman_cb_dqrr_consume;
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 pkt_drop:

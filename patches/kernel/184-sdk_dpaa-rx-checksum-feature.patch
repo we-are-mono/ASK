@@ -1,4 +1,4 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From d421b01aa468c898b4e5048803492505ba685208 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 9 Nov 2026 21:00:00 +0100
 Subject: [PATCH] sdk_dpaa: enable Rx checksum validation and GRO safely
@@ -19,10 +19,29 @@ nobody flushed (TCP SYN-ACKs held for seconds, connections timing out).
 The poller now records itself per CPU (qman_poll_napi) around each
 DQRR poll, and _dpa_rx() uses GRO only through it, falling back to
 netif_receive_skb() outside a poll.
+
+GRO also stamps each skb with the polling NAPI's id, and a socket that
+has received one may busy-poll that NAPI (SO_BUSY_POLL needs no
+privilege): napi_busy_loop() runs its poll from the socket's task, on
+any CPU, with the portal's dequeue interrupt still enabled, and
+qman_p_poll_dqrr() BUG()s -- a panic any local user could cause. A
+portal is one CPU's, drained only by the poll its interrupt scheduled,
+so every NAPI that drains one -- the portal's own and each port's, and
+VWD's in cdx -- is registered NO_BUSY_POLL, as netif_napi_add_tx()
+does: none is in the NAPI hash, so none has an id to stamp.
 ---
+ .../net/ethernet/freescale/sdk_dpaa/dpaa_eth.c    | 14 ++++++++++++--
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_common.c | 10 +++-------
+ .../net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 15 ++++++---------
+ drivers/staging/fsl_qbman/qman_high.c             | 15 ++++++++++++++-
+ include/linux/fsl_qman.h                          |  2 ++
+ 5 files changed, 37 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
+index 7ccbcb7dff51..aa2b49ebf118 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
-@@ -395,8 +395,11 @@
+@@ -399,8 +399,11 @@ int dpaa_eth_poll(struct napi_struct *napi, int budget)
  {
  	struct dpa_napi_portal *np =
  			container_of(napi, struct dpa_napi_portal, napi);
@@ -35,9 +54,29 @@ netif_receive_skb() outside a poll.
  
  	if (cleaned < budget) {
  		int tmp;
+@@ -946,9 +949,16 @@ static int dpa_private_napi_add(struct net_device *net_dev)
+ 			return -ENOMEM;
+ 		}
+ 
+-		for (i = 0; i < qman_portal_max; i++)
++		/* Each drains one CPU's portal, which only that CPU's poll may do,
++		 * with DQRI masked: never from a busy-polling socket's task. Out of
++		 * the NAPI hash, as netif_napi_add_tx() keeps a NAPI, so GRO has no
++		 * id of theirs to stamp either. */
++		for (i = 0; i < qman_portal_max; i++) {
++			set_bit(NAPI_STATE_NO_BUSY_POLL,
++				&percpu_priv->np[i].napi.state);
+ 			netif_napi_add(net_dev, &percpu_priv->np[i].napi,
+ 					dpaa_eth_poll);
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
+index 6341181b110d..858300f3c7ab 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
-@@ -310,13 +310,9 @@
+@@ -310,13 +310,9 @@ EXPORT_SYMBOL(dpa_set_features);
  netdev_features_t dpa_fix_features(struct net_device *dev,
  				   netdev_features_t features)
  {
@@ -54,9 +93,11 @@ netif_receive_skb() outside a poll.
  	return features;
  }
  
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
+index 1833c50014b2..0ae67645cdd5 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-@@ -819,16 +819,13 @@
+@@ -819,16 +819,13 @@ void __hot _dpa_rx(struct net_device *net_dev,
  
  	skb_record_rx_queue(skb, raw_smp_processor_id());
  
@@ -79,9 +120,11 @@ netif_receive_skb() outside a poll.
  
  	return;
  
+diff --git a/drivers/staging/fsl_qbman/qman_high.c b/drivers/staging/fsl_qbman/qman_high.c
+index cf312e3d40eb..e41d339cd12c 100644
 --- a/drivers/staging/fsl_qbman/qman_high.c
 +++ b/drivers/staging/fsl_qbman/qman_high.c
-@@ -591,14 +591,22 @@
+@@ -591,14 +591,22 @@ struct dev_pm_domain qman_portal_device_pm_domain = {
  	}
  };
  
@@ -105,9 +148,23 @@ netif_receive_skb() outside a poll.
  
  	if (cleaned < budget) {
  		napi_complete(napi);
+@@ -775,6 +783,11 @@ struct qman_portal *qman_create_portal(
+ #ifdef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
+ 	/* Initilize NAPI for Rx processing */
+ 	init_dummy_netdev(&portal->dummy_dev);
++	/* The portal is this CPU's and is drained only with DQRI masked, so its
++	 * poll must never run from a busy-polling socket's task: keep it out of
++	 * the NAPI hash, as netif_napi_add_tx() does, which also leaves GRO no
++	 * id to stamp on what it receives. */
++	set_bit(NAPI_STATE_NO_BUSY_POLL, &portal->napi.state);
+ 	netif_napi_add(&portal->dummy_dev, &portal->napi, qman_portal_dqrr_poll);
+ 	napi_enable(&portal->napi);
+ #endif
+diff --git a/include/linux/fsl_qman.h b/include/linux/fsl_qman.h
+index b5731b365416..2bda93e9ca93 100644
 --- a/include/linux/fsl_qman.h
 +++ b/include/linux/fsl_qman.h
-@@ -3971,6 +3971,8 @@
+@@ -3971,6 +3971,8 @@ const struct qman_portal_config *qman_p_get_portal_config(struct qman_portal
  int qman_p_irqsource_add(struct qman_portal *p, u32 bits);
  int qman_p_irqsource_remove(struct qman_portal *p, u32 bits);
  int qman_p_poll_dqrr(struct qman_portal *p, unsigned int limit);
@@ -118,3 +175,4 @@ netif_receive_skb() outside a poll.
  void qman_p_stop_dequeues(struct qman_portal *p);
 -- 
 2.47.3
+
