@@ -574,7 +574,29 @@ host's own SA to report no replay or integrity failure. Its ceiling is that
 host's software ESP rather than the DUT, so its streams' entries need only
 move together: the host reorders its ESP enough for SEC to refuse some as
 late, which can stall one stream (A342).
-Each floor can be overridden with an environment variable named beside it.
+
+`flowtable_wireguard.py::test_rate` carries TCP through one, two and four
+WireGuard tunnels to the WAN host, each way and both at once. WireGuard's
+crypto runs on the DUT's CPUs, so its floor is the KASAN image's own: 0.5
+Gbit/s over every tunnel and direction, against 678-1859 Mbit/s measured
+2026-11-10 (one tunnel ~0.7 Gbit/s each way; more tunnels either that or
+about twice it, as their receiving CPUs coincide or not) and 39-77 Mbit/s
+through the software path. It does not share `tcp_floor()`: a run saturates
+the DUT's CPUs and its console answers only once the run ends, so its proof
+is read at idle on either side of the run rather than inside a window. Per
+tunnel, cdx's counts in `/proc/cdx_wireguard` must account for the frames
+the WAN host's end of it counted, acknowledgements included -- every one it
+received sealed, every one it sent forwarded -- but 1000 per connection: its
+first frames, before its flow is admitted (480 the most measured). Each
+direction a case drives must also move at least 20 Mbit/s a tunnel, more
+frames than that allowance, so neither direction of a bidirectional run can
+stay in software behind the other's acknowledgements. Nothing may fail or be
+dropped, at most 512 frames per tunnel may fall back to the kernel's
+transmit (`slow`) or stack (`to_stack`), and the kernel's own transmit on
+either port must stay within 512 frames plus the same allowance for every
+connection.
+Each floor can be overridden with an environment variable named beside it
+(`ASK_WIREGUARD_MIN_GBPS` here).
 
 `flowtable_jumbo.py` carries MTU 9000 on every hop: offloaded NAT TCP at
 8 Gbit/s each way and byte-exact 8972-byte UDP, a VLAN at 9000, a LAN at 9000

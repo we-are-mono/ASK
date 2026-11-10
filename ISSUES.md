@@ -152,6 +152,22 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A436 — offloaded WireGuard frames are miscounted on the device.** Where: the seal in
+  `patches/kernel/180-wireguard-fastpath.patch`. `peer->tx_bytes` adds the frame's outer Ethernet, IP and UDP headers
+  (`WG_FP_HLEN`, 42 bytes) where the ordinary send counts the message alone, and the wg device's own TX statistics
+  are never bumped, though the open path bumps RX. Why it matters: `wg show` over-reports sent bytes (~3% for full
+  frames, ~40% for acknowledgements) and `ip -s link` leaves sealed traffic out of TX; statistics must come through
+  the standard tools. From review, not measured. Fix direction: count the message length, and add sealed frames to
+  the device's TX statistics as the ordinary transmit does.
+
+- [ ] **A435 — a WireGuard egress ignores Netfilter's destination words.** Where: the `l3` branch of the Ethernet
+  word checks in `cdx/ask_flowtable_core.c`, which copies the made-up MAC without looking at the destination words,
+  against that function's own rule that each word is required exactly (the ppp branch requires zero). Why it
+  matters: a kernel that started resolving something else there would be silently overridden. Netfilter offers zero
+  for a WireGuard device today (a NOARP neighbour on a device with no address). From review. Fix direction: require
+  `is_zero_ether_addr(ethernet)` there, with a nonzero-word case refused in `tools/host_tests/flowtable.c`'s
+  `test_wireguard_egress()`.
+
 - [ ] **A434 — a QMan portal's interrupt can be moved off its CPU.** Where: the portal IRQs in
   `drivers/staging/fsl_qbman/qman_high.c` are requested without `IRQF_NOBALANCING`. Root or irqbalance can retarget
   one; the portal's NAPI then drains that portal from another CPU, without the stash-destination (SDEST) update the
