@@ -1,4 +1,4 @@
-From 30a3ddeaa3e38e38afe6dcc1213772cc672a3eb4 Mon Sep 17 00:00:00 2001
+From 07dc4cc57fab0cf5f508fe0d414077dc43f81127 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 9 Nov 2026 12:00:00 +0100
 Subject: [PATCH] wireguard, netfilter: fast path for offloaded tunnels
@@ -54,11 +54,11 @@ Offload entry points (include/net/wg_fastpath.h):
  drivers/net/wireguard/receive.c       |  52 ++-
  drivers/net/wireguard/send.c          |  52 ++-
  include/crypto/poly1305.h             |   3 +
- include/net/netfilter/nf_flow_table.h |  16 +
- include/net/wg_fastpath.h             |  55 +++
+ include/net/netfilter/nf_flow_table.h |  17 +
+ include/net/wg_fastpath.h             |  58 +++
  net/netfilter/nf_flow_table_inet.c    |  18 +
  net/netfilter/nf_flow_table_ip.c      |  92 ++++
- 21 files changed, 1037 insertions(+), 24 deletions(-)
+ 21 files changed, 1041 insertions(+), 24 deletions(-)
  create mode 100644 drivers/net/wireguard/fastpath.c
  create mode 100644 include/net/wg_fastpath.h
 
@@ -1249,10 +1249,10 @@ index 090692ec3bc7..628b1e04d014 100644
  
  static inline void poly1305_final(struct poly1305_desc_ctx *desc, u8 *digest)
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index 2f90ebb0a6cd..daf9eba2cdb9 100644
+index 2f90ebb0a6cd..10ba097dbcf0 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
-@@ -467,6 +467,22 @@ unsigned int nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
+@@ -467,6 +467,23 @@ unsigned int nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
  unsigned int nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
  				       const struct nf_hook_state *state);
  
@@ -1264,6 +1264,7 @@ index 2f90ebb0a6cd..daf9eba2cdb9 100644
 +	u8			h_source[ETH_ALEN];
 +};
 +
++struct iphdr;
 +int nf_flow_offload_ip_raw(struct nf_flowtable *flow_table,
 +			   const struct net_device *in, struct iphdr *iph,
 +			   unsigned int len,
@@ -1277,15 +1278,18 @@ index 2f90ebb0a6cd..daf9eba2cdb9 100644
  extern int nf_flow_register_bpf(void);
 diff --git a/include/net/wg_fastpath.h b/include/net/wg_fastpath.h
 new file mode 100644
-index 000000000000..5730c3cad4aa
+index 000000000000..66574110a61b
 --- /dev/null
 +++ b/include/net/wg_fastpath.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,58 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _NET_WG_FASTPATH_H
 +#define _NET_WG_FASTPATH_H
 +
 +#include <linux/netdevice.h>
++
++struct iphdr;
++struct udphdr;
 +
 +/* Where wg_fastpath_seal() left a sealed frame: the device to transmit it on
 + * and its new offset and length in the same buffer. */
