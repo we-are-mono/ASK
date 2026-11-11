@@ -20,6 +20,7 @@ SRC_URI = "git://github.com/nxp-imx/mwifiex.git;protocol=https;branch=hotfix/lf-
            file://0006-moal-give-each-mlan-spinlock-its-own-lockdep-class.patch \
            file://0007-mlan-aggregate-an-A-MSDU-under-one-hold-of-the-ralis.patch \
            file://0008-moal-own-scan-requests-through-completion-and-teardown.patch \
+           file://0009-mlan-take-INT_MAX-and-UINT_MAX-from-the-kernel.patch \
 "
 SRCREV = "09f41e1423e4806a127507d5fa284cd02c46772f"
 
@@ -55,19 +56,10 @@ NXP_FEATURE_FLAGS = " \
     CONFIG_UAP_WEXT=n \
 "
 
-# mlan_wmm.c and mlan_11n_aggr.c use INT_MAX without including it. OpenWrt
-# never sees this because its backports build force-includes
-# backport/backport.h, which drags in the header chain that defines it; a
-# plain kernel build has no such umbrella. KCFLAGS rather than ccflags-y,
-# because the driver's own Makefile appends to ccflags-y and a command-line
-# assignment would silently discard everything it adds.
-KCFLAGS = "-include linux/limits.h"
-
 EXTRA_OEMAKE = " \
     -C ${STAGING_KERNEL_DIR} \
     M=${S} \
     KERNELDIR=${STAGING_KERNEL_DIR} \
-    KCFLAGS='${KCFLAGS}' \
     ${NXP_CHIP_FLAGS} \
     ${NXP_FEATURE_FLAGS} \
 "
