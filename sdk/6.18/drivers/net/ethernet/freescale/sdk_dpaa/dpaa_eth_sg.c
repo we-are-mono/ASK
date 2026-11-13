@@ -267,6 +267,56 @@ handle_fail:
 EXPORT_SYMBOL(dpaa_bp_alloc_n_add_buffs);
 
 
+#ifdef CONFIG_FSL_DPAA_ETH_JUMBO_FRAME
+/* A jumbo Rx buffer is larger than a page, and the page fragment cache serves
+ * nothing larger than one: it fails such a request outright. The buffers are
+ * carved from compound pages here instead, as many to a page as fit, each
+ * holding one reference on its page, which the skb built on it drops when it
+ * is freed (skb_free_frag()). A page the order cannot be had at is replaced by
+ * one a single buffer fits in. One carve serves one _dpa_bp_add_8_bufs() call;
+ * the references of buffers it never handed out go with dpa_jumbo_end().
+ */
+#define DPA_JUMBO_PAGE_ORDER	3
+
+struct dpa_jumbo_carve {
+	struct page *page;
+	void *next;
+	unsigned int left;
+};
+
+static void *dpa_jumbo_buf(struct dpa_jumbo_carve *c, unsigned int size)
+{
+	unsigned int order = DPA_JUMBO_PAGE_ORDER;
+	void *buf;
+
+	if (!c->left) {
+		c->page = alloc_pages(GFP_ATOMIC | __GFP_COMP | __GFP_NOWARN, order);
+		if (!c->page) {
+			order = get_order(size);
+			c->page = alloc_pages(GFP_ATOMIC | __GFP_COMP | __GFP_NOWARN,
+					      order);
+			if (!c->page)
+				return NULL;
+		}
+		c->left = (PAGE_SIZE << order) / size;
+		page_ref_add(c->page, c->left - 1);
+		c->next = page_address(c->page);
+	}
+	buf = c->next;
+	c->next += size;
+	c->left--;
+	return buf;
+}
+
+static void dpa_jumbo_end(struct dpa_jumbo_carve *c)
+{
+	while (c->left) {
+		c->left--;
+		put_page(c->page);
+	}
+}
+#endif
+
 static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
 {
 	void *new_buf, *fman_buf;
@@ -275,6 +325,9 @@ static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
 	uint8_t i;
 	struct device *dev = dpa_bp->dev;
 	struct sk_buff *skb, **skbh;
+#ifdef CONFIG_FSL_DPAA_ETH_JUMBO_FRAME
+	struct dpa_jumbo_carve carve = {};
+#endif
 
 	memset(bmb, 0, sizeof(struct bm_buffer) * 8);
 
@@ -296,6 +349,16 @@ static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
 			}
 			new_buf = page_address(new_page);
 		} else {
+#ifdef CONFIG_FSL_DPAA_ETH_JUMBO_FRAME
+			new_buf = dpa_jumbo_buf(&carve, SMP_CACHE_BYTES +
+						DPA_BP_RAW_SIZE_JUMBO);
+			if (unlikely(!new_buf)) {
+				dev_err_ratelimited(dev, "%s: jumbo buffer of %zu bytes failed\n",
+						    __func__, SMP_CACHE_BYTES +
+						    DPA_BP_RAW_SIZE_JUMBO);
+				goto err_release_previous_bufs;
+			}
+#else
 			new_buf = netdev_alloc_frag(SMP_CACHE_BYTES +
 						    DPA_BP_RAW_SIZE);
 			if (unlikely(!new_buf)) {
@@ -303,6 +366,7 @@ static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
 						    __func__, SMP_CACHE_BYTES + DPA_BP_RAW_SIZE);
 				goto err_release_previous_bufs;
 			}
+#endif
 		}
 
 		new_buf = PTR_ALIGN(new_buf, SMP_CACHE_BYTES);
@@ -351,6 +415,9 @@ static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
 	}
 
 release_bufs:
+#ifdef CONFIG_FSL_DPAA_ETH_JUMBO_FRAME
+	dpa_jumbo_end(&carve);
+#endif
 	/* Release the buffers. In case bman is busy, keep trying
 	 * until successful. bman_release() is guaranteed to succeed
 	 * in a reasonable amount of time
@@ -369,6 +436,9 @@ err_release_previous_bufs:
 	if (likely(i))
 		goto release_bufs;
 
+#ifdef CONFIG_FSL_DPAA_ETH_JUMBO_FRAME
+	dpa_jumbo_end(&carve);
+#endif
 	return 0;
 }
 
@@ -577,6 +647,18 @@ struct sk_buff *__hot contig_fd_to_skb(const struct dpa_priv_s *priv,
 	 * are added.
 	 */
 	DPA_READ_SKB_PTR(skb, skbh, vaddr, -1);
+
+#ifdef CONFIG_FSL_DPAA_ETH_JUMBO_FRAME
+	/* With jumbo Rx buffers, frames risk being dropped as the socket
+	 * backlog reaches its maximum allowed size. Use the frame length for
+	 * the skb truesize instead of the buffer size, as this is the size of
+	 * the data that actually gets copied to userspace. The stack may grow
+	 * the payload; it then warns that the frame is larger than its
+	 * truesize, which this accepts.
+	 */
+	skb->truesize = SKB_TRUESIZE(dpa_fd_length(fd));
+#endif
+
 	DPA_BUG_ON(fd_off != priv->rx_headroom);
 	skb_reserve(skb, fd_off);
 	skb_put(skb, dpa_fd_length(fd));

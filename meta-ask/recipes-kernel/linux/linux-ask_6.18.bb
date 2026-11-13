@@ -22,7 +22,6 @@ SRC_URI += "\
            file://093-netlink-name-every-cb-mutex-class.patch \
            file://094-qbman-kasan-sanitize-off.patch \
            file://110-sdk-mainline-build-compat.patch \
-           file://112-sdk_dpaa-jumbo-rx-buffers.patch \
            file://120-emc2305-dt-fan-control.patch \
            file://130-thermal-linear-governor.patch \
            file://139-netfilter-nftables-commit-in-progress.patch \

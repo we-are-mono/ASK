@@ -95,7 +95,22 @@ static inline void DPA_BUG_ON(bool cond)
  * the buffer size is increased from 2048 to 2176, to accommodate them in a
  * contiguous fd.
  */
-#define DPA_BP_RAW_SIZE		2176
+#define DPA_BP_RAW_SIZE_STD	2176
+#ifndef CONFIG_FSL_DPAA_ETH_JUMBO_FRAME
+#define DPA_BP_RAW_SIZE		DPA_BP_RAW_SIZE_STD
+#else
+/* For jumbo frames, buffers large enough to hold a 9.6K frame, the FD's
+ * maximum offset, the skb shared info and some room for further alignment.
+ * With erratum A050385 a buffer must not cross a 4K boundary, so it stays
+ * a standard one, in a page of its own (_dpa_bp_add_8_bufs()).
+ */
+#define DPA_MAX_FRM_SIZE	9600
+#define DPA_BP_RAW_SIZE_JUMBO \
+	((DPA_MAX_FRM_SIZE + DPA_MAX_FD_OFFSET + \
+	  sizeof(struct skb_shared_info) + 128) & ~(SMP_CACHE_BYTES - 1))
+#define DPA_BP_RAW_SIZE ((unlikely(fm_has_errata_a050385())) ? \
+			 DPA_BP_RAW_SIZE_STD : DPA_BP_RAW_SIZE_JUMBO)
+#endif
 
 /* This is what FMan is ever allowed to use.
  * FMan-DMA requires 16-byte alignment for Rx buffers, but SKB_DATA_ALIGN is

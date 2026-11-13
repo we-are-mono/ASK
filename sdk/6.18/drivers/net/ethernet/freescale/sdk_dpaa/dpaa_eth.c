@@ -1114,6 +1114,15 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
 	 */
 	dpa_bp->size = dpa_bp_size(&buf_layout[RX]);
 
+#ifdef CONFIG_FSL_DPAA_ETH_JUMBO_FRAME
+	/* The jumbo buffer layout is only of use when the L2 maximum frame
+	 * size admits jumbo frames as well.
+	 */
+	if (fm_get_max_frm() < 9600)
+		dev_warn(dev,
+			"Invalid configuration: if jumbo frames support is on, FSL_FM_MAX_FRAME_SIZE should be set to 9600\n");
+#endif
+
 	INIT_LIST_HEAD(&priv->dpa_fq_list);
 
 	memset(&port_fqs, 0, sizeof(port_fqs));

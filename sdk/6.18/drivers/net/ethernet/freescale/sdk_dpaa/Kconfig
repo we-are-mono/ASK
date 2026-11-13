@@ -68,6 +68,20 @@ config FSL_DPAA_ADVANCED_DRIVERS
 	  is needed to support advanced scenarios. Select this to also build the advanced
 	  drivers.
 
+config FSL_DPAA_ETH_JUMBO_FRAME
+	bool "Receive a jumbo frame into one buffer"
+	default n
+	help
+	  Size the Rx buffers for a whole 9.6K frame, so a jumbo frame is
+	  received into one buffer rather than scattered across several.
+	  The offload paths that re-inject or transform a frame (the SEC,
+	  the fragmenter, Wi-Fi) take it in one buffer.
+	  NOTE: This option can only be used if FSL_FM_MAX_FRAME_SIZE
+	  is set to 9600 bytes.
+	  The buffers are larger than a page and are carved from compound
+	  pages, three to an order-3 page; the skb truesize follows the
+	  frame length rather than the buffer size.
+
 config FSL_DPAA_TS
 	bool "Linux compliant timestamping"
 	depends on FSL_SDK_DPAA_ETH
