@@ -89,7 +89,10 @@ caller gave up on, and its next command of any kind consumes that late
 answer before it is written: otherwise QMan would see no new valid bit, and
 the old answer would be taken for the new command's. qm_shutdown_fq()
 stays bounded: its waits record what they give up on, and it does not
-start a command on a portal still owed one.
+start a command on a portal still owed one; debugfs's frame-queue
+queries are bounded too. A host command waits up to a millisecond for
+room in its portal's ring, past the ~200 us QMan can leave every ring
+full under load, rather than failing the sync it carries.
 
 The HC answer and error queues sit at WQ0 of the first CPU's portal
 channel: QMan serves WQ0 and WQ1 strictly ahead of the rest, so an
@@ -190,7 +193,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/src/wrapper/fman_test.c          | 1629 ------
  .../sdk_fman/src/wrapper/lnxwrp_fm.c          |  146 +-
  .../sdk_fman/src/wrapper/lnxwrp_fm.h          |   11 +-
- .../sdk_fman/src/wrapper/lnxwrp_fm_port.c     |  188 +-
+ .../sdk_fman/src/wrapper/lnxwrp_fm_port.c     |  196 +-
  .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c   | 4796 -----------------
  .../src/wrapper/lnxwrp_ioctls_fm_compat.c     | 1167 ----
  .../src/wrapper/lnxwrp_ioctls_fm_compat.h     |  708 ---
@@ -200,6 +203,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  drivers/staging/fsl_qbman/Kconfig             |    7 +
  drivers/staging/fsl_qbman/fsl_usdpaa.c        |    1 -
  drivers/staging/fsl_qbman/qman_config.c       |    2 +
+ drivers/staging/fsl_qbman/qman_debugfs.c      |    9 +-
  drivers/staging/fsl_qbman/qman_high.c         |  195 +-
  drivers/staging/fsl_qbman/qman_low.h          |  119 +-
  include/linux/fsl_oh_port.h                   |   26 +
@@ -213,7 +217,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    3 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   30 +-
- 84 files changed, 8803 insertions(+), 12494 deletions(-)
+ 85 files changed, 8817 insertions(+), 12497 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -17004,7 +17008,7 @@ index 6e6f07eb499e9..95812cace4d5e 100644
  
  #endif /* __LNXWRP_FM_H__ */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
-index ea42358476866..f111ebbd7f421 100644
+index ea42358476866..955c312cbe674 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
 @@ -43,7 +43,6 @@
@@ -17070,12 +17074,22 @@ index ea42358476866..f111ebbd7f421 100644
  
  	return qman_cb_dqrr_consume;
  }
-@@ -187,49 +180,92 @@ static struct qman_fq *FqAlloc(t_LnxWrpFmDev * p_LnxWrpFmDev,
+@@ -184,50 +177,101 @@ static struct qman_fq *FqAlloc(t_LnxWrpFmDev * p_LnxWrpFmDev,
+ 	return fq;
+ }
+ 
++/* How long a host command waits for room in the portal's enqueue ring. Under
++ * load QMan can leave every portal's ring full at once for some 200 us (an
++ * order restoration point's walk, cdx_wg.c), and a command refused fails the
++ * sync it carries, which is asked again only a second later. */
++#define HC_ENQUEUE_WAIT_NS	(1000 * NSEC_PER_USEC)
++
  static t_Error QmEnqueueCB(t_Handle h_Arg, void *p_Fd)
  {
  	t_LnxWrpFmDev *p_LnxWrpFmDev = (t_LnxWrpFmDev *) h_Arg;
 -	int _errno, timeout = 1000000;
 -	unsigned long flags;
++	u64 deadline = ktime_get_ns() + HC_ENQUEUE_WAIT_NS;
 +	int _errno;
  
  	ASSERT_COND(p_LnxWrpFmDev);
@@ -17083,49 +17097,43 @@ index ea42358476866..f111ebbd7f421 100644
 -	spin_lock_irqsave(&lock, flags);
 -	hcFrmRcv++;
 -	spin_unlock_irqrestore(&lock, flags);
--
++	hc_swap_frame((struct qm_fd *)p_Fd);
+ 
 -#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 -{
 -	/* extract the HC frame address */
 -	uint32_t *hcf_va = XX_PhysToVirt(qm_fd_addr((struct qm_fd *) p_Fd));
 -	int hcf_l = ((struct qm_fd *)p_Fd)->length20;
 -	int i;
--
--	/* 32b byteswap of all data in the HC Frame */
--	for(i = 0; i < hcf_l / 4; ++i)
--		hcf_va[i] =
--			___constant_swab32(hcf_va[i]);
--}
--#endif
-+	hc_swap_frame((struct qm_fd *)p_Fd);
- 
- 	_errno = qman_enqueue(p_LnxWrpFmDev->hc_tx_fq, (struct qm_fd *) p_Fd,
- 			      0);
--	if (_errno)
--		RETURN_ERROR(MINOR, E_INVALID_STATE,
--			     ("qman_enqueue() failed"));
--
--	while (hcFrmRcv && --timeout) {
--		udelay(1);
--		cpu_relax();
--	}
--	if (timeout == 0) {
--		dump_stack();
--		RETURN_ERROR(MINOR, E_WRITE_FAILED,
--			     ("timeout waiting for Tx confirmation"));
--		return E_WRITE_FAILED;
++	while ((_errno = qman_enqueue(p_LnxWrpFmDev->hc_tx_fq, (struct qm_fd *) p_Fd,
++				      0)) == -EBUSY && ktime_get_ns() < deadline)
++		cpu_relax();
 +	if (_errno) {
 +		/* Rejection leaves ownership with the caller, in CPU byte order.
 +		 * EnQFrm() reports it, if it is the first of a run: a sync
 +		 * retried on a timer is rejected the same way every time. */
 +		hc_swap_frame((struct qm_fd *)p_Fd);
 +		return ERROR_CODE(E_INVALID_STATE);
- 	}
++	}
  
+-	/* 32b byteswap of all data in the HC Frame */
+-	for(i = 0; i < hcf_l / 4; ++i)
+-		hcf_va[i] =
+-			___constant_swab32(hcf_va[i]);
 +	/* Accepted: the SDK waits for this frame's confirmation. */
- 	return E_OK;
++	return E_OK;
  }
+-#endif
+-
+-	_errno = qman_enqueue(p_LnxWrpFmDev->hc_tx_fq, (struct qm_fd *) p_Fd,
+-			      0);
+-	if (_errno)
+-		RETURN_ERROR(MINOR, E_INVALID_STATE,
+-			     ("qman_enqueue() failed"));
  
+-	while (hcFrmRcv && --timeout) {
+-		udelay(1);
+-		cpu_relax();
 +/* How long the description waits for each of QMan's answers. The command it
 + * describes went unanswered past its own deadline, so QMan may have stopped
 + * answering commands altogether: a query not answered in this time is said
@@ -17158,7 +17166,12 @@ index ea42358476866..f111ebbd7f421 100644
 +		err = qman_query_fq_np_timeout(fqs[i], &np, HC_DESCRIBE_TIMEOUT_US);
 +		if (!err)
 +			frames[i] = np.frm_cnt;
-+	}
+ 	}
+-	if (timeout == 0) {
+-		dump_stack();
+-		RETURN_ERROR(MINOR, E_WRITE_FAILED,
+-			     ("timeout waiting for Tx confirmation"));
+-		return E_WRITE_FAILED;
 +	n = scnprintf(buf, size, "frames queued: command %ld, answer %ld, error %ld",
 +		      frames[0], frames[1], frames[2]);
 +	if (err == -ETIMEDOUT) {
@@ -17177,7 +17190,9 @@ index ea42358476866..f111ebbd7f421 100644
 +			n += scnprintf(buf + n, size - n, "; QMan did not answer cpu %d's portal in %u us",
 +				       self, HC_DESCRIBE_TIMEOUT_US);
 +		}
-+	}
+ 	}
+-
+-	return E_OK;
 +	put_cpu();
 +	/* Dequeued, but not yet processed by the CPU that portal belongs to
 +	 * (lnxwrp_fm.c, hcCh): an answer on neither queue is either here or
@@ -17190,12 +17205,10 @@ index ea42358476866..f111ebbd7f421 100644
 +	n += scnprintf(buf + n, size - n, "; enqueue rings hold");
 +	for_each_online_cpu(cpu)
 +		n += scnprintf(buf + n, size - n, " %d", qman_affine_portal_eqcr_fill(cpu));
-+}
-+
+ }
+ 
  static t_LnxWrpFmPortDev *ReadFmPortDevTreeNode(struct platform_device
- 						*of_dev)
- {
-@@ -792,11 +828,10 @@ static t_Error InitFmPortDev(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev)
+@@ -792,11 +836,10 @@ static t_Error InitFmPortDev(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev)
  
  
      if ((p_LnxWrpFmPortDev->settings.param.portType != e_FM_PORT_TYPE_TX) &&
@@ -17211,7 +17224,7 @@ index ea42358476866..f111ebbd7f421 100644
      }
  
      if (CheckNConfigFmPortAdvArgs(p_LnxWrpFmPortDev) != E_OK)
-@@ -999,8 +1034,6 @@ static void LnxwrpFmPcdDevIndexedExceptionsCb(t_Handle h_App,
+@@ -999,8 +1042,6 @@ static void LnxwrpFmPcdDevIndexedExceptionsCb(t_Handle h_App,
  
  static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
  {
@@ -17220,7 +17233,7 @@ index ea42358476866..f111ebbd7f421 100644
  	if (p_LnxWrpFmDev->pcdActive) {
  		t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = &p_LnxWrpFmDev->hcPort;
  		t_FmPcdParams fmPcdParams;
-@@ -1038,11 +1071,18 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
+@@ -1038,11 +1079,18 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
  			RETURN_ERROR(MAJOR, E_NULL_POINTER,
  				     ("Frame queue allocation failed..."));
  
@@ -17240,7 +17253,7 @@ index ea42358476866..f111ebbd7f421 100644
  		if (!p_LnxWrpFmDev->hc_tx_conf_fq)
  			RETURN_ERROR(MAJOR, E_NULL_POINTER,
  				     ("Frame queue allocation failed..."));
-@@ -1051,7 +1091,7 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
+@@ -1051,7 +1099,7 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
  			FqAlloc(p_LnxWrpFmDev,
  				0,
  				QMAN_FQ_FLAG_NO_ENQUEUE,
@@ -17249,7 +17262,7 @@ index ea42358476866..f111ebbd7f421 100644
  		if (!p_LnxWrpFmDev->hc_tx_err_fq)
  			RETURN_ERROR(MAJOR, E_NULL_POINTER,
  				     ("Frame queue allocation failed..."));
-@@ -1067,6 +1107,7 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
+@@ -1067,6 +1115,7 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
  			qman_fq_fqid(p_LnxWrpFmDev->hc_tx_conf_fq);
  		fmPcdParams.hc.qmChannel = p_LnxWrpFmPortDev->txCh;
  		fmPcdParams.hc.f_QmEnqueue = QmEnqueueCB;
@@ -17257,7 +17270,7 @@ index ea42358476866..f111ebbd7f421 100644
  		fmPcdParams.hc.h_QmArg = (t_Handle) p_LnxWrpFmDev;
  
  		p_LnxWrpFmDev->h_PcdDev = FM_PCD_Config(&fmPcdParams);
-@@ -1164,55 +1205,33 @@ static int /*__devinit*/ fm_port_probe(struct platform_device *of_dev)
+@@ -1164,55 +1213,33 @@ static int /*__devinit*/ fm_port_probe(struct platform_device *of_dev)
  	if (p_LnxWrpFmPortDev->settings.param.portType == e_FM_PORT_TYPE_RX) {
  		Sprint(p_LnxWrpFmPortDev->name, "%s-port-rx%d",
  		       p_LnxWrpFmDev->name, p_LnxWrpFmPortDev->id);
@@ -17313,7 +17326,7 @@ index ea42358476866..f111ebbd7f421 100644
  		FreeFmPortDev(p_LnxWrpFmPortDev);
  		REPORT_ERROR(MAJOR, E_INVALID_STATE,
  			     ("Unable to create sys entry - fm port!!!"));
-@@ -1231,7 +1250,6 @@ static int /*__devinit*/ fm_port_probe(struct platform_device *of_dev)
+@@ -1231,7 +1258,6 @@ static int /*__devinit*/ fm_port_probe(struct platform_device *of_dev)
  static void fm_port_remove(struct platform_device *of_dev)
  {
  	t_LnxWrpFmPortDev *p_LnxWrpFmPortDev;
@@ -17321,7 +17334,7 @@ index ea42358476866..f111ebbd7f421 100644
  	struct device *dev;
  
  	dev = &of_dev->dev;
-@@ -1239,10 +1257,6 @@ static void fm_port_remove(struct platform_device *of_dev)
+@@ -1239,10 +1265,6 @@ static void fm_port_remove(struct platform_device *of_dev)
  
  	fm_port_sysfs_destroy(dev);
  
@@ -24385,6 +24398,47 @@ index 114e2773845bf..a44e26aff9459 100644
  
  int qman_ceetm_get_xsfdr(enum qm_dc_portal portal, unsigned int *num)
  {
+diff --git a/drivers/staging/fsl_qbman/qman_debugfs.c b/drivers/staging/fsl_qbman/qman_debugfs.c
+index fe042ffc0cdbe..43174afce3693 100644
+--- a/drivers/staging/fsl_qbman/qman_debugfs.c
++++ b/drivers/staging/fsl_qbman/qman_debugfs.c
+@@ -31,6 +31,9 @@
+ #include "qman_private.h"
+ 
+ #define MAX_FQID (0x00ffffff)
++/* How long a frame-queue query waits for QMan: these files are read when QMan
++ * may be the thing that stopped answering (qman_query_fq_np_timeout()). */
++#define QMAN_DEBUGFS_TIMEOUT_US	10000
+ #define QM_FQD_BLOCK_SIZE     64
+ #define QM_FQD_AR             (0xC10)
+ 
+@@ -239,7 +242,7 @@ static int query_fq_np_fields_show(struct seq_file *file, void *offset)
+ 	struct qman_fq fq;
+ 
+ 	fq.fqid = query_fq_np_fields_data.fqid;
+-	ret = qman_query_fq_np(&fq, &np);
++	ret = qman_query_fq_np_timeout(&fq, &np, QMAN_DEBUGFS_TIMEOUT_US);
+ 	if (ret)
+ 		return ret;
+ 	/* Print state */
+@@ -998,7 +1001,7 @@ static int qman_fqd_state_show(struct seq_file *file, void *offset)
+ 
+ 	for (i = 1; i < fqid_max; i++) {
+ 		fq.fqid = i;
+-		ret = qman_query_fq_np(&fq, &np);
++		ret = qman_query_fq_np_timeout(&fq, &np, QMAN_DEBUGFS_TIMEOUT_US);
+ 		if (ret)
+ 			return ret;
+ 		if (*state == (np.state & QM_MCR_NP_STATE_MASK))
+@@ -1098,7 +1101,7 @@ static int qman_fqd_non_prog_summary_show(struct seq_file *file, void *offset)
+ 
+ 	for (i = 1; i < fqid_max; i++) {
+ 		fq.fqid = i;
+-		ret = qman_query_fq_np(&fq, &np);
++		ret = qman_query_fq_np_timeout(&fq, &np, QMAN_DEBUGFS_TIMEOUT_US);
+ 		if (ret)
+ 			return ret;
+ 		/* Keep a summary count of all states */
 diff --git a/drivers/staging/fsl_qbman/qman_high.c b/drivers/staging/fsl_qbman/qman_high.c
 index 4085aa9a2dcba..80cbf767b85ab 100644
 --- a/drivers/staging/fsl_qbman/qman_high.c

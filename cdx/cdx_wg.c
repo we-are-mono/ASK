@@ -538,6 +538,28 @@ static int cdx_wg_orp_enqueue(struct cdx_wg_rxq *q, struct qman_fq *fq,
 	return err;
 }
 
+/* How long an enqueue outside an order restoration point waits for room in
+ * the portal's ring: past the ~200 us QMan leaves every ring full for under
+ * ORP load, which a fixed count of tries did not outlast, and short of holding
+ * the softirq for long. The frame is dropped after it. */
+#define CDX_WG_ENQ_WAIT_NS	(1 * NSEC_PER_MSEC)
+
+static int cdx_wg_enqueue(struct qman_fq *fq, const struct qm_fd *fd)
+{
+	u64 start = 0, now;
+	int err;
+
+	while ((err = qman_enqueue(fq, fd, 0)) == -EBUSY) {
+		now = ktime_get_ns();
+		if (!start)
+			start = now;
+		else if (now - start > CDX_WG_ENQ_WAIT_NS)
+			break;
+		cpu_relax();
+	}
+	return err;
+}
+
 /* Give up the frame's place in the order, before anything slow is done with
  * it. A hole goes in under the steer queue's own object with an empty
  * descriptor, so a rejection has nothing to free (cdx_wg_hole_ern()). */
@@ -727,7 +749,7 @@ static bool cdx_wg_rx_raw(struct cdx_wg_rxq *q, const struct qm_fd *fd,
 	struct udphdr *uh;
 	struct iphdr *iph;
 	struct qm_fd tfd;
-	int i, err;
+	int err;
 
 	/* An ordered queue is opened on every CPU already, so auto is on. */
 	if (fd->format != qm_fd_contig || !READ_ONCE(wg_rx_raw) ||
@@ -804,10 +826,8 @@ static bool cdx_wg_rx_raw(struct cdx_wg_rxq *q, const struct qm_fd *fd,
 		s->owed = !!err;
 	} else {
 		/* One CPU's queue: the frames are in order already. */
-		for (i = 0; i < 1000 && err == -EBUSY; i++)
-			err = qman_enqueue(&eth->fwd_tx_fqinfo[smp_processor_id() &
-							       (DPAA_FWD_TX_QUEUES - 1)],
-					   &tfd, 0);
+		err = cdx_wg_enqueue(&eth->fwd_tx_fqinfo[smp_processor_id() &
+							 (DPAA_FWD_TX_QUEUES - 1)], &tfd);
 	}
 	if (unlikely(err)) {
 		dpa_fd_release(port, &tfd);
@@ -1284,7 +1304,7 @@ static bool cdx_wg_seal(struct cdx_wg_sealq *sq, struct net_device *dev,
 	struct wg_fastpath_tx tx;
 	struct qm_fd fd = *in;
 	struct qman_fq *fq;
-	int i, err;
+	int err;
 
 	if (unlikely(!o))
 		return false;
@@ -1295,9 +1315,7 @@ static bool cdx_wg_seal(struct cdx_wg_sealq *sq, struct net_device *dev,
 		 * the device's seal queue on the next CPU. A flow's frames all
 		 * take the same turn, so they stay in order. */
 		fq = &w->sq[(sq - w->sq + 1) % w->nq].fq;
-		err = -EBUSY;
-		for (i = 0; i < 1000 && err == -EBUSY; i++)
-			err = qman_enqueue(fq, &fd, 0);
+		err = cdx_wg_enqueue(fq, &fd);
 		if (unlikely(err)) {
 			this_cpu_inc(w->pc->tx_fail);
 			dpa_fd_release(NULL, &fd);
@@ -1317,9 +1335,7 @@ static bool cdx_wg_seal(struct cdx_wg_sealq *sq, struct net_device *dev,
 		/* One flow's frames arrive on one seal queue, so on one CPU: a
 		 * queue per CPU keeps them in order. */
 		fq = &eth->fwd_tx_fqinfo[smp_processor_id() & (DPAA_FWD_TX_QUEUES - 1)];
-		err = -EBUSY;
-		for (i = 0; i < 1000 && err == -EBUSY; i++)
-			err = qman_enqueue(fq, &fd, 0);
+		err = cdx_wg_enqueue(fq, &fd);
 	}
 	if (unlikely(err)) {
 		this_cpu_inc(w->pc->tx_fail);

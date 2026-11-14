@@ -174,9 +174,11 @@ result independently of those temporary files.
   queue's FQID 0x809a had been freed ~2 s before it was reused, so stale ORP state is a candidate trigger, as is
   a hole sent under the steer queue's own FQID. Next: on a recurrence, the HC timeout line says whether QMan
   answers and what each CPU's enqueue ring holds (all non-zero and no answer: a global stop); print the ORP
-  fields (bounded query) right after the steer queue's `qman_init_fq()`; A/B a smaller window. Debugfs
-  `query_fq_np` still waits without bound, so it cannot be used on a silent QMan. Whether 6.12 can do it too is
-  unknown (same code).
+  fields (bounded query) right after the steer queue's `qman_init_fq()`; A/B a smaller window. On a silent QMan
+  read only debugfs `query_fq_np` (gives up after 10 ms): the other debugfs queries (fq, wq, cgr, congestion,
+  ceetm) still wait without bound, also for a timed-out query's late answer; bound them with this work, and give
+  `cdx_wg_enqueue()` a ratelimited line when its 1 ms runs out (it counts only `dropped`/`tx_fail`). Whether 6.12
+  can do it too is unknown (same code).
 
 - [x] **A441 — `test_restart_budget_waits_in_software`'s second window armed a fault nothing tripped.**
   `Rig.clear_ct()` returned before the flowtable's GC retired the connection's entries, so the next admission saw

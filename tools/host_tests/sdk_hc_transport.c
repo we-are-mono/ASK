@@ -49,6 +49,15 @@ enum qman_cb_dqrr_result { qman_cb_dqrr_consume };
 typedef struct { t_Handle h_PcdDev; struct qman_fq *hc_tx_fq; } t_LnxWrpFmDev;
 typedef struct { struct qman_fq fq; t_Handle h_Arg; } t_FmTestFq;
 static int qman_enqueue(struct qman_fq *, const struct qm_fd *, u32);
+/* The wrapper waits for room in the ring on a clock of its own: here it
+ * advances only while the wrapper spins for room, and in coarse steps, so a
+ * wait bounded by time takes a handful of tries where a fixed count of them
+ * would run far past it. */
+#define NSEC_PER_USEC 1000ULL
+#define RELAX_NS (50 * NSEC_PER_USEC)
+static u64 now_ns;
+static u64 ktime_get_ns(void) { return now_ns; }
+static void cpu_relax(void) { now_ns += RELAX_NS; }
 #include "hc_wrapper.inc"
 #include "hc_production.inc"
 
@@ -56,6 +65,9 @@ struct spin { bool held; };
 static unsigned delays, confirm_at, submissions, frees, port_frees;
 static int allocation_budget = -1;
 static bool reject, inline_confirm, confirm_on_timeout, nested_command;
+/* Refused until then: a ring full for a while, as QMan leaves every portal's
+ * under load. */
+static u64 reject_until;
 /* The opcode the next submission must carry. */
 static uint32_t command;
 #define SYNC (HC_HCOR_GBL | HC_HCOR_OPCODE_SYNC)
@@ -133,7 +145,7 @@ static int qman_enqueue(struct qman_fq *fq, const struct qm_fd *fd, u32 flags)
     /* The command must reach QMan in hardware byte order. */
     assert(bytes[0] == command >> 24 && bytes[1] == (uint8_t)(command >> 16) &&
            bytes[2] == (uint8_t)(command >> 8) && bytes[3] == (uint8_t)command);
-    if (reject) return -EBUSY;
+    if (reject || now_ns < reject_until) return -EBUSY;
     if (nested_command) {
         /* A second caller completes while the first still owns its command.
          * Neither completion may wait for a global outstanding-frame count. */
@@ -190,7 +202,14 @@ static void rejection_and_completion(void)
     unsigned reported = reports, recovered = recoveries;
     reject = true;
     for (unsigned n = 0; n < 2 * HC_CMD_POOL_SIZE; n++) {
+        u64 start = now_ns;
+        unsigned tried = submissions;
         assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_INVALID_STATE);
+        /* A ring that stays full is given up on when the wait ends: not
+         * before, and not a step later. */
+        assert(now_ns - start >= HC_ENQUEUE_WAIT_NS &&
+               now_ns - start < HC_ENQUEUE_WAIT_NS + RELAX_NS);
+        assert(submissions - tried <= HC_ENQUEUE_WAIT_NS / RELAX_NS + 1);
         /* A refused sync was never sent: nothing is left unanswered, and
          * the next can complete. */
         assert(!hc->nextSeqNumLocation && !HcUnanswered(hc) && !delays);
@@ -211,6 +230,12 @@ static void rejection_and_completion(void)
     assert(GET_ERROR_TYPE(FmHcPcdSync(hc)) == E_INVALID_STATE && reports == reported + 2);
     reject = false;
     assert(FmHcPcdSync(hc) == E_OK && recoveries == recovered + 2 && reports == reported + 2);
+    /* A ring full for a moment -- some 200 us under load -- is waited out:
+     * the command goes in once there is room, and nothing failed. */
+    reject_until = now_ns + 200 * NSEC_PER_USEC;
+    unsigned sent = submissions;
+    assert(FmHcPcdSync(hc) == E_OK && !hc->failures && reports == reported + 2);
+    assert(submissions > sent + 1 && now_ns >= reject_until);
     inline_confirm = false;
     confirm_at = HC_CONFIRM_POLLS; /* Completion at the deadline wins. */
     assert(FmHcPcdSync(hc) == E_OK && !HcUnanswered(hc));
