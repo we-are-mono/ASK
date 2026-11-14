@@ -1,0 +1,1532 @@
+From 8c86b0cd37a577105aad3c73f29e6b1f31832969 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sun, 9 Aug 2026 23:32:38 +0200
+Subject: [PATCH] ask: XFRM/IPsec hardware offload
+
+Adds the IPsec packet offload to the FMAN SEC (CAAM) engine: hook points
+in xfrm_input.c, xfrm_output.c, xfrm_device.c and xfrm_state.c. New Kconfigs
+INET_IPSEC_OFFLOAD (net/ipv4/Kconfig) and INET6_IPSEC_OFFLOAD
+(net/ipv6/Kconfig), both depending on CPE_FAST_PATH from 010.
+
+The IP output path carries its bypasses (net/ipv4/ip_output.c,
+net/ipv6/{ip6_output,output_core}.c): a transport-mode frame for a
+packet-offloaded SA (skb->ipsec_offload, the skb field from 010) is
+still plaintext and leaves by the SA's own device. It skips LOCAL_OUT,
+POST_ROUTING and fragmentation on the way there, since SEC builds the
+ESP packet.
+
+Also the CAAM PDB struct packing (drivers/crypto/caam/pdb.h) required
+for SEC's view of the IPsec descriptor layout, and the xfrm_state handle
+and its byh index (xfrm.h, netns/xfrm.h).
+
+PF_KEY gets no ESN flag. It has no way to carry the replay_esn state an
+ESN SA needs, so an imported flag left a valid state whose inbound
+replay check dereferences a NULL replay_esn. ESN SAs come from netlink,
+which validates and allocates that state.
+
+The handle is the driver's: xdo_dev_state_add() sets it before the state
+is inserted, and the state is indexed by it so that the driver can
+resolve a frame SEC has decrypted back to its state. A state no driver
+took has no handle and is not indexed.
+
+GCM SAs offload like every other supported cipher; the shared
+descriptor sharing policy that made them unsafe is fixed on the cdx
+side (DNCPE-2358). GMAC does not offload: SEC's GMAC ICV leaves out the
+IV that RFC 4543 authenticates, so the cdx adapter refuses it.
+
+A packet-offloaded SA's frames leave only by the SA's own device, the
+one that hands them to SEC: a bundle routed to another device is dropped
+and counted as XfrmOutBundleCheckError, and validate_xmit_xfrm() drops a
+frame moved off it later. A bundle of more than one transform is dropped
+the same way, since the driver applies only the first. Tunnel mode goes
+to the device directly with an Ethernet header the IPsec offline port
+rewrites, so no neighbour of the inner family is resolved; the SA's own
+next hop is still used per packet, as neighbour output used it, so Linux
+keeps that entry resolved. A GSO packet is segmented in software first,
+checksums finished, so SEC gets one packet per ESP. The frame's DPOVRD
+follows the SA's mode: a tunnel's names the inner protocol, a transport
+SA's the frame's own IP header length and next-header offset. A frame
+the driver could not give SEC is counted as a transmit drop, not in
+`tx toenc`. An update that would change a packet-offloaded state's
+encapsulation ports or output mark in place is refused: no driver hears
+of an update, and the hardware SA carries the ports and was addressed by
+a route looked up with the mark, so deleting and adding the state is
+what programs new ones.
+
+A state with a handle is received through SEC and nothing else: SEC
+keeps its anti-replay window, and xfrm's copy of it is refreshed from
+SEC but never written back. xfrm_input() hands its ESP to the driver,
+which takes only a frame that arrived on the state's own device, and
+drops whatever SEC is not given -- another device's or another port's
+ESP, a frame the driver could not queue, ESP delivered by GRO -- as
+XfrmInStateMismatch rather than decrypt it against a second window. A
+state another driver offloads is received as upstream receives it. Each
+frame it does give SEC carries a DPOVRD describing its header as the
+stack parsed it, IPv4 options and IPv6 extension headers included, since
+the SA's PDB states a plain one: a tunnel's the outer header SEC strips,
+a transport SA's its header up to ESP and the byte naming ESP.
+
+A packet-offloaded state's sequence numbers and anti-replay window move in
+its device, so xfrm's copy of them is the driver's to publish.
+XFRM_MSG_GETAE and xfrm_state_migrate() ask it to
+(xdo_dev_state_update_stats()) before they read that copy, as
+XFRM_MSG_GETSA already does, and XFRM_MSG_NEWAE refuses to write it: no
+driver hears of an update, so the state would report a replay state its
+device never had.
+
+Compiles warning-free: xfrm_state_lookup_byhandle() is declared in
+include/net/xfrm.h and __xfrm_state_lookup_byhandle is static.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ drivers/crypto/caam/pdb.h                     |  12 +-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 286 ++++++++++++++++--
+ include/net/netns/xfrm.h                      |   3 +
+ include/net/xfrm.h                            |  11 +
+ net/ipv4/Kconfig                              |   6 +
+ net/ipv4/ip_output.c                          |  24 +-
+ net/ipv6/Kconfig                              |   6 +
+ net/ipv6/ip6_output.c                         |  18 +-
+ net/ipv6/output_core.c                        |   8 +
+ net/xfrm/xfrm_device.c                        |  24 ++
+ net/xfrm/xfrm_input.c                         |  48 +++
+ net/xfrm/xfrm_output.c                        | 248 +++++++++++++++
+ net/xfrm/xfrm_state.c                         | 202 +++++++++++++
+ net/xfrm/xfrm_user.c                          |  27 ++
+ 14 files changed, 884 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/crypto/caam/pdb.h b/drivers/crypto/caam/pdb.h
+index 4b1bcf53f7ac..1669e0d267e3 100644
+--- a/drivers/crypto/caam/pdb.h
++++ b/drivers/crypto/caam/pdb.h
+@@ -145,7 +145,7 @@ struct ipsec_encap_pdb {
+ 	u32 spi;
+ 	u32 ip_hdr_len;
+ 	u32 ip_hdr[];
+-};
++}__attribute__((packed));
+ 
+ /**
+  * ipsec_decap_cbc - PDB part for IPsec CBC decapsulation
+@@ -153,7 +153,7 @@ struct ipsec_encap_pdb {
+  */
+ struct ipsec_decap_cbc {
+ 	u32 rsvd[2];
+-};
++}__attribute__((packed));
+ 
+ /**
+  * ipsec_decap_ctr - PDB part for IPsec CTR decapsulation
+@@ -163,7 +163,7 @@ struct ipsec_decap_cbc {
+ struct ipsec_decap_ctr {
+ 	u8 ctr_nonce[4];
+ 	u32 ctr_initial;
+-};
++}__attribute__((packed));
+ 
+ /**
+  * ipsec_decap_ccm - PDB part for IPsec CCM decapsulation
+@@ -177,7 +177,7 @@ struct ipsec_decap_ctr {
+ struct ipsec_decap_ccm {
+ 	u8 salt[4];
+ 	u32 ccm_opt;
+-};
++}__attribute__((packed));
+ 
+ /**
+  * ipsec_decap_gcm - PDB part for IPsec GCN decapsulation
+@@ -187,7 +187,7 @@ struct ipsec_decap_ccm {
+ struct ipsec_decap_gcm {
+ 	u8 salt[4];
+ 	u32 resvd;
+-};
++}__attribute__((packed));
+ 
+ /**
+  * ipsec_decap_pdb - PDB for IPsec decapsulation
+@@ -211,7 +211,7 @@ struct ipsec_decap_pdb {
+ 	u32 seq_num_ext_hi;
+ 	u32 seq_num;
+ 	__be32 anti_replay[4];
+-};
++}__attribute__((packed));
+ 
+ /*
+  * IPSec ESP Datapath Protocol Override Register (DPOVRD)
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
+index f1609f46faba..f877d2ce6c25 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
+@@ -58,6 +58,7 @@
+ #include <uapi/linux/ppp_defs.h>
+ #include <uapi/linux/if_pppox.h>
+ #include <linux/if_vlan.h>
++#include <net/ipv6.h>
+ #include <net/xfrm.h>
+ #endif
+ 
+@@ -1442,6 +1443,30 @@ static int pfe_eth_get_queuenum( struct sk_buff *skb )
+ #define ETHHDR_MACEND_OFFSET    12
+ 
+ #define DPOVRD_ENABLE		0x80000000
++/* A tunnel SA's decapsulation word (SEC RM table 9-27) carries the length of
++ * the outer IP header material SEC strips in its low twelve bits. The offset
++ * of the IP header within that material, the bits above, stays zero. */
++#define DPOVRD_TUNNEL_DECAP_LEN	0xfff
++
++/* The longest IP header SEC may keep ahead of a transport SA's ESP, either
++ * way. Whatever SEC outputs is parsed next by the IPsec offline port, behind
++ * the Ethernet header and the SA's 4-byte VLAN tag the descriptor inserts:
++ * outbound it finds the SA by ESP's SPI, inbound the decrypted flow by its
++ * transport header. FMan's parser reads only a frame's first 256-byte
++ * internal buffer, of which the board DTS's buffer-layout keeps the first 96
++ * bytes (FMBM_RIM[FOF]) as headroom for the headers the microcode inserts:
++ * it reaches byte 160 of the frame. A header it cannot finish there leaves
++ * the frame marked block-limit-exceeded, and the microcode discards many
++ * such frames (A367). Measured with IPv6 extension headers: ESP's SPI
++ * and sequence number ending at byte 154 of SEC's output were always
++ * classified, ending at 162 almost never. The eight bytes left here are
++ * ESP's or a UDP header's. A decrypted TCP header is longer and meets the
++ * limit with a shorter IP header: SEC decrypts such a packet and the offline
++ * port discards it, which nothing here can tell before decryption. The bound
++ * is well inside DPOVRD's eight-bit length field. */
++#define DPA_IPSEC_PARSE_REACH	(256 - 96)
++#define DPA_IPSEC_TRANSPORT_HDR_MAX \
++	(DPA_IPSEC_PARSE_REACH - ETH_HDR_SIZE - VLAN_HDR_SIZE - 8)
+ 
+ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_proto, unsigned short* l3_offset)
+ {
+@@ -1478,17 +1503,120 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+ 	}
+ }
+ 
+-static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
++/* The transport-mode DPOVRD for an IP header `hdr_len` bytes long whose byte
++ * `at` is the next header ESP follows, with `next` in the next-header field;
++ * false if SEC cannot be told about that header.
++ *
++ * With the override bit set SEC takes the header's length and the offset of
++ * that byte from here instead of from the SA's PDB. It encrypts or decrypts
++ * only what follows the header. Encapsulating, it moves the byte into the ESP
++ * trailer and writes `next` in its place; decapsulating, it writes the
++ * protocol it finds in the trailer there, and `next` is reserved.
++ */
++static bool dpa_ipsec_transport_dpovrd(const u8 *nh, unsigned int hdr_len,
++				       unsigned int at, u8 next, u32 *dpovrd)
++{
++	unsigned int nh_offset;
++
++	if (hdr_len > DPA_IPSEC_TRANSPORT_HDR_MAX)
++		return false;
++	if ((*nh >> 4) == IPVERSION)
++		/* Any non-zero offset names byte 9 of an IPv4 header. */
++		nh_offset = 1;
++	else if (at == offsetof(struct ipv6hdr, nexthdr))
++		/* SEC reads byte 6 for an offset of one... */
++		nh_offset = 1;
++	else if (at % 8 == 0)
++		/* ...and eight times the offset otherwise, which is where
++		 * every extension header, starting on an eight-byte boundary,
++		 * keeps its own. */
++		nh_offset = at / 8;
++	else
++		return false;
++	*dpovrd = DPOVRD_ENABLE | hdr_len << 16 | nh_offset << 8 | next;
++	return true;
++}
++
++/* The DPOVRD value SEC encrypts a frame for `x` with; false if the frame's IP
++ * header is one it cannot be told about.
++ *
++ * A tunnel's is the inner packet's own protocol for the ESP trailer, IPIP or
++ * IPv6. A transport SA's describes the frame's own IP header, with ESP for
++ * the next header (dpa_ipsec_transport_dpovrd()). Given a tunnel's value --
++ * offset and length zero -- a transport frame has its IP header encrypted and
++ * IPIP named in the trailer, which no peer decodes. The PDB's own values fit
++ * only a header of the plain length, so a transport frame's are taken from
++ * the frame, IPv4 options and IPv6 extension headers included.
++ */
++static bool dpa_ipsec_dpovrd(const struct xfrm_state *x, const u8 *nh,
++			     unsigned int len, u32 *dpovrd)
++{
++	unsigned int hdr_len, at;
++
++	if (x->props.mode != XFRM_MODE_TRANSPORT) {
++		*dpovrd = DPOVRD_ENABLE |
++			  ((*nh >> 4) == IPVERSION ? IPPROTO_IPIP : IPPROTO_IPV6);
++		return true;
++	}
++	if ((*nh >> 4) == IPVERSION) {
++		hdr_len = (nh[0] & 0xf) * 4;
++		if (hdr_len < sizeof(struct iphdr) || hdr_len > len)
++			return false;
++		at = offsetof(struct iphdr, protocol);
++	} else {
++		bool routing = false;
++		u8 next;
++
++		at = offsetof(struct ipv6hdr, nexthdr);
++		hdr_len = sizeof(struct ipv6hdr);
++		if (hdr_len > len)
++			return false;
++		next = nh[at];
++		/* ESP follows hop-by-hop options, a routing header and any
++		 * destination options ahead of one, where ip6_find_1stfragopt()
++		 * puts the transport header. */
++		for (;;) {
++			if (next == NEXTHDR_ROUTING)
++				routing = true;
++			else if (next != NEXTHDR_HOP &&
++				 (next != NEXTHDR_DEST || routing))
++				break;
++			if (hdr_len + 2 > len)
++				return false;
++			at = hdr_len;
++			next = nh[at];
++			hdr_len += (nh[at + 1] + 1) * 8;
++			if (hdr_len > len)
++				return false;
++		}
++		/* The offline port sends a frame with a hop limit of 1 or 0 to
++		 * the CPU unless its fixed header names ESP: it cannot see ESP
++		 * behind extension headers before it decides, and anything else
++		 * there may be a decrypted packet its forwarding entry would
++		 * pass on expired. On the CPU an outbound SA's output can only
++		 * be freed, so such a frame is not encrypted at all. */
++		if (at != offsetof(struct ipv6hdr, nexthdr) &&
++		    nh[offsetof(struct ipv6hdr, hop_limit)] <= 1)
++			return false;
++	}
++	return dpa_ipsec_transport_dpovrd(nh, hdr_len, at, IPPROTO_ESP, dpovrd);
++}
++
++/* Hand a frame for a packet-offloaded SA to SEC. 0 means SEC has it; anything
++ * else means it was freed here instead and counted as dropped on net_dev, so
++ * a caller counting what it gave SEC counts only a 0.
++ */
++static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
+ {
+ 	struct xfrm_state *x;
+ 	struct qman_fq *egress_fq = NULL;
+ 	struct qm_fd		 fd;
+-	int err = 0,ii;
++	int err = -ENOENT, ii;
+ 	int new_ethhdr_end, old_ethhdr_end;
+ 	unsigned short l3_proto, l3_offset;
+ 	unsigned char* skb_nh ;
+ 	struct sec_path *sp;
+-	unsigned int dpovrd = 0;
++	u32 dpovrd = 0;
+ 	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
+ 	 * concurrently; never read the global twice */
+ 	cdx_get_ipsec_fq_hook_t get_ipsec_fq = READ_ONCE(cdx_get_ipsec_fq_hookfn);
+@@ -1505,9 +1633,9 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
+ 		use the below code */
+ 		if (!egress_fq)
+ 		{
+-			printk("%s(%d) egress frame queue not found \n",
+-			__func__, __LINE__);
+-			goto sec_submit_failed;	
++			net_err_ratelimited("%s: no SEC queue for SA handle %u\n",
++					    __func__, x->handle);
++			goto sec_submit_failed;
+ 		}
+ 
+ 		/*
+@@ -1528,7 +1656,8 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
+ 				 * offload interface), COW it first so the capture is not
+ 				 * corrupted. skb_cow_head() is a cheap branch when the skb is
+ 				 * not cloned; on failure drop the packet like the paths below. */
+-				if (skb_cow_head(skb, 0))
++				err = skb_cow_head(skb, 0);
++				if (err)
+ 					goto sec_submit_failed;
+ 				/* skb_cow_head() may have reallocated skb->head, so the cached
+ 				 * network-header pointer is now stale; re-derive it against the
+@@ -1544,22 +1673,20 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
+ 				skb->data = skb->data + l3_offset - ETH_HDR_SIZE;
+ 				skb->len = skb->len - l3_offset + ETH_HDR_SIZE;
+ 			}
+-			if ((*skb_nh >> 4) == IPVERSION) /* Extracting ip version from network header */
+-			{
+-				dpovrd = IPPROTO_IPIP; /* ESP trailer NH type. Here traffic is IPv4 */
+-			}
+-			else
+-			{
+-				dpovrd = IPPROTO_IPV6; /* ESP trailer NH type. Here traffic is IPv4 */
++			if (!dpa_ipsec_dpovrd(x, skb_nh,
++					      skb_headlen(skb) - (skb_nh - skb->data),
++					      &dpovrd)) {
++				err = -EINVAL;
++				goto sec_submit_failed;
+ 			}
+-			dpovrd |= DPOVRD_ENABLE; /* OVRD enable */
+ 		}
+ 
+ 
+ 		err =  skb_fraglist_to_sg_fd(dpa_bp->dev, net_dev, skb, &fd, dpovrd);
+ 		if (unlikely(err < 0))
+ 		{
+-			printk("%s(%d) skb_fraglist_to_sg_fd \n",__func__,__LINE__);
++			net_err_ratelimited("%s: no S/G frame for SEC: %d\n",
++					    __func__, err);
+ 			goto sec_submit_failed;
+ 		}
+ 
+@@ -1617,12 +1744,12 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
+ 
+ 		/* sucessful transmit to CAAM */
+ 		netif_trans_update(net_dev);
+-		return;
++		return 0;
+ 	}
+ sec_submit_failed:
+-	dev_kfree_skb(skb);
+-	return;
+-
++	dev_core_stats_tx_dropped_inc(net_dev);
++	kfree_skb(skb);
++	return err;
+ }
+ 
+ /* Whether @dev is a port of this driver, and so has a struct dpa_priv_s as
+@@ -1647,11 +1774,79 @@ static bool dpa_inb_port_ok(const struct net_device *port,
+ 	return dpa_netdev_is_dpaa_port(port) && port == READ_ONCE(x->xso.dev);
+ }
+ 
++/* The DPOVRD value SEC decrypts @skb, an inbound frame of @x, with; false if
++ * its IP header is one SEC cannot be told about. Read as xfrm_input() has the
++ * frame: data at ESP, the network header at the IP header ESP came in.
++ *
++ * Either mode's PDB states a plain IP header of the SA's family
++ * (cdx_ipsec_build_in_sa_pdb()), so a frame with IPv4 options or IPv6
++ * extension headers ahead of ESP would have them read as ESP and fail SEC's
++ * ICV check. Each frame's value describes its own header instead, as the
++ * stack found it, and so as the stack would have decrypted it.
++ *
++ * A tunnel's gives the length of everything ahead of ESP, which SEC strips:
++ * the outer IP header and, for ESP-in-UDP, the UDP header behind it. The
++ * frame has to come the way the state receives, which xfrm_input() checks
++ * only after this: through the state's UDP encapsulation if it has one, bare
++ * otherwise. Only ESP-in-UDP without a non-ESP marker is offloaded
++ * (ft_ipsec_spec()), from which xfrm4_udp_encap_rcv() and
++ * xfrm6_udp_encap_rcv() pull exactly the UDP header.
++ *
++ * A transport SA's gives SEC the frame's header up to ESP and the byte naming
++ * ESP, the one the stack found it by (IP6CB()'s nhoff, where
++ * xfrm6_transport_finish() writes the protocol too), for SEC to write the
++ * protocol from the trailer into. ESP the stack found anywhere else -- behind
++ * a UDP header, say -- is not this SA's to decrypt.
++ */
++static bool dpa_ipsec_inb_dpovrd(const struct xfrm_state *x,
++				 const struct sk_buff *skb, u32 *dpovrd)
++{
++	const u8 *nh = skb_network_header(skb);
++	bool tunnel = x->props.mode != XFRM_MODE_TRANSPORT;
++	unsigned int hdr_len, ip_len, at;
++	u8 next = IPPROTO_ESP;
++
++	*dpovrd = 0;
++	if (skb->data <= nh)
++		return false;
++	hdr_len = ip_len = skb->data - nh;
++	if (x->encap) {
++		if (!tunnel || ip_len <= sizeof(struct udphdr))
++			return false;
++		ip_len -= sizeof(struct udphdr);
++		next = IPPROTO_UDP;
++	}
++	switch (*nh >> 4) {
++	case IPVERSION:
++		if (ip_len != (nh[0] & 0xf) * 4)
++			return false;
++		at = offsetof(struct iphdr, protocol);
++		break;
++	case 6:
++		at = IP6CB(skb)->nhoff;
++		if (ip_len < sizeof(struct ipv6hdr) || at >= ip_len)
++			return false;
++		break;
++	default:
++		return false;
++	}
++	if (nh[at] != next)
++		return false;
++	if (tunnel) {
++		if (hdr_len > DPOVRD_TUNNEL_DECAP_LEN)
++			return false;
++		*dpovrd = DPOVRD_ENABLE | hdr_len;
++		return true;
++	}
++	return dpa_ipsec_transport_dpovrd(nh, hdr_len, at, 0, dpovrd);
++}
++
+ /* Hand an inbound ESP frame of the packet-offloaded state @x to SEC, from
+  * xfrm_input(). 0: SEC has the frame. Anything else: SEC was not given it --
+  * no hook, no queue for the state's handle, a frame that did not arrive on
+- * the state's own port (directly, over a VLAN or in a PPPoE session), or one
+- * that could not be queued -- and the skb is exactly as it came, for
++ * the state's own port (directly, over a VLAN or in a PPPoE session), a
++ * header SEC cannot be told about, or one that could not be queued -- and the
++ * skb is as it came, a stale IPv4 header checksum at most put right, for
+  * xfrm_input() to decide what becomes of it.
+  */
+ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+@@ -1661,10 +1856,14 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+ 	struct dpa_percpu_priv_s *percpu_priv = NULL;
+ 	struct qm_fd		 fd;
+ 	int err, ii;
+-	uint8_t tmp_len = 0, data[ETH_HLEN],ipvsn;
++	/* How far the frame is moved back to its MAC header: past a tunnel's
++	 * outer header, which may run to DPOVRD_TUNNEL_DECAP_LEN. */
++	unsigned int tmp_len = 0;
++	uint8_t data[ETH_HLEN], ipvsn;
+ 	struct net_device *netdev;
+ 	struct device* dev;
+ 	struct net_device *real_dev = NULL;
++	u32 dpovrd;
+ 	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
+ 	 * concurrently; never read the global twice */
+ 	cdx_get_ipsec_fq_hook_t get_ipsec_fq = READ_ONCE(cdx_get_ipsec_fq_hookfn);
+@@ -1679,7 +1878,11 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+ 		{
+ 			return -1; /* give packet to linux */
+ 		}
+-		if (skb->dev->type == ARPHRD_ETHER) 
++		/* Measured from ESP, before the frame is moved to its MAC
++		 * header below. */
++		if (!dpa_ipsec_inb_dpovrd(x, skb, &dpovrd))
++			return -1;
++		if (skb->dev->type == ARPHRD_ETHER)
+ 		{
+ 			/* Get the corresponding physical device info, if the skb->dev corresponds to vlan*/
+ 			real_dev = is_vlan_dev(skb->dev) ? vlan_dev_real_dev(skb->dev) : skb->dev;
+@@ -1745,16 +1948,36 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+ 		if (!priv)
+ 			return -1;
+ 
++		/* The stack writes its address into a Record Route or
++		 * Timestamp option of a packet it delivers, in place, after
++		 * checking the header checksum and without updating it. SEC
++		 * updates that checksum for the transport header it passes on
++		 * rather than computing it afresh, so the decrypted packet
++		 * would carry the stale one and the offline port discard it.
++		 * The header may be shared again since, with a raw socket's
++		 * clone say, so it is unshared before it is written. A
++		 * tunnel's outer header is stripped, checksum and all. */
++		if (x->props.mode == XFRM_MODE_TRANSPORT && dpovrd &&
++		    (skb_network_header(skb)[0] >> 4) == IPVERSION) {
++			struct iphdr *iph = ip_hdr(skb);
++
++			if (iph->ihl > 5 && ip_fast_csum(iph, iph->ihl)) {
++				if (skb_cow_head(skb, 0))
++					goto err_giveback;
++				ip_send_check(ip_hdr(skb));
++			}
++		}
++
+ 		/* Both arms above leave the state's own port in priv, so the
+ 		 * frame is mapped for that port's pool whatever device it
+ 		 * reached the stack by. */
+ 		dev = priv->dpa_bp->dev;
+ 		netdev = priv->net_dev;
+-		err =  skb_fraglist_to_sg_fd(dev, netdev, skb, &fd, 0);
++		err =  skb_fraglist_to_sg_fd(dev, netdev, skb, &fd, dpovrd);
+ 		if (unlikely(err < 0))
+ 		{
+-			printk("%s(%d) skb_fraglist_to_sg_fd failed\n",
+-					__func__,__LINE__);
++			net_err_ratelimited("%s: no S/G frame for SEC: %d\n",
++					    __func__, err);
+ 			goto err_giveback; /* give packet to linux */
+ 		}
+ 
+@@ -1860,9 +2083,12 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+ #ifdef CONFIG_XFRM
+ #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
+ 	if(skb->ipsec_offload) {
+-		dpaa_submit_outb_pkt_to_SEC(skb, net_dev, priv->dpa_bp);
+-		percpu_priv = raw_cpu_ptr(priv->percpu_priv);
+-		percpu_priv->tx_caam_enc++;
++		/* tx toenc counts frames SEC was given; one freed instead is
++		 * already counted as dropped. */
++		if (!dpaa_submit_outb_pkt_to_SEC(skb, net_dev, priv->dpa_bp)) {
++			percpu_priv = raw_cpu_ptr(priv->percpu_priv);
++			percpu_priv->tx_caam_enc++;
++		}
+ 		return NETDEV_TX_OK;
+ 	}
+ #endif
+diff --git a/include/net/netns/xfrm.h b/include/net/netns/xfrm.h
+index b73983a17e08..77d04c715e01 100644
+--- a/include/net/netns/xfrm.h
++++ b/include/net/netns/xfrm.h
+@@ -42,6 +42,9 @@ struct netns_xfrm {
+ 	struct hlist_head	__rcu *state_bydst;
+ 	struct hlist_head	__rcu *state_bysrc;
+ 	struct hlist_head	__rcu *state_byspi;
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	struct hlist_head	__rcu *state_byh;
++#endif
+ 	struct hlist_head	__rcu *state_byseq;
+ 	struct hlist_head	 __percpu *state_cache_input;
+ 	unsigned int		state_hmask;
+diff --git a/include/net/xfrm.h b/include/net/xfrm.h
+index a20a01dd6f98..2412c22ce0a6 100644
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -183,6 +183,11 @@ struct xfrm_state {
+ 		struct hlist_node	bysrc;
+ 	};
+ 	struct hlist_node	byspi;
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	struct hlist_node	byh;
++	u16			handle;
++	u16			in_byh_hash;
++#endif
+ 	struct hlist_node	byseq;
+ 	struct hlist_node	state_cache;
+ 	struct hlist_node	state_cache_input;
+@@ -320,6 +325,12 @@ enum {
+ 	XFRM_STATE_EXPIRED,
+ 	XFRM_STATE_DEAD
+ };
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++/* The packet-offloaded state the driver knows by this handle, held; for the
++ * out-of-tree cdx module, which gets the handle back from SEC with each
++ * decrypted frame. */
++struct xfrm_state *xfrm_state_lookup_byhandle(struct net *net, u16 handle);
++#endif
+ 
+ /* callback structure passed from either netlink or pfkey */
+ struct km_event {
+diff --git a/net/ipv4/Kconfig b/net/ipv4/Kconfig
+index 4cfd87b28c04..8871e4f90f2c 100644
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@ -392,6 +392,12 @@ config INET_ESPINTCP
+ 
+ 	  If unsure, say N.
+ 
++config INET_IPSEC_OFFLOAD
++	bool "IPsec Fast Path Processing offload"
++	depends on (INET_ESP || INET_AH) && CPE_FAST_PATH
++	help
++	  Support for IPsec Fast Path offload.
++
+ config INET_IPCOMP
+ 	tristate "IP: IPComp transformation"
+ 	select INET_XFRM_TUNNEL
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 1f81d5152471..8dc47336a30c 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -116,6 +116,14 @@ int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 
+ 	skb->protocol = htons(ETH_P_IP);
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD)
++	if(skb->ipsec_offload)
++	{
++		dst_output(net, sk, skb);
++		return 0;
++	}
++	else
++#endif /* endif for CONFIG_INET_IPSEC_OFFLOAD */
+ 	return nf_hook(NFPROTO_IPV4, NF_INET_LOCAL_OUT,
+ 		       net, sk, skb, NULL, skb_dst_dev(skb),
+ 		       dst_output);
+@@ -308,7 +316,11 @@ static int __ip_finish_output(struct net *net, struct sock *sk, struct sk_buff *
+ 	if (skb_is_gso(skb))
+ 		return ip_finish_output_gso(net, sk, skb, mtu);
+ 
+-	if (skb->len > mtu || IPCB(skb)->frag_max_size)
++	if (
++#if defined(CONFIG_INET_IPSEC_OFFLOAD)
++		(skb->ipsec_offload == 0) &&
++#endif
++		(skb->len > mtu || IPCB(skb)->frag_max_size))
+ 		return ip_fragment(net, sk, skb, mtu, ip_finish_output2);
+ 
+ 	return ip_finish_output2(net, sk, skb);
+@@ -434,6 +446,16 @@ int ip_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 	skb->dev = dev;
+ 	skb->protocol = htons(ETH_P_IP);
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD)
++	/* Bypass invoking post routing hooks since the tunnel header and ESP
++	 * processing is not done in slow path for IPSec offloaded cases
++	 */
++	if (skb->ipsec_offload) {
++		ret_val = ip_finish_output(net, sk, skb);
++		rcu_read_unlock();
++		return ret_val;
++	}
++#endif
+ 	ret_val = NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING,
+ 				net, sk, skb, indev, dev,
+ 				ip_finish_output,
+diff --git a/net/ipv6/Kconfig b/net/ipv6/Kconfig
+index 1c9c686d9522..396a081a12b9 100644
+--- a/net/ipv6/Kconfig
++++ b/net/ipv6/Kconfig
+@@ -103,6 +103,12 @@ config INET6_ESPINTCP
+ 
+ 	  If unsure, say N.
+ 
++config INET6_IPSEC_OFFLOAD
++	bool "IPsec IPv6 Fast Path Processing offload"
++	depends on (INET6_ESP && CPE_FAST_PATH)
++	help
++	  Support for IPsec IPv6 Fast Path offload.
++
+ config INET6_IPCOMP
+ 	tristate "IPv6: IPComp transformation"
+ 	select INET6_XFRM_TUNNEL
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index e53dbf14873a..42db19bb6e46 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -210,8 +210,15 @@ static int __ip6_finish_output(struct net *net, struct sock *sk, struct sk_buff
+ 	if (skb_is_gso(skb))
+ 		return ip6_finish_output_gso(net, sk, skb, mtu);
+ 
+-	if (unlikely(skb->len > mtu ||
+-	    (IP6CB(skb)->frag_max_size && skb->len > IP6CB(skb)->frag_max_size)))
++	if (
++#if defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		/* If ipsec offload is there, do not do fragment. So, when IPSec
++		 * offload is enabled it directly calls ip6_finish_output2
++		 */
++		(skb->ipsec_offload == 0) &&
++#endif
++		unlikely(skb->len > mtu ||
++		(IP6CB(skb)->frag_max_size && skb->len > IP6CB(skb)->frag_max_size)))
+ 		return ip6_fragment(net, sk, skb, ip6_finish_output2);
+ 
+ 	return ip6_finish_output2(net, sk, skb);
+@@ -247,6 +254,13 @@ int ip6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 		return 0;
+ 	}
+ 
++#if defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/* Bypass invoking post routing hooks since the tunnel header and ESP
++	 * processing is not done in slow path for IPSec offloaded cases
++	 */
++	if (skb->ipsec_offload)
++		return ip6_finish_output(net, sk, skb);
++#endif
+ 	return NF_HOOK_COND(NFPROTO_IPV6, NF_INET_POST_ROUTING,
+ 			    net, sk, skb, indev, dev,
+ 			    ip6_finish_output,
+diff --git a/net/ipv6/output_core.c b/net/ipv6/output_core.c
+index d21fe27fe21e..57abe1413854 100644
+--- a/net/ipv6/output_core.c
++++ b/net/ipv6/output_core.c
+@@ -140,6 +140,14 @@ int __ip6_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 
+ 	skb->protocol = htons(ETH_P_IPV6);
+ 
++#if defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	if(skb->ipsec_offload)
++	{
++		dst_output(net, sk, skb);
++		return 0;
++	}
++	else
++#endif
+ 	return nf_hook(NFPROTO_IPV6, NF_INET_LOCAL_OUT,
+ 		       net, sk, skb, NULL, skb_dst_dev(skb),
+ 		       dst_output);
+diff --git a/net/xfrm/xfrm_device.c b/net/xfrm/xfrm_device.c
+index 7744ed8e4c83..f2a7fa2704a4 100644
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@ -122,6 +122,30 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
+ 	struct net_device *dev = skb->dev;
+ 	struct sec_path *sp;
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/* A frame for a packet-offloaded SA carries its state without olen
++	 * (see xfrm_output()), so xo is NULL for it and the wrong-device
++	 * check below never sees it. It is still plaintext, and only the
++	 * SA's own device hands it to SEC: sent anywhere else it would leave
++	 * in the clear. xfrm_output() refuses a bundle routed elsewhere; this
++	 * catches a frame moved after that, by a hook, a qdisc action or a
++	 * device it was handed on to.
++	 */
++	if (skb->ipsec_offload && !xo) {
++		sp = skb_sec_path(skb);
++		x = sp && sp->len ? sp->xvec[sp->len - 1] : NULL;
++		if (x && x->xso.type == XFRM_DEV_OFFLOAD_PACKET &&
++		    x->xso.dir == XFRM_DEV_OFFLOAD_OUT &&
++		    READ_ONCE(x->xso.dev) != dev) {
++			XFRM_INC_STATS(dev_net(dev),
++				       LINUX_MIB_XFRMOUTBUNDLECHECKERROR);
++			dev_core_stats_tx_dropped_inc(dev);
++			kfree_skb_list(skb);
++			return NULL;
++		}
++	}
++#endif
++
+ 	if (!xo || (xo->flags & XFRM_XMIT))
+ 		return skb;
+ 
+diff --git a/net/xfrm/xfrm_input.c b/net/xfrm/xfrm_input.c
+index 63d1504b50a9..d3b9a9f13af9 100644
+--- a/net/xfrm/xfrm_input.c
++++ b/net/xfrm/xfrm_input.c
+@@ -44,6 +44,27 @@ struct xfrm_trans_cb {
+ 
+ #define XFRM_TRANS_SKB_CB(__skb) ((struct xfrm_trans_cb *)&((__skb)->cb[0]))
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++extern int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb,
++				      const struct xfrm_state *x);
++
++/*
++ * Whether @x is received through SEC and nothing else: a packet-offloaded
++ * state the DPAA offload module took, the one driver that gives a state a
++ * handle (from xdo_dev_state_add(), before the state is inserted). SEC keeps
++ * such a state's anti-replay window. xfrm's own is a copy the driver
++ * refreshes now and then, and nothing tells SEC what software accepted, so
++ * decrypting a frame here would check it against a second window, each
++ * accepting what the other had already seen. What SEC is not given is
++ * dropped instead. A state another driver offloads has no handle and is
++ * received as upstream receives it.
++ */
++static bool xfrm_state_sec_only(const struct xfrm_state *x)
++{
++	return x->xso.type == XFRM_DEV_OFFLOAD_PACKET && x->handle;
++}
++#endif /* IPSEC */
++
+ static DEFINE_SPINLOCK(xfrm_input_afinfo_lock);
+ static struct xfrm_input_afinfo const __rcu *xfrm_input_afinfo[2][AF_INET6 + 1];
+ 
+@@ -608,6 +629,19 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+ 			goto drop;
+ 		}
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		/*
++		 * A packet-offloaded SA's frames are decrypted by SEC, and only
++		 * a live SA's: a deleted/expired SA goes XFRM_STATE_DEAD before
++		 * the km.state check below, and submitting its stale handle
++		 * would target a hardware SA context the driver may already
++		 * have torn down (or reused).
++		 */
++		if (xfrm_state_sec_only(x) &&
++		    x->km.state == XFRM_STATE_VALID &&
++		    !dpaa_submit_inb_pkt_to_SEC(skb, x))
++			return 0;
++#endif /* IPSEC offload end */
+ lock:
+ 		spin_lock(&x->lock);
+ 
+@@ -620,6 +654,20 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+ 			goto drop_unlock;
+ 		}
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		/*
++		 * Whatever of such a state SEC was not given: ESP that arrived
++		 * on another device or another port, ESP the driver could not
++		 * queue, and ESP that GRO brought straight here. The state is
++		 * valid and the frame may be genuine, but it did not come the
++		 * way this state receives, as with the encapsulation below.
++		 */
++		if (xfrm_state_sec_only(x)) {
++			XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEMISMATCH);
++			goto drop_unlock;
++		}
++#endif
++
+ 		if ((x->encap ? x->encap->encap_type : 0) != encap_type) {
+ 			XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEMISMATCH);
+ 			goto drop_unlock;
+diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
+index 53654c5fa9e9..c23cc825fabd 100644
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -642,6 +642,102 @@ static int xfrm_dev_direct_output(struct sock *sk, struct xfrm_state *x,
+ 	return dev_queue_xmit(skb);
+ }
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++/* Use a packet-offloaded tunnel SA's next hop as neighbour output would use
++ * it for every packet: that keeps the entry from ageing out, moves a stale one
++ * on to a probe and starts resolution for one that is gone. Linux's entry is
++ * what refreshes the address the SA was programmed with and what lets its
++ * flows back into hardware; the frame does not wait for it.
++ *
++ * `path` is the bundle's route, which is the route to the SA's endpoint when
++ * the two share a family, so its neighbour for that endpoint is the next hop,
++ * found exactly as neighbour output would find it. Returns false if the SA's
++ * endpoint no longer routes by the SA's device; for an SA of the flow's family
++ * the caller has already proved that it does, by checking `path` itself.
++ */
++static bool xfrm_dev_sec_next_hop(struct xfrm_state *x, struct dst_entry *path)
++{
++	struct neighbour *n = NULL;
++
++	if (path->ops->family == x->props.family)
++		n = dst_neigh_lookup(path, &x->id.daddr);
++	if (n) {
++		neigh_event_send(n, NULL);
++		neigh_release(n);
++	}
++	return true;
++}
++
++/* Hand a tunnel-mode packet for a packet-offloaded SA straight to the SA's
++ * device, as xfrm_dev_direct_output() does for forwarded ones, but with the
++ * Ethernet header the SEC path is built around rather than uninitialised
++ * space.
++ *
++ * The driver reads that header's ethertype to find the inner packet, and SEC
++ * copies its fourteen bytes ahead of the tunnel header it builds. The IPsec
++ * offline port then rewrites both addresses and the ethertype from the SA's
++ * own next hop and outer family. So the header has to be well formed and
++ * name the inner protocol, which is all the neighbour path contributed to the
++ * frame: the inner family has no neighbour for a tunnel endpoint of the other
++ * family, and a link carrying only IPv4 has no IPv6 neighbours at all.
++ *
++ * The SA's next hop is still used, by xfrm_dev_sec_next_hop() before the
++ * packet gets here.
++ *
++ * Unlike xfrm_dev_direct_output() this does not run the child route's
++ * local_out. The inner header is already final -- the forwarding path
++ * finished a forwarded packet, and a local one was finished by its protocol's
++ * output on the bundle before it reached xfrm_output() -- and with
++ * ipsec_offload set the child's local_out skips LOCAL_OUT and transmits
++ * through the child route's neighbour itself, which is the path this
++ * replaces.
++ */
++static int xfrm_dev_sec_output(struct xfrm_state *x, struct sk_buff *skb)
++{
++	/* The offline port writes both addresses. */
++	static const u8 unset[ETH_ALEN];
++	struct net *net = xs_net(x);
++	struct net_device *dev;
++	struct dst_entry *dst;
++	int err;
++
++	dst = skb_dst_pop(skb);
++	if (!dst) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
++		kfree_skb(skb);
++		return -EHOSTUNREACH;
++	}
++	skb_dst_set(skb, dst);
++	nf_reset_ct(skb);
++
++	rcu_read_lock();
++	dev = READ_ONCE(x->xso.dev);
++	if (unlikely(!dev)) {
++		err = -ENODEV;
++		goto drop;
++	}
++	if (unlikely(skb_cow_head(skb, LL_RESERVED_SPACE(dev)))) {
++		err = -ENOMEM;
++		goto drop;
++	}
++	if (unlikely(dev_hard_header(skb, dev, ntohs(skb->protocol), unset,
++				     NULL, skb->len) < 0)) {
++		err = -EINVAL;
++		goto drop;
++	}
++	skb->dev = dev;
++	err = dev_queue_xmit(skb);
++	rcu_read_unlock();
++	return err;
++
++drop:
++	rcu_read_unlock();
++	XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
++	kfree_skb(skb);
++	return err;
++}
++#endif
++
+ static int xfrm_output2(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+ 	return xfrm_output_resume(sk, skb, 1);
+@@ -732,6 +828,127 @@ static void xfrm_get_inner_ipproto(struct sk_buff *skb, struct xfrm_state *x)
+ 	}
+ }
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++/* Carry one packet for a packet-offloaded SA on to SEC. The caller has
++ * already checked that its bundle leaves by the SA's own port.
++ *
++ * The state travels with the frame instead of being looked up again: the
++ * transmit path needs the SA to pick a SEC frame queue, and the sec_path is
++ * where a driver is already expected to find it. The reference is released
++ * with the skb.
++ */
++static int xfrm_dev_sec_xmit(struct sock *sk, struct xfrm_state *x,
++			     struct sk_buff *skb)
++{
++	struct sec_path *sp;
++	int err;
++
++	/* A forwarded packet decrypted by another SA still
++	 * carries that SA in its sec_path. The receive policy
++	 * has been checked by now, and the driver takes the
++	 * first entry as the SA to encrypt with, so start
++	 * from an empty one, as the software path does. */
++	secpath_reset(skb);
++	sp = secpath_set(skb);
++	if (!sp) {
++		XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++		kfree_skb(skb);
++		return -ENOMEM;
++	}
++	/* len only, deliberately not olen.
++	 *
++	 * xfrm_offload() answers non-NULL exactly when olen is
++	 * non-zero and equal to len, and a non-NULL answer is
++	 * what draws the frame into validate_xmit_xfrm() on
++	 * the way out -- which, on a device advertising
++	 * NETIF_F_HW_ESP, encrypts it in software and hands
++	 * the finished packet to the driver. SEC would then
++	 * never see it, and the only visible sign would be a
++	 * tunnel that works with the hardware counter at zero.
++	 * xfrm_output()'s crypto-offload branch does increment
++	 * olen, because that path wants exactly that fixup. This
++	 * one does not: it needs the state carried to the driver
++	 * and nothing else done to the frame. */
++	sp->xvec[sp->len++] = x;
++	xfrm_state_hold(x);
++	skb->ipsec_offload = 1;
++	/* Finish the inner checksum before SEC sees the frame.
++	 *
++	 * The engine encrypts what it is given, and ESP
++	 * authenticates the ciphertext rather than the payload
++	 * inside it -- so a locally generated packet still
++	 * carrying CHECKSUM_PARTIAL encrypts, traverses, and
++	 * decrypts perfectly at the far end, which then drops
++	 * the inner datagram for a bad checksum. The peer's SA
++	 * counters advance and nothing is delivered.
++	 *
++	 * xfrm_output()'s software path does this for the same
++	 * reason; it is only skipped for a device advertising
++	 * NETIF_F_HW_ESP_TX_CSUM, which computes the inner sum
++	 * itself. This one does not claim that. */
++	if (skb->ip_summed == CHECKSUM_PARTIAL) {
++		err = skb_checksum_help(skb);
++		if (err) {
++			XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++			kfree_skb(skb);
++			return err;
++		}
++	}
++	/* A tunnel's inner destination is not the next hop,
++	 * and in a tunnel of the other family it has no
++	 * neighbour at all, so tunnel mode goes straight to
++	 * the device, locally generated packets included: the
++	 * offline port frames them from the SA, not from a
++	 * neighbour. Transport mode is addressed to the peer
++	 * itself and keeps the ordinary path. */
++	if (x->props.mode == XFRM_MODE_TUNNEL)
++		return xfrm_dev_sec_output(x, skb);
++	return xfrm_output_resume(sk, skb, 0);
++}
++
++/* A GSO packet is segmented here, in software and with every checksum
++ * finished, and each segment goes on as a packet of its own.
++ *
++ * SEC encrypts what it is handed as one ESP packet, so it has to be handed
++ * segments, and the inner checksums have to be complete before it sees them
++ * (see xfrm_dev_sec_xmit()). Left to the port, a GSO packet would be
++ * segmented with the port's own checksum offload, which finishes the sum on
++ * a transmit path that frames bound for SEC never take; and finishing it
++ * here with skb_checksum_help() refuses a GSO packet outright, with a
++ * warning. So this segments with no features at all, as xfrm_output_gso()
++ * does for a software transform. Every segment is sent whatever became of
++ * the one before, as ip_finish_output_gso() does, and the first failure is
++ * what is returned.
++ */
++static int xfrm_dev_sec_gso(struct sock *sk, struct xfrm_state *x,
++			    struct sk_buff *skb)
++{
++	struct sk_buff *segs, *nskb;
++	int ret = 0;
++
++	BUILD_BUG_ON(sizeof(*IPCB(skb)) > SKB_GSO_CB_OFFSET);
++	BUILD_BUG_ON(sizeof(*IP6CB(skb)) > SKB_GSO_CB_OFFSET);
++	segs = skb_gso_segment(skb, 0);
++	if (IS_ERR_OR_NULL(segs)) {
++		XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++		kfree_skb(skb);
++		return segs ? PTR_ERR(segs) : -EINVAL;
++	}
++	consume_skb(skb);
++
++	skb_list_walk_safe(segs, segs, nskb) {
++		int err;
++
++		skb_mark_not_on_list(segs);
++		err = xfrm_dev_sec_xmit(sk, x, segs);
++		if (err && !ret)
++			ret = err;
++	}
++
++	return ret;
++}
++#endif
++
+ int xfrm_output(struct sock *sk, struct sk_buff *skb)
+ {
+ 	struct net *net = dev_net(skb_dst(skb)->dev);
+@@ -761,6 +978,37 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
+ 			return -EHOSTUNREACH;
+ 		}
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		/* The frame leaves as plaintext and only the SA's own device
++		 * hands it to SEC; on any other it would be sent in the
++		 * clear. So a bundle whose route leaves elsewhere is dropped
++		 * here. For an SA of the flow's family that route is the one
++		 * to the peer, moved off the SA's port by a failover, a more
++		 * specific route or a routing rule, and the SA has to be
++		 * installed again where it now leads. validate_xmit_xfrm()
++		 * backs this up for a frame sent elsewhere after this point.
++		 */
++		{
++			/* The driver hands SEC the frame with the first state
++			 * of its sec_path and nothing else, so a bundle of more
++			 * than one transform would leave with one applied. */
++			if (xfrm_dst_child(skb_dst(skb))->xfrm ||
++			    xfrm_dst_path(skb_dst(skb))->dev !=
++			    READ_ONCE(x->xso.dev) ||
++			    (x->props.mode == XFRM_MODE_TUNNEL &&
++			     !xfrm_dev_sec_next_hop(x, xfrm_dst_path(skb_dst(skb))))) {
++				XFRM_INC_STATS(net,
++					       LINUX_MIB_XFRMOUTBUNDLECHECKERROR);
++				kfree_skb(skb);
++				return -EHOSTUNREACH;
++			}
++
++			if (skb_is_gso(skb))
++				return xfrm_dev_sec_gso(sk, x, skb);
++			return xfrm_dev_sec_xmit(sk, x, skb);
++		}
++#endif
++
+ 		/* Exclusive direct xmit for tunnel mode, as
+ 		 * some filtering or matching rules may apply
+ 		 * in transport mode.
+diff --git a/net/xfrm/xfrm_state.c b/net/xfrm/xfrm_state.c
+index 701b5163b6b1..6f83a0944533 100644
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@ -58,6 +58,28 @@ static inline bool xfrm_state_hold_rcu(struct xfrm_state __rcu *x)
+ 	return refcount_inc_not_zero(&x->refcnt);
+ }
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++/*
++ * Index a packet-offloaded state by the handle its driver gave it, so that
++ * the driver can find the state again from a frame SEC has decrypted: the
++ * handle is all such a frame carries. The driver allocates the handle,
++ * because it indexes the driver's own SA table, and sets it from
++ * xdo_dev_state_add(), which runs before the state is inserted. A state no
++ * driver took has no handle and is not indexed, so a handle can only ever
++ * resolve to the state the hardware holds. The caller holds
++ * net->xfrm.xfrm_state_lock -- every 'byh' insert site does.
++ */
++static void xfrm_state_insert_byh(struct net *net, struct xfrm_state *x)
++{
++	unsigned int h;
++
++	if (x->in_byh_hash || !x->handle)
++		return;
++	h = x->handle & net->xfrm.state_hmask;
++	hlist_add_head_rcu(&x->byh, net->xfrm.state_byh + h);
++	x->in_byh_hash = 1;
++}
++#endif
+ static inline unsigned int xfrm_dst_hash(struct net *net,
+ 					 const xfrm_address_t *daddr,
+ 					 const xfrm_address_t *saddr,
+@@ -114,12 +136,22 @@ static unsigned int xfrm_seq_hash(struct net *net, u32 seq)
+ 			hlist_add_before_rcu(_n, &_x->by);                 \
+ 	}
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
+ static void xfrm_hash_transfer(struct hlist_head *list,
+ 			       struct hlist_head *ndsttable,
+ 			       struct hlist_head *nsrctable,
+ 			       struct hlist_head *nspitable,
+ 			       struct hlist_head *nseqtable,
++			       struct hlist_head *nhtable,
+ 			       unsigned int nhashmask)
++#else
++static void xfrm_hash_transfer(struct hlist_head *list,
++			       struct hlist_head *ndsttable,
++			       struct hlist_head *nsrctable,
++			       struct hlist_head *nspitable,
++			       struct hlist_head *nseqtable,
++			       unsigned int nhashmask)
++#endif
+ {
+ 	struct hlist_node *tmp;
+ 	struct xfrm_state *x;
+@@ -150,6 +182,13 @@ static void xfrm_hash_transfer(struct hlist_head *list,
+ 			XFRM_STATE_INSERT(byseq, &x->byseq, nseqtable + h,
+ 					  x->xso.type);
+ 		}
++
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		if (x->handle && x->in_byh_hash) {
++			h = (x->handle & nhashmask);
++			hlist_add_head_rcu(&x->byh, nhtable + h);
++		}
++#endif
+ 	}
+ }
+ 
+@@ -162,6 +201,9 @@ static void xfrm_hash_resize(struct work_struct *work)
+ {
+ 	struct net *net = container_of(work, struct net, xfrm.state_hash_work);
+ 	struct hlist_head *ndst, *nsrc, *nspi, *nseq, *odst, *osrc, *ospi, *oseq;
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	struct hlist_head *nh, *oh;
++#endif
+ 	unsigned long nsize, osize;
+ 	unsigned int nhashmask, ohashmask;
+ 	int i;
+@@ -188,6 +230,16 @@ static void xfrm_hash_resize(struct work_struct *work)
+ 		xfrm_hash_free(nspi, nsize);
+ 		return;
+ 	}
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	nh = xfrm_hash_alloc(nsize);
++	if (!nh) {
++		xfrm_hash_free(ndst, nsize);
++		xfrm_hash_free(nsrc, nsize);
++		xfrm_hash_free(nspi, nsize);
++		xfrm_hash_free(nseq, nsize);
++		return;
++	}
++#endif
+ 
+ 	spin_lock_bh(&net->xfrm.xfrm_state_lock);
+ 	write_seqcount_begin(&net->xfrm.xfrm_state_hash_generation);
+@@ -195,17 +247,27 @@ static void xfrm_hash_resize(struct work_struct *work)
+ 	nhashmask = (nsize / sizeof(struct hlist_head)) - 1U;
+ 	odst = xfrm_state_deref_prot(net->xfrm.state_bydst, net);
+ 	for (i = net->xfrm.state_hmask; i >= 0; i--)
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		xfrm_hash_transfer(odst + i, ndst, nsrc, nspi, nseq, nh, nhashmask);
++#else
+ 		xfrm_hash_transfer(odst + i, ndst, nsrc, nspi, nseq, nhashmask);
++#endif
+ 
+ 	osrc = xfrm_state_deref_prot(net->xfrm.state_bysrc, net);
+ 	ospi = xfrm_state_deref_prot(net->xfrm.state_byspi, net);
+ 	oseq = xfrm_state_deref_prot(net->xfrm.state_byseq, net);
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	oh = xfrm_state_deref_prot(net->xfrm.state_byh, net);
++#endif
+ 	ohashmask = net->xfrm.state_hmask;
+ 
+ 	rcu_assign_pointer(net->xfrm.state_bydst, ndst);
+ 	rcu_assign_pointer(net->xfrm.state_bysrc, nsrc);
+ 	rcu_assign_pointer(net->xfrm.state_byspi, nspi);
+ 	rcu_assign_pointer(net->xfrm.state_byseq, nseq);
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	rcu_assign_pointer(net->xfrm.state_byh, nh);
++#endif
+ 	net->xfrm.state_hmask = nhashmask;
+ 
+ 	write_seqcount_end(&net->xfrm.xfrm_state_hash_generation);
+@@ -219,6 +281,9 @@ static void xfrm_hash_resize(struct work_struct *work)
+ 	xfrm_hash_free(osrc, osize);
+ 	xfrm_hash_free(ospi, osize);
+ 	xfrm_hash_free(oseq, osize);
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	xfrm_hash_free(oh, osize);
++#endif
+ }
+ 
+ static DEFINE_SPINLOCK(xfrm_state_afinfo_lock);
+@@ -685,6 +750,9 @@ struct xfrm_state *xfrm_state_alloc(struct net *net)
+ 		INIT_HLIST_NODE(&x->bysrc);
+ 		INIT_HLIST_NODE(&x->byspi);
+ 		INIT_HLIST_NODE(&x->byseq);
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		INIT_HLIST_NODE(&x->byh);
++#endif
+ 		hrtimer_init(&x->mtimer, CLOCK_BOOTTIME, HRTIMER_MODE_ABS_SOFT);
+ 		x->mtimer.function = xfrm_timer_handler;
+ 		timer_setup(&x->rtimer, xfrm_replay_timer_handler, 0);
+@@ -695,6 +763,10 @@ struct xfrm_state *xfrm_state_alloc(struct net *net)
+ 		x->lft.hard_packet_limit = XFRM_INF;
+ 		x->replay_maxage = 0;
+ 		x->replay_maxdiff = 0;
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		/* The handle is the driver's, set when it takes the state. */
++		x->in_byh_hash = 0;
++#endif
+ 		x->pcpu_num = UINT_MAX;
+ 		spin_lock_init(&x->lock);
+ 	}
+@@ -769,6 +841,17 @@ int __xfrm_state_delete(struct xfrm_state *x)
+ 
+ 		if (!hlist_unhashed(&x->byspi))
+ 			hlist_del_init_rcu(&x->byspi);
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		/*
++		 * if 'handle' value is assigned and xfrm_state is inserted
++		 * into 'byh' hash table, remove it now and reset 'in_byh_hash'
++		 * to zero.
++		 */
++		if (x->handle && x->in_byh_hash) {
++			hlist_del_rcu(&x->byh);
++			x->in_byh_hash = 0;
++		}
++#endif
+ 		net->xfrm.state_num--;
+ 		xfrm_nat_keepalive_state_updated(x);
+ 		spin_unlock(&net->xfrm.xfrm_state_lock);
+@@ -1529,6 +1612,15 @@ xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
+ 						  net->xfrm.state_byseq + h,
+ 						  x->xso.type);
+ 			}
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++			/*
++			 * at this point, xfrm_state is activated because it
++			 * has been inserted into other linux original hash
++			 * tables.  it must be inserted into 'byh' hash table
++			 * too if it is not yet inserted.
++			 */
++			xfrm_state_insert_byh(net, x);
++#endif
+ 			x->lft.hard_add_expires_seconds = net->xfrm.sysctl_acq_expires;
+ 			hrtimer_start(&x->mtimer,
+ 				      ktime_set(net->xfrm.sysctl_acq_expires, 0),
+@@ -1699,6 +1791,15 @@ static void __xfrm_state_insert(struct xfrm_state *x)
+ 				  x->xso.type);
+ 	}
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/*
++	 * at this point, xfrm_state is activated because it has been inserted
++	 * into other linux original hash tables.  it must also be inserted
++	 * into 'byh' hash table if it is not yet inserted.
++	 */
++	xfrm_state_insert_byh(net, x);
++#endif
++
+ 	hrtimer_start(&x->mtimer, ktime_set(1, 0), HRTIMER_MODE_REL_SOFT);
+ 	if (x->replay_maxage)
+ 		mod_timer(&x->rtimer, jiffies + x->replay_maxage);
+@@ -2073,6 +2174,15 @@ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
+ {
+ 	struct xfrm_state *xc;
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/* The clone carries on from x's replay state, which for a
++	 * packet-offloaded x moves in its device and reaches xfrm's copy only
++	 * when the driver publishes it. Have it do so first, under x->lock as
++	 * the state timer asks, so the clone starts where the device is. */
++	spin_lock_bh(&x->lock);
++	xfrm_dev_state_update_stats(x);
++	spin_unlock_bh(&x->lock);
++#endif
+ 	xc = xfrm_state_clone(x, encap);
+ 	if (!xc)
+ 		return NULL;
+@@ -2103,6 +2213,40 @@ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
+ EXPORT_SYMBOL(xfrm_state_migrate);
+ #endif
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++/* Whether an update may be copied into the packet-offloaded state @x1 in
++ * place. An update reaches no driver, so it may not change what the hardware
++ * SA was programmed from:
++ *
++ *  - the encapsulation ports, which SEC writes in front of every frame it
++ *    encrypts and the classifier keys the SA's inbound frames on;
++ *  - the output mark, which the peer's route was looked up with to address
++ *    the SA's frames, and is looked up with again whenever the peer moves.
++ *
++ * Changing either in place would leave the hardware on the old value while
++ * the state reports the new one, so that is refused; deleting the state and
++ * adding it again programs it. An update that keeps them, or names no mark
++ * at all and so keeps the state's, is unaffected, and so are the lifetimes,
++ * which this state's own expiry enforces from the counters the driver
++ * reports.
++ */
++static bool xfrm_state_update_offload_ok(const struct xfrm_state *x1,
++					 const struct xfrm_state *x)
++{
++	if (x1->xso.type != XFRM_DEV_OFFLOAD_PACKET)
++		return true;
++	if (x->encap && x1->encap &&
++	    (x->encap->encap_sport != x1->encap->encap_sport ||
++	     x->encap->encap_dport != x1->encap->encap_dport))
++		return false;
++	if ((x->props.smark.v || x->props.smark.m) &&
++	    (x->props.smark.v != x1->props.smark.v ||
++	     x->props.smark.m != x1->props.smark.m))
++		return false;
++	return true;
++}
++#endif
++
+ int xfrm_state_update(struct xfrm_state *x)
+ {
+ 	struct xfrm_state *x1, *to_put;
+@@ -2159,6 +2303,10 @@ int xfrm_state_update(struct xfrm_state *x)
+ 	err = -EINVAL;
+ 	spin_lock_bh(&x1->lock);
+ 	if (likely(x1->km.state == XFRM_STATE_VALID)) {
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		if (!xfrm_state_update_offload_ok(x1, x))
++			goto fail;
++#endif
+ 		if (x->encap && x1->encap &&
+ 		    x->encap->encap_type == x1->encap->encap_type)
+ 			memcpy(x1->encap, x->encap, sizeof(*x1->encap));
+@@ -2277,6 +2425,36 @@ xfrm_state_lookup_byaddr(struct net *net, u32 mark,
+ }
+ EXPORT_SYMBOL(xfrm_state_lookup_byaddr);
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++static struct xfrm_state *__xfrm_state_lookup_byhandle(struct net *net, u16 handle)
++{
++	unsigned int h = (handle & net->xfrm.state_hmask);
++	struct xfrm_state *x;
++
++	hlist_for_each_entry(x, net->xfrm.state_byh + h, byh) {
++		if (x->handle != handle)
++			continue;
++
++		xfrm_state_hold(x);
++		return x;
++	}
++
++	return NULL;
++}
++
++struct xfrm_state *
++xfrm_state_lookup_byhandle(struct net *net, u16 handle)
++{
++	struct xfrm_state *x;
++
++	spin_lock_bh(&net->xfrm.xfrm_state_lock);
++	x = __xfrm_state_lookup_byhandle(net, handle);
++	spin_unlock_bh(&net->xfrm.xfrm_state_lock);
++	return x;
++}
++EXPORT_SYMBOL(xfrm_state_lookup_byhandle);
++#endif
++
+ struct xfrm_state *
+ xfrm_find_acq(struct net *net, const struct xfrm_mark *mark, u8 mode, u32 reqid,
+ 	      u32 if_id, u32 pcpu_num, u8 proto, const xfrm_address_t *daddr,
+@@ -2526,6 +2704,16 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high,
+ 			x->id.spi = newspi;
+ 			h = xfrm_spi_hash(net, &x->id.daddr, newspi, x->id.proto, x->props.family);
+ 			XFRM_STATE_INSERT(byspi, &x->byspi, net->xfrm.state_byspi + h, x->xso.type);
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++			/*
++			 * at this point, xfrm_state is inserted into 'byspi' hash
++			 * table.  this may be an additional step to make the entry
++			 * searchable by SPI.  however, it is a time to consider
++			 * whether the entry is also inserted into 'byh' hash table
++			 * or not.  if it still not be inserted, insert it now.
++			 */
++			xfrm_state_insert_byh(net, x);
++#endif
+ 			spin_unlock_bh(&net->xfrm.xfrm_state_lock);
+ 			err = 0;
+ 			goto unlock;
+@@ -3212,6 +3400,12 @@ int __net_init xfrm_state_init(struct net *net)
+ 	if (!net->xfrm.state_byseq)
+ 		goto out_byseq;
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	net->xfrm.state_byh = xfrm_hash_alloc(sz);
++	if (!net->xfrm.state_byh)
++		goto out_byh;
++#endif
++
+ 	net->xfrm.state_cache_input = alloc_percpu(struct hlist_head);
+ 	if (!net->xfrm.state_cache_input)
+ 		goto out_state_cache_input;
+@@ -3226,6 +3420,10 @@ int __net_init xfrm_state_init(struct net *net)
+ 	return 0;
+ 
+ out_state_cache_input:
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	xfrm_hash_free(net->xfrm.state_byh, sz);
++out_byh:
++#endif
+ 	xfrm_hash_free(net->xfrm.state_byseq, sz);
+ out_byseq:
+ 	xfrm_hash_free(net->xfrm.state_byspi, sz);
+@@ -3256,6 +3454,10 @@ void xfrm_state_fini(struct net *net)
+ 	xfrm_hash_free(net->xfrm.state_bysrc, sz);
+ 	WARN_ON(!hlist_empty(net->xfrm.state_bydst));
+ 	xfrm_hash_free(net->xfrm.state_bydst, sz);
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	WARN_ON(!hlist_empty(net->xfrm.state_byh));
++	xfrm_hash_free(net->xfrm.state_byh, sz);
++#endif
+ 	free_percpu(net->xfrm.state_cache_input);
+ }
+ 
+diff --git a/net/xfrm/xfrm_user.c b/net/xfrm/xfrm_user.c
+index c1e753d554e7..ef6f427cf031 100644
+--- a/net/xfrm/xfrm_user.c
++++ b/net/xfrm/xfrm_user.c
+@@ -2706,6 +2706,16 @@ static int xfrm_get_ae(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	 * while we are still reading) - jhs
+ 	*/
+ 	spin_lock_bh(&x->lock);
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/* A packet-offloaded state's sequence numbers and anti-replay window
++	 * move in its device, and xfrm's copy of them only when the driver
++	 * publishes it. Have it do so now, as XFRM_MSG_GETSA does before it
++	 * reports the lifetime (copy_to_user_state()): a keying daemon reads
++	 * this to carry the SA over when it re-adds it at a new address, and
++	 * a stale copy would start the new SA behind the old one. Under
++	 * x->lock, where the state timer asks too. */
++	xfrm_dev_state_update_stats(x);
++#endif
+ 	c.data.aevent = p->flags;
+ 	c.seq = nlh->nlmsg_seq;
+ 	c.portid = nlh->nlmsg_pid;
+@@ -2766,6 +2776,23 @@ static int xfrm_new_ae(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	if (err)
+ 		goto out;
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/* A packet-offloaded state's replay state is its device's: the device
++	 * numbers and checks the frames, and no driver hears of an update.
++	 * Written here, it would change what the state reports and nothing
++	 * the device does -- and a driver publishing only forward would keep
++	 * anything moved ahead for its next re-add to start from. The state is
++	 * added again with the replay state it is to start from instead. The
++	 * message is refused whole, so a NEWAE that also names a lifetime or a
++	 * threshold changes nothing; one naming only those, which are xfrm's
++	 * own, still applies. */
++	if ((rp || re) && x->xso.type == XFRM_DEV_OFFLOAD_PACKET) {
++		NL_SET_ERR_MSG(extack, "The replay state of a packet-offloaded SA is its device's");
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++#endif
++
+ 	spin_lock_bh(&x->lock);
+ 	xfrm_update_ae_params(x, attrs, 1);
+ 	spin_unlock_bh(&x->lock);
+-- 
+2.47.3
+

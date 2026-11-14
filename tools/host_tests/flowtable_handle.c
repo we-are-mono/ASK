@@ -142,8 +142,13 @@ static struct flow_offload_tuple_rhash *rhashtable_lookup(struct rhashtable *tab
 static unsigned flow_offload_get_timeout(struct flow_offload *flow) { return 100; }
 #define NF_CT_DAY 86400
 static unsigned refreshes, extensions;
+#ifdef NF_CT_REFRESH_TAKES_SKB
+static void nf_ct_refresh(struct nf_conn *ct, const void *skb, unsigned extra)
+{ assert(ct->refs && !skb && extra == NF_CT_DAY); refreshes++; }
+#else
 static void nf_ct_refresh(struct nf_conn *ct, unsigned extra)
 { assert(ct->refs && extra == NF_CT_DAY); refreshes++; }
+#endif
 /* The GC extends a live flow's conntrack on every pass, and never one it is
  * tearing down: that one's timeout was just handed back to conntrack. */
 static void nf_flow_table_extend_ct_timeout(struct nf_conn *ct) { assert(ct->refs); extensions++; }
@@ -403,25 +408,32 @@ int main(void)
     flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
     /* Work not yet run for a flow -- its offer, a deletion or a counter
      * read -- leaves the flow to that work: the collector neither judges
-     * it, though expired, nor extends its conntrack, nor queues more. */
+     * it, though expired, nor extends its conntrack, nor queues more. A
+     * collector older than that (6.12's) judges it as any other. */
     flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
     unsigned read_before = stats, deleted_before = deletes, extended_before = extensions;
     retirements = teardowns;
-    set_bit(NF_FLOW_PENDING, &flow->flags);
+#ifdef GC_LEAVES_PENDING
+    set_bit(FLOW_PENDING, &flow->flags);
     flowtable_clock = flow->timeout;
     nf_flow_offload_gc_step(&table, flow, NULL);
     assert(!test_bit(NF_FLOW_TEARDOWN, &flow->flags) && teardowns == retirements);
     assert(stats == read_before && deletes == deleted_before && extensions == extended_before);
     flowtable_clock = 1000;
-    clear_bit(NF_FLOW_PENDING, &flow->flags);
+    clear_bit(FLOW_PENDING, &flow->flags);
+#endif
+#ifdef HAVE_FLOW_CLOSING
     /* A closing flow, its TCP FIN or RST seen, leaves the hardware once and
-     * stays in software until it is judged done. */
+     * stays in software until it is judged done (6.18; 6.12 has no such
+     * state). */
     set_bit(NF_FLOW_CLOSING, &flow->flags);
     nf_flow_offload_gc_step(&table, flow, NULL);
     assert(deletes == deleted_before + 1 && !test_bit(NF_FLOW_TEARDOWN, &flow->flags));
     assert(extensions == extended_before + 1);
     nf_flow_offload_gc_step(&table, flow, NULL);
     assert(deletes == deleted_before + 1 && !test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+#endif
+    (void)read_before; (void)deleted_before; (void)extended_before;
     flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
     /* A table freed with no driver bound frees its flows in place: no
      * deletion is queued for a hardware flow, which would reach no one, and

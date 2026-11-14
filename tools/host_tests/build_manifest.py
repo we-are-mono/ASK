@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-from ask_orch import build_record, manifest
+from ask_orch import build_record, kernel_line, manifest
 from ask_orch.provenance import IMAGE
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,7 +18,7 @@ KERNEL_RECIPE = "meta-ask/recipes-kernel/linux/linux-ask_6.18.bb"
 CDX_RECIPE = "meta-ask/recipes-ask/cdx/cdx_1.0.bb"
 # What each recipe of the fixture layer records, as the class derives it: the
 # recipe, its local sources, its external tree, its declared directories.
-INPUTS = {manifest.KERNEL: [KERNEL_RECIPE, "patches/kernel/010-one.patch", "patches/kernel"],
+INPUTS = {manifest.KERNEL: [KERNEL_RECIPE, "patches/kernel/6.18/010-one.patch", "patches/kernel/6.18"],
           "cdx": [CDX_RECIPE, "cdx"]}
 
 
@@ -34,7 +34,7 @@ def checkout(tmp_path):
     for name, text in {
             ".gitignore": "*.o\nmeta-ask/build/\n",
             KERNEL_RECIPE: "SRC_URI = file://010-one.patch\n",
-            "patches/kernel/010-one.patch": "the kernel change\n",
+            "patches/kernel/6.18/010-one.patch": "the kernel change\n",
             CDX_RECIPE: "EXTERNALSRC = cdx\n",
             "cdx/cdx_main.c": "int cdx;\n",
             "cdx/cdx_main.o": "build output\n"}.items():
@@ -57,7 +57,8 @@ def build(root, out):
     for name, paths in INPUTS.items():
         data = build_record.encode(build_record.record(root, name, paths))
         (records / f"{name}.json").write_bytes(data)
-        kept = root / manifest.BUILD_RECORDS.format(name).replace("*", "arch", 1).replace("*", "1.0")
+        kept = root / (manifest.BUILD_RECORDS.format(name)
+                       .replace("*", "6.18", 1).replace("*", "arch", 1).replace("*", "1.0"))
         kept.parent.mkdir(parents=True, exist_ok=True)
         kept.write_bytes(data)
     devicetree = out / manifest.DEVICETREE_PROPERTY
@@ -78,8 +79,29 @@ def test_an_image_built_from_the_checkout_matches_it(checkout, tmp_path_factory)
     image = report(*build(checkout, tmp_path_factory.mktemp("image")))
     assert sorted(image["build"]) == manifest.components(checkout) == ["cdx", manifest.KERNEL]
     # A file in a recorded directory adds nothing to the inputs.
-    assert image["build"][manifest.KERNEL]["paths"] == [KERNEL_RECIPE, "patches/kernel"]
+    assert image["build"][manifest.KERNEL]["paths"] == [KERNEL_RECIPE, "patches/kernel/6.18"]
     assert manifest.verify(checkout, image) == []
+
+
+def test_each_kernel_lines_recipe_builds_the_one_kernel(checkout, tmp_path_factory):
+    """Every line has a recipe of its own; the image of any one of them
+    records the one kernel component."""
+    image = report(*build(checkout, tmp_path_factory.mktemp("image")))
+    (checkout / KERNEL_RECIPE.replace("6.18", "6.12")).write_text("SRC_URI = file://010-other.patch\n")
+    assert manifest.components(checkout) == ["cdx", manifest.KERNEL]
+    assert manifest.verify(checkout, image) == []
+
+
+def test_an_image_of_another_kernel_line_is_named_as_such(checkout, tmp_path_factory):
+    """The kernel's record names the recipe, and with it the line: a run
+    about one line refuses another line's image."""
+    image = report(*build(checkout, tmp_path_factory.mktemp("image")))
+    assert manifest.line_problem(image, "6.18") is None
+    assert manifest.line_problem(image, "6.12").startswith(
+        "the DUT runs the 6.18 kernel line, not 6.12: test with LINE=6.18")
+    # An image without a kernel record is verify()'s to name.
+    assert manifest.line_problem({"build": {}}, "6.12") is None
+    assert manifest.line_problem({"build": {manifest.KERNEL: {"paths": None}}}, "6.12") is None
 
 
 @pytest.mark.parametrize("change, problems", [
@@ -92,18 +114,21 @@ def test_an_image_built_from_the_checkout_matches_it(checkout, tmp_path_factory)
      ["cdx: built from other sources than this checkout's (cdx/cdx_main.c)"]),
     (lambda root: (root / CDX_RECIPE).write_text("# a comment is still the recipe\n"),
      [f"cdx: built from other sources than this checkout's ({CDX_RECIPE})"]),
-    (lambda root: (root / "patches/kernel/010-one.patch").write_text("revised\n"),
-     ["linux-ask: built from other sources than this checkout's (patches/kernel/010-one.patch)"]),
+    (lambda root: (root / "patches/kernel/6.18/010-one.patch").write_text("revised\n"),
+     ["linux-ask: built from other sources than this checkout's (patches/kernel/6.18/010-one.patch)"]),
     # A patch beside the series: the directory is recorded whole, and the
     # series test below keeps the two the same.
-    (lambda root: (root / "patches/kernel/020-new.patch").write_text("x\n"),
-     ["linux-ask: built from other sources than this checkout's (patches/kernel/020-new.patch)"]),
+    (lambda root: (root / "patches/kernel/6.18/020-new.patch").write_text("x\n"),
+     ["linux-ask: built from other sources than this checkout's (patches/kernel/6.18/020-new.patch)"]),
+    # Another line's series is no input of this line's kernel.
+    (lambda root: (root / "patches/kernel/6.12").mkdir() or
+     (root / "patches/kernel/6.12/010-one.patch").write_text("x\n"), []),
     # Nothing the build reads: its own output, and a mode bitbake's
     # checksums never see.
     (lambda root: (root / "cdx/cdx_main.o").write_text("rebuilt\n"), []),
     (lambda root: (root / "cdx/cdx_main.c").chmod(0o755), []),
 ], ids=["edited", "added", "removed", "recipe", "kernel-patch", "series-directory",
-        "ignored-output", "mode"])
+        "other-line", "ignored-output", "mode"])
 def test_a_change_to_a_component_input_marks_only_that_component(checkout, tmp_path_factory, change,
                                                                  problems):
     image = report(*build(checkout, tmp_path_factory.mktemp("image")))
@@ -174,8 +199,10 @@ def test_a_source_tree_is_checked_against_its_component(checkout, tmp_path):
     (tree / manifest.TREE_FILE).write_bytes(
         build_record.encode(build_record.record(checkout, manifest.KERNEL, INPUTS[manifest.KERNEL])))
     assert manifest.tree(checkout, tree, manifest.KERNEL) is None
+    assert manifest.tree(checkout, tree, manifest.KERNEL, "6.18") is None
+    assert "prepared for kernel line 6.18, not 6.12" in manifest.tree(checkout, tree, manifest.KERNEL, "6.12")
     assert "records linux-ask, not cdx" in manifest.tree(checkout, tree, "cdx")
-    (checkout / "patches/kernel/010-one.patch").write_text("revised\n")
+    (checkout / "patches/kernel/6.18/010-one.patch").write_text("revised\n")
     assert "prepared from other linux-ask sources" in manifest.tree(checkout, tree, manifest.KERNEL)
     (tree / manifest.TREE_FILE).write_text("{")
     assert "is not a build record" in manifest.tree(checkout, tree, manifest.KERNEL)
@@ -187,17 +214,34 @@ def test_a_source_tree_is_checked_against_its_component(checkout, tmp_path):
 def test_every_recipe_in_the_layer_records_its_inputs():
     """A recipe without the class leaves the image without its record, and
     the first DUT run of a release would be the one to find out."""
-    recipes = sorted((ROOT / "meta-ask").glob("recipes-*/*/*.bb"))
-    assert len(recipes) == len(manifest.components(ROOT))
-    for recipe in recipes:
-        assert re.search(r"^inherit\b.*\bask-provenance\b", recipe.read_text(), re.M), recipe
+    for recipe in sorted((ROOT / "meta-ask").glob("recipes-*/*/*.bb")):
+        text = recipe.read_text()
+        # A kernel line's recipe takes the class with what every line shares.
+        text += "".join((recipe.parent / name).read_text()
+                        for name in re.findall(r"^require (\S+\.inc)$", text, re.M))
+        assert re.search(r"^inherit\b.*\bask-provenance\b", text, re.M), recipe
     assert {manifest.KERNEL, "ask-image", "cdx", "ask-flowtable"} <= set(manifest.components(ROOT))
 
 
-def test_the_kernel_series_is_every_patch_in_patches_kernel():
+@pytest.mark.parametrize("line", kernel_line.lines())
+def test_each_kernel_line_records_what_its_recipe_requires(line):
+    """bitbake hands the class a recipe's own file, not the files it pulls in
+    by require: what every line shares and the line's SDK pin count only as
+    declared paths, beside the line's series."""
+    shared = (ROOT / kernel_line.RECIPES / "linux-ask.inc").read_text()
+    assert re.search(rf'^ASK_KERNEL_LINE = "{re.escape(line)}"$', kernel_line.recipe(line).read_text(), re.M)
+    declared = re.search(r'^ASK_PROVENANCE_PATHS = "(.*?)"$', shared, re.M | re.S)[1]
+    paths = declared.replace("\\\n", " ").replace("${ASK_KERNEL_LINE}", line).split()
+    required = [path.replace("${ASK_KERNEL_LINE}", line)
+                for path in re.findall(r"^require \$\{ASK_SRCROOT\}/(\S+)$", shared, re.M)]
+    assert required and all((ROOT / path).is_file() for path in required)
+    assert {f"{kernel_line.RECIPES}/linux-ask.inc", f"patches/kernel/{line}", *required} <= set(paths)
+
+
+@pytest.mark.parametrize("line", kernel_line.lines())
+def test_each_kernel_lines_series_is_every_patch_in_its_directory(line):
     """The host tests and the image compile the series the recipe lists; a
     patch only in the directory would be in the checkout and the kernel
     record, yet in neither tree."""
-    recipe = (ROOT / KERNEL_RECIPE).read_text()
-    listed = re.findall(r"file://(\S+\.patch)", recipe)
-    assert sorted(listed) == sorted(path.name for path in (ROOT / "patches/kernel").iterdir())
+    listed = re.findall(r"file://(\S+\.patch)", kernel_line.recipe(line).read_text())
+    assert sorted(listed) == sorted(path.name for path in kernel_line.patches(line).iterdir())

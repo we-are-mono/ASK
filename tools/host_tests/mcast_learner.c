@@ -65,13 +65,9 @@ union nf_inet_addr {
 #define ENOSPC 28
 #define E2BIG 7
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
-/* As include/linux/if_bridge.h has them with patch 161. */
-#define BR_MCAST_TO_HOST_JOINED (1U << 0)
-#define BR_MCAST_TO_HOST_ROUTER (1U << 1)
-#define BR_MCAST_TO_HOST_FLOOD  (1U << 2)
-#define BR_MCAST_TO_HOST_PROMISC (1U << 3)
-#define BR_MCAST_SNOOPED (1U << 4)
-#define BR_MCAST_TO_HOST_ALLMULTI (1U << 5)
+/* As the line's include/linux/if_bridge.h has them with patch 161: 6.18's
+ * adds BR_MCAST_TO_HOST_ALLMULTI, which picks the adapter's reasons. */
+#include "mcast_bridge_flags.inc"
 #define IFF_PROMISC 0x100
 #define IFF_ALLMULTI 0x200
 #define IPV6_ADDR_SCOPE_LINKLOCAL 0x02
@@ -1920,7 +1916,10 @@ static void the_bridge_decides(void)
      * flow when that delivery starts; forwarding resumes when it stops. */
     const unsigned host_copies[] = { BR_MCAST_TO_HOST_JOINED, BR_MCAST_TO_HOST_FLOOD,
                                     BR_MCAST_TO_HOST_ROUTER, BR_MCAST_TO_HOST_PROMISC,
-                                    BR_MCAST_TO_HOST_ALLMULTI };
+#ifdef BR_MCAST_TO_HOST_ALLMULTI
+                                    BR_MCAST_TO_HOST_ALLMULTI,
+#endif
+                                  };
     for (unsigned i = 0; i < ARRAY_SIZE(host_copies); i++) {
         reset();
         assert(ft_mc_membership(&BR, &P2, &any, true, false));
@@ -2323,12 +2322,14 @@ static void one_stream_both_learners(void)
     f->dirty = true;
     pass();
     assert(f->routed_host && !f->hw && !strcmp(ft_mc_state(f), "refused-routed"));
+#ifdef BR_MCAST_TO_HOST_ALLMULTI
     /* So does an all-multicast one -- ipmr makes each VIF device one -- with
      * the last bridged listener gone: the routed copy still needs the host. */
     answer(&P1, S, 289, BR_MCAST_TO_HOST_ALLMULTI, 0);
     f->dirty = true;
     pass();
     assert(f->routed_host && !f->hw && !strcmp(ft_mc_state(f), "refused-routed"));
+#endif
     answer(&P1, S, 289, 0, 1, &P2);
     f->dirty = true;
     pass();
@@ -2430,10 +2431,15 @@ static void one_stream_both_learners(void)
     ft_mc_route_publish(&r1, &want);
     assert(!r1.learns);
     /* An all-multicast bridge -- a VIF on it makes it one -- hands its
-     * streams up as a promiscuous one does. */
+     * streams up as a promiscuous one does, where the kernel's bridge hands
+     * an all-multicast device's up at all. */
     BR.flags |= IFF_ALLMULTI;
     ft_mc_route_publish(&r1, &want);
+#ifdef BR_MCAST_TO_HOST_ALLMULTI
     assert(r1.learns);
+#else
+    assert(!r1.learns);
+#endif
     BR.flags &= ~IFF_ALLMULTI;
     ft_mc_route_publish(&r1, &want);
     assert(!r1.learns);

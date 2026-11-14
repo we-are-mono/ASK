@@ -1,0 +1,105 @@
+From 94331a27aaecb355fe6022792892da4bcf1f0c54 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sun, 20 Sep 2026 11:27:11 +0200
+Subject: [PATCH] mlan: aggregate an A-MSDU under one hold of the ralist lock
+
+wlan_11n_aggregate_pkt() dropped ra_list_spinlock for every MSDU it
+copied into the aggregate, freed the source through the completion
+callback, took the lock back and revalidated the ralist before peeking
+the next one. On the 88W9098 every transmitted frame crosses this loop
+on the adapter's single TX worker, and the per-MSDU unlock, relock and
+revalidation were a measurable share of that worker's time.
+
+Copy under the lock instead -- a few hundred bytes to a few kilobytes
+of memcpy, cheaper than the lock traffic it replaces -- and collect the
+sources on a local list, handing them to wlan_write_data_complete()
+once the lock is dropped for good. The completion callback still runs
+without the lock, as it must: it wakes netdev queues. The in-loop
+revalidation goes with the unlock that made it necessary; the ralist
+cannot be torn down while the lock is held.
+
+Upstream-Status: Pending
+---
+ mlan/mlan_11n_aggr.c | 38 +++++++++++++++++++++-----------------
+ 1 file changed, 21 insertions(+), 17 deletions(-)
+
+diff --git a/mlan/mlan_11n_aggr.c b/mlan/mlan_11n_aggr.c
+index af799e9..f6a9d7d 100644
+--- a/mlan/mlan_11n_aggr.c
++++ b/mlan/mlan_11n_aggr.c
+@@ -851,7 +851,9 @@ int wlan_11n_aggregate_pkt(mlan_private *priv, raListTbl *pra_list,
+ {
+ 	int pkt_size = 0;
+ 	pmlan_adapter pmadapter = priv->adapter;
+-	mlan_buffer *pmbuf_aggr, *pmbuf_src;
++	mlan_buffer *pmbuf_aggr, *pmbuf_src, *pmbuf_done;
++	/* The MSDUs copied into this A-MSDU, freed after the lock is dropped */
++	mlan_list_head done;
+ 	t_u8 *data;
+ 	int pad = 0;
+ 	mlan_status ret = MLAN_STATUS_SUCCESS;
+@@ -871,6 +873,8 @@ int wlan_11n_aggregate_pkt(mlan_private *priv, raListTbl *pra_list,
+ 		return MLAN_STATUS_FAILURE;
+ 	}
+ 	PRINTM(MDAT_D, "Handling Aggr packet\n");
++	util_init_list_head((t_void *)pmadapter->pmoal_handle, &done, MFALSE,
++			    MNULL);
+ #ifdef PCIEAW693
+ 	if (!wlan_copy_on_tx_enabled(pmadapter) &&
+ 	    IS_PCIEAW693(pmadapter->card_type)) {
+@@ -950,9 +954,13 @@ int wlan_11n_aggregate_pkt(mlan_private *priv, raListTbl *pra_list,
+ 		util_scalar_decrement(pmadapter->pmoal_handle,
+ 				      &priv->wmm.tx_pkts_queued, MNULL, MNULL);
+ 
+-		pmadapter->callbacks.moal_spin_unlock(
+-			pmadapter->pmoal_handle, priv->wmm.ra_list_spinlock);
+-
++		/* The copy runs under the lock: a few hundred bytes to a few
++		 * kilobytes of memcpy, which is cheaper than the unlock, the
++		 * relock and the ralist revalidation that dropping it for
++		 * every MSDU used to cost. The source is not freed here -- the
++		 * completion callback wakes netdev queues and must not run
++		 * under this lock -- but collected, and given back once the
++		 * lock is dropped for good below. */
+ 		if (pmbuf_src) {
+ 			pkt_size += wlan_11n_form_amsdu_pkt(
+ 				pmadapter, (data + pkt_size),
+@@ -961,19 +969,9 @@ int wlan_11n_aggregate_pkt(mlan_private *priv, raListTbl *pra_list,
+ 
+ 			DBG_HEXDUMP(MDAT_D, "pmbuf_src", pmbuf_src,
+ 				    sizeof(mlan_buffer));
+-			wlan_write_data_complete(pmadapter, pmbuf_src,
+-						 MLAN_STATUS_SUCCESS);
+-		}
+-
+-		pmadapter->callbacks.moal_spin_lock(pmadapter->pmoal_handle,
+-						    priv->wmm.ra_list_spinlock);
+-
+-		if (!wlan_is_ralist_valid(priv, pra_list, ptrindex)) {
+-			pmadapter->callbacks.moal_spin_unlock(
+-				pmadapter->pmoal_handle,
+-				priv->wmm.ra_list_spinlock);
+-			LEAVE();
+-			return MLAN_STATUS_FAILURE;
++			util_enqueue_list_tail(pmadapter->pmoal_handle, &done,
++					       (pmlan_linked_list)pmbuf_src,
++					       MNULL, MNULL);
+ 		}
+ 
+ 		pmbuf_src =
+@@ -987,6 +985,12 @@ int wlan_11n_aggregate_pkt(mlan_private *priv, raListTbl *pra_list,
+ 	pmadapter->callbacks.moal_spin_unlock(pmadapter->pmoal_handle,
+ 					      priv->wmm.ra_list_spinlock);
+ 
++	/* The sources, now that nothing is held. */
++	while ((pmbuf_done = (pmlan_buffer)util_dequeue_list(
++			pmadapter->pmoal_handle, &done, MNULL, MNULL)))
++		wlan_write_data_complete(pmadapter, pmbuf_done,
++					 MLAN_STATUS_SUCCESS);
++
+ 	/* Last AMSDU packet does not need padding */
+ 	pkt_size -= pad;
+ 	pmbuf_aggr->data_len = pkt_size;
+-- 
+2.47.3
+

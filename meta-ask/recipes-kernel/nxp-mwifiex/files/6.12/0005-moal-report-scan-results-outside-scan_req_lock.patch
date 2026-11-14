@@ -1,0 +1,135 @@
+From 59f036ff385ff240bb700b22bdf3249dc49b4b63 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sun, 20 Sep 2026 11:13:32 +0200
+Subject: [PATCH] moal: report scan results to cfg80211 outside scan_req_lock
+
+woal_send_bss_scan_result() and the fake-completion branch of
+woal_scan_timeout_handler() held scan_req_lock, an irqsave spinlock,
+across woal_inform_bss_from_scan_result(). That hands every BSS to
+cfg80211_inform_bss(), which allocates with GFP_KERNEL and takes the
+wiphy's bss_lock with local_bh_disable(); the first scan also runs
+woal_set_scan_time(), which waits for the firmware. A debug kernel
+reports it on every station scan:
+
+  BUG: sleeping function called from invalid context at include/linux/sched/mm.h:321
+  in_atomic(): 1, irqs_disabled(): 1, non_block: 0, pid: 908, name: kworker/u17:4
+  Workqueue: MOAL_EVT_WORK_QUEUE woal_evt_work_queue [moal]
+   __kmalloc_noprof
+   cfg80211_inform_single_bss_data [cfg80211]
+   cfg80211_inform_bss_data [cfg80211]
+   woal_inform_bss_from_scan_result [moal]
+   woal_evt_work_queue [moal]
+
+The lock covers scan_request and nothing else, so take the request
+under it, report outside it, and complete under it again -- that
+request only. One cancelled in between was completed by whoever
+cancelled it; a new one issued since is completed by its own report.
+
+Upstream-Status: Pending
+---
+ mlinux/moal_main.c | 76 +++++++++++++++++++++++++++++++---------------
+ 1 file changed, 51 insertions(+), 25 deletions(-)
+
+diff --git a/mlinux/moal_main.c b/mlinux/moal_main.c
+index 883c2e6..1b38799 100644
+--- a/mlinux/moal_main.c
++++ b/mlinux/moal_main.c
+@@ -13336,17 +13336,25 @@ t_void woal_scan_timeout_handler(struct work_struct *work)
+ 	if (IS_STA_CFG80211(handle->params.cfg80211_wext)) {
+ 		spin_lock_irqsave(&handle->scan_req_lock, flags);
+ 		if (handle->scan_request && handle->fake_scan_complete) {
++			struct cfg80211_scan_request *request =
++				handle->scan_request;
++
+ 			PRINTM(MMSG,
+ 			       "wlan: Send fake scan result for scan_request %p\n",
+-			       handle->scan_request);
++			       request);
++			/* Outside the lock, and completing only the request
++			 * seen here, for the reasons given at
++			 * woal_send_bss_scan_result(). */
++			spin_unlock_irqrestore(&handle->scan_req_lock, flags);
+ 			if (priv)
+ 				woal_inform_bss_from_scan_result(priv, NULL,
+ 								 MOAL_NO_WAIT);
+-			if (handle->scan_request)
+-				woal_cfg80211_scan_done(handle->scan_request,
+-							MFALSE);
+-			handle->scan_request = NULL;
+-			handle->fake_scan_complete = MFALSE;
++			spin_lock_irqsave(&handle->scan_req_lock, flags);
++			if (handle->scan_request == request) {
++				woal_cfg80211_scan_done(request, MFALSE);
++				handle->scan_request = NULL;
++				handle->fake_scan_complete = MFALSE;
++			}
+ 			spin_unlock_irqrestore(&handle->scan_req_lock, flags);
+ 		} else if (handle->scan_request) {
+ 			PRINTM(MMSG, "wlan: scan timeout!\n");
+@@ -13746,26 +13754,44 @@ static void woal_survey_dump_reset(moal_private *priv)
+  */
+ static void woal_send_bss_scan_result(moal_private *priv)
+ {
++	moal_handle *handle = priv->phandle;
++	struct cfg80211_scan_request *request;
+ 	unsigned long flags;
+-	spin_lock_irqsave(&priv->phandle->scan_req_lock, flags);
+-	if (priv->phandle->scan_request) {
+-		PRINTM(MINFO, "Reporting scan results\n");
+-		woal_inform_bss_from_scan_result(priv, NULL, MOAL_NO_WAIT);
+-		if (!priv->phandle->first_scan_done) {
+-			priv->phandle->first_scan_done = MTRUE;
+-			if (!priv->phandle->user_scan_cfg)
+-				woal_set_scan_time(priv, ACTIVE_SCAN_CHAN_TIME,
+-						   PASSIVE_SCAN_CHAN_TIME,
+-						   SPECIFIC_SCAN_CHAN_TIME);
+-		}
+-		if (priv->phandle->scan_request) {
+-			cancel_delayed_work(&priv->phandle->scan_timeout_work);
+-			woal_cfg80211_scan_done(priv->phandle->scan_request,
+-						MFALSE);
+-			priv->phandle->scan_request = NULL;
+-		}
+-	}
+-	spin_unlock_irqrestore(&priv->phandle->scan_req_lock, flags);
++
++	/* scan_req_lock covers scan_request, and only that. Handing the
++	 * scan table to cfg80211 cannot happen under it: cfg80211_inform_bss()
++	 * allocates every BSS with GFP_KERNEL and takes its bss_lock with
++	 * local_bh_disable(), and the first scan's woal_set_scan_time() waits
++	 * for the firmware -- none of which is legal with interrupts off,
++	 * and a debug kernel reports it on every station scan ("sleeping
++	 * function called from invalid context"). So: take the request under
++	 * the lock, report outside it, and complete under it again -- that
++	 * request and no other. One cancelled in between was completed by
++	 * whoever cancelled it, and a new one issued since is still running
++	 * and will be completed by its own report. */
++	spin_lock_irqsave(&handle->scan_req_lock, flags);
++	request = handle->scan_request;
++	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++	if (!request)
++		return;
++
++	PRINTM(MINFO, "Reporting scan results\n");
++	woal_inform_bss_from_scan_result(priv, NULL, MOAL_NO_WAIT);
++	if (!handle->first_scan_done) {
++		handle->first_scan_done = MTRUE;
++		if (!handle->user_scan_cfg)
++			woal_set_scan_time(priv, ACTIVE_SCAN_CHAN_TIME,
++					   PASSIVE_SCAN_CHAN_TIME,
++					   SPECIFIC_SCAN_CHAN_TIME);
++	}
++
++	spin_lock_irqsave(&handle->scan_req_lock, flags);
++	if (handle->scan_request == request) {
++		cancel_delayed_work(&handle->scan_timeout_work);
++		woal_cfg80211_scan_done(request, MFALSE);
++		handle->scan_request = NULL;
++	}
++	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
+ }
+ #endif
+ /**
+-- 
+2.47.3
+

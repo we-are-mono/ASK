@@ -14,8 +14,11 @@ ASKD_SERVICE   := $(CURDIR)/meta-ask/recipes-support/ask-test-agent/files/askd-a
 # Agent and orchestrator share the pinned dependency set.
 ASKD_REQUIREMENTS := -r $(CURDIR)/tools/requirements.txt
 
-# TFTP root on the WAN host — U-Boot on the DUT does
-#   tftpboot ${loadaddr} ${tftp_root}/Image; booti ...
-# to pull the test image. Override if your tftpd serves from elsewhere.
+# TFTP root on the WAN host, from which U-Boot on the DUT pulls the test
+# image and its device tree (docs/testing.md, "Booting the image"). Override
+# if your tftpd serves from elsewhere. Each kernel line is staged under its
+# own names (Image-ask-<line>.gz, mono-gateway-dk-<line>.dtb); these two
+# name whichever line was staged last, the pair the board's `run ask` fetches.
 TFTP_ROOT       ?= /srv/tftp
 TFTP_IMAGE_NAME ?= Image-ask-test.gz
+TFTP_DTB_NAME   ?= mono-gateway-dk.dtb

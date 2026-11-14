@@ -337,8 +337,7 @@ static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
  * (cdx_dpa_ipsec_fq_stop()): what is left on them then is dropped. A volatile
  * dequeue can end on an entry with no frame. */
 static enum qman_cb_dqrr_result dpa_ipsec_drain_dqrr(struct qman_portal *qm,
-		struct qman_fq *fq, const struct qm_dqrr_entry *dq,
-		bool sched_napi, struct qman_poll_ctx *ctx)
+		struct qman_fq *fq, const struct qm_dqrr_entry *dq CDX_DQRR_POLL)
 {
 	if (dq->stat & QM_DQRR_STAT_FD_VALID)
 		dpa_ipsec_fd_drop(&dq->fd);
@@ -380,9 +379,8 @@ extern 	struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,
 		uint16_t *sagd_pkt, uint16_t *tag);
 static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *qm,
 		struct qman_fq *fq,
-		const struct qm_dqrr_entry *dq,
-		bool sched_napi,
-		struct qman_poll_ctx *ctx)
+		const struct qm_dqrr_entry *dq
+		CDX_DQRR_POLL)
 {
 
 	/* Decrypted frames that missed hardware forwarding re-enter Linux. */
@@ -469,7 +467,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	/* IRQ handler, non-migratable; safe to use raw_cpu_ptr here */
 	percpu_priv = raw_cpu_ptr(priv->percpu_priv);
 #ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
-	if (unlikely(dpaa_eth_napi_schedule(percpu_priv, qm, sched_napi)))
+	if (unlikely(cdx_napi_schedule(percpu_priv, qm)))
 	{
 		DPAIPSEC_ERROR("%s(%d) dpaa_eth_napi_schedule failed\n",
 				__func__,__LINE__);

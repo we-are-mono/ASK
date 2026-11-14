@@ -11,7 +11,7 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("kernel", type=Path, help="disposable Linux 6.12 source tree")
+    parser.add_argument("kernel", type=Path, help="disposable Linux source tree of a kernel line ASK builds")
     parser.add_argument("build", type=Path, help="separate UML build directory")
     parser.add_argument("--jobs", type=int, default=8)
     args = parser.parse_args()
@@ -22,8 +22,10 @@ def main():
     driver = repo / "meta-ask/recipes-kernel/sfp-led/files/sfp-led.c"
     if not (kernel / "tools/testing/kunit/kunit.py").is_file():
         parser.error("kernel must contain a Linux source tree with KUnit")
-    if kernel == (repo / "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"):
-        parser.error("use a disposable copy, not the active Yocto kernel tree")
+    # Each kernel line's image build keeps its own tree (meta-ask/build/tmp-<line>).
+    if kernel in {tree.resolve() for tree in
+                  (repo / "meta-ask/build").glob("tmp-*/work-shared/ask-ls1046a/kernel-source")}:
+        parser.error("use a disposable copy, not an active Yocto kernel tree")
 
     dest = kernel / "drivers/leds/sfp-led-kunit"
     dest.mkdir(exist_ok=True)

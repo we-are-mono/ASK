@@ -14,7 +14,11 @@ def test_flowtable_strict_reverse_route(tmp_path):
     end = source.index("\n}\n", start) + 3
     flags = "\n".join(line for line in (kernel / "include/net/flow.h").read_text().splitlines()
                       if line.startswith("#define FLOWI_FLAG_"))
-    (tmp_path / "route_production.inc").write_text(flags + "\n" + source[start:end])
+    # The address test 6.12's lookup still makes, as the kernel defines it.
+    inet = (kernel / "include/linux/in.h").read_text()
+    zeronet = inet.index("static inline bool ipv4_is_zeronet(")
+    (tmp_path / "route_production.inc").write_text(
+        flags + "\n" + inet[zeronet:inet.index("\n}\n", zeronet) + 3] + source[start:end])
     binary = tmp_path / "flowtable_route"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",

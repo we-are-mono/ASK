@@ -24,7 +24,7 @@ the physical port, one lower neighbour at a time. That walk stopped dead at a
 `sit` or `ip6_tnl` device in Linux 6.12: only vlan, bridge, dsa, ppp and
 mac80211 devices carried an `ndo_fill_forward_path`, so the mechanism VLAN,
 bridge and PPPoE rode never reached a tunnel. The first piece of this increment
-is therefore a kernel hook, `patches/kernel/143-ask-flowtable-tunnel-path.patch`,
+is therefore a kernel hook, `patches/kernel/<line>/143-ask-flowtable-tunnel-path.patch`,
 which gives `sit` and `ip6_tnl` that op. Each resolves the hop exactly as its
 own transmit path would: it looks up the outer route the same way
 `ipip6_tunnel_xmit()` and `ip6_tnl_xmit()` do, finds the neighbour on the

@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "xfrm_provider_line.inc"
 
 #define CONFIG_MODULES 1
 #define CONFIG_XFRM_OFFLOAD 1
@@ -39,12 +40,20 @@ struct module { int state, refs; bool refuse; };
 struct xfrm_state;
 struct xfrm_policy;
 struct net_device;
+/* A state callback's parameters: the device first where the line passes it
+ * (6.16), which must be the state's own. */
+#ifdef XDO_PASSES_DEV
+#define XDO_STATE(x) struct net_device *d, struct xfrm_state *x
+#define XDO_THE_STATES_DEVICE(x) assert(d == (x)->xso.dev)
+#else
+#define XDO_STATE(x) struct xfrm_state *x
+#define XDO_THE_STATES_DEVICE(x) ((void)0)
+#endif
 struct xfrmdev_ops {
     struct module *owner;
-    int (*xdo_dev_state_add)(struct net_device *, struct xfrm_state *,
-                             struct netlink_ext_ack *);
-    void (*xdo_dev_state_delete)(struct net_device *, struct xfrm_state *);
-    void (*xdo_dev_state_free)(struct net_device *, struct xfrm_state *);
+    int (*xdo_dev_state_add)(XDO_STATE(x), struct netlink_ext_ack *);
+    void (*xdo_dev_state_delete)(XDO_STATE(x));
+    void (*xdo_dev_state_free)(XDO_STATE(x));
     void (*xdo_dev_state_advance_esn)(struct xfrm_state *);
     void (*xdo_dev_state_update_stats)(struct xfrm_state *);
     int (*xdo_dev_policy_add)(struct xfrm_policy *, struct netlink_ext_ack *);
@@ -108,7 +117,8 @@ static void kmem_cache_free(int c, void *p) { free(p); }
 #include "xfrm_provider_production.inc"
 
 /* ESP's offload type, pinned the way xfrm_set_type_offload() pins it when
- * a state asks for offload; the state's destruction unpins it. */
+ * a state asks for offload (6.18), or xfrm_init_state() when the state is
+ * built (6.12); the state's destruction unpins it. */
 static struct module esp_offload;
 static const struct xfrm_type_offload esp_type = {.owner = &esp_offload};
 static struct xfrm_state *typed(struct xfrm_state *x)
@@ -117,17 +127,28 @@ static struct xfrm_state *typed(struct xfrm_state *x)
     x->type_offload = &esp_type;
     return x;
 }
+/* What the state's destruction does with its offload type. */
+static void untyped(struct xfrm_state *x)
+{
+#ifdef UNSET_TYPE_OFFLOAD
+    xfrm_unset_type_offload(x);
+#else
+    if (x->type_offload)
+        xfrm_put_type_offload(x->type_offload);
+    x->type_offload = NULL;
+#endif
+}
 
 static void pinned(const struct xfrmdev_ops *ops)
 { assert(ops && (!ops->owner || ops->owner->refs > 0)); }
-static int state_add(struct net_device *d, struct xfrm_state *x, struct netlink_ext_ack *e)
-{ assert(d == x->xso.dev); pinned(x->xso.ops); state_adds++; return add_error; }
+static int state_add(XDO_STATE(x), struct netlink_ext_ack *e)
+{ XDO_THE_STATES_DEVICE(x); pinned(x->xso.ops); state_adds++; return add_error; }
 static int policy_add(struct xfrm_policy *x, struct netlink_ext_ack *e)
 { pinned(x->xdo.ops); policy_adds++; return add_error; }
-static void state_delete(struct net_device *d, struct xfrm_state *x)
-{ assert(d == x->xso.dev); pinned(x->xso.ops); state_deletes++; }
-static void state_free(struct net_device *d, struct xfrm_state *x)
-{ assert(d == x->xso.dev); pinned(x->xso.ops); state_frees++; }
+static void state_delete(XDO_STATE(x))
+{ XDO_THE_STATES_DEVICE(x); pinned(x->xso.ops); state_deletes++; }
+static void state_free(XDO_STATE(x))
+{ XDO_THE_STATES_DEVICE(x); pinned(x->xso.ops); state_frees++; }
 static void policy_delete(struct xfrm_policy *x)
 { pinned(x->xdo.ops); policy_deletes++; }
 static void policy_free(struct xfrm_policy *x)
@@ -161,7 +182,7 @@ int main(void)
         assert(xfrm_dev_state_add(&net, typed(&x), &request, NULL) == -EINVAL);
         assert(xfrm_dev_policy_add(&net, &p, &request, XFRM_POLICY_OUT, NULL) == -EINVAL);
         assert(!owner.refs && !device.refs && !state_adds && !policy_adds);
-        xfrm_unset_type_offload(&x);
+        untyped(&x);
         assert(!esp_offload.refs);
     }
     owner.state = MODULE_STATE_LIVE;
@@ -176,10 +197,15 @@ int main(void)
         assert(xfrm_dev_state_add(&net, typed(&x), &request, NULL) < 0);
         assert(xfrm_dev_policy_add(&net, &p, &request, XFRM_POLICY_OUT, NULL) < 0);
         assert(!owner.refs && !device.refs && !x.xso.ops && !p.xdo.ops);
+#ifdef REFUSAL_DROPS_TYPE
         /* A callback that refused the state drops its offload type too; a
          * provider with no callback leaves it to the state's destruction. */
         assert(x.type_offload == (err == 2 ? &esp_type : NULL));
-        xfrm_unset_type_offload(&x);
+#else
+        /* The state keeps its offload type until its destruction. */
+        assert(x.type_offload == &esp_type);
+#endif
+        untyped(&x);
         assert(!esp_offload.refs);
     }
     ops.xdo_dev_state_add = state_add;
@@ -210,7 +236,7 @@ int main(void)
     xfrm_dev_policy_free(&p);
     assert(policy_deletes == 1 && policy_frees == 1);
     assert(owner.refs == 1 && !device.refs);
-    xfrm_unset_type_offload(x);
+    untyped(x);
     xfrm_state_free(x);
     assert(!owner.refs && !esp_offload.refs && !read_depth);
 

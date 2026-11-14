@@ -26,16 +26,30 @@ def _run(tmp_path, harness, includes, flags=()):
     })
 
 
-def _source(path="net/netfilter/nf_flow_table_path.c"):
+def _source(path=None):
+    """A kernel file; by default the route builder's, which 6.18 moved out of
+    nft_flow_offload.c into nf_flow_table_path.c."""
+    if path is None:
+        path = "net/netfilter/nf_flow_table_path.c"
+        if not (kernel_source() / path).exists():
+            path = "net/netfilter/nft_flow_offload.c"
     return (kernel_source() / path).read_text()
 
 
 def test_flowtable_ipsec_route(tmp_path):
     source = _source()
-    _run(tmp_path, "flowtable_ipsec_route.c", {"route_production.inc":
-         source[source.index("static enum flow_offload_xmit_type nft_xmit_type"):
-                source.index("static bool nft_is_valid_ether_device")]
-         + function(source, "nft_flow_route")})
+    route = function(source, "nft_flow_route")
+    # 6.12's builder walks a route for a table without neighbour output only
+    # when neither direction is transformed; 6.18's walks each NEIGH
+    # direction on its own, for every table.
+    both = re.search(r"xmit_type\s*== FLOW_OFFLOAD_XMIT_NEIGH &&\s*"
+                     r"route->tuple\[!dir\]\.xmit_type\s*== FLOW_OFFLOAD_XMIT_NEIGH\)", route)
+    _run(tmp_path, "flowtable_ipsec_route.c", {
+        "route_walks.inc": "#define WALKS_NEED_BOTH_NEIGH\n" if both else "",
+        "route_production.inc":
+            source[source.index("static enum flow_offload_xmit_type nft_xmit_type"):
+                   source.index("static bool nft_is_valid_ether_device")]
+            + route})
 
 
 def test_flowtable_forward_path_unresolved_hops(tmp_path):
@@ -54,7 +68,17 @@ def test_flowtable_forward_path_unresolved_hops(tmp_path):
     table can retire the flow."""
     source = _source()
     dev = _source("net/core/dev.c")
+    api = _source("net/netfilter/nf_tables_api.c")
+    route = function(source, "nft_flow_route")
+    walk = source[source.index("static enum flow_offload_xmit_type nft_xmit_type"):
+                  source.index(route[:-1]) + len(route)]
     _run(tmp_path, "flowtable_forward_path.c", {
+        # How the line's software path sends a NEIGH direction: 6.12 hands
+        # it to neigh_xmit() on the routed destination's device, 6.18 to
+        # dev_queue_xmit() on the device the route names in out.ifindex.
+        "forward_path_xmit.inc":
+            "#define NEIGH_XMIT_BY_DST\n" if "neigh_xmit(" in _source("net/netfilter/nf_flow_table_ip.c")
+            else "",
         "forward_path_devices.inc":
             function(dev, "dev_fwd_path") + function(dev, "dev_fill_forward_path")
             + function(_source("net/8021q/vlan_dev.c"), "vlan_dev_fill_forward_path")
@@ -63,10 +87,12 @@ def test_flowtable_forward_path_unresolved_hops(tmp_path):
             + function(_source("net/ipv6/ip6_tunnel.c"), "ip6_tnl_fill_forward_path")
             + function(_source("drivers/net/ppp/ppp_generic.c"), "ppp_fill_forward_path")
             + function(_source("drivers/net/ppp/pppoe.c"), "pppoe_fill_forward_path"),
+        # From nft_xmit_type to the end of nft_flow_route, and the lookup of a
+        # hook's registration for a device where a hook holds one per device
+        # its name matches (6.16).
         "forward_path_production.inc":
-            function(_source("net/netfilter/nf_tables_api.c"), "nft_hook_find_ops_rcu")
-            + source[source.index("static enum flow_offload_xmit_type nft_xmit_type"):
-                     source.index("EXPORT_SYMBOL_GPL(nft_flow_route);")],
+            (function(api, "nft_hook_find_ops_rcu") if "nft_hook_find_ops_rcu(" in api else "")
+            + walk,
     # The hooks compare an int count with ARRAY_SIZE(), as the kernel, which
     # builds without this warning, lets them.
     }, flags=("-Wno-sign-compare",))

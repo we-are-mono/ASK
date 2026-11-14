@@ -28,12 +28,8 @@ typedef uint16_t u16;
 #define MDB_RTR_TYPE_DISABLED 0
 #define MDB_RTR_TYPE_TEMP_QUERY 1
 #define MDB_RTR_TYPE_PERM 2
-#define BR_MCAST_TO_HOST_JOINED (1U << 0)
-#define BR_MCAST_TO_HOST_ROUTER (1U << 1)
-#define BR_MCAST_TO_HOST_FLOOD (1U << 2)
-#define BR_MCAST_TO_HOST_PROMISC (1U << 3)
-#define BR_MCAST_SNOOPED (1U << 4)
-#define BR_MCAST_TO_HOST_ALLMULTI (1U << 5)
+/* As the line's patch 161 defines them. */
+#include "bridge_mcast_flags.inc"
 #define MDB_PG_FLAGS_BLOCKED 1
 #define MCAST_INCLUDE 1
 #define BROPT_VLAN_ENABLED 0
@@ -453,13 +449,18 @@ int main(void)
                    local == (BR_MCAST_SNOOPED | BR_MCAST_TO_HOST_JOINED |
                              BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC));
             /* An all-multicast bridge -- ipmr makes each VIF device one --
-             * hands up what it snoops as well (a496d2f0fd61), as a router
-             * does; flooded data goes up for flooding alone. */
+             * hands up what it snoops as well where the kernel does so
+             * (a496d2f0fd61, 6.18), as a router does; flooded data goes up
+             * for flooding alone. */
             bridge.flags = IFF_ALLMULTI;
             mdb[0].host_joined = false;
             ctx()->multicast_router = MDB_RTR_TYPE_DISABLED;
+#ifdef BR_MCAST_TO_HOST_ALLMULTI
             assert(received(0, 8) == 2 &&
                    local == (BR_MCAST_SNOOPED | BR_MCAST_TO_HOST_ALLMULTI));
+#else
+            assert(received(0, 8) == 2 && local == BR_MCAST_SNOOPED);
+#endif
             ctx()->querier[family] = false;
             assert(received(0, 8) == 0 && local == BR_MCAST_TO_HOST_FLOOD);
             ctx()->querier[family] = true;

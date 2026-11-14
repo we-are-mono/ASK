@@ -34,9 +34,10 @@ The components:
   the source of truth. Their sources remain in the `mono-1.0.x` release tags,
   which is what docs citing `cmm/`, `fci/`, `auto_bridge/` or `patches/fmc`
   paths refer to.
-- **Kernel side** — the `patches/kernel/` stack (`010`–`130`: the vendored
-  DPAA/FMAN SDK, ASK's hooks, and board drivers, applied onto stock mainline
-  6.12) and the board device tree in `dts/`. See
+- **Kernel side** — a patch stack per supported kernel line,
+  `patches/kernel/<line>/` (the vendored DPAA/FMAN SDK, ASK's hooks, and board
+  drivers, applied onto stock mainline 6.12 or 6.18 with that line's NXP SDK,
+  pinned in `pins/<line>/`), and the board device tree in `dts/`. See
   [fan control](docs/fan-control.md) for the EMC2305 kernel interface and testing.
 - **Runtime config** — module load order and init scripts (`config/`). The PCD /
   soft-parser XML in `config/pcd/` is a build-time input, not shipped.
@@ -52,7 +53,7 @@ reference:
 |-----------|--------|
 | `cdx`, `ask_flowtable` (kernel modules) | `meta-ask/recipes-ask/cdx/` |
 | `ask-flowtable` (userspace) | `meta-ask/recipes-ask/flowtable/` |
-| kernel + ASK patch stack | `meta-ask/recipes-kernel/linux/linux-ask_6.18.bb` |
+| kernel + ASK patch stack | `meta-ask/recipes-kernel/linux/linux-ask_<line>.bb` (per line), `linux-ask.inc` (shared) |
 | bootable showcase image | `meta-ask/recipes-core/images/ask-image.bb` |
 
 For example, OpenWrt consumes ASK by mirroring these as `package/ask/*` Makefiles
@@ -81,8 +82,9 @@ Verified from scratch on a clean Debian 13 (trixie) amd64 host.
 
 - Debian 13 (trixie) or newer, amd64.
 - **Disk:** an empty-sstate build uses roughly **85 GB** — about 70 GB for the
-  build tree (`meta-ask/build/tmp`), 13 GB of downloads, and a few GB of sstate.
-  Provision **≥100 GB free** on the build filesystem.
+  build tree (`meta-ask/build/tmp-<line>`, one per kernel line built), 13 GB of
+  downloads, and a few GB of sstate. Provision **≥100 GB free** on the build
+  filesystem, and about 70 GB more for each further line.
 - **RAM:** 16 GB minimum, 32 GB comfortable for a parallel build. Note that a
   default systemd `/tmp` is a tmpfs sized to half of RAM; a heavily parallel
   native compile can exhaust a small `/tmp`. If you hit `No space left on
@@ -128,10 +130,13 @@ sstate cache turns a ~40-minute build into minutes.
 ### 3. Build
 
 ```sh
-make ask-image        # builds the test image with KASAN enabled
+make ask-image                # builds the 6.18 test image with KASAN enabled
+make ask-image LINE=6.12      # the 6.12 line's
 ```
 
-The image lands in `meta-ask/build/tmp/deploy/images/ask-ls1046a/` as
+One checkout builds every supported kernel line side by side; `LINE` picks one
+(the newest by default). Each line's image lands in
+`meta-ask/build/tmp-<line>/deploy/images/ask-ls1046a/` as
 `Image.gz-initramfs-ask-ls1046a.bin` (kernel + initramfs, ~104 MB). From an empty
 sstate cache the build takes ~40 minutes.
 
@@ -144,12 +149,16 @@ enables it, and the DUT suite checks the running kernel before any test setup.
 The image boots in RAM over TFTP from U-Boot on the lab board:
 
 ```sh
-make stage-image      # copy image + matching DTB into $TFTP_ROOT (default /srv/tftp)
+make stage-image      # copy LINE's image + matching DTB into $TFTP_ROOT (default /srv/tftp)
 ```
 
-Then, at the DUT's U-Boot prompt: `tftpboot ${loadaddr} <name>; booti ${loadaddr} - ${fdtaddr}`.
-Also load the staged `mono-gateway-dk.dtb` into the DTB RAM buffer passed to
-`booti`; it contains the board's fan curve configuration.
+Each line is staged as `Image-ask-<line>.gz` and `mono-gateway-dk-<line>.dtb`,
+and `Image-ask-test.gz` / `mono-gateway-dk.dtb` are pointed at the line just
+staged. At the DUT's U-Boot prompt, load an image and its device tree and boot
+them, e.g. `tftpboot 0xc0000000 Image-ask-6.18.gz; tftpboot 0xe0000000
+mono-gateway-dk-6.18.dtb; booti 0xc0000000 - 0xe0000000` (the KASAN image needs
+high load addresses: see [Booting the image](docs/testing.md#booting-the-image)).
+The device tree carries the board's fan curve configuration.
 
 ### Make targets
 
@@ -159,8 +168,8 @@ harness — it does not build ASK components standalone.
 | Target | Does |
 |--------|------|
 | `make setup` | install host build deps + locale (one-time, sudo) |
-| `make ask-image` | build the test image via kas |
-| `make stage-image` | copy the built image and matching DTB into the TFTP root |
+| `make ask-image` | build the test image via kas, for `LINE` (`6.12` or `6.18`, default `6.18`) |
+| `make stage-image` | copy `LINE`'s image and matching DTB into the TFTP root |
 | `make test-env` | install the pinned Python runner dependencies |
 | `make deploy-agents` | install the askd test agent and runner dependencies on the WAN host |
 | `make test` | run host and DUT tests using ignored `.ask-test.mk` bench settings |
@@ -173,14 +182,17 @@ The [test dependency guide](docs/testing.md#runner-dependencies-and-installation
 covers the Python environment, system packages, source trees, and DUT/LAN
 requirements. Python package versions are pinned in
 [`tools/requirements.txt`](tools/requirements.txt). Filter a run with
-`make test K='ipsec or mcast'`; extra pytest options go in `ARGS`.
+`make test K='ipsec or mcast'`; extra pytest options go in `ARGS`. Test targets
+run against `LINE`'s patch series and build tree, and refuse a DUT booted into
+another line's image.
 
 ## Versioning and branches
 
-ASK is versioned per kernel-compatibility line. In short: `master` is active
-development for the newest supported kernel; `mono-6.12` is the 6.12 maintenance
-line; releases are tagged (`mono-1.0.0`). See [docs/versioning.md](docs/versioning.md)
-for the full branch model.
+One trunk (`master`) carries every supported kernel line side by side, each with
+its own patch series and SDK pin (`patches/kernel/<line>/`, `pins/<line>/`); one
+ASK version spans the lines, each release is tagged once (`mono-1.4.0`), and
+its `RELEASED_LINES` names the lines it covers. See
+[docs/versioning.md](docs/versioning.md) for the full model.
 
 The `feat/linux-flowtable-offload` branch replaces CMM flow management with
 Linux's native flowtables. The test image boots only that path, and the CMM,

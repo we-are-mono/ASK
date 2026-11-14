@@ -1,15 +1,16 @@
 """A189: execute the kernel's complete multicast egress snapshot."""
 
+from ask_orch import kernel_line
 from ask_orch.process import run_process
 import os
 from pathlib import Path
+import re
 
 import pytest
 
 from _host_qos_lifecycle import (function)
 
-ROOT = Path(__file__).resolve().parents[2]
-PATCH = ROOT / "patches/kernel/161-bridge-multicast-egress-snapshot.patch"
+PATCH = kernel_line.patches() / "161-bridge-multicast-egress-snapshot.patch"
 
 
 def snapshot_source():
@@ -22,8 +23,18 @@ def snapshot_source():
             + function(added, "br_multicast_membership_interval"))
 
 
+def snapshot_flags():
+    """What the line's patch says the host is handed a group's frames for:
+    6.18's adds an all-multicast bridge (BR_MCAST_TO_HOST_ALLMULTI)."""
+    header = PATCH.read_text().split("+++ b/include/linux/if_bridge.h\n", 1)[1].split("\ndiff --git ", 1)[0]
+    flags = re.findall(r"^\+(#define BR_MCAST_\w+\s+\(1U << \d+\))", header, re.M)
+    assert flags
+    return "\n".join(flags) + "\n"
+
+
 @pytest.mark.parametrize("ipv6", [0, 1])
 def test_bridge_mcast_snapshot(tmp_path, ipv6):
+    (tmp_path / "bridge_mcast_flags.inc").write_text(snapshot_flags())
     (tmp_path / "bridge_mcast_snapshot.inc").write_text(snapshot_source())
     binary = tmp_path / "snapshot"
     run_process([

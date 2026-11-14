@@ -343,4 +343,4 @@ that today's internal Linux interfaces or firmware features will last unchanged.
 - [BPF kernel functions](https://docs.kernel.org/bpf/kfuncs.html) describe explicit
   exposure and compatibility constraints for BPF access to kernel facilities.
 - [ASK testing](../../testing.md), [versioning](../../versioning.md), and the
-  [SDK source pin](../../../pins/nxp-sdk-srcrev.inc) define existing project practices.
+  [SDK source pin](../../../pins/6.12/nxp-sdk-srcrev.inc) define existing project practices.

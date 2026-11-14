@@ -16,6 +16,8 @@ def command(suite, environ, executable=sys.executable):
         "DUT_IP": ("ASK_TARGET_IP",),
         "WAN_IP": ("ASK_WAN_IP", "ASK_WAN_IPERF_IP"),
         "WAN_AGENT_IP": ("ASK_WAN_IP",),
+        # The kernel line, as the image targets name it.
+        "LINE": ("ASK_LINE",),
     }.items():
         if env.get(short):
             env.update((name, env[short]) for name in names)

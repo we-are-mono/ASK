@@ -137,8 +137,7 @@ uint8_t iface_count;
 
 
 static enum qman_cb_dqrr_result fwd_tx_drain_dqrr(struct qman_portal *portal,
-		struct qman_fq *fq, const struct qm_dqrr_entry *dq,
-		bool sched_napi, struct qman_poll_ctx *ctx)
+		struct qman_fq *fq, const struct qm_dqrr_entry *dq CDX_DQRR_POLL)
 {
 	/* These FQs carry pool-backed forwarding frames normally freed by
 	 * FMan (EBD). Retirement returns any unsent frames to software.

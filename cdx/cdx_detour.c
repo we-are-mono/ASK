@@ -256,9 +256,8 @@ static int cdx_detour_frame_ingress(const struct sk_buff *skb)
 /* A frame the offline port handed back: to Linux, on the port it arrived by. */
 static enum qman_cb_dqrr_result cdx_detour_rx(struct qman_portal *portal,
 					      struct qman_fq *fq,
-					      const struct qm_dqrr_entry *dq,
-					      bool sched_napi,
-					      struct qman_poll_ctx *ctx)
+					      const struct qm_dqrr_entry *dq
+					      CDX_DQRR_POLL)
 {
 	struct net_device *dev;
 	struct sk_buff *skb;
@@ -292,9 +291,8 @@ static enum qman_cb_dqrr_result cdx_detour_rx(struct qman_portal *portal,
  * see has nothing Linux could do with it. */
 static enum qman_cb_dqrr_result cdx_detour_error(struct qman_portal *portal,
 						 struct qman_fq *fq,
-						 const struct qm_dqrr_entry *dq,
-						 bool sched_napi,
-						 struct qman_poll_ctx *ctx)
+						 const struct qm_dqrr_entry *dq
+						 CDX_DQRR_POLL)
 {
 	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
 		return qman_cb_dqrr_consume;
@@ -306,9 +304,8 @@ static enum qman_cb_dqrr_result cdx_detour_error(struct qman_portal *portal,
 /* What the queue into the port still holds when it is torn down. */
 static enum qman_cb_dqrr_result cdx_detour_drain(struct qman_portal *portal,
 						 struct qman_fq *fq,
-						 const struct qm_dqrr_entry *dq,
-						 bool sched_napi,
-						 struct qman_poll_ctx *ctx)
+						 const struct qm_dqrr_entry *dq
+						 CDX_DQRR_POLL)
 {
 	if (dq->stat & QM_DQRR_STAT_FD_VALID)
 		dpa_fd_release(NULL, &dq->fd);

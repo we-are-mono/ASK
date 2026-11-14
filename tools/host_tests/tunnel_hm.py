@@ -1,5 +1,6 @@
 """Check the production tunnel header manipulations' bytes and debug decoding."""
 
+from ask_orch import kernel_line
 from ask_orch.process import run_process
 
 import os
@@ -44,7 +45,7 @@ def test_tunnel_hm(tmp_path, ifstats):
     # Test the shipped patch, without depending on a previously built kernel.
     run_process([
         "git", "apply", f"--include={HEADER}",
-        str(ROOT / "patches/kernel/010-ask-fman-dpaa-ehash.patch"),
+        str(kernel_line.patches() / "010-ask-fman-dpaa-ehash.patch"),
     ], cwd=tmp_path, check=True)
     header = (tmp_path / HEADER).read_text()
     common = (ROOT / "cdx/cdx_common.h").read_text()

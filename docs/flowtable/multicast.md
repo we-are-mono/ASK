@@ -1027,7 +1027,7 @@ tests.
 
 ### 4. Patch the bridge
 
-`patches/kernel/`, a new number because this is a distinct concern: carry the
+`patches/kernel/<line>/`, a new number because this is a distinct concern: carry the
 `struct br_ip` into `struct switchdev_obj_port_mdb` and populate it in
 `br_switchdev_mdb_populate()`. Two files, additive, no behaviour change for a
 driver that ignores the field.

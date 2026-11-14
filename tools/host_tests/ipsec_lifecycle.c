@@ -6,6 +6,7 @@
 #include <string.h>
 #include <errno.h>
 #undef errno
+#include "cdx_compat.inc"
 
 #define MAX_MATCH_TABLES 4
 #define IPSEC_FMAN_IDX 0
@@ -183,8 +184,7 @@ struct qman_fq {
     enum qman_fq_state state;
     struct {
         enum qman_cb_dqrr_result (*dqrr)(struct qman_portal *, struct qman_fq *,
-                                         const struct qm_dqrr_entry *, bool,
-                                         struct qman_poll_ctx *);
+                                         const struct qm_dqrr_entry * CDX_DQRR_POLL);
         void (*ern)(struct qman_portal *, struct qman_fq *, const struct qm_mr_entry *);
     } cb;
 };
@@ -391,10 +391,8 @@ static void dpa_fd_release(const struct net_device *dev, const struct qm_fd *fd)
  * resolve any more: it marked itself SA_DELETE first. */
 static U16 *releasing_flags;
 static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *qm,
-        struct qman_fq *fq, const struct qm_dqrr_entry *dq, bool sched_napi,
-        struct qman_poll_ctx *ctx)
+        struct qman_fq *fq, const struct qm_dqrr_entry *dq CDX_DQRR_POLL)
 {
-    (void)sched_napi; (void)ctx;
     if (dq->stat & QM_DQRR_STAT_FD_VALID) {
         assert(releasing_flags && (*releasing_flags & SA_DELETE));
         cp_drops++;
@@ -508,12 +506,12 @@ static void vdq_deliver(struct qman_fq *fq)
     assert(fq->flags & QMAN_FQ_STATE_VDQCR);
     for (unsigned i = 0; i < fq->held; i++) {
         dq.stat = QM_DQRR_STAT_FD_VALID; dq.fd = fq->frames[i];
-        assert(fq->cb.dqrr(NULL, fq, &dq, false, NULL) == qman_cb_dqrr_consume);
+        assert(fq->cb.dqrr(NULL, fq, &dq CDX_DQRR_POLL_ARGS) == qman_cb_dqrr_consume);
     }
     fq->held = 0;
     dq.stat = QM_DQRR_STAT_FQ_EMPTY | QM_DQRR_STAT_DQCR_EXPIRED;
     memset(&dq.fd, 0, sizeof(dq.fd));
-    assert(fq->cb.dqrr(NULL, fq, &dq, false, NULL) == qman_cb_dqrr_consume);
+    assert(fq->cb.dqrr(NULL, fq, &dq CDX_DQRR_POLL_ARGS) == qman_cb_dqrr_consume);
     fq->flags &= ~(QMAN_FQ_STATE_NE | QMAN_FQ_STATE_VDQCR);
     callbacks++;
 }

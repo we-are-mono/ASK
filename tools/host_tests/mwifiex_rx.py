@@ -1,28 +1,21 @@
 """Exercise the driver's receive epilogue with descriptor/skb shared storage.
 
-The fix ASK once carried for it (a skb freed after the stack had it) is in
-NXP's own release now (lf-6.18.37_2.1.0), so the pinned source is tested as
-it ships."""
+The driver is tested as its recipe builds it for the line: on 6.12 a local
+fix keeps a skb the stack already has from being freed; NXP's lf-6.18.37_2.1.0
+release carries that fix itself."""
 
 from ask_orch.process import run_process
 import os
-from pathlib import Path
-import re
-import subprocess
 
+import _host_mwifiex as mwifiex
 from _host_flowtable import (function)
-
-ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_cleanup(tmp_path):
-    recipe = ROOT / "meta-ask/recipes-kernel/nxp-mwifiex/nxp-mwifiex_git.bb"
-    source = ROOT / "meta-ask/build/tmp/work/ask_ls1046a-oe-linux/nxp-mwifiex/git/git"
-    revision = re.search(r'SRCREV = "([0-9a-f]+)"', recipe.read_text())[1]
-    path = tmp_path / "mlinux/moal_shim.c"
-    path.parent.mkdir()
-    path.write_bytes(subprocess.check_output(["git", "show", revision + ":mlinux/moal_shim.c"], cwd=source))
-    epilogue = function(path.read_text(), "moal_recv_packet").split("\ndone:\n")[1]
+    tree = tmp_path / "mwifiex"
+    tree.mkdir()
+    mwifiex.unpack(tree)
+    epilogue = function((tree / "mlinux/moal_shim.c").read_text(), "moal_recv_packet").split("\ndone:\n")[1]
     harness = '''
 #include <assert.h>
 #include <stdlib.h>

@@ -7,6 +7,8 @@ ccflags-y += -I$(srctree)/drivers/crypto/caam
 ccflags-y += -DSEC_PROFILE_SUPPORT -DVLAN_FILTER -DENABLE_EGRESS_QOS
 ccflags-y += -DDPA_IPSEC_OFFLOAD
 ccflags-y += -Werror -I$(src) -DENDIAN_LITTLE -DGCC_TOOLCHAIN
+# Ahead of every source: what differs between the kernel lines (compat.h).
+ccflags-y += -include $(src)/compat.h
 # CFG_FLAGS is forwarded by cdx/Makefile from the outer make invocation
 # (kbuild prefers Kbuild over Makefile when both exist, so the latter's
 # ccflags-y += $(CFG_FLAGS) line never runs in this build path).

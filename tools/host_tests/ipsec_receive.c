@@ -14,6 +14,8 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include "cdx_compat.inc"
+#include "ipsec_receive_sdk.inc"
 
 typedef uintptr_t dma_addr_t;
 #define likely(x) (x)
@@ -157,9 +159,10 @@ static struct xfrm_state *xfrm_state_lookup_byhandle(void *net, unsigned handle)
 static void xfrm_state_put(struct xfrm_state *x) { assert(x == &state && refs); refs--; }
 static struct dpa_priv_s *netdev_priv(struct net_device *dev) { return dev->priv; }
 #ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
-static bool dpaa_eth_napi_schedule(struct dpa_percpu_priv_s *p, struct qman_portal *q,
-                                   bool sched_napi)
-{ (void)p; (void)q; (void)sched_napi; return napi_defer; }
+/* Taking what the line's SDK declares (lf-6.18 adds the callback's
+ * sched_napi); whether it schedules is the run's to say. */
+static bool dpaa_eth_napi_schedule(DPAA_ETH_NAPI_SCHEDULE_PARAMS)
+{ return napi_defer; }
 #endif
 static struct sk_buff *contig_fd_to_skb(struct dpa_priv_s *p, const struct qm_fd *fd, bool *gro, bool ts)
 {
@@ -318,7 +321,7 @@ int main(void)
             dq.fd.status = fault == 5 ? FM_FD_RX_STATUS_ERR_NON_FM : 0;
             dq.stat = fault == 6 ? 0 : QM_DQRR_STAT_FD_VALID;
             memcpy(pristine, frame, sizeof(frame));
-            assert(ipsec_exception_pkt_handler(&portal, &fq, &dq, false, NULL) == qman_cb_dqrr_consume);
+            assert(ipsec_exception_pkt_handler(&portal, &fq, &dq CDX_DQRR_POLL_ARGS) == qman_cb_dqrr_consume);
             assert(!refs);
             /* A copied frame's buffer is back before the stack sees the
              * copy; a converted one's goes with the skb. */
@@ -365,14 +368,14 @@ int main(void)
             reset(); dq.stat = QM_DQRR_STAT_FD_VALID; dq.fd.status = 0;
             frame[16] = v6 ? 8 : 0x86; frame[17] = v6 ? 0 : 0xdd;
             frame[18] = v6 ? 0x60 : 0x45;
-            assert(ipsec_exception_pkt_handler(&portal, &fq, &dq, false, NULL) == qman_cb_dqrr_consume);
+            assert(ipsec_exception_pkt_handler(&portal, &fq, &dq CDX_DQRR_POLL_ARGS) == qman_cb_dqrr_consume);
             assert(delivered == 1 && packet.protocol == htons(v6 ? ETHERTYPE_IPV6 : ETHERTYPE_IPV4));
             for (unsigned i = 0; i < sizeof(table); i++) assert(table[i] == 0);
             run_refill();
         }
 #ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
         reset(); dq.stat = QM_DQRR_STAT_FD_VALID; dq.fd.status = 0; napi_defer = true;
-        assert(ipsec_exception_pkt_handler(&portal, &fq, &dq, false, NULL) == qman_cb_dqrr_stop);
+        assert(ipsec_exception_pkt_handler(&portal, &fq, &dq CDX_DQRR_POLL_ARGS) == qman_cb_dqrr_stop);
         assert(!refs && !converted && !fd_releases && !skb_frees);
 #endif
     }
@@ -388,7 +391,7 @@ int main(void)
         reset(); dq.stat = QM_DQRR_STAT_FD_VALID; dq.fd.status = 0;
         dq.fd.format = qm_fd_contig; dq.fd.addr = fd_buffer = (uintptr_t)frame;
         sa_device = others[i];
-        assert(ipsec_exception_pkt_handler(&portal, &fq, &dq, false, NULL) == qman_cb_dqrr_consume);
+        assert(ipsec_exception_pkt_handler(&portal, &fq, &dq CDX_DQRR_POLL_ARGS) == qman_cb_dqrr_consume);
         assert(fd_releases == 1 && !unmapped && !converted && !skb_frees && !delivered);
         assert(!refs && others[i]->rx_dropped == 1 && errors_logged == 1);
         assert(pool.count == 512 && !ipsec_pool_debt && bp_count == 640);

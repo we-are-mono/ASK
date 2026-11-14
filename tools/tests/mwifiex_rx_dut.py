@@ -12,11 +12,12 @@ import sys
 
 import pytest
 
+from ask_orch import kernel_line
 from ask_orch.uart import Console
 from _flowtable_rig import (artifact_dir, command, console_command)
 
 REPO = Path(__file__).resolve().parents[2]
-SOURCE = REPO / "meta-ask/build/tmp/work/ask_ls1046a-oe-linux/nxp-mwifiex/git/git"
+SOURCE = kernel_line.tmpdir() / "work/ask_ls1046a-oe-linux/nxp-mwifiex/git/git"
 OBJCOPY = SOURCE.parent / "recipe-sysroot-native/usr/bin/aarch64-oe-linux/aarch64-oe-linux-objcopy"
 
 

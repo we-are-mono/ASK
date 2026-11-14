@@ -909,9 +909,8 @@ release:
 
 static enum qman_cb_dqrr_result cdx_wg_rxq_dqrr(struct qman_portal *portal,
 						struct qman_fq *fq,
-						const struct qm_dqrr_entry *dq,
-						bool sched_napi,
-						struct qman_poll_ctx *ctx)
+						const struct qm_dqrr_entry *dq
+						CDX_DQRR_POLL)
 {
 	struct cdx_wg_rxq *q = container_of(fq, struct cdx_wg_rxq, fq);
 	struct cdx_wg_seq s;
@@ -1361,9 +1360,8 @@ static void cdx_wg_seal_slow(struct cdx_wg_dev *w, struct net_device *dev,
 
 static enum qman_cb_dqrr_result cdx_wg_seal_dqrr(struct qman_portal *portal,
 						 struct qman_fq *fq,
-						 const struct qm_dqrr_entry *dq,
-						 bool sched_napi,
-						 struct qman_poll_ctx *ctx)
+						 const struct qm_dqrr_entry *dq
+						 CDX_DQRR_POLL)
 {
 	struct cdx_wg_sealq *sq = container_of(fq, struct cdx_wg_sealq, fq);
 	struct cdx_wg_dev *w = sq->w;

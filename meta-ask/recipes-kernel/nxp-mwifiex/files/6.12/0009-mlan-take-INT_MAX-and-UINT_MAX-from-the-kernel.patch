@@ -1,0 +1,101 @@
+From 1deb677e9af633f5b2cf1d8d014433f760313951 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Wed, 11 Nov 2026 11:44:00 +0100
+Subject: [PATCH] mlan: take INT_MAX and UINT_MAX from the kernel
+
+mlan_util.h and mlan_decl.h defined their own INT_MAX and UINT_MAX unless
+CONFIG_KASAN was set. Without KASAN they collide with linux/limits.h
+("redefined", fatal under CONFIG_WERROR); with it, INT_MAX was left
+undefined. Include the kernel header instead.
+
+Upstream-Status: Pending
+---
+ mlan/mlan_decl.h   | 20 +-------------------
+ mlan/mlan_util.h   |  8 +-------
+ mlinux/mlan_decl.h | 20 +-------------------
+ 3 files changed, 3 insertions(+), 45 deletions(-)
+
+diff --git a/mlan/mlan_decl.h b/mlan/mlan_decl.h
+index 78a0afc..74bd0cc 100644
+--- a/mlan/mlan_decl.h
++++ b/mlan/mlan_decl.h
+@@ -3160,25 +3160,7 @@ MLAN_API void mlan_process_pcie_interrupt_cb(t_void *pmadapter, int type);
+ #endif
+ #endif
+ 
+-#ifdef ANDROID_SDK_VERSION
+-#ifndef UINT_MAX
+-#ifdef MLAN_64BIT
+-#define UINT_MAX UINT64_MAX
+-#else
+-#define UINT_MAX UINT32_MAX
+-#endif
+-#endif
+-#else
+-#ifndef CONFIG_KASAN
+-#ifndef UINT_MAX
+-#ifdef MLAN_64BIT
+-#define UINT_MAX UINT64_MAX
+-#else
+-#define UINT_MAX UINT32_MAX
+-#endif
+-#endif
+-#endif
+-#endif
++#include <linux/limits.h>
+ 
+ typedef enum {
+ 	TYPE_SINT8,
+diff --git a/mlan/mlan_util.h b/mlan/mlan_util.h
+index b1be492..8ed999c 100644
+--- a/mlan/mlan_util.h
++++ b/mlan/mlan_util.h
+@@ -535,13 +535,7 @@ static INLINE t_void util_scalar_decrement(
+  *  @return			Value after offset or 0 if (scalar_value + offset)
+  * overflows
+  */
+-#ifdef ANDROID_SDK_VERSION
+-#define INT_MAX 2147483647
+-#else
+-#ifndef CONFIG_KASAN
+-#define INT_MAX 2147483647
+-#endif
+-#endif
++#include <linux/limits.h>
+ static INLINE t_s32 util_scalar_offset(
+ 	t_void *pmoal_handle, pmlan_scalar pscalar, t_s32 offset,
+ 	mlan_status (*moal_spin_lock)(t_void *handle, t_void *plock),
+diff --git a/mlinux/mlan_decl.h b/mlinux/mlan_decl.h
+index 78a0afc..74bd0cc 100644
+--- a/mlinux/mlan_decl.h
++++ b/mlinux/mlan_decl.h
+@@ -3160,25 +3160,7 @@ MLAN_API void mlan_process_pcie_interrupt_cb(t_void *pmadapter, int type);
+ #endif
+ #endif
+ 
+-#ifdef ANDROID_SDK_VERSION
+-#ifndef UINT_MAX
+-#ifdef MLAN_64BIT
+-#define UINT_MAX UINT64_MAX
+-#else
+-#define UINT_MAX UINT32_MAX
+-#endif
+-#endif
+-#else
+-#ifndef CONFIG_KASAN
+-#ifndef UINT_MAX
+-#ifdef MLAN_64BIT
+-#define UINT_MAX UINT64_MAX
+-#else
+-#define UINT_MAX UINT32_MAX
+-#endif
+-#endif
+-#endif
+-#endif
++#include <linux/limits.h>
+ 
+ typedef enum {
+ 	TYPE_SINT8,
+-- 
+2.47.3
+

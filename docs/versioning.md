@@ -1,249 +1,116 @@
 # ASK Versioning and Branching
 
-This document describes how ASK is versioned, branched, released, and maintained across different Linux kernel versions.
+How ASK is versioned, released and maintained across Linux kernel lines.
 
-## Branches
+## One trunk, every line
 
-ASK uses the following branch model:
-
-* `master` — active development for the newest kernel version we support.
-* `mono-6.12` — maintenance branch for the Linux 6.12 compatibility line.
-* `mono-6.18` — maintenance branch for the Linux 6.18 compatibility line.
-
-The `mono-*` branches are created when a kernel compatibility line becomes a released/stable version of ASK.
-
-`master` always represents the next version of ASK under active development.
-
-### Example
-
-While ASK 1.0 is the current release:
+ASK is coupled to its kernel: the patch series, the NXP SDK it overlays and the
+interface between cdx and the kernel hooks all follow the kernel line. Rather
+than a branch per line, one trunk carries every supported line side by side,
+the way OpenWrt carries its targets' kernels:
 
 ```text
-master       -> development for Linux 6.18
-mono-6.12    -> ASK 1.0 maintenance for Linux 6.12
+patches/kernel/6.12/   patches/kernel/6.18/      the series, one per line
+pins/6.12/             pins/6.18/                the NXP SDK revision
+meta-ask/recipes-kernel/linux/
+    linux-ask_6.12.bb  linux-ask_6.18.bb         pins and series order
+    linux-ask.inc                                what the lines share
 ```
 
-After the first stable 6.18 release:
+Everything else -- cdx, ask_flowtable, the flowtable daemon, the tests -- is one
+copy that builds for every line. What differs between kernel or SDK releases is
+kept in `cdx/compat.h`, keyed on the release that changed it, so the sources are
+written once, in the newest line's terms.
+
+A build picks its line: `make ask-image LINE=6.12` (the default is the newest).
+Each line builds in its own `meta-ask/build/tmp-<line>`, and the test targets
+take the same `LINE`.
+
+`master` is the trunk and stays releasable. Work happens on short-lived branches
+off `master`, is tested, and merges back.
+
+## Versions and tags
+
+There is one ASK version across lines, and one tag per release: the release
+commit is tagged once, annotated, `mono-<version>` (`mono-1.4.0`). Every line
+is built from that same commit, so the line is not part of the name; a
+consumer's own kernel picks the series it applies (OpenWrt reads its
+`KERNEL_PATCHVER`).
+
+What the tag does carry is which lines the release is released for -- tested
+with the full rig suite and supported. The release commit declares them in
+`RELEASED_LINES`, one per line, and the tag message repeats them:
 
 ```text
-master       -> development for the next kernel version
-mono-6.18    -> 6.18 maintenance
-mono-6.12    -> 6.12 maintenance
+$ cat RELEASED_LINES
+6.12
+$ git tag -a mono-1.4.0 -m "ASK 1.4.0 (lines: 6.12)"
 ```
 
-## Initial 6.12 Release
-
-ASK initially targets Linux 6.12.
-
-Until ASK 1.0 is released, all development remains on `master`, including fixes and improvements to the 6.12 implementation.
-
-Once the 6.12 implementation is considered stable and ASK 1.0 is released:
-
-```bash
-git tag -a v1.0.0 -m "ASK 1.0.0"
-git branch mono-6.12
-```
-
-The `mono-6.12` branch represents the 6.12 maintenance line from that point onward.
-
-`master` then becomes the development branch for the next kernel compatibility target, initially Linux 6.18.
-
-## Developing a New Kernel Compatibility Version
-
-A new kernel compatibility version is developed on `master`.
-
-For example, after ASK 1.0:
-
-```text
-mono-6.12  -> maintenance
-master     -> 6.18 development
-```
-
-There is no need to create `mono-6.18` when 6.18 development starts.
-
-`mono-6.18` is created only when the 6.18 implementation is stable and becomes a released version of ASK.
-
-For example:
-
-```bash
-git tag -a v2.0.0 -m "ASK 2.0.0"
-git branch mono-6.18
-```
-
-After this point:
-
-```text
-master     -> development for the next kernel version
-mono-6.18  -> 6.18 maintenance
-mono-6.12  -> 6.12 maintenance
-```
-
-## Fixes and Backports
-
-New fixes should normally be developed on `master` first.
-
-Once a fix is committed to `master`, determine which maintained branches are affected.
-
-If a fix is also required on an older compatibility branch, cherry-pick the fix onto that branch:
-
-```bash
-git switch mono-6.12
-git cherry-pick -x <commit>
-```
-
-The `-x` option records the original commit in the backport commit, making the relationship between the two changes explicit.
-
-Do not routinely merge maintenance branches into `master`, or `master` into maintenance branches.
-
-The normal direction is:
-
-```text
-                    master
-                      │
-                  fix/feature
-                      │
-          ┌───────────┼───────────┐
-          │           │           │
-          ▼           ▼           ▼
-      6.18 branch  6.12 branch  other
-       (if needed)  (if needed)
-```
-
-A fix should only be backported when it is applicable to the older branch.
-
-## API and Kernel-Version Differences
-
-A backport does not have to be identical to the original commit.
-
-Different kernel versions may provide different APIs or require different implementations.
-
-For example:
-
-```text
-master / 6.18:
-    use new_kernel_api()
-
-mono-6.12:
-    use old_kernel_api()
-```
-
-If the same logical bug exists in both versions, fix it on `master` first and adapt the implementation when backporting it to `mono-6.12`.
-
-The important requirement is that the branches receive the appropriate equivalent fix, not that their source code or Git history remain identical.
-
-## Features
-
-New features should normally be developed on `master`.
-
-Features should only be backported to an older maintenance branch when there is an explicit reason to support them there.
-
-Maintenance branches should not automatically receive every change from `master`.
-
-In particular, kernel-version-specific functionality that depends on a newer kernel API should not be backported merely to keep the branches similar.
-
-## Commit Structure
-
-Keep commits focused and logically independent whenever practical.
-
-For example:
-
-```text
-module: fix race in foo
-module: improve error handling
-module: add support for new kernel API
-module: fix memory leak
-```
-
-Avoid combining unrelated fixes into large commits.
-
-This makes it possible to selectively cherry-pick individual fixes into maintained branches.
-
-A commit on `master` should therefore be considered the canonical version of a change whenever possible.
-
-## Release Tags
-
-Tags identify the exact ASK version that was released.
-
-For example:
-
-```text
-v1.0.0
-v1.0.1
-v1.1.0
-v2.0.0
-```
-
-Branches identify maintenance lines, while tags identify exact releases.
-
-For example:
-
-```text
-mono-6.12
-    ├── v1.0.0
-    ├── v1.0.1
-    └── v1.0.2
-
-mono-6.18
-    ├── v2.0.0
-    └── v2.0.1
-```
-
-## Support Policy
-
-Each `mono-*` branch represents a specific kernel compatibility line.
-
-For example:
-
-```text
-mono-6.12 -> Linux 6.12.y
-mono-6.18 -> Linux 6.18.y
-```
-
-The branch name refers to the kernel series, not to one particular kernel patch release.
-
-ASK should be tested against appropriate current releases from each supported kernel series.
-
-A maintenance branch may be retired when support for its corresponding kernel series is discontinued.
-
-## Summary
-
-The rules are:
-
-1. `master` is the active development branch.
-2. The current kernel compatibility implementation is developed on `master` until it is released.
-3. A `mono-X.Y` branch is created when the corresponding kernel compatibility line becomes a stable/released ASK version.
-4. Release branches are maintained independently after they are created.
-5. Fixes are developed on `master` first whenever practical.
-6. Applicable fixes are selectively backported to maintained branches using `git cherry-pick -x`.
-7. Do not routinely merge maintenance branches into `master` or `master` into maintenance branches.
-8. Backported fixes may require different implementations because of kernel API differences.
-9. New features are developed on `master` and only selectively backported.
-10. Tags identify exact ASK releases; branches identify maintained kernel compatibility lines.
-
-The intended long-term structure is:
-
-```text
-                         master
-                           │
-                    next development
-                           │
-                           ▼
-                         ...
-                           │
-                       v2.0.0
-                           │
-                           └── mono-6.18
-                                  │
-                                  │ maintenance
-                                  ▼
-
-v1.0.0 ─────────────────────── mono-6.12
-                                  │
-                                  │ maintenance
-                                  ▼
-```
-
-The key principle is:
-
-> `master` moves forward; `mono-*` branches stay behind and receive only the fixes and changes that are applicable to their supported kernel series.
-
+Consumers refuse a release whose `RELEASED_LINES` lacks their kernel's line:
+the OpenWrt sync and the `ask-version` pin both check it. `make release-status
+LINE=<line>` reports whether the line's release matrix qualifies and whether
+the line is listed.
+
+The version follows ASK's own changes, not the kernel's: porting to a new line
+changes no functionality, so it is no major bump. A pushed tag never moves.
+
+Tags from before the trunk (`mono-1.0.0` to `mono-1.3.1`) are 6.12 releases
+and stay as they are. The `mt-6.12.y` branch stays where it is; no new `mt-*`
+branches are made.
+
+## How many lines
+
+At most two lines are released at once.
+
+- **A new line** (7.x, once NXP publishes an SDK for it and the fleet's OpenWrt
+  targets that kernel) is ported on a topic branch: copy the newest line's series
+  and recipe, port them, and adapt `cdx/compat.h`. It merges into `master` once
+  it builds warning-free and its host suite is green, and joins
+  `RELEASED_LINES` at parity -- its full rig suite green; releases cover it
+  from then on.
+- **The older line** takes critical fixes only once the fleet's OpenWrt has left
+  its kernel, and is removed after: it leaves `RELEASED_LINES`, then its
+  series, pin and recipe go, with the `compat.h` branches only it needed.
+
+## Fixes and backports
+
+A fix lands on the newest line first, then on the other line where it applies.
+A backport keeps its link to the original change: it is cherry-picked, and
+adapted by hand only where the pick does not apply -- toward the same intent,
+never a different fix on one line.
+
+- **Shared code** (cdx, ask_flowtable, the daemon, the tests) has nothing to
+  backport: it is one commit for every line. A kernel interface that differs
+  goes behind `cdx/compat.h`, keyed on the release that changed it.
+- **A kernel patch** is a file in each line's series: the same change is made
+  in each line's copy, regenerated from each line's base -- the two copies may
+  differ only where the kernels do.
+- **An upstream fix** a line lacks comes, by preference, with a stable bump
+  that carries it (below). If none does, it is cherry-picked with `-x` onto
+  the line's series as a patch of its own -- its upstream subject, a
+  `[ Upstream commit <sha> ]` line, a note of anything adapted, a new number
+  and `SRC_URI` entry -- and it goes again with the bump that brings it.
+
+The regression test travels with the fix: the host suite runs against each
+line's tree (`make test-host LINE=<line>`), so one test proves every copy.
+
+A release covers the lines its `RELEASED_LINES` lists. A fix for one line
+only is a release like any other; the other line's consumers can stay on the
+version they have.
+
+## Testing
+
+| When | What |
+|---|---|
+| Every change | host suite on every line; scoped rig tests on the newest line and on the line the change targets |
+| Every stable bump | the upstream commits between the old and the new stable tag that touch files the line's patches touch, reviewed |
+| Every release | the full suite on each line released |
+
+## Stable bumps
+
+A line follows its kernel's stable releases. A bump moves the line's
+`KERNEL_SRCREV`, regenerates its series against the new base, and is reviewed
+against the upstream changes to the files the series touches: stable backports
+have changed behaviour the patches rely on before (the 6.18 flowtable's
+transmit path, its TCP close).

@@ -12,6 +12,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from ask_orch import kernel_line
 from ask_orch.build_record import TREE_FILE, encode, record
 
 # Where the image carries its records.
@@ -22,8 +23,8 @@ IMAGE_DIR = "/usr/share/ask/provenance"
 DEVICETREE_PROPERTY = "mono,ask-provenance"
 KERNEL = "linux-ask"
 REMEDY = "rebuild with make ask-image, run make stage-image and boot the staged image"
-# Where the image build leaves each recipe's record.
-BUILD_RECORDS = "meta-ask/build/tmp/work/*/{0}/*/ask-provenance/{0}.json"
+# Where the image build leaves each recipe's record, in every line's tree.
+BUILD_RECORDS = "meta-ask/build/tmp-*/work/*/{0}/*/ask-provenance/{0}.json"
 
 
 def digest(data):
@@ -32,9 +33,21 @@ def digest(data):
 
 def components(root):
     """What an image built from this checkout records: one component per
-    recipe in the layer, named as bitbake names it."""
-    return sorted(path.name.split("_")[0].removesuffix(".bb")
-                  for path in (Path(root) / "meta-ask").glob("recipes-*/*/*.bb"))
+    recipe in the layer, named as bitbake names it. Each kernel line's recipe
+    builds the one kernel component."""
+    return sorted({path.name.split("_")[0].removesuffix(".bb")
+                   for path in (Path(root) / "meta-ask").glob("recipes-*/*/*.bb")})
+
+
+def line_problem(image, line):
+    """Why a DUT image is not one of kernel line `line`, or None when it is
+    or carries no kernel record to tell by (verify() names that)."""
+    paths = ((image.get("build") or {}).get(KERNEL) or {}).get("paths")
+    built = kernel_line.recorded(paths) if isinstance(paths, list) else None
+    if built and built != line:
+        return (f"the DUT runs the {built} kernel line, not {line}: test with LINE={built}, or "
+                f"build, stage and boot the {line} image (make ask-image stage-image LINE={line})")
+    return None
 
 
 def _difference(root, name, entry):
@@ -77,9 +90,10 @@ def verify(root, image):
     return problems
 
 
-def tree(root, path, component):
+def tree(root, path, component, line=None):
     """Why a source tree the build unpacked for `component` was not made from
-    this checkout's inputs, or None when it was."""
+    this checkout's inputs, for kernel line `line` when one is given, or None
+    when it was."""
     marker = Path(path) / TREE_FILE
     try:
         data = marker.read_bytes()
@@ -96,4 +110,6 @@ def tree(root, path, component):
         return f"{marker} records {entry.get('component')}, not {component}"
     if encode(record(root, component, paths)) != data:
         return f"{path} was prepared from other {component} sources than this checkout's"
+    if line and (built := kernel_line.recorded(paths)) != line:
+        return f"{path} was prepared for kernel line {built or 'unknown'}, not {line}"
     return None

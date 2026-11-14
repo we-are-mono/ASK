@@ -14,9 +14,23 @@ def test_lifecycle(tmp_path):
     source = (kernel / "net/netfilter/nf_flow_table_core.c").read_text()
     offload = (kernel / "net/netfilter/nf_flow_table_offload.c").read_text()
     header = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
-    # The flow's flags as the kernel numbers them.
+    conntrack = (kernel / "include/net/netfilter/nf_conntrack.h").read_text()
+    flags = re.search(r"^enum nf_flow_flags \{.*?^\};\n", header, re.M | re.S).group()
+    # The flag queued work holds (NF_FLOW_HW_PENDING until 6.18 renamed it),
+    # whether the collector leaves such a flow to that work, whether flows
+    # close on a FIN or RST (NF_FLOW_CLOSING, 6.18), and whether
+    # nf_ct_refresh() still takes the skb (dropped by 6.18).
+    pending = re.search(r"if \(test_and_set_bit\((NF_FLOW_\w+), &flow->flags\)\)",
+                        offload[offload.index("\nnf_flow_offload_work_alloc("):])
+    assert pending, "the flag work_alloc claims"
+    gc_step = function(source, "nf_flow_offload_gc_step")
+    refresh = re.search(r"static inline void nf_ct_refresh\(([^)]*)\)", conntrack)
+    assert refresh, "nf_ct_refresh"
     (tmp_path / "handle_types.inc").write_text(
-        re.search(r"^enum nf_flow_flags \{.*?^\};\n", header, re.M | re.S).group())
+        flags + f"#define FLOW_PENDING {pending[1]}\n"
+        + ("#define GC_LEAVES_PENDING\n" if f"test_bit({pending[1]}, &flow->flags)" in gc_step else "")
+        + ("#define HAVE_FLOW_CLOSING\n" if re.search(r"\bNF_FLOW_CLOSING,", flags) else "")
+        + ("#define NF_CT_REFRESH_TAKES_SKB\n" if "const struct sk_buff *skb" in refresh[1] else ""))
     (tmp_path / "handle_production.inc").write_text(
         source[source.index("struct nf_flow_offload_handle {"):
                source.index("static void\nflow_offload_fill_dir")]

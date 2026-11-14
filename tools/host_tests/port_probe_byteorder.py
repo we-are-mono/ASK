@@ -36,9 +36,16 @@ def test_the_probe_knows_only_what_the_expression_leaves(tmp_path):
     byteorder = (kernel / "net/netfilter/nft_byteorder.c").read_text()
     probe = (kernel / "net/netfilter/nf_tables_port_probe.c").read_text()
 
+    # Before 6.18 the expression converts len bytes, a value of the size at a
+    # time, and a 16-bit result leaves the rest of its register alone.
+    expression = _declaration(core, "struct nft_byteorder {")
+    has_len = bool(re.search(r"^\tu8\s+len;$", expression, re.M))
+    clears = "nft_reg_store16(dst," in function(byteorder, "nft_byteorder_eval")
     (tmp_path / "byteorder_types.inc").write_text(
-        _declaration(uapi, "enum nft_byteorder_ops {")
-        + _declaration(core, "struct nft_byteorder {")
+        ("#define BYTEORDER_HAS_LEN\n" if has_len else "")
+        + ("#define STORE16_CLEARS\n" if clears else "")
+        + _declaration(uapi, "enum nft_byteorder_ops {")
+        + expression
         + _declaration(probe, "enum nft_probe_res {")
         + _declaration(probe, "struct nft_probe_regs {"))
     (tmp_path / "byteorder_production.inc").write_text(

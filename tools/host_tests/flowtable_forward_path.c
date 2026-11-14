@@ -1,6 +1,7 @@
 /* The forward-path walk and the route builder around it are production code
- * (nf_flow_table_path.c, from nft_xmit_type to nft_flow_route, and the hook
- * lookup it asks, nft_hook_find_ops_rcu()), and so
+ * (nf_flow_table_path.c, nft_flow_offload.c before 6.18, from nft_xmit_type
+ * to nft_flow_route, and the hook lookup it asks, nft_hook_find_ops_rcu(),
+ * where there is one), and so
  * are the walker and the hooks it calls: dev_fill_forward_path() and the VLAN,
  * bridge, sit, ip6_tnl, ppp and PPPoE hooks. The FIB, the neighbour table, the
  * bridge's FDB, port and VLAN state, and the ppp unit, its channel and the
@@ -25,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include "forward_path_xmit.inc"
 
 typedef uint8_t u8;
 typedef uint16_t u16, __u16;
@@ -212,7 +214,9 @@ struct nf_conn {
 struct flowi4 {
 	__be32 daddr, saddr;
 	u32 flowi4_mark;
-	int flowi4_oif, flowi4_iif, flowi4_dscp, flowi4_flags, flowi4_proto;
+	int flowi4_oif, flowi4_iif, flowi4_flags, flowi4_proto;
+	/* DSCP since 6.18, which renamed the field. */
+	union { int flowi4_tos, flowi4_dscp; };
 };
 struct flowi6 {
 	struct in6_addr daddr, saddr;
@@ -258,9 +262,14 @@ struct nf_flow_route {
 	} tuple[2];
 };
 struct nf_flowtable { bool use_neigh, hw; };
-/* A hook holds one registration per device its name matches. */
+/* A hook holds one registration per device its name matches (6.16), or
+ * names its one device in its own ops (6.12): the bench fills both. */
 struct nf_hook_ops { struct list_head list; struct net_device *dev; };
-struct nft_hook { struct list_head list; struct list_head ops_list; };
+struct nft_hook {
+	struct list_head list;
+	struct list_head ops_list;
+	struct { struct net_device *dev; } ops;
+};
 struct nft_flowtable { struct nf_flowtable data; struct list_head hook_list; };
 
 struct iphdr { u8 tos, ttl; __be16 frag_off; __be32 saddr, daddr; };
@@ -661,6 +670,7 @@ static void prepare(struct setup *s, bool use_neigh, struct net_device *lan,
 	for (int i = 0; i < 2; i++) {
 		s->hooks[i].ops_list.next = &s->registrations[i].list;
 		s->registrations[i].list.next = &s->hooks[i].ops_list;
+		s->hooks[i].ops.dev = s->registrations[i].dev;
 	}
 	s->lan_neigh.nud_state = lan_state;
 	if (lan_state & NUD_VALID)
@@ -701,6 +711,18 @@ static enum ip_conntrack_dir lan_dir(enum ip_conntrack_dir dir, bool lan_bound)
 static int route(struct setup *s, enum ip_conntrack_dir dir)
 {
 	return nft_flow_route(&s->pkt, &s->ct, &s->route, dir, &s->ft);
+}
+
+/* The device a NEIGH direction's software path sends on: the routed
+ * destination's where the line hands the frame to neigh_xmit() (6.12), the
+ * one the route names in out.ifindex where it uses dev_queue_xmit() (6.18). */
+static u32 neigh_out(const struct setup *s, enum ip_conntrack_dir dir)
+{
+#ifdef NEIGH_XMIT_BY_DST
+	return s->route.tuple[dir].dst->dev->ifindex;
+#else
+	return s->route.tuple[dir].out.ifindex;
+#endif
 }
 
 /* Takes dev's hook off the table's list, as a port that lost carrier leaves
@@ -792,12 +814,12 @@ static void lan_walked(struct net_device *lan, u8 state, enum ip_conntrack_dir d
 	assert(s.route.tuple[to_lan].in.num_encaps == 0);
 	assert(s.route.tuple[0].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH);
 	assert(s.route.tuple[1].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH);
-	/* NEIGH output transmits by out.ifindex in software: a table with
-	 * neighbour output sends through the device each direction was routed
-	 * to, as routing does -- the bridge or VLAN device puts on its address
-	 * and tag -- never straight out of the port the walk found below it. */
-	assert(s.route.tuple[to_lan].out.ifindex == (u32)lan->ifindex);
-	assert(s.route.tuple[!to_lan].out.ifindex == (u32)eth4.ifindex);
+	/* A table with neighbour output sends through the device each
+	 * direction was routed to, as routing does -- the bridge or VLAN device
+	 * puts on its address and tag -- never straight out of the port the
+	 * walk found below it. */
+	assert(neigh_out(&s, to_lan) == (u32)lan->ifindex);
+	assert(neigh_out(&s, !to_lan) == (u32)eth4.ifindex);
 	none_unlisted(&s);
 	drop(&s);
 }
@@ -865,7 +887,7 @@ static void tunnel_cases(enum ip_conntrack_dir dir, bool lan_bound, int nf)
 			/* Either way the software path transmits into the
 			 * tunnel device, which encapsulates: a refused hop
 			 * leaves no walked device to name, never no device. */
-			assert(s.route.tuple[!to_lan].out.ifindex == (u32)tun->ifindex);
+			assert(neigh_out(&s, !to_lan) == (u32)tun->ifindex);
 			none_unlisted(&s);
 			drop(&s);
 

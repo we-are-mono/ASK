@@ -101,17 +101,16 @@ while the driver controls the powered fan.
 ## Build and stage
 
 ```sh
-cd meta-ask
-kas build .config.yaml
-cd ..
-make stage-image
+make ask-image LINE=6.18      # or 6.12
+make stage-image LINE=6.18
 ```
 
 Load both staged artifacts using the board's TFTP/booti procedure:
 
-- `/srv/tftp/Image-ask-test.gz`, also hard-linked as
-  `Image.gz-initramfs-ask-ls1046a.bin`.
-- `/srv/tftp/mono-gateway-dk.dtb`.
+- `/srv/tftp/Image-ask-<line>.gz`, also hard-linked as `Image-ask-test.gz`
+  and `Image.gz-initramfs-ask-ls1046a.bin`.
+- `/srv/tftp/mono-gateway-dk-<line>.dtb`, also hard-linked as
+  `mono-gateway-dk.dtb`.
 
 The kernel and matching DTB are both required for the floor and curve. Keep
 the kernel, decompression buffer and DTB at separate RAM addresses.
@@ -122,7 +121,8 @@ config also enables thermal emulation for verification. KUnit and the
 
 ## Verification
 
-Run KUnit in a Linux 6.18.63 tree with patches 120 and 130 applied:
+Run KUnit in a tree of either kernel line (the recipe's `LINUX_VERSION`) with
+that line's patches 120 and 130 applied:
 
 ```sh
 cat > /tmp/fan.kunitconfig <<'EOF'

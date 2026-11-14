@@ -159,7 +159,9 @@ CONFIG_NF_FLOW_TABLE=m
 CONFIG_NF_FLOW_TABLE_INET=m
 # Since 6.15 the legacy tables below (and the test image's iptables-legacy
 # NAT, S40gateway-setup) need this; it must be here, ahead of the first
-# olddefconfig pass, or that pass drops them before ask.cfg is merged.
+# olddefconfig pass, or that pass drops them before ask.cfg is merged. The
+# 6.12 line predates the symbol: its olddefconfig drops it as unknown, and
+# its legacy tables need nothing in its place.
 CONFIG_NETFILTER_XTABLES_LEGACY=y
 CONFIG_NETFILTER_XT_SET=m
 CONFIG_NETFILTER_XT_TARGET_CHECKSUM=m

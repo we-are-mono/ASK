@@ -113,7 +113,7 @@ t_Error FM_PORT_Free(t_Handle p) { port_frees++; return E_OK; }
 void FM_PCD_HcTxConf(t_Handle p, t_DpaaFD *fd) { FmHcTxConf(p, fd); }
 static void confirm(void)
 {
-    assert(qm_tx_conf_dqrr_cb(NULL, &confirmation_queue.fq, &pending, false, NULL) ==
+    assert(qm_tx_conf_dqrr_cb(NULL, &confirmation_queue.fq, &pending DQRR_POLL_ARGS) ==
            qman_cb_dqrr_consume);
 }
 void XX_UDelay(uint32_t usecs)

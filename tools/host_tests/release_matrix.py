@@ -1,5 +1,5 @@
 """A release is the matrix of runs it declares, each run exactly as declared,
-on one checkout and one DUT image."""
+on one checkout, one kernel line and one DUT image."""
 
 import io
 import os
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from ask_orch import release
+from ask_orch import kernel_line, release
 from run_tests import command
 
 FAKE = {
@@ -40,7 +40,7 @@ def hardware_bench():
 
 @pytest.fixture
 def bench(pytester, monkeypatch):
-    for name in ("ASK_SOAK", "ASK_SOAK_FAILS", "ASK_FLOWTABLE_MIN_GBPS", "ASK_RELEASE_LEDGER"):
+    for name in ("ASK_SOAK", "ASK_SOAK_FAILS", "ASK_FLOWTABLE_MIN_GBPS", "ASK_RELEASE_LEDGER", "ASK_LINE"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("ASK_TEST_ARTIFACTS", str(pytester.path / "artifacts"))
     pytester.makeconftest(CONFTEST)
@@ -57,14 +57,16 @@ def ledger(pytester):
     return release.read(pytester.path / "artifacts" / "release-ledger.jsonl")
 
 
-def test_each_run_lands_in_the_ledger_with_its_boot_and_image(bench, monkeypatch):
+def test_each_run_lands_in_the_ledger_with_its_line_boot_and_image(bench, monkeypatch):
     bench.runpytest_subprocess("suite", "--release-run", "plain").assert_outcomes(passed=1, deselected=1)
     monkeypatch.setenv("ASK_SOAK", "1")
     monkeypatch.setenv("ASK_SOAK_FAILS", "1")
+    monkeypatch.setenv("ASK_LINE", "6.12")
     bench.runpytest_subprocess("suite/test_soak.py", "--release-run", "soak").assert_outcomes(failed=1)
     bench.runpytest_subprocess("suite/test_soak.py", "--release-run", "soak", "--collect-only")
     plain, soak = ledger(bench)
     assert (plain["run"], plain["exitstatus"], plain["failed"], plain["selected"]) == ("plain", 0, [], 1)
+    assert (plain["line"], soak["line"]) == (kernel_line.DEFAULT, "6.12")
     assert plain["boot_id"] == "boot-1"
     assert plain["image"] == {"kernel_notes_sha256": "k", "modules_sha256": "m"}
     assert (soak["run"], soak["exitstatus"], soak["failed"]) == ("soak", 1, ["suite/test_soak.py::test_soak"])
@@ -73,6 +75,7 @@ def test_each_run_lands_in_the_ledger_with_its_boot_and_image(bench, monkeypatch
 
 
 @pytest.mark.parametrize("args, environ, refusal", [
+    ([], {"ASK_LINE": "5.4"}, "ASK_LINE=5.4 is none of this checkout's kernel lines"),
     (["-k", "plain"], {}, "narrows the selection with keyword"),
     (["--deselect", "suite/test_plain.py::test_plain"], {}, "narrows the selection with deselect"),
     (["suite/test_plain.py"], {}, "selects ['suite', 'suite/test_plain.py']"),
@@ -109,16 +112,39 @@ def test_nothing_in_a_session_uses_the_boot_a_destructive_case_ended(bench):
     result.stdout.fnmatch_lines(["*bench requires recovery: suite/test_plain.py::test_ends*"])
 
 
-def _entry(run, exitstatus=0, image="a", finished=1.0):
-    return {"run": run, "checkout": "c", "exitstatus": exitstatus, "finished": finished,
+def _entry(run, exitstatus=0, image="a", finished=1.0, line="6.18"):
+    return {"run": run, "checkout": "c", "line": line, "exitstatus": exitstatus, "finished": finished,
             "image": {"kernel_notes_sha256": image, "modules_sha256": image},
             "boot_id": "b", "run_dir": "/r", "failed": [] if exitstatus == 0 else ["x::y"]}
+
+
+def test_a_release_covers_the_lines_its_commit_declares(tmp_path, monkeypatch):
+    """One tag per release; RELEASED_LINES in the release commit names the
+    lines it is released for, each a line the checkout builds, and the status
+    report says whether its line is one."""
+    assert set(kernel_line.released()) <= set(kernel_line.lines())
+    recipes = tmp_path / kernel_line.RECIPES
+    recipes.mkdir(parents=True)
+    for line in ("6.12", "6.18"):
+        (recipes / f"linux-ask_{line}.bb").write_text("")
+    (tmp_path / "RELEASED_LINES").write_text("# Released once its full suite is green.\n6.12\n\n")
+    assert kernel_line.released(tmp_path) == ["6.12"]
+    (tmp_path / "RELEASED_LINES").write_text("6.12\n7.1\n")
+    with pytest.raises(ValueError, match="7.1"):
+        kernel_line.released(tmp_path)
+    monkeypatch.setattr(release, "MATRIX", dict(FAKE))
+    source = {"sha256": "c", "revision": "r" * 40}
+    for line, said in (("6.12", "kernel line 6.12 is released"),
+                       ("6.18", "kernel line 6.18 is not released")):
+        out = io.StringIO()
+        release.report(release.status([], source, line), source, line, "ledger", out, released=["6.12"])
+        assert said in out.getvalue(), out.getvalue()
 
 
 def test_status_needs_every_entry_passed_on_one_image(monkeypatch):
     monkeypatch.setattr(release, "MATRIX", dict(FAKE))
     source = {"sha256": "c", "revision": "r" * 40}
-    states = lambda entries: {row["run"]: row["state"] for row in release.status(entries, source)}
+    states = lambda entries: {row["run"]: row["state"] for row in release.status(entries, source, "6.18")}
     assert states([]) == {"plain": "missing", "soak": "missing"}
     assert states([_entry("plain"), _entry("soak", 1)]) == {"plain": "passed", "soak": "failed"}
     # The latest run of an entry is the one that counts.
@@ -126,12 +152,19 @@ def test_status_needs_every_entry_passed_on_one_image(monkeypatch):
     assert states([_entry("plain"), _entry("soak", image="b")])["soak"] == "other image"
     other = dict(_entry("soak"), checkout="d")
     assert states([_entry("plain"), other])["soak"] == "missing"
+    # Each kernel line qualifies on its own, and a run from before lines
+    # counts for none.
+    assert states([_entry("plain"), _entry("soak", line="6.12")])["soak"] == "missing"
+    unlined = {key: value for key, value in _entry("soak").items() if key != "line"}
+    assert states([_entry("plain"), unlined])["soak"] == "missing"
     out = io.StringIO()
-    assert release.report(release.status([_entry("plain"), _entry("soak")], source), source, "ledger", out)
+    assert release.report(release.status([_entry("plain"), _entry("soak")], source, "6.18"), source,
+                          "6.18", "ledger", out)
     assert out.getvalue().endswith("release qualified: 2 of 2 runs passed\n")
     out = io.StringIO()
-    assert not release.report(release.status([_entry("plain")], source), source, "ledger", out)
-    assert "  soak   missing    make test-release RUN=soak  (on the staged test image)\n" in out.getvalue()
+    assert not release.report(release.status([_entry("plain")], source, "6.18"), source, "6.18", "ledger", out)
+    assert ("  soak   missing    make test-release LINE=6.18 RUN=soak  (on the staged test image)\n"
+            in out.getvalue())
 
 
 def test_uncovered_explicit_cases_and_gate_overrides(monkeypatch):
@@ -163,6 +196,13 @@ def test_make_runs_one_entry_with_only_its_settings(monkeypatch):
         command("release", {"RUN": "suite", "K": "ipsec"})
     with pytest.raises(SystemExit, match="RUN names one release run"):
         command("release", {})
+
+
+def test_make_hands_its_line_to_the_run_through_sudo(monkeypatch):
+    monkeypatch.setattr("os.geteuid", lambda: 1000)
+    argv, env = command("dut", {"LINE": "6.12", "ASK_LINE": "6.18"}, "/venv/python")
+    assert env["ASK_LINE"] == "6.12"
+    assert argv[:2] == ["sudo", "env"] and "ASK_LINE=6.12" in argv
 
 
 @pytest.mark.parametrize("run", sorted(release.MATRIX))

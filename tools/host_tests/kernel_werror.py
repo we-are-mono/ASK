@@ -1,12 +1,13 @@
 """Every build of the test kernel fails on a compiler warning, as OpenWrt's
 build of the same kernel does: ask.cfg sets CONFIG_WERROR, the recipe merges
-ask.cfg in every build mode, and no other fragment turns it off."""
+ask.cfg in every build mode, and no other fragment turns it off. The fragments
+and the configure step are one for every kernel line (linux-ask.inc)."""
 
 from pathlib import Path
 import re
 
 FILES = Path(__file__).resolve().parents[2] / "meta-ask/recipes-kernel/linux/files"
-RECIPE = FILES.parent / "linux-ask_6.18.bb"
+RECIPE = FILES.parent / "linux-ask.inc"
 WERROR = re.compile(r"^(?:CONFIG_WERROR=\S*|# CONFIG_WERROR is not set)$", re.M)
 
 
@@ -39,3 +40,8 @@ def test_no_other_fragment_turns_werror_off():
     for fragment in sorted(FILES.iterdir()):
         if fragment.name != "ask.cfg":
             assert set(WERROR.findall(fragment.read_text())) <= {"CONFIG_WERROR=y"}, fragment.name
+
+
+def test_no_kernel_line_configures_apart():
+    for recipe in sorted(FILES.parent.glob("linux-ask_*.bb")):
+        assert "do_configure" not in recipe.read_text(), recipe.name

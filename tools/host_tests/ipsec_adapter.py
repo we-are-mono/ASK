@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 
+from _cdx_compat import compat
 from _host_flowtable import (flowtable_source)
 from _host_qos_lifecycle import (function)
 from _kernel_source import (kernel_source)
@@ -24,6 +25,12 @@ def test_ipsec_adapter(tmp_path):
     rule = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     backend = (ROOT / "cdx/cdx_ipsec_backend.h").read_text()
     kernel = kernel_source()
+    # The bench's xfrmdev_ops takes compat.h's state parameters: those of
+    # the tree's own table.
+    passes_dev = compat(tmp_path, kernel)["CDX_XDO_DEV"][1] != ""
+    ops = re.search(r"^struct xfrmdev_ops \{.*?^\};",
+                    (kernel / "include/linux/netdevice.h").read_text(), re.M | re.S).group()
+    assert passes_dev == bool(re.search(r"\(\*xdo_dev_state_add\)\s*\(struct net_device \*dev,", ops))
     policy = (kernel / "net/xfrm/xfrm_policy.c").read_text()
     state = (kernel / "net/xfrm/xfrm_state.c").read_text()
     replay = (kernel / "net/xfrm/xfrm_replay.c").read_text()
@@ -350,6 +357,12 @@ def test_ipsec_receive_ownership(tmp_path):
     port, whatever device the SA names."""
     source = (ROOT / "cdx/dpa_ipsec.c").read_text()
     kernel = kernel_source()
+    compat(tmp_path, kernel)
+    sdk = (kernel / "drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h").read_text()
+    napi = re.search(r"\bint dpaa_eth_napi_schedule\(([^)]*)\)", sdk)
+    assert napi, "dpaa_eth_napi_schedule"
+    (tmp_path / "ipsec_receive_sdk.inc").write_text(
+        "#define DPAA_ETH_NAPI_SCHEDULE_PARAMS " + " ".join(napi[1].split()) + "\n")
     text = (kernel / "net/xfrm/xfrm_input.c").read_text()
     start = text.index("struct sec_path *secpath_set(")
     end = text.index("\nEXPORT_SYMBOL(secpath_set)", start)

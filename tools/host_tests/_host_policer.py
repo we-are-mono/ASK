@@ -4,6 +4,8 @@ harness built over plcr_fixture.h."""
 import re
 from pathlib import Path
 
+from ask_orch import kernel_line
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -42,7 +44,7 @@ def policer_layer(tmp_path: Path) -> None:
     # with, as patch 010 sets it: what the layer's own assertions check the
     # profile count against.
     backend = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
-    fman = (ROOT / "patches/kernel/010-ask-fman-dpaa-ehash.patch").read_text()
+    fman = (kernel_line.patches() / "010-ask-fman-dpaa-ehash.patch").read_text()
     shared = re.search(r"^\+(#define LNXWRP_FM_NUM_OF_SHARED_PROFILES\s+\d+)", fman, re.M)
     assert shared
     (tmp_path / "plcr_layout.inc").write_text(

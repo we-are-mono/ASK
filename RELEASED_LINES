@@ -1,0 +1,5 @@
+# The kernel lines a release tag from this commit is released for, one per
+# line. A line is listed once its full rig suite is green on the release
+# commit, and unlisted when it retires (docs/versioning.md). Consumers refuse
+# a release that does not list their kernel's line.
+6.12

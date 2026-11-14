@@ -69,11 +69,20 @@ they conflict with modern kernel APIs or clean design, prefer the modern approac
 
 ## Build & deploy
 
-- **Build only through kas/Yocto** (`meta-ask/.config.yaml`): the kernel (v6.18.63 +
-  `patches/kernel/`), cdx, ask_flowtable and the flowtable daemon. Never raw
-  `bitbake`, never standalone `make modules` / GCC-15 recipes — those use different
-  toolchains/defines and don't prove the shipped build is clean. A GCC 15 cross
-  toolchain is fine for compile-only warning checks; it isn't a build.
+- **Build only through kas/Yocto** (`meta-ask/.config.yaml`): the kernel (one line's
+  mainline + `patches/kernel/<line>/`), cdx, ask_flowtable and the flowtable daemon.
+  Never raw `bitbake`, never standalone `make modules` / GCC-15 recipes — those use
+  different toolchains/defines and don't prove the shipped build is clean. A GCC 15
+  cross toolchain is fine for compile-only warning checks; it isn't a build.
+- **One checkout builds both kernel lines**, 6.12 (v6.12.112, NXP lf-6.12.49-2.2.0,
+  what OpenWrt ships) and 6.18 (v6.18.63, NXP lf-6.18.37-2.1.0).
+  `make ask-image LINE=6.12|6.18` picks one (default: the newest); kas reads it as
+  `ASK_LINE`, the distro conf turns it into `PREFERRED_VERSION_linux-ask` and the
+  `ask612`/`ask618` override, and each line builds in its own
+  `meta-ask/build/tmp-<line>`. Test targets take the same `LINE` (`ASK_LINE` for
+  direct pytest) and refuse a DUT running the other line's image. The lines share one
+  kas build directory, so their builds run one at a time (bitbake's lock) — which cdx
+  and the daemon need anyway: they build in their source directories (externalsrc).
 - **Always build the KASAN image** (`make ask-image`, or `KASAN=1` on a direct
   `kas build`). DUT tests require it: the conftest preflight refuses a kernel without
   `CONFIG_KASAN=y`. KASAN never explains low throughput — offloaded frames bypass the
@@ -82,11 +91,13 @@ they conflict with modern kernel APIs or clean design, prefer the modern approac
   the rule carries `flags offload`, `flows` rows present) — not KASAN.
 - Make targets: `setup` (host deps, one-time sudo), `ask-image`, `stage-image`,
   `deploy-agents`, `test-env`, and the test targets under **Testing**.
-- **After every successful build run `make stage-image`** — it copies the image and
-  the DTB into `TFTP_ROOT` (`build/deploy.mk`), which U-Boot fetches; without it the
-  next boot silently loads the previous image. Run it **unpiped** (a pipe into `tail`
-  masks failure and leaves the stale image) and assert a build marker (`pr_info` at
-  module init) in dmesg after boot.
+- **After every successful build run `make stage-image`** (same `LINE`) — it copies
+  the image and the DTB into `TFTP_ROOT` (`build/deploy.mk`) as `Image-ask-<line>.gz`
+  and `mono-gateway-dk-<line>.dtb`, and points `Image-ask-test.gz` /
+  `mono-gateway-dk.dtb` (what `run ask` fetches) at them; without it the next boot
+  silently loads the previous image. Run it **unpiped** (a pipe into `tail` masks
+  failure and leaves the stale image) and assert a build marker (`pr_info` at module
+  init) in dmesg after boot.
 - Redirect build output to a log file **outside the checkout** — an untracked file in
   it changes the checkout fingerprint that release preflight compares.
 - The test image is **TFTP-booted** by U-Boot, never flashed (`docs/testing.md`,
@@ -98,17 +109,21 @@ they conflict with modern kernel APIs or clean design, prefer the modern approac
 
 ## Kernel patches
 
-- **`patches/kernel/*.patch` is the single source of truth**; any kernel checkout is
-  only a place to regenerate from. The series order is the explicit per-patch
-  `SRC_URI` list in `meta-ask/recipes-kernel/linux/linux-ask_6.18.bb` — hand-edit it for
-  every new patch (old `0*`/`0[1-9]*` globs silently dropped patches numbered ≥100).
-- **Changing a patch:** in a scratch clone, check out the base — the recipe's
-  `KERNEL_SRCREV` (v6.18.63) with the NXP SDK overlay at `pins/nxp-sdk-srcrev.inc`
-  applied as `do_overlay_sdk` does. `git am` the current series in `SRC_URI` order,
+- **`patches/kernel/<line>/*.patch` is the single source of truth**, one series per
+  kernel line; any kernel checkout is only a place to regenerate from. A line's series
+  order is the explicit per-patch `SRC_URI` list in its recipe,
+  `meta-ask/recipes-kernel/linux/linux-ask_<line>.bb` — hand-edit it for every new
+  patch (old `0*`/`0[1-9]*` globs silently dropped patches numbered ≥100). What the
+  lines share (SDK overlay, config fragments, provenance, DTS) lives in
+  `linux-ask.inc`; a line's recipe holds only its pins, its overlay additions and its
+  series. A fix that applies to both lines lands in both series, as two patches.
+- **Changing a patch:** in a scratch clone, check out the line's base — its recipe's
+  `KERNEL_SRCREV` with the NXP SDK overlay at `pins/<line>/nxp-sdk-srcrev.inc`
+  applied as `do_overlay_sdk` does. `git am` the line's series in `SRC_URI` order,
   change the patch's commit (fixup + `git rebase --autosquash`), regenerate with
   `git format-patch --no-numbered` (subjects stay `[PATCH] subsystem: …`; the filename
   prefix carries order), confirm the whole series applies to a fresh base, then build
-  with kas.
+  with kas (`make ask-image LINE=<line>`).
 - Patches are organized **per-concern, not per-fix-site**: when a new bug fits an
   existing patch's concern (another iomem mem-op crash → extend 095, another lockdep
   nesting site → extend 092), add a hunk to that patch. New numbers are for *distinct*
@@ -117,20 +132,33 @@ they conflict with modern kernel APIs or clean design, prefer the modern approac
 
 ## Git, commits and releases
 
-- **Branches and tags follow the kernel line** — ASK is coupled to its kernel (patch
-  series, NXP SDK pin, cdx↔hook ABI), so a kernel line is the unit of release:
-  - `master` is the development branch and stays releasable. Work on short-lived
-    branches off `master`, test, merge back.
-  - `mt-<line>.y` (`mt-6.12.y`, later `mt-6.18.y`) is a line's release branch. It only
-    fast-forwards to each new release tag of its line. **Never commit to it directly.**
-  - Releases are annotated tags `mono-X.Y.Z` on the release commit. The major names the
-    kernel line (1.x = 6.12, 2.x = 6.18); a stable bump within a line is a patch
-    release. A pushed tag never moves.
-  - A new kernel line is ported on a topic branch (e.g. `kernel-6.18`) and merges into
-    `master` only at parity (full suite green). Its first release is X.0.0 and cuts
-    `mt-<line>.y`. From then on the previous line's fixes go on a branch off its
-    `mt-<line>.y`, are tagged there, and are forward-ported to `master` where they
-    apply. A line retires when the fleet's OpenWrt leaves its kernel.
+- **One trunk carries every supported kernel line**, side by side (OpenWrt's model),
+  not a branch per line. ASK is coupled to its kernel, so each line keeps its own
+  series (`patches/kernel/<line>/`), SDK pin (`pins/<line>/`) and recipe; cdx,
+  ask_flowtable, the daemon and the tests are shared and build for every line, with
+  what differs in `cdx/compat.h`, keyed on the release that changed it.
+  - `master` is the trunk and stays releasable. Work on short-lived branches off
+    `master`, test, merge back.
+  - **One ASK version across lines, one tag per release:** the release commit is
+    tagged once, annotated, `mono-<version>` (`mono-1.4.0`); its `RELEASED_LINES`
+    names the lines the release covers, and the tag message repeats them. A
+    consumer's own kernel picks the series it applies, and consumers refuse a
+    release that does not list their line. The version follows ASK's changes, not
+    the kernel's: a port to a new line is no major bump. A pushed tag never moves.
+    Tags from before the trunk (`mono-1.0.0` to `mono-1.3.1`) are 6.12 releases;
+    `mt-6.12.y` stays where it is, and no new `mt-*` branches are made.
+  - **At most two released lines.** A newer one (7.x) is ported into its own series
+    and recipe on a topic branch, merges once it builds and its host suite is green,
+    and joins `RELEASED_LINES` at parity (its full suite green; `make release-status
+    LINE=<line>`). The older line takes critical fixes only once the fleet's OpenWrt
+    has left its kernel, and leaves `RELEASED_LINES` when it retires.
+  - **A fix lands on the newest line first**, then in the other line's series where
+    it applies — a fix to a patch is made in each line's copy.
+- **Testing by scope:** per change, the host suite on every line (`make test-host
+  LINE=<line>`) and scoped rig tests on the newest line and the line the change
+  targets; per stable bump, a review of the upstream commits between the old and new
+  stable tag that touch files the line's patches touch; before a release, the full
+  suite on each released line. Tag or release only when asked.
 - CMM, FCI (with libfci) and auto_bridge are gone from the tree; their sources live on
   in the `mono-1.0.x` tags (`git show mono-1.0.7:cmm/src/module_ipsec.c`). Docs citing
   `cmm/`, `fci/` or `auto_bridge/` paths refer to those.
@@ -294,7 +322,7 @@ VM and NIC) go in the gitignored `.ask-test.mk` (start from `.ask-test.mk.exampl
   is the bare FMD object — casting `->fm` to the wrapper compiles but yields NULL
   handles. Use `->fm_dev`.
 - **Tunnel offload:** only **6o4 (`sit`) and 4o6 (`ip6tnl`)** are in scope
-  (EtherIP/GRE-over-IPv6/MACVLAN out); flowtable kernel hook `patches/kernel/143-*`;
+  (EtherIP/GRE-over-IPv6/MACVLAN out); flowtable kernel hook `patches/kernel/<line>/143-*`;
   the outer header carries no DF (hardware limit, don't retry). **Routed multicast** is
   an in-kernel learner on the FIB notifier chain (IPMR/IP6MR MFC events) feeding the
   same encoder as bridged MDB; no ASK userspace (consumer runs smcroute/igmpproxy/omcproxy).

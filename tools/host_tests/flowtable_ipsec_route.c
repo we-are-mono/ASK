@@ -37,7 +37,9 @@ struct flowi {
 	union {
 		struct {
 			uint32_t daddr, saddr, flowi4_mark;
-			int flowi4_oif, flowi4_iif, flowi4_dscp, flowi4_flags;
+			int flowi4_oif, flowi4_iif, flowi4_flags;
+			/* DSCP since 6.18, which renamed the field. */
+			union { int flowi4_tos, flowi4_dscp; };
 		} ip4;
 		struct {
 			struct in6_addr daddr, saddr;
@@ -109,6 +111,7 @@ static int nft_dev_forward_path(struct nf_flow_route *route,
 }
 
 #include "route_production.inc"
+#include "route_walks.inc"
 
 static void check_route(int family, enum ip_conntrack_dir dir,
 			bool use_neigh, bool this_xfrm, bool other_xfrm)
@@ -120,11 +123,20 @@ static void check_route(int family, enum ip_conntrack_dir dir,
 	struct nft_flowtable ft = { { use_neigh } };
 	struct nf_conn ct = {};
 	struct nf_flow_route route = {};
+#ifdef WALKS_NEED_BOTH_NEIGH
+	/* A table with neighbour output walks each NEIGH direction on its own,
+	 * so a transform in one direction hides neither the other's bridge/VLAN
+	 * path nor its physical ingress; any other walks only a route with no
+	 * transform at all (6.12). */
+	bool walk_this = !this_xfrm && (use_neigh || !other_xfrm);
+	bool walk_other = !other_xfrm && (use_neigh || !this_xfrm);
+#else
 	/* Each NEIGH direction is walked on its own, for every table: a
 	 * transform in one direction hides neither the other's bridge/VLAN
 	 * path nor its physical ingress. */
 	bool walk_this = !this_xfrm;
 	bool walk_other = !other_xfrm;
+#endif
 
 	memset(walks, 0, sizeof(walks));
 	reverse_dst = &there;

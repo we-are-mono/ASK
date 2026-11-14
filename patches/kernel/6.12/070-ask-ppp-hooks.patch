@@ -1,0 +1,473 @@
+From 764e953aa02bf3bae9e290b667217f6ebd909385 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sun, 9 Aug 2026 03:42:47 +0200
+Subject: [PATCH] ask: PPP/PPPoE fast-path hooks
+
+Extends drivers/net/ppp/ppp_generic.c and pppoe.c with hook points for
+PPPoE session offload (session create/destroy notifications, per-session
+data carrying offload state).
+
+The connect-channel NEWLINK notification is sent after all_ppp_mutex is
+released (device held across the gap): taking rtnl_lock under
+all_ppp_mutex inverts against ppp_nl_newlink's rtnl->all_ppp order and
+lockdep flags it on the first PPPIOCNEWUNIT. The notification is also
+now skipped when the connect fails, instead of announcing a link that
+did not change.
+
+A channel joining or leaving the unit is announced as
+NETDEV_CHANGEINFODATA, raised under RTNL, for which rtnetlink sends the
+NEWLINK, naming no bonding event. pppd dialling on demand keeps the
+unit, its addresses and routes when a session ends, so nothing else
+tells a driver that offloaded flows through the unit: it would go on
+inserting the ended session, and since it carries that traffic, none of
+it would reach the unit, whose pppd then never sees a packet to dial
+for. Not NETDEV_CHANGE: addrconf resends MLD reports through a ready
+device on it, which a dormant unit loops to pppd as traffic, redialling
+at once, and the FIB flushes every route cache in the namespace. A
+disconnect runs under the channel's socket or tty locks, and under RTNL
+too when a PPPoE device goes down, so it is told from an item on the
+module's own queue: queued after the grace period that lets every walk
+which saw the channel add its flow, once for the disconnects pending
+together, holding the device, and not for a unit that is closing. Neither
+side tells a device that is not registered.
+
+The walk reports a unit with no channel, or whose PPPoE session is not
+connected, as -EAGAIN rather than -ENODEV or -1: a path not known yet,
+so the flowtable caches nothing. A flow cached on the ppp device would
+keep it as the reply's ingress, which no driver can redirect to, for as
+long as the connection lasted. The unit queues or drops those packets
+anyway, and demand dialling still sees them. A multilink bundle and a
+channel without the hook fall back as before.
+
+The walk and the channel's transmit read the session's device and id
+under no socket lock, while the PADT work and release clear the device
+before they unregister the channel, and the relay path transmits on
+another socket, whose id connect writes after hashing it. Each reads
+them once, through READ_ONCE(), as the device flush's scan does the
+device, and every write of either goes through WRITE_ONCE(). A data
+race, not a use-after-free, for the walk and the channel's transmit:
+the device is cleared when it goes down, a grace period before it can
+be freed.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ drivers/net/ppp/ppp_generic.c | 114 +++++++++++++++++++++++++++++++++-
+ drivers/net/ppp/pppoe.c       |  67 +++++++++++++++-----
+ net/core/rtnetlink.c          |   9 ++-
+ 3 files changed, 173 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
+index 5d6d69632c84..7e17c7c7756c 100644
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -137,6 +137,9 @@ struct ppp {
+ 	unsigned long	last_recv;	/* jiffies when last pkt rcvd a0 */
+ 	struct net_device *dev;		/* network interface device a4 */
+ 	int		closing;	/* is device closing down? a8 */
++#if defined(CONFIG_CPE_FAST_PATH)
++	struct work_struct link_work;	/* tells of a channel that left */
++#endif
+ #ifdef CONFIG_PPP_MULTILINK
+ 	int		nxchan;		/* next channel to send something on */
+ 	u32		nxseq;		/* next sequence number to send */
+@@ -306,6 +309,51 @@ static inline struct ppp_net *ppp_pernet(struct net *net)
+ 	return net_generic(net, ppp_net_id);
+ }
+ 
++#if defined(CONFIG_CPE_FAST_PATH)
++/* A unit gaining or losing its channel changes the path it describes
++ * (ppp_fill_forward_path()) and nothing else: the device stays up and keeps
++ * its addresses and routes, as pppd dialling on demand keeps them across a
++ * redial. A driver that offloaded flows through the unit would go on
++ * inserting a session the peer has ended, and since it carries that traffic,
++ * none of it would reach the unit: a demand-dialling pppd would never see a
++ * packet to dial for. NETDEV_CHANGEINFODATA tells such a driver, and gives
++ * userspace the RTM_NEWLINK a connect has always sent. Not NETDEV_CHANGE:
++ * addrconf resends MLD reports through a ready device on it, which a dormant
++ * unit loops to pppd as traffic, so that it redials at once, and the FIB
++ * flushes every route cache in the namespace.
++ */
++static struct workqueue_struct *ppp_link_wq;
++
++static void ppp_link_changed(struct net_device *dev)
++{
++	ASSERT_RTNL();
++	/* Nothing for a unit whose registration failed, or that is being
++	 * unregistered, which retires what went through it. */
++	if (dev->reg_state == NETREG_REGISTERED)
++		call_netdevice_notifiers(NETDEV_CHANGEINFODATA, dev);
++}
++
++/* A channel leaves its unit under the channel's own locks -- the socket lock
++ * of a PPPoE, PPTP or L2TP channel, a tty's line discipline locks, and the
++ * RTNL too when a PPPoE device goes down (pppoe_flush_dev()) -- where taking
++ * the RTNL would invert against pppoe_flush_dev() or recurse on it. So the
++ * disconnect is told from here, once for every disconnect pending. The item
++ * holds the device, which unregistration waits for before it can free the
++ * unit, and ppp_cleanup() drains the queue.
++ */
++static void ppp_link_work(struct work_struct *work)
++{
++	struct ppp *ppp = container_of(work, struct ppp, link_work);
++	struct net_device *dev = ppp->dev;
++
++	rtnl_lock();
++	ppp_link_changed(dev);
++	rtnl_unlock();
++	/* The unit may go with this reference. */
++	dev_put(dev);
++}
++#endif
++
+ /* Translates a PPP protocol number to a NP index (NP == network protocol) */
+ static inline int proto_to_npindex(int proto)
+ {
+@@ -1261,6 +1309,9 @@ static int ppp_dev_configure(struct net *src_net, struct net_device *dev,
+ 	INIT_LIST_HEAD(&ppp->channels);
+ 	spin_lock_init(&ppp->rlock);
+ 	spin_lock_init(&ppp->wlock);
++#if defined(CONFIG_CPE_FAST_PATH)
++	INIT_WORK(&ppp->link_work, ppp_link_work);
++#endif
+ 
+ 	ppp->xmit_recursion = alloc_percpu(int);
+ 	if (!ppp->xmit_recursion) {
+@@ -1406,6 +1457,12 @@ static int __init ppp_init(void)
+ 
+ 	pr_info("PPP generic driver version " PPP_VERSION "\n");
+ 
++#if defined(CONFIG_CPE_FAST_PATH)
++	ppp_link_wq = alloc_workqueue("ppp_link", 0, 0);
++	if (!ppp_link_wq)
++		return -ENOMEM;
++#endif
++
+ 	err = register_pernet_device(&ppp_net_ops);
+ 	if (err) {
+ 		pr_err("failed to register PPP pernet device (%d)\n", err);
+@@ -1440,6 +1497,9 @@ static int __init ppp_init(void)
+ out_net:
+ 	unregister_pernet_device(&ppp_net_ops);
+ out:
++#if defined(CONFIG_CPE_FAST_PATH)
++	destroy_workqueue(ppp_link_wq);
++#endif
+ 	return err;
+ }
+ 
+@@ -1598,13 +1658,21 @@ static int ppp_fill_forward_path(struct net_device_path_ctx *ctx,
+ 	if (ppp->flags & SC_MULTILINK)
+ 		return -EOPNOTSUPP;
+ 
++	/* A unit with no channel -- pppd dialling on demand keeps the unit,
++	 * its addresses and routes while the session is down -- or with one
++	 * going away is a path not known yet rather than none: a flow cached
++	 * on the ppp device now would stay there once a session is back. Have
++	 * the caller cache nothing until then. The unit queues or drops what
++	 * it is sent meanwhile anyway, and demand dialling still sees it: the
++	 * walk caches nothing, so the packet goes on to the unit.
++	 */
+ 	pch = list_first_or_null_rcu(&ppp->channels, struct channel, clist);
+ 	if (!pch)
+-		return -ENODEV;
++		return -EAGAIN;
+ 
+ 	chan = READ_ONCE(pch->chan);
+ 	if (!chan)
+-		return -ENODEV;
++		return -EAGAIN;
+ 
+ 	if (!chan->ops->fill_forward_path)
+ 		return -EOPNOTSUPP;
+@@ -3498,6 +3566,9 @@ ppp_connect_channel(struct channel *pch, int unit)
+ 	struct ppp_net *pn;
+ 	int ret = -ENXIO;
+ 	int hdrlen;
++#if defined(CONFIG_CPE_FAST_PATH)
++	struct net_device *dev = NULL;
++#endif
+ 
+ 	pn = ppp_pernet(pch->chan_net);
+ 
+@@ -3539,8 +3610,27 @@ ppp_connect_channel(struct channel *pch, int unit)
+ 
+  outl:
+ 	write_unlock_bh(&pch->upl);
++#if defined(CONFIG_CPE_FAST_PATH)
++	/* Only take a device reference here; the notification
++	 * (ppp_link_changed()) is raised after all_ppp_mutex is dropped.
++	 * Taking rtnl_lock while holding all_ppp_mutex would invert against
++	 * ppp_nl_newlink, which takes them in the opposite order. */
++	if (!ret && ppp->dev && !ppp->closing) {
++		dev = ppp->dev;
++		dev_hold(dev);
++	}
++#endif
++
+  out:
+ 	mutex_unlock(&pn->all_ppp_mutex);
++#if defined(CONFIG_CPE_FAST_PATH)
++	if (dev) {
++		rtnl_lock();
++		ppp_link_changed(dev);
++		rtnl_unlock();
++		dev_put(dev);
++	}
++#endif
+ 	return ret;
+ }
+ 
+@@ -3565,6 +3655,21 @@ ppp_disconnect_channel(struct channel *pch)
+ 			wake_up_interruptible(&ppp->file.rwait);
+ 		ppp_unlock(ppp);
+ 		synchronize_net();
++#if defined(CONFIG_CPE_FAST_PATH)
++		/* After the grace period, so that every walk that saw the
++		 * channel has added its flow by the time a driver is told
++		 * (ppp_link_work()). Not for a unit that is closing, whose
++		 * unregistration retires what went through it; one that is
++		 * not closing yet under ppp_lock is one whose unregistration
++		 * will wait for the reference taken here. */
++		ppp_lock(ppp);
++		if (!ppp->closing) {
++			dev_hold(ppp->dev);
++			if (!queue_work(ppp_link_wq, &ppp->link_work))
++				dev_put(ppp->dev);
++		}
++		ppp_unlock(ppp);
++#endif
+ 		if (refcount_dec_and_test(&ppp->file.refcnt))
+ 			ppp_destroy_interface(ppp);
+ 		err = 0;
+@@ -3612,6 +3717,11 @@ static void __exit ppp_cleanup(void)
+ 	device_destroy(&ppp_class, MKDEV(PPP_MAJOR, 0));
+ 	class_unregister(&ppp_class);
+ 	unregister_pernet_device(&ppp_net_ops);
++#if defined(CONFIG_CPE_FAST_PATH)
++	/* Every unit has been unregistered, each once the item that held it
++	 * had let it go; this waits for the last of them to return. */
++	destroy_workqueue(ppp_link_wq);
++#endif
+ 	rcu_barrier(); /* wait for RCU callbacks before module unload */
+ }
+ 
+diff --git a/drivers/net/ppp/pppoe.c b/drivers/net/ppp/pppoe.c
+index 8ff2024dde60..0df598159293 100644
+--- a/drivers/net/ppp/pppoe.c
++++ b/drivers/net/ppp/pppoe.c
+@@ -282,7 +282,7 @@ static void pppoe_flush_dev(struct net_device *dev)
+ 		struct sock *sk;
+ 
+ 		while (po) {
+-			while (po && po->pppoe_dev != dev) {
++			while (po && READ_ONCE(po->pppoe_dev) != dev) {
+ 				po = po->next;
+ 			}
+ 
+@@ -307,7 +307,7 @@ static void pppoe_flush_dev(struct net_device *dev)
+ 			    sk->sk_state & (PPPOX_CONNECTED | PPPOX_BOUND)) {
+ 				pppox_unbind_sock(sk);
+ 				sk->sk_state_change(sk);
+-				po->pppoe_dev = NULL;
++				WRITE_ONCE(po->pppoe_dev, NULL);
+ 				dev_put(dev);
+ 			}
+ 
+@@ -471,7 +471,7 @@ static void pppoe_unbind_sock_work(struct work_struct *work)
+ 	lock_sock(sk);
+ 	if (po->pppoe_dev) {
+ 		dev_put(po->pppoe_dev);
+-		po->pppoe_dev = NULL;
++		WRITE_ONCE(po->pppoe_dev, NULL);
+ 	}
+ 	pppox_unbind_sock(sk);
+ 	release_sock(sk);
+@@ -584,7 +584,7 @@ static int pppoe_release(struct socket *sock)
+ 
+ 	if (po->pppoe_dev) {
+ 		dev_put(po->pppoe_dev);
+-		po->pppoe_dev = NULL;
++		WRITE_ONCE(po->pppoe_dev, NULL);
+ 	}
+ 
+ 	pppox_unbind_sock(sk);
+@@ -655,7 +655,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+ 			    po->pppoe_pa.remote, po->pppoe_ifindex);
+ 		if (po->pppoe_dev) {
+ 			dev_put(po->pppoe_dev);
+-			po->pppoe_dev = NULL;
++			WRITE_ONCE(po->pppoe_dev, NULL);
+ 		}
+ 
+ 		po->pppoe_ifindex = 0;
+@@ -663,7 +663,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+ 		memset(&po->pppoe_relay, 0, sizeof(po->pppoe_relay));
+ 		memset(&po->chan, 0, sizeof(po->chan));
+ 		po->next = NULL;
+-		po->num = 0;
++		WRITE_ONCE(po->num, 0);
+ 
+ 		sk->sk_state = PPPOX_NONE;
+ 	}
+@@ -676,7 +676,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+ 		if (!dev)
+ 			goto err_put;
+ 
+-		po->pppoe_dev = dev;
++		WRITE_ONCE(po->pppoe_dev, dev);
+ 		po->pppoe_ifindex = dev->ifindex;
+ 		pn = pppoe_pernet(net);
+ 		if (!(dev->flags & IFF_UP)) {
+@@ -711,7 +711,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+ 		sk->sk_state = PPPOX_CONNECTED;
+ 	}
+ 
+-	po->num = sp->sa_addr.pppoe.sid;
++	WRITE_ONCE(po->num, sp->sa_addr.pppoe.sid);
+ 
+ end:
+ 	release_sock(sk);
+@@ -719,7 +719,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+ err_put:
+ 	if (po->pppoe_dev) {
+ 		dev_put(po->pppoe_dev);
+-		po->pppoe_dev = NULL;
++		WRITE_ONCE(po->pppoe_dev, NULL);
+ 	}
+ 	goto end;
+ }
+@@ -920,7 +920,7 @@ static int pppoe_sendmsg(struct socket *sock, struct msghdr *m,
+ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
+ {
+ 	struct pppox_sock *po = pppox_sk(sk);
+-	struct net_device *dev = po->pppoe_dev;
++	struct net_device *dev = READ_ONCE(po->pppoe_dev);
+ 	struct pppoe_hdr *ph;
+ 	int data_len = skb->len;
+ 
+@@ -930,6 +930,13 @@ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
+ 	 * But, we also can't do a lock_sock since that introduces a potential
+ 	 * deadlock as we'd reverse the lock ordering used when calling
+ 	 * ppp_unregister_channel().
++	 *
++	 * The PADT work and release clear the device before they unregister
++	 * the channel, though, and the relay path (pppoe_rcv_core()) transmits
++	 * on another socket, which connect hashes and marks connected before
++	 * it writes the id: read both once (pppoe_fill_forward_path()).
++	 * sk_state needs no marking: it is volatile, and KCSAN treats its
++	 * aligned accesses as marked.
+ 	 */
+ 
+ 	if (sock_flag(sk, SOCK_DEAD) || !(sk->sk_state & PPPOX_CONNECTED))
+@@ -951,7 +958,7 @@ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
+ 	ph->ver	= 1;
+ 	ph->type = 1;
+ 	ph->code = 0;
+-	ph->sid	= po->num;
++	ph->sid	= READ_ONCE(po->num);
+ 	ph->length = htons(data_len);
+ 
+ 	skb->protocol = cpu_to_be16(ETH_P_PPP_SES);
+@@ -980,21 +987,38 @@ static int pppoe_xmit(struct ppp_channel *chan, struct sk_buff *skb)
+ 	return __pppoe_xmit(sk, skb);
+ }
+ 
++/* Reached under RCU through the unit the channel is attached to, holding no
++ * socket lock, while the PADT work and release clear the device before they
++ * unregister the channel: the device is read once, and either value it sees
++ * gives the walk of an instant earlier or -EAGAIN. Cleared by
++ * pppoe_flush_dev() when it goes down, the device is freed only a grace
++ * period later. The state needs no marking: sk_state is volatile, and KCSAN
++ * treats its aligned accesses as marked. The id and peer change only before
++ * PPPIOCGCHAN hands userspace the channel's index, or a grace period after
++ * the channel left the unit (ppp_disconnect_channel()); the peer, an array,
++ * needs nothing. The id is read once for a userspace that attaches a guessed
++ * index mid-connect: its walk can see the session connected while the id is
++ * still 0, and carries only traffic through the unit it attached to.
++ */
+ static int pppoe_fill_forward_path(struct net_device_path_ctx *ctx,
+ 				   struct net_device_path *path,
+ 				   const struct ppp_channel *chan)
+ {
+ 	struct sock *sk = chan->private;
+ 	struct pppox_sock *po = pppox_sk(sk);
+-	struct net_device *dev = po->pppoe_dev;
++	struct net_device *dev = READ_ONCE(po->pppoe_dev);
+ 
++	/* A session not connected, or one that ended -- under a unit that
++	 * stays, as pppd dialling on demand keeps it -- is a path not known
++	 * yet, as a unit with no channel is (ppp_fill_forward_path()): have
++	 * the caller cache nothing until a session is up. */
+ 	if (sock_flag(sk, SOCK_DEAD) ||
+ 	    !(sk->sk_state & PPPOX_CONNECTED) || !dev)
+-		return -1;
++		return -EAGAIN;
+ 
+ 	path->type = DEV_PATH_PPPOE;
+ 	path->encap.proto = htons(ETH_P_PPP_SES);
+-	path->encap.id = be16_to_cpu(po->num);
++	path->encap.id = be16_to_cpu(READ_ONCE(po->num));
+ 	memcpy(path->encap.h_dest, po->pppoe_pa.remote, ETH_ALEN);
+ 	memcpy(ctx->daddr, po->pppoe_pa.remote, ETH_ALEN);
+ 	path->dev = ctx->dev;
+@@ -1038,17 +1062,32 @@ static int pppoe_seq_show(struct seq_file *seq, void *v)
+ {
+ 	struct pppox_sock *po;
+ 	char *dev_name;
++#if defined(CONFIG_CPE_FAST_PATH)
++	char *ppp_name;
++#endif
+ 
+ 	if (v == SEQ_START_TOKEN) {
++#if defined(CONFIG_CPE_FAST_PATH)
++		seq_puts(seq, "Id   Address           Device     PPPDevice  Unit\n");
++#else
+ 		seq_puts(seq, "Id       Address              Device\n");
++#endif
+ 		goto out;
+ 	}
+ 
+ 	po = v;
+ 	dev_name = po->pppoe_pa.dev;
++#if defined(CONFIG_CPE_FAST_PATH)
++	ppp_name = ppp_dev_name(&po->chan);
++	if (!ppp_name)
++		goto out;
+ 
++	seq_printf(seq, "%04X %pM %-10s %-10s %d\n",
++	ntohs(po->pppoe_pa.sid), po->pppoe_pa.remote, dev_name, ppp_name, ppp_unit_number(&po->chan));
++#else
+ 	seq_printf(seq, "%08X %pM %8s\n",
+ 		po->pppoe_pa.sid, po->pppoe_pa.remote, dev_name);
++#endif
+ out:
+ 	return 0;
+ }
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index 6ad562621f7d..84b97b6b30a5 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -6837,12 +6837,19 @@ static int rtnetlink_event(struct notifier_block *this, unsigned long event, voi
+ 	case NETDEV_NOTIFY_PEERS:
+ 	case NETDEV_CHANGEUPPER:
+ 	case NETDEV_RESEND_IGMP:
+-	case NETDEV_CHANGEINFODATA:
+ 	case NETDEV_CHANGELOWERSTATE:
+ 	case NETDEV_CHANGE_TX_QUEUE_LEN:
+ 		rtmsg_ifinfo_event(RTM_NEWLINK, dev, 0, rtnl_get_event(event),
+ 				   GFP_KERNEL, NULL, 0, 0, NULL);
+ 		break;
++	case NETDEV_CHANGEINFODATA:
++		/* A ppp unit raises it too, when it gains or loses its channel,
++		 * and that is no bonding option. */
++		rtmsg_ifinfo_event(RTM_NEWLINK, dev, 0,
++				   netif_is_bond_master(dev) ?
++				   rtnl_get_event(event) : IFLA_EVENT_NONE,
++				   GFP_KERNEL, NULL, 0, 0, NULL);
++		break;
+ 	default:
+ 		break;
+ 	}
+-- 
+2.47.3
+

@@ -3,9 +3,9 @@
  * register file whose bits are partly known, and nft_byteorder_eval() on the
  * registers of a packet that agrees with every known bit. Whatever the probe
  * calls known must be what the expression leaves there -- on every operation,
- * size and register pair, whatever the registers held before -- and a result
- * whose source was known is known whole, the rest of a 16-bit result's
- * register included, which the expression clears. */
+ * size, length and register pair, whatever the registers held before -- and a
+ * result whose source was known is known whole, the rest of a 16-bit result's
+ * register included where the expression clears it (STORE16_CLEARS, 6.18). */
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
@@ -95,19 +95,29 @@ static u32 rnd_known(void)
 int main(void)
 {
 	static const u8 sizes[] = { 2, 4, 8 };
+#ifdef STORE16_CLEARS
 	unsigned int cleared = 0;
+#endif
 
 	for (unsigned int n = 0; n < 200000; n++) {
 		struct nft_probe_ctx ctx = { 0 };
 		struct nft_expr expr = { 0 };
 		struct nft_byteorder *priv = &expr.priv;
 		struct nft_regs regs;
-		unsigned int words, last;
+		unsigned int words, last, bytes;
 		bool whole = true;
 
 		priv->size = sizes[rnd() % 3];
 		priv->op = rnd() % 2 ? NFT_BYTEORDER_HTON : NFT_BYTEORDER_NTOH;
-		words = (priv->size + 3) / 4;
+#ifdef BYTEORDER_HAS_LEN
+		/* One value or two of the size: an expression with a length
+		 * takes any multiple of it (6.12). */
+		priv->len = priv->size * (1 + rnd() % 2);
+		bytes = priv->len;
+#else
+		bytes = priv->size;
+#endif
+		words = (bytes + 3) / 4;
 		last = NFT_REG32_NUM - words;
 		priv->sreg = rnd() % (last + 1);
 		priv->dreg = rnd() % 4 ? rnd() % (last + 1) : priv->sreg;
@@ -123,7 +133,7 @@ int main(void)
 		if (rnd() % 2)
 			memset(&ctx.regs.known[priv->sreg], 0xff,
 			       words * sizeof(u32));
-		for (unsigned int b = 0; b < priv->size; b++)
+		for (unsigned int b = 0; b < bytes; b++)
 			if (((u8 *)&ctx.regs.known[priv->sreg])[b] != 0xff)
 				whole = false;
 		for (unsigned int r = 0; r < NFT_REG32_NUM; r++)
@@ -144,15 +154,24 @@ int main(void)
 			}
 		}
 		if (whole) {
+#ifdef STORE16_CLEARS
 			for (unsigned int w = 0; w < words; w++)
 				assert(ctx.regs.known[priv->dreg + w] == ~0u);
 			if (priv->size == 2) {
 				assert(!(ctx.regs.data[priv->dreg] >> 16));
 				cleared++;
 			}
+#else
+			/* What was written is known; a 16-bit store leaves the
+			 * rest of its register as it was. */
+			for (unsigned int b = 0; b < bytes; b++)
+				assert(((u8 *)&ctx.regs.known[priv->dreg])[b] == 0xff);
+#endif
 		}
 	}
+#ifdef STORE16_CLEARS
 	assert(cleared);
+#endif
 	printf("port probe byteorder checks passed\n");
 	return 0;
 }

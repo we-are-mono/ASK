@@ -62,6 +62,8 @@ struct sk_buff_head { int unused; };
 typedef struct { int unused; } wait_queue_head_t;
 typedef struct { int refs; } refcount_t;
 typedef struct { bool held; } spinlock_t;
+/* What a channel's upl was before 6.18 made it a spinlock. */
+typedef struct { bool held; } rwlock_t;
 struct rw_semaphore { int unused; };
 typedef struct { int unused; } netns_tracker;
 struct rcu_head { int unused; };
@@ -162,8 +164,12 @@ static void spin_unlock_bh(spinlock_t *l)
 	if (watched && l == &watched->wlock)
 		record(PPP_UNLOCK);
 }
-static void spin_lock(spinlock_t *l) { assert(!l->held); l->held = true; spinning++; }
-static void spin_unlock(spinlock_t *l) { assert(l->held); l->held = false; spinning--; }
+/* A channel's upl, whichever lock the line makes it: inline, as only one
+ * pair is taken. */
+static inline void spin_lock(spinlock_t *l) { assert(!l->held); l->held = true; spinning++; }
+static inline void spin_unlock(spinlock_t *l) { assert(l->held); l->held = false; spinning--; }
+static inline void write_lock_bh(rwlock_t *l) { assert(!l->held); l->held = true; spinning++; }
+static inline void write_unlock_bh(rwlock_t *l) { assert(l->held); l->held = false; spinning--; }
 static void mutex_lock(struct mutex *m) { assert(!m->held && !spinning); m->held = true; }
 static void mutex_unlock(struct mutex *m) { assert(m->held); m->held = false; record(MUTEX_UNLOCK); }
 static void rtnl_lock(void) { assert(!rtnl_held && !spinning); rtnl_held = true; record(RTNL_LOCK); }

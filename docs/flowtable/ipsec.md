@@ -42,7 +42,7 @@ Concretely, in a flowtable boot today:
 ## Patch 040 is the kernel half of a userspace design
 
 This has to be said plainly because the opposite reading is easy and it changes
-what the work is. `patches/kernel/040-ask-xfrm-ipsec-offload.patch` is 2,319
+what the work is. `patches/kernel/<line>/040-ask-xfrm-ipsec-offload.patch` is 2,319
 lines and its header describes a fast path wiring `xfrm_state` into SEC. It
 does not do that. It wires `xfrm_state` into a **netlink bus whose only
 consumer is CMM**.
@@ -209,7 +209,7 @@ rather than a protocol.
 ### What Option B costs, stated honestly
 
 **The outbound slow path loses its SA pointer.** `cpe_fp_tx()`
-(`patches/kernel/010-…:1699`) reaches SEC through
+(`patches/kernel/<line>/010-…:1699`) reaches SEC through
 `dpaa_submit_outb_pkt_to_SEC()`, which reads `skb_sec_path(skb)->xvec[0]` and
 looks the frame queue up by `x->handle`. `xfrm_dev_direct_output()` sets no
 sec_path. The fix is a small hunk in `xfrm_output()` that attaches a

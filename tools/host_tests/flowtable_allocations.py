@@ -3,6 +3,7 @@
 from ask_orch.process import run_process
 import os
 from pathlib import Path
+import re
 
 from _host_flowtable import (function)
 from _kernel_source import (kernel_source)
@@ -15,12 +16,21 @@ def test_native_admission_allocation_recovery(tmp_path):
     # Normalize only the declaration line break for the shared extractor.
     source = source.replace("static struct nf_flow_rule *\n", "static struct nf_flow_rule *")
     source = source.replace("static struct flow_offload_work *\n", "static struct flow_offload_work *")
+    work_alloc = function(source[source.index("static struct flow_offload_work *nf_flow_offload_work_alloc"):],
+                          "nf_flow_offload_work_alloc")
+    # The flow's flags as the kernel numbers them, and the one queued work
+    # holds (NF_FLOW_HW_PENDING before 6.18 renamed it NF_FLOW_PENDING).
+    header = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
+    pending = re.search(r"if \(test_and_set_bit\((NF_FLOW_\w+), &flow->flags\)\)", work_alloc)
+    assert pending, "the flag work_alloc claims"
+    (tmp_path / "allocations_types.inc").write_text(
+        re.search(r"^enum nf_flow_flags \{.*?^\};\n", header, re.M | re.S).group()
+        + f"#define WORK_PENDING {pending[1]}\n")
     (tmp_path / "allocations_production.inc").write_text(
         function(core, "nf_flow_offload_handle_invalidate")
         + function(source[source.index("static struct nf_flow_rule *nf_flow_offload_rule_alloc"):],
                    "nf_flow_offload_rule_alloc")
-        + function(source[source.index("static struct flow_offload_work *nf_flow_offload_work_alloc"):],
-                   "nf_flow_offload_work_alloc"))
+        + work_alloc)
     binary = tmp_path / "flowtable_allocations"
     run_process([os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
                     "-Werror", "-Wno-unused-parameter", "-fsanitize=address,undefined",

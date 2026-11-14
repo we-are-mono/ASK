@@ -2,7 +2,9 @@
 # an image its checkout did not build (tools/ask_orch/manifest.py).
 #
 # The record lists the recipe, its local SRC_URI entries, its external source
-# tree and ASK_PROVENANCE_PATHS (checkout-relative), each file by content. It
+# tree and ASK_PROVENANCE_PATHS (checkout-relative), each file by content; a
+# file the recipe pulls in by require or include counts only as one of those
+# paths (linux-ask.inc declares itself and each kernel line's pin). It
 # is taken before configure -- for an image, before its rootfs -- and taken
 # again whenever the set of those files or one of them changes, so everything
 # the recipe builds afterwards is built from what it records. ${PN}-provenance

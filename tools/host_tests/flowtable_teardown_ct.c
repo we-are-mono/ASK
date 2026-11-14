@@ -42,9 +42,11 @@ struct ip_ct_tcp_state { u32 td_maxwin; u8 flags; };
 struct ip_ct_tcp { struct ip_ct_tcp_state seen[2]; u8 state; };
 struct nf_conn { int lock; unsigned long status; u32 timeout; u8 protonum;
                  union { struct ip_ct_tcp tcp; } proto; };
-static void spin_lock_bh(int *l) { assert(!*l); *l = 1; }
-static void spin_unlock_bh(int *l) { assert(*l); *l = 0; }
-static void nf_ct_refresh(struct nf_conn *ct, u32 extra_jiffies)
+/* Inline: a line whose hand-back writes the timeout itself, as 6.12's does,
+ * takes neither the lock nor the refresh. */
+static inline void spin_lock_bh(int *l) { assert(!*l); *l = 1; }
+static inline void spin_unlock_bh(int *l) { assert(*l); *l = 0; }
+static inline void nf_ct_refresh(struct nf_conn *ct, u32 extra_jiffies)
 { WRITE_ONCE(ct->timeout, nfct_time_stamp + extra_jiffies); }
 struct net { struct nf_generic_net generic; struct nf_tcp_net tcp; struct nf_udp_net udp; };
 static struct net net;

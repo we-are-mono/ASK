@@ -364,17 +364,24 @@ struct ft_mc_group {
 
 /* Why a snooping bridge hands a group's frames to the host for a VIF or a
  * capture to see, besides a membership of the host's own: it is a multicast
- * router, or its device is promiscuous or takes all multicast -- ipmr makes
- * each VIF device all-multicast, and the bridge then hands up everything it
- * snoops (br_handle_frame_finish()). */
+ * router, or its device is promiscuous or, where the kernel hands up an
+ * all-multicast bridge's snooped frames (6.18; the egress snapshot then says
+ * so, BR_MCAST_TO_HOST_ALLMULTI), takes all multicast -- ipmr makes each VIF
+ * device all-multicast (br_handle_frame_finish()). */
+#ifdef BR_MCAST_TO_HOST_ALLMULTI
 #define FT_MC_TO_HOST_UP (BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC | \
 			  BR_MCAST_TO_HOST_ALLMULTI)
+#define FT_MC_BRIDGE_UP_FLAGS (IFF_PROMISC | IFF_ALLMULTI)
+#else
+#define FT_MC_TO_HOST_UP (BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC)
+#define FT_MC_BRIDGE_UP_FLAGS IFF_PROMISC
+#endif
 
 /* The same of a bridge device, as a route through it asks without a flow. */
 static inline bool ft_mc_bridge_hands_up(const struct net_device *bridge)
 {
 	return br_multicast_router(bridge) ||
-	       (READ_ONCE(bridge->flags) & (IFF_PROMISC | IFF_ALLMULTI));
+	       (READ_ONCE(bridge->flags) & FT_MC_BRIDGE_UP_FLAGS);
 }
 
 /* A flow: one source's frames of a group as they arrive on one bridge port,

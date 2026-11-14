@@ -1,0 +1,993 @@
+From: ASK maintainers <ask@localhost>
+Subject: [PATCH] moal: own cfg80211 scans through admission, completion and teardown
+
+Give cached and firmware scans a separate cfg80211 owner and a generation.
+Serialize every completion, stamp queued reports at receipt, and drain the
+old timer before rearming it. Complete real timeouts even when hang recovery
+is suppressed, and stop delayed work before destroying its queue. Keep
+fallible request preparation before ownership transfer and return success
+once the driver has accepted (and possibly already completed) a request.
+
+Serialize release of the firmware scan semaphore too: cancellation, a scan
+report and cleanup may race to release the same acquisition. Preserve ACS's
+existing non-aborted completion behavior.
+
+Upstream-Status: Pending
+---
+diff --git a/mlinux/moal_cfg80211.h b/mlinux/moal_cfg80211.h
+--- a/mlinux/moal_cfg80211.h
++++ b/mlinux/moal_cfg80211.h
+@@ -224,7 +224,7 @@
+ 					  bool aborted)
+ {
+ #if KERNEL_VERSION(4, 8, 0) <= CFG80211_VERSION_CODE
+-	struct cfg80211_scan_info info;
++	struct cfg80211_scan_info info = {};
+ 
+ 	info.aborted = aborted;
+ 	cfg80211_scan_done(request, &info);
+diff --git a/mlinux/moal_ioctl.c b/mlinux/moal_ioctl.c
+--- a/mlinux/moal_ioctl.c
++++ b/mlinux/moal_ioctl.c
+@@ -5617,6 +5617,32 @@
+ 	return status;
+ }
+ 
++/* The firmware event, cancel response and teardown may all release the
++ * asynchronous scan. Serialize that release as well as the cfg80211 owner. */
++void woal_scan_pending_start(moal_private *priv)
++{
++	moal_handle *handle = priv->phandle;
++	unsigned long flags;
++
++	spin_lock_irqsave(&handle->scan_req_lock, flags);
++	handle->scan_pending_on_block = MTRUE;
++	handle->scan_priv = priv;
++	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++}
++
++void woal_scan_pending_complete(moal_handle *handle)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&handle->scan_req_lock, flags);
++	if (handle->scan_pending_on_block) {
++		handle->scan_pending_on_block = MFALSE;
++		handle->scan_priv = NULL;
++		MOAL_REL_SEMAPHORE(&handle->async_sem);
++	}
++	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++}
++
+ /**
+  *  @brief Request a scan
+  *
+@@ -5641,8 +5667,7 @@
+ 		LEAVE();
+ 		return MLAN_STATUS_FAILURE;
+ 	}
+-	handle->scan_pending_on_block = MTRUE;
+-	handle->scan_priv = priv;
++	woal_scan_pending_start(priv);
+ 
+ 	/* Allocate an IOCTL request buffer */
+ 	ioctl_req = woal_alloc_mlan_ioctl_req(sizeof(mlan_ds_scan));
+@@ -5684,9 +5709,7 @@
+ 		kfree(ioctl_req);
+ 
+ 	if (ret == MLAN_STATUS_FAILURE) {
+-		handle->scan_pending_on_block = MFALSE;
+-		handle->scan_priv = NULL;
+-		MOAL_REL_SEMAPHORE(&handle->async_sem);
++		woal_scan_pending_complete(handle);
+ 	}
+ 	LEAVE();
+ 	return ret;
+@@ -6162,8 +6185,7 @@
+ 		LEAVE();
+ 		return MLAN_STATUS_FAILURE;
+ 	}
+-	handle->scan_pending_on_block = MTRUE;
+-	handle->scan_priv = priv;
++	woal_scan_pending_start(priv);
+ 
+ 	/* Allocate an IOCTL request buffer */
+ 	ioctl_req = woal_alloc_mlan_ioctl_req(sizeof(mlan_ds_scan) +
+@@ -6194,9 +6216,7 @@
+ 		woal_cancel_scan(priv, MOAL_IOCTL_WAIT_TIMEOUT);
+ 	}
+ 	if (ret == MLAN_STATUS_FAILURE) {
+-		handle->scan_pending_on_block = MFALSE;
+-		handle->scan_priv = NULL;
+-		MOAL_REL_SEMAPHORE(&handle->async_sem);
++		woal_scan_pending_complete(handle);
+ 	}
+ 	LEAVE();
+ 	return ret;
+@@ -6344,38 +6364,25 @@
+ 	mlan_ioctl_req *req = NULL;
+ 	mlan_status ret = MLAN_STATUS_SUCCESS;
+ 	moal_handle *handle = priv->phandle;
+-	moal_private *scan_priv = handle->scan_priv;
++	moal_private *scan_priv;
++	unsigned long flags;
+ #ifdef STA_CFG80211
+-	unsigned long flags;
+-#endif
+-
++	t_u64 generation;
++#endif
++
++	spin_lock_irqsave(&handle->scan_req_lock, flags);
++	scan_priv = handle->scan_priv;
+ #ifdef STA_CFG80211
+-	// cancel scan timeout
+-	if (IS_STA_CFG80211(handle->params.cfg80211_wext) &&
+-	    handle->scan_request)
+-		cancel_delayed_work(&handle->scan_timeout_work);
+-#endif
+-	/* If scan is in process, cancel the scan command */
+-	if (!handle->scan_pending_on_block || !scan_priv) {
+-#ifdef STA_CFG80211
+-		spin_lock_irqsave(&handle->scan_req_lock, flags);
+-		if (IS_STA_CFG80211(handle->params.cfg80211_wext) &&
+-		    handle->scan_request) {
+-			/* some supplicant cannot handle SCAN abort event */
+-			if (scan_priv &&
+-			    (scan_priv->bss_type == MLAN_BSS_TYPE_STA))
+-				woal_cfg80211_scan_done(handle->scan_request,
+-							MTRUE);
+-			else
+-				woal_cfg80211_scan_done(handle->scan_request,
+-							MFALSE);
+-			handle->scan_request = NULL;
+-			handle->fake_scan_complete = MFALSE;
+-		}
+-		spin_unlock_irqrestore(&handle->scan_req_lock, flags);
+-#endif
+-		return ret;
+-	}
++	generation = handle->scan_request ? handle->scan_generation : 0;
++	/* Keep new cfg80211 scans out until the cancel response and firmware
++	 * settling interval have finished, including when an event wins. */
++	handle->scan_canceling++;
++#endif
++	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++	/* Keep the generation across the firmware wait. An event or timeout
++	 * may finish this request while the cancel command is in progress. */
++	if (!handle->scan_pending_on_block || !scan_priv)
++		goto done;
+ 	req = woal_alloc_mlan_ioctl_req(sizeof(mlan_ds_scan));
+ 	if (req == NULL) {
+ 		ret = MLAN_STATUS_FAILURE;
+@@ -6385,29 +6392,17 @@
+ 	req->action = MLAN_ACT_SET;
+ 	((mlan_ds_scan *)req->pbuf)->sub_command = MLAN_OID_SCAN_CANCEL;
+ 	ret = woal_request_ioctl(scan_priv, req, wait_option);
+-	handle->scan_pending_on_block = MFALSE;
+-	MOAL_REL_SEMAPHORE(&handle->async_sem);
++	woal_scan_pending_complete(handle);
++	/* Firmware may delay its scan report after the cancel response. Never
++	 * clear a new scan's owner after this settling interval. */
++	woal_sched_timeout(300);
++done:
+ #ifdef STA_CFG80211
++	woal_cfg80211_scan_complete(handle, generation, MTRUE);
+ 	spin_lock_irqsave(&handle->scan_req_lock, flags);
+-	if (IS_STA_CFG80211(handle->params.cfg80211_wext) &&
+-	    handle->scan_request) {
+-		/** some supplicant can not handle SCAN abort event */
+-		if (scan_priv->bss_type == MLAN_BSS_TYPE_STA)
+-			woal_cfg80211_scan_done(handle->scan_request, MTRUE);
+-		else
+-			woal_cfg80211_scan_done(handle->scan_request, MFALSE);
+-		handle->scan_request = NULL;
+-	}
++	handle->scan_canceling--;
+ 	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
+ #endif
+-	/* add 300ms delay, incase firmware delay 0x7f event after scan cancel
+-	 * command response */
+-	woal_sched_timeout(300);
+-	/* scan_priv is cleared after scan completion in a controlled context
+-	 * where concurrent access is not expected */
+-	// coverity[LOCK_EVASION:SUPPRESS]
+-	handle->scan_priv = NULL;
+-done:
+ 	if (ret != MLAN_STATUS_PENDING)
+ 		kfree(req);
+ 	return ret;
+diff --git a/mlinux/moal_main.c b/mlinux/moal_main.c
+--- a/mlinux/moal_main.c
++++ b/mlinux/moal_main.c
+@@ -1189,20 +1189,8 @@
+ 	int cfg80211_wext = 0;
+ 	cfg80211_wext = handle->params.cfg80211_wext;
+ #ifdef STA_CFG80211
+-	if (IS_STA_CFG80211(cfg80211_wext) && handle->scan_request &&
+-	    handle->scan_priv) {
+-		moal_private *scan_priv = handle->scan_priv;
+-		/** some supplicant can not handle SCAN abort event */
+-		if (scan_priv->bss_type == MLAN_BSS_TYPE_STA)
+-			woal_cfg80211_scan_done(handle->scan_request, MTRUE);
+-		else
+-			woal_cfg80211_scan_done(handle->scan_request, MFALSE);
+-		handle->scan_request = NULL;
+-		handle->scan_priv = NULL;
+-		cancel_delayed_work_sync(&handle->scan_timeout_work);
+-		handle->scan_pending_on_block = MFALSE;
+-		MOAL_REL_SEMAPHORE(&handle->async_sem);
+-	}
++	woal_cfg80211_scan_stop(handle);
++	woal_scan_pending_complete(handle);
+ #endif
+ #ifdef UAP_CFG80211
+ #if CFG80211_VERSION_CODE >= KERNEL_VERSION(3, 12, 0)
+@@ -2600,6 +2588,10 @@
+ 	spin_lock_init(&handle->driver_lock);
+ 	spin_lock_init(&handle->ioctl_lock);
+ 	spin_lock_init(&handle->scan_req_lock);
++#ifdef STA_CFG80211
++	INIT_DELAYED_WORK(&handle->scan_timeout_work, woal_scan_timeout_handler);
++	handle->scan_stopping = MFALSE;
++#endif
+ 
+ 	handle->is_suspended = MFALSE;
+ 	handle->hs_activated = MFALSE;
+@@ -7289,6 +7281,9 @@
+ void woal_terminate_workqueue(moal_handle *handle)
+ {
+ 	ENTER();
++#ifdef STA_CFG80211
++	woal_cfg80211_scan_stop(handle);
++#endif
+ 
+ 	/* Terminate main workqueue */
+ 	if (handle->workqueue) {
+@@ -13312,6 +13307,118 @@
+ }
+ 
+ #ifdef STA_CFG80211
++/* All accepted requests, including cached scans and ACS, have one owner and
++ * a generation. Never use the request address as a completion token: cfg80211
++ * may free it after scan_done() and reuse that address for the next scan. */
++int woal_cfg80211_scan_busy(moal_handle *handle)
++{
++	unsigned long flags;
++	int busy;
++
++	spin_lock_irqsave(&handle->scan_req_lock, flags);
++	busy = handle->scan_request || handle->scan_starting ||
++		handle->scan_canceling || handle->scan_stopping;
++	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++	return busy;
++}
++
++int woal_cfg80211_scan_begin(moal_private *priv,
++			    struct cfg80211_scan_request *request, t_u8 fake,
++			    t_u32 timeout, t_u64 *generation)
++{
++	moal_handle *handle = priv->phandle;
++	unsigned long flags;
++	int ret = -EBUSY;
++
++	spin_lock_irqsave(&handle->scan_req_lock, flags);
++	if (handle->scan_request || handle->scan_starting ||
++	    handle->scan_canceling || handle->scan_stopping)
++		goto unlock;
++	handle->scan_starting = MTRUE;
++	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++
++	/* Completion cancels without waiting. Drain a running old callback
++	 * before reusing the delayed work and its generation. No lock held. */
++	cancel_delayed_work_sync(&handle->scan_timeout_work);
++
++	spin_lock_irqsave(&handle->scan_req_lock, flags);
++	handle->scan_starting = MFALSE;
++	if (handle->scan_stopping || handle->scan_canceling ||
++	    handle->driver_status || handle->surprise_removed ||
++	    (!fake && handle->scan_pending_on_block) || !handle->evt_workqueue)
++		goto unlock;
++	if (!++handle->scan_generation)
++		++handle->scan_generation;
++	handle->scan_request = request;
++	handle->cfg_scan_priv = priv;
++	handle->fake_scan_complete = fake;
++	handle->scan_timeout_generation = handle->scan_generation;
++	/* Arming under the lock prevents teardown from cancelling before this
++	 * timer has been queued. begin() has drained the previous instance. */
++	queue_delayed_work(handle->evt_workqueue, &handle->scan_timeout_work,
++			   msecs_to_jiffies(timeout));
++	*generation = handle->scan_generation;
++	ret = 0;
++unlock:
++	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++	return ret;
++}
++
++void woal_cfg80211_scan_complete(moal_handle *handle, t_u64 generation,
++				t_u8 aborted)
++{
++	struct cfg80211_scan_request *request;
++	unsigned long flags;
++
++	spin_lock_irqsave(&handle->scan_req_lock, flags);
++	if (!generation || !handle->scan_request ||
++	    handle->scan_generation != generation)
++		goto unlock;
++	request = handle->scan_request;
++	/* Preserve the driver's ACS compatibility with supplicants that do
++	 * not handle an aborted AP scan. The cfg owner exists for fake scans. */
++	if (handle->cfg_scan_priv->bss_type != MLAN_BSS_TYPE_STA)
++		aborted = MFALSE;
++	handle->scan_request = NULL;
++	handle->cfg_scan_priv = NULL;
++	handle->fake_scan_complete = MFALSE;
++	handle->scan_timeout_generation = 0;
++	cancel_delayed_work(&handle->scan_timeout_work);
++	/* cfg80211_scan_done only queues notification work; BSS reporting and
++	 * firmware commands, which may sleep, must stay outside this lock. */
++	woal_cfg80211_scan_done(request, aborted);
++unlock:
++	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++}
++
++void woal_cfg80211_scan_stop(moal_handle *handle)
++{
++	unsigned long flags;
++	t_u64 generation;
++
++	spin_lock_irqsave(&handle->scan_req_lock, flags);
++	handle->scan_stopping = MTRUE;
++	generation = handle->scan_generation;
++	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++	/* Unconditional: the request may have completed while work was running.
++	 * destroy_workqueue() alone does not drain a delayed-work timer. */
++	cancel_delayed_work_sync(&handle->scan_timeout_work);
++	woal_cfg80211_scan_complete(handle, generation, MTRUE);
++	/* A result worker may have dropped scan_req_lock to report BSS entries.
++	 * Keep its interface alive until it returns, including during FLR. */
++	if (handle->evt_workqueue)
++		flush_work(&handle->evt_work);
++}
++
++void woal_cfg80211_scan_restart(moal_handle *handle)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&handle->scan_req_lock, flags);
++	handle->scan_stopping = MFALSE;
++	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++}
++
+ /**
+  *  @brief This workqueue function handles woal scan timeout work
+  *
+@@ -13322,72 +13429,53 @@
+ t_void woal_scan_timeout_handler(struct work_struct *work)
+ {
+ 	struct delayed_work *delayed_work = to_delayed_work(work);
+-	// Coverity violation raised for kernel's API
+-	// coverity[cert_arr39_c_violation:SUPPRESS]
+ 	moal_handle *handle =
+ 		container_of(delayed_work, moal_handle, scan_timeout_work);
+ 	unsigned long flags;
+-	moal_private *priv = woal_get_priv(handle, MLAN_BSS_ROLE_STA);
++	moal_private *priv;
++	t_u64 generation;
++	t_u8 fake;
+ 	t_u8 auto_fw_dump = MFALSE;
+-	moal_handle *ref_handle = NULL;
+-
+-	ENTER();
+-
+-	if (IS_STA_CFG80211(handle->params.cfg80211_wext)) {
+-		spin_lock_irqsave(&handle->scan_req_lock, flags);
+-		if (handle->scan_request && handle->fake_scan_complete) {
+-			struct cfg80211_scan_request *request =
+-				handle->scan_request;
+-
+-			PRINTM(MMSG,
+-			       "wlan: Send fake scan result for scan_request %p\n",
+-			       request);
+-			/* Outside the lock, and completing only the request
+-			 * seen here, for the reasons given at
+-			 * woal_send_bss_scan_result(). */
+-			spin_unlock_irqrestore(&handle->scan_req_lock, flags);
+-			if (priv)
+-				woal_inform_bss_from_scan_result(priv, NULL,
+-								 MOAL_NO_WAIT);
+-			spin_lock_irqsave(&handle->scan_req_lock, flags);
+-			if (handle->scan_request == request) {
+-				woal_cfg80211_scan_done(request, MFALSE);
+-				handle->scan_request = NULL;
+-				handle->fake_scan_complete = MFALSE;
+-			}
+-			spin_unlock_irqrestore(&handle->scan_req_lock, flags);
+-		} else if (handle->scan_request) {
+-			PRINTM(MMSG, "wlan: scan timeout!\n");
+-			spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++	moal_handle *ref_handle;
++
++	spin_lock_irqsave(&handle->scan_req_lock, flags);
++	generation = handle->scan_timeout_generation;
++	if (!handle->scan_request || !generation || handle->scan_stopping ||
++	    generation != handle->scan_generation) {
++		spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++		return;
++	}
++	priv = handle->cfg_scan_priv;
++	fake = handle->fake_scan_complete;
++	/* Close admission before completing a timed-out real scan. Firmware
++	 * recovery is independent of returning the request to cfg80211. */
++	if (!fake)
++		handle->driver_status = MTRUE;
++	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++
++	if (fake) {
++		woal_inform_bss_from_scan_result(priv, NULL, MOAL_NO_WAIT);
++		woal_cfg80211_scan_complete(handle, generation, MFALSE);
++		return;
++	}
++	PRINTM(MMSG, "wlan: scan timeout!\n");
++	woal_cfg80211_scan_complete(handle, generation, MTRUE);
+ #ifdef DEBUG_LEVEL1
+-			if (drvdbg & MFW_D)
+-				auto_fw_dump = MTRUE;
+-#endif
+-			if (priv) {
+-				woal_mlan_debug_info(priv);
+-				woal_moal_debug_info(priv, NULL, MFALSE);
+-			}
+-			handle->driver_status = MTRUE;
+-			mlan_set_driver_status(handle->pmlan_adapter,
+-					       handle->driver_status);
+-
+-			ref_handle = (moal_handle *)handle->pref_mac;
+-			if (ref_handle) {
+-				ref_handle->driver_status = MTRUE;
+-				mlan_set_driver_status(
+-					ref_handle->pmlan_adapter,
+-					ref_handle->driver_status);
+-			}
+-
+-			if (!auto_fw_dump && !handle->fw_dump && priv)
+-				woal_process_hang(priv->phandle);
+-			wifi_status = WIFI_STATUS_SCAN_TIMEOUT;
+-		} else {
+-			spin_unlock_irqrestore(&handle->scan_req_lock, flags);
+-		}
+-	}
+-
+-	LEAVE();
++	if (drvdbg & MFW_D)
++		auto_fw_dump = MTRUE;
++#endif
++	woal_mlan_debug_info(priv);
++	woal_moal_debug_info(priv, NULL, MFALSE);
++	mlan_set_driver_status(handle->pmlan_adapter, handle->driver_status);
++	ref_handle = (moal_handle *)handle->pref_mac;
++	if (ref_handle) {
++		ref_handle->driver_status = MTRUE;
++		mlan_set_driver_status(ref_handle->pmlan_adapter,
++				       ref_handle->driver_status);
++	}
++	if (!auto_fw_dump && !handle->fw_dump)
++		woal_process_hang(handle);
++	wifi_status = WIFI_STATUS_SCAN_TIMEOUT;
+ }
+ #endif
+ 
+@@ -13752,30 +13840,22 @@
+  * @return              N/A
+  *
+  */
+-static void woal_send_bss_scan_result(moal_private *priv)
++static void woal_send_bss_scan_result(moal_private *priv, t_u64 generation)
+ {
+ 	moal_handle *handle = priv->phandle;
+-	struct cfg80211_scan_request *request;
+ 	unsigned long flags;
+-
+-	/* scan_req_lock covers scan_request, and only that. Handing the
+-	 * scan table to cfg80211 cannot happen under it: cfg80211_inform_bss()
+-	 * allocates every BSS with GFP_KERNEL and takes its bss_lock with
+-	 * local_bh_disable(), and the first scan's woal_set_scan_time() waits
+-	 * for the firmware -- none of which is legal with interrupts off,
+-	 * and a debug kernel reports it on every station scan ("sleeping
+-	 * function called from invalid context"). So: take the request under
+-	 * the lock, report outside it, and complete under it again -- that
+-	 * request and no other. One cancelled in between was completed by
+-	 * whoever cancelled it, and a new one issued since is still running
+-	 * and will be completed by its own report. */
++	t_u8 active;
++
+ 	spin_lock_irqsave(&handle->scan_req_lock, flags);
+-	request = handle->scan_request;
++	active = handle->scan_request && !handle->scan_stopping &&
++		!handle->fake_scan_complete && handle->cfg_scan_priv == priv &&
++		generation && handle->scan_generation == generation;
+ 	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
+-	if (!request)
++	if (!active)
+ 		return;
+ 
+-	PRINTM(MINFO, "Reporting scan results\n");
++	/* Reporting BSS entries allocates with GFP_KERNEL; setting scan times
++	 * waits for firmware. Neither may execute with scan_req_lock held. */
+ 	woal_inform_bss_from_scan_result(priv, NULL, MOAL_NO_WAIT);
+ 	if (!handle->first_scan_done) {
+ 		handle->first_scan_done = MTRUE;
+@@ -13784,14 +13864,7 @@
+ 					   PASSIVE_SCAN_CHAN_TIME,
+ 					   SPECIFIC_SCAN_CHAN_TIME);
+ 	}
+-
+-	spin_lock_irqsave(&handle->scan_req_lock, flags);
+-	if (handle->scan_request == request) {
+-		cancel_delayed_work(&handle->scan_timeout_work);
+-		woal_cfg80211_scan_done(request, MFALSE);
+-		handle->scan_request = NULL;
+-	}
+-	spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++	woal_cfg80211_scan_complete(handle, generation, MFALSE);
+ }
+ #endif
+ /**
+@@ -13972,7 +14045,8 @@
+ 			break;
+ #ifdef STA_CFG80211
+ 		case WOAL_EVENT_CFG80211_INFORM_BSS:
+-			woal_send_bss_scan_result((moal_private *)evt->priv);
++			woal_send_bss_scan_result((moal_private *)evt->priv,
++					  evt->scan_generation);
+ 			break;
+ #endif
+ 		default:
+@@ -14732,10 +14806,6 @@
+ #endif
+ #endif
+ 
+-#ifdef STA_CFG80211
+-	INIT_DELAYED_WORK(&handle->scan_timeout_work,
+-			  woal_scan_timeout_handler);
+-#endif
+ 
+ 	INIT_DELAYED_WORK(&handle->emergency_reset_work,
+ 			  &woal_emergency_reset_handler);
+@@ -15242,6 +15312,12 @@
+ 		goto exit;
+ 	}
+ 
++#ifdef STA_CFG80211
++	/* init_sw() will reinitialize the delayed work. Drain both scan work
++	 * paths before removing the interfaces they may still be reporting. */
++	woal_cfg80211_scan_stop(handle);
++#endif
++
+ 	/* Reset all interfaces */
+ 	priv = woal_get_priv(handle, MLAN_BSS_ROLE_ANY);
+ 	if (MLAN_STATUS_SUCCESS !=
+@@ -15551,7 +15627,7 @@
+ 			}
+ 		}
+ 		PRINTM(MMSG, "wlan: post_reset remove/add interface done\n");
+-		goto done;
++		goto scan_restart;
+ 	}
+ 
+ 	PRINTM(MMSG, "wlan: start interfaces reset\n");
+@@ -15618,6 +15694,11 @@
+ 	}
+ #endif
+ 
++scan_restart:
++#ifdef STA_CFG80211
++	woal_cfg80211_scan_restart(handle);
++#endif
++
+ done:
+ 	if (handle->dpd_data) {
+ 		release_firmware(handle->dpd_data);
+@@ -15960,9 +16041,6 @@
+ 	moal_handle *handle = NULL;
+ 	int index = 0;
+ 	int i;
+-#if defined(STA_SUPPORT) && defined(STA_CFG80211)
+-	unsigned long flags;
+-#endif
+ 
+ 	ENTER();
+ 
+@@ -15973,6 +16051,9 @@
+ 		handle = m_handle[index];
+ 		if (!handle)
+ 			continue;
++#ifdef STA_CFG80211
++		woal_cfg80211_scan_stop(handle);
++#endif
+ 		handle->params.auto_fw_reload = MFALSE;
+ 		if (!handle->priv_num)
+ 			goto exit;
+@@ -16049,20 +16130,6 @@
+ 				if (IS_STA_CFG80211(
+ 					    handle->params.cfg80211_wext))
+ 					woal_clear_conn_params(handle->priv[i]);
+-				spin_lock_irqsave(&handle->scan_req_lock,
+-						  flags);
+-				if (IS_STA_CFG80211(
+-					    handle->params.cfg80211_wext) &&
+-				    handle->scan_request) {
+-					cancel_delayed_work(
+-						&handle->scan_timeout_work);
+-					woal_cfg80211_scan_done(
+-						handle->scan_request, MTRUE);
+-					handle->scan_request = NULL;
+-					handle->scan_priv = NULL;
+-				}
+-				spin_unlock_irqrestore(&handle->scan_req_lock,
+-						       flags);
+ #if CFG80211_VERSION_CODE >= KERNEL_VERSION(3, 2, 0)
+ 				if (IS_STA_CFG80211(
+ 					    handle->params.cfg80211_wext) &&
+diff --git a/mlinux/moal_main.h b/mlinux/moal_main.h
+--- a/mlinux/moal_main.h
++++ b/mlinux/moal_main.h
+@@ -1366,6 +1366,7 @@
+ 	/** priv pointer */
+ 	void *priv;
+ 	struct cfg80211_bss *assoc_bss;
++	t_u64 scan_generation;
+ 	union {
+ 		chan_band_info chan_info;
+ 		woal_evt_buf evt;
+@@ -3451,6 +3452,14 @@
+ #ifdef STA_CFG80211
+ 	/** CFG80211 scan request description */
+ 	struct cfg80211_scan_request *scan_request;
++	/* Protected by scan_req_lock. Firmware scan_priv may be cleared before
++	 * the cfg80211 result is delivered, and is absent for a fake scan. */
++	moal_private *cfg_scan_priv;
++	t_u64 scan_generation;
++	t_u64 scan_timeout_generation;
++	t_u8 scan_starting;
++	t_u32 scan_canceling;
++	t_u8 scan_stopping;
+ 	/** fake scan flag */
+ 	u8 fake_scan_complete;
+ 	/** Scan timeout work*/
+@@ -4558,6 +4567,8 @@
+ mlan_status woal_set_wpa_enable(moal_private *priv, t_u8 wait_option,
+ 				t_u32 enable);
+ /** cancel scan command */
++void woal_scan_pending_start(moal_private *priv);
++void woal_scan_pending_complete(moal_handle *handle);
+ mlan_status woal_cancel_scan(moal_private *priv, t_u8 wait_option);
+ /** Find best network to connect */
+ mlan_status woal_find_best_network(moal_private *priv, t_u8 wait_option,
+@@ -4718,6 +4729,14 @@
+ #endif
+ 
+ #ifdef STA_CFG80211
++int woal_cfg80211_scan_busy(moal_handle *handle);
++int woal_cfg80211_scan_begin(moal_private *priv,
++			    struct cfg80211_scan_request *request, t_u8 fake,
++			    t_u32 timeout, t_u64 *generation);
++void woal_cfg80211_scan_complete(moal_handle *handle, t_u64 generation,
++				t_u8 aborted);
++void woal_cfg80211_scan_stop(moal_handle *handle);
++void woal_cfg80211_scan_restart(moal_handle *handle);
+ t_void woal_scan_timeout_handler(struct work_struct *work);
+ #endif
+ t_void woal_emergency_reset_handler(struct work_struct *work);
+diff --git a/mlinux/moal_priv.c b/mlinux/moal_priv.c
+--- a/mlinux/moal_priv.c
++++ b/mlinux/moal_priv.c
+@@ -4750,8 +4750,7 @@
+ 		LEAVE();
+ 		return MLAN_STATUS_FAILURE;
+ 	}
+-	handle->scan_pending_on_block = MTRUE;
+-	handle->scan_priv = priv;
++	woal_scan_pending_start(priv);
+ 
+ 	/* Allocate an IOCTL request buffer */
+ 	req = woal_alloc_mlan_ioctl_req(sizeof(mlan_ds_scan) +
+@@ -4782,9 +4781,7 @@
+ 	}
+ 
+ done:
+-	handle->scan_pending_on_block = MFALSE;
+-	handle->scan_priv = NULL;
+-	MOAL_REL_SEMAPHORE(&handle->async_sem);
++	woal_scan_pending_complete(handle);
+ 	if (status != MLAN_STATUS_PENDING)
+ 		kfree(req);
+ 	LEAVE();
+diff --git a/mlinux/moal_shim.c b/mlinux/moal_shim.c
+--- a/mlinux/moal_shim.c
++++ b/mlinux/moal_shim.c
+@@ -3649,11 +3649,23 @@
+ 	if (evt) {
+ 		evt->priv = priv;
+ 		evt->type = WOAL_EVENT_CFG80211_INFORM_BSS;
++		spin_lock_irqsave(&handle->scan_req_lock, flags);
++		if (handle->scan_request && !handle->scan_stopping &&
++		    !handle->fake_scan_complete && handle->cfg_scan_priv == priv)
++			evt->scan_generation = handle->scan_generation;
++		if (!evt->scan_generation) {
++			spin_unlock_irqrestore(&handle->scan_req_lock, flags);
++			kfree(evt);
++			return;
++		}
+ 		INIT_LIST_HEAD(&evt->link);
+-		spin_lock_irqsave(&handle->evt_lock, flags);
++		/* Enqueue before dropping scan_req_lock so stop() cannot miss a
++		 * producer that has captured an interface it is about to free. */
++		spin_lock(&handle->evt_lock);
+ 		list_add_tail(&evt->link, &handle->evt_queue);
+-		spin_unlock_irqrestore(&handle->evt_lock, flags);
++		spin_unlock(&handle->evt_lock);
+ 		queue_work(handle->evt_workqueue, &handle->evt_work);
++		spin_unlock_irqrestore(&handle->scan_req_lock, flags);
+ 	}
+ 	// evt buffer will be freed by woal_evt_work_queue() once event is
+ 	// handled coverity[misra_c_2012_rule_22_1_violation:SUPPRESS]
+@@ -3889,11 +3901,7 @@
+ 			woal_broadcast_event(priv, (t_u8 *)&pmevent->event_id,
+ 					     sizeof(mlan_event_id));
+ 		}
+-		if (priv->phandle->scan_pending_on_block == MTRUE) {
+-			priv->phandle->scan_pending_on_block = MFALSE;
+-			priv->phandle->scan_priv = NULL;
+-			MOAL_REL_SEMAPHORE(&priv->phandle->async_sem);
+-		}
++		woal_scan_pending_complete(priv->phandle);
+ 		if (!is_zero_timeval(priv->phandle->scan_time_start)) {
+ 			woal_get_monotonic_time(&priv->phandle->scan_time_end);
+ 			priv->phandle->scan_time +=
+diff --git a/mlinux/moal_sta_cfg80211.c b/mlinux/moal_sta_cfg80211.c
+--- a/mlinux/moal_sta_cfg80211.c
++++ b/mlinux/moal_sta_cfg80211.c
+@@ -5501,9 +5501,9 @@
+ 
+ #if CFG80211_VERSION_CODE >= KERNEL_VERSION(3, 6, 0)
+ /**
+- * @brief Request the driver to do a scan. Always returning
+- * zero meaning that the scan request is given to driver,
+- * and will be valid until passed to cfg80211_scan_done().
++ * @brief Request the driver to do a scan. Returning zero transfers the
++ * request to the driver until cfg80211_scan_done(). A negative return
++ * rejects the request without completing it.
+  * To inform scan results, call cfg80211_inform_bss().
+  *
+  * @param wiphy           A pointer to wiphy structure
+@@ -5515,9 +5515,9 @@
+ 			      struct cfg80211_scan_request *request)
+ #else
+ /**
+- * @brief Request the driver to do a scan. Always returning
+- * zero meaning that the scan request is given to driver,
+- * and will be valid until passed to cfg80211_scan_done().
++ * @brief Request the driver to do a scan. Returning zero transfers the
++ * request to the driver until cfg80211_scan_done(). A negative return
++ * rejects the request without completing it.
+  * To inform scan results, call cfg80211_inform_bss().
+  *
+  * @param wiphy           A pointer to wiphy structure
+@@ -5542,7 +5542,7 @@
+ 	t_u8 buf[ETH_ALEN];
+ #endif
+ 	int ret = 0, i, num_chans;
+-	unsigned long flags;
++	t_u64 generation;
+ 	t_u16 max_gap = 0;
+ 	t_u16 total_scan_time = 0;
+ 
+@@ -5555,6 +5555,8 @@
+ 		LEAVE();
+ 		return -EFAULT;
+ 	}
++	if (woal_cfg80211_scan_busy(priv->phandle))
++		return -EBUSY;
+ 	if (priv->phandle->scan_pending_on_block == MTRUE)
+ 		woal_sched_timeout(200);
+ 	if (priv->phandle->scan_pending_on_block == MTRUE) {
+@@ -5582,18 +5584,9 @@
+ #endif
+ #endif
+ #endif
+-	cancel_delayed_work(&priv->phandle->scan_timeout_work);
+-	priv->phandle->fake_scan_complete = priv->fake_scan_complete;
+-	if (priv->fake_scan_complete) {
+-		PRINTM(MEVENT, "fake scan complete flag is on\n");
+-		spin_lock_irqsave(&priv->phandle->scan_req_lock, flags);
+-		priv->phandle->scan_request = request;
+-		spin_unlock_irqrestore(&priv->phandle->scan_req_lock, flags);
+-		queue_delayed_work(priv->phandle->evt_workqueue,
+-				   &priv->phandle->scan_timeout_work,
+-				   msecs_to_jiffies(1000));
+-		return ret;
+-	}
++	if (priv->fake_scan_complete)
++		return woal_cfg80211_scan_begin(priv, request, MTRUE, 1000,
++						&generation);
+ 
+ #if CFG80211_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
+ 	/* This check is to prevent the situation where
+@@ -5615,28 +5608,10 @@
+ 			PRINTM(MEVENT,
+ 			       "Block scan in mlan module for scan_request %p\n",
+ 			       request);
+-			spin_lock_irqsave(&priv->phandle->scan_req_lock, flags);
+-			priv->phandle->fake_scan_complete = MTRUE;
+-			priv->phandle->scan_request = request;
+-			spin_unlock_irqrestore(&priv->phandle->scan_req_lock,
+-					       flags);
+-			queue_delayed_work(priv->phandle->evt_workqueue,
+-					   &priv->phandle->scan_timeout_work,
+-					   msecs_to_jiffies(1000));
+-			return ret;
+-		}
+-	}
+-	if (priv->phandle->scan_request &&
+-	    priv->phandle->scan_request != request) {
+-		PRINTM(MCMND,
+-		       "different scan_request is coming before previous one is finished on %s...\n",
+-		       dev->name);
+-		LEAVE();
+-		return -EBUSY;
+-	}
+-	spin_lock_irqsave(&priv->phandle->scan_req_lock, flags);
+-	priv->phandle->scan_request = request;
+-	spin_unlock_irqrestore(&priv->phandle->scan_req_lock, flags);
++			return woal_cfg80211_scan_begin(priv, request, MTRUE,
++							1000, &generation);
++		}
++	}
+ 	if (is_zero_timeval(priv->phandle->scan_time_start)) {
+ 		woal_get_monotonic_time(&priv->phandle->scan_time_start);
+ 		PRINTM(MINFO, "%s : start_timeval=%d:%d \n", __func__,
+@@ -5683,11 +5658,10 @@
+ 	if (scan_cfg.ext_scan == 3)
+ 		scan_req->ext_scan_type = EXT_SCAN_ENHANCE;
+ 
+-	for (i = 0; i < priv->phandle->scan_request->n_ssids; i++) {
++	for (i = 0; i < request->n_ssids; i++) {
+ #if CFG80211_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+ 		if (request->scan_6ghz) {
+-			if (i &&
+-			    !priv->phandle->scan_request->ssids[i].ssid_len)
++			if (i && !request->ssids[i].ssid_len)
+ 				continue;
+ 		}
+ #endif
+@@ -5695,10 +5669,10 @@
+ 		// buffer size
+ 		// coverity[cert_arr30_c_violation: SUPPRESS]
+ 		moal_memcpy_ext(priv->phandle, scan_req->ssid_list[i].ssid,
+-				priv->phandle->scan_request->ssids[i].ssid,
+-				priv->phandle->scan_request->ssids[i].ssid_len,
++				request->ssids[i].ssid,
++				request->ssids[i].ssid_len,
+ 				sizeof(scan_req->ssid_list[i].ssid));
+-		if (priv->phandle->scan_request->ssids[i].ssid_len)
++		if (request->ssids[i].ssid_len)
+ 			scan_req->ssid_list[i].max_len = 0;
+ 		else
+ 			scan_req->ssid_list[i].max_len = 0xff;
+@@ -5707,7 +5681,7 @@
+ #if defined(WIFI_DIRECT_SUPPORT)
+ #if CFG80211_VERSION_CODE >= WIFI_DIRECT_KERNEL_VERSION
+ 	if (priv->bss_type == MLAN_BSS_TYPE_WIFIDIRECT &&
+-	    priv->phandle->scan_request->n_ssids) {
++	    request->n_ssids) {
+ 		if (!memcmp(scan_req->ssid_list[0].ssid, "DIRECT-", 7))
+ 			scan_req->ssid_list[0].max_len = 0xfe;
+ 	}
+@@ -5719,17 +5693,16 @@
+ 		       priv->scan_setband_mask);
+ 	}
+ 	for (i = 0, num_chans = 0;
+-	     i < (int)MIN(WLAN_USER_SCAN_CHAN_MAX,
+-			  priv->phandle->scan_request->n_channels);
++	     i < (int)MIN(WLAN_USER_SCAN_CHAN_MAX, request->n_channels);
+ 	     i++) {
+-		chan = priv->phandle->scan_request->channels[i];
++		chan = request->channels[i];
+ 		if (MFALSE == is_scan_band_allowed(priv, chan))
+ 			continue;
+ 		scan_req->chan_list[num_chans].chan_number = chan->hw_value;
+ 		scan_req->chan_list[num_chans].radio_type =
+ 			woal_ieee_band_to_radio_type(chan->band);
+ 		if ((chan->flags & IEEE80211_CHAN_PASSIVE_SCAN) ||
+-		    !priv->phandle->scan_request->n_ssids)
++		    !request->n_ssids)
+ 			scan_req->chan_list[num_chans].scan_type =
+ 				MLAN_SCAN_TYPE_PASSIVE;
+ 		else if (chan->flags & IEEE80211_CHAN_RADAR)
+@@ -5742,14 +5715,14 @@
+ 		       chan->hw_value, chan->flags);
+ #if CFG80211_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
+ 		scan_req->chan_list[num_chans].scan_time =
+-			priv->phandle->scan_request->duration;
++			request->duration;
+ #else
+ 		scan_req->chan_list[num_chans].scan_time = 0;
+ #endif
+ #if defined(WIFI_DIRECT_SUPPORT)
+ #if CFG80211_VERSION_CODE >= WIFI_DIRECT_KERNEL_VERSION
+ 		if (priv->bss_type == MLAN_BSS_TYPE_WIFIDIRECT &&
+-		    priv->phandle->scan_request->n_ssids) {
++		    request->n_ssids) {
+ 			if (!memcmp(scan_req->ssid_list[0].ssid, "DIRECT-", 7))
+ 				scan_req->chan_list[num_chans].scan_time =
+ 					MIN_SPECIFIC_SCAN_CHAN_TIME;
+@@ -5818,11 +5791,10 @@
+ 	if (scan_req->scan_chan_gap && priv->phandle->pref_mac)
+ 		scan_req->scan_chan_gap |= GAP_FLAG_OPTIONAL;
+ 
+-	if (priv->phandle->scan_request->ie &&
+-	    priv->phandle->scan_request->ie_len) {
++	if (request->ie && request->ie_len) {
+ 		if (woal_find_wps_ie_in_probereq(
+-			    (const t_u8 *)priv->phandle->scan_request->ie,
+-			    priv->phandle->scan_request->ie_len)) {
++			    (const t_u8 *)request->ie,
++			    request->ie_len)) {
+ 			PRINTM(MIOCTL,
+ 			       "Notify firmware only keep probe response\n");
+ 			scan_req->proberesp_only = MTRUE;
+@@ -5830,8 +5802,8 @@
+ 		if (MLAN_STATUS_SUCCESS !=
+ 		    woal_cfg80211_mgmt_frame_ie(
+ 			    priv, NULL, 0, NULL, 0, NULL, 0,
+-			    (const t_u8 *)priv->phandle->scan_request->ie,
+-			    priv->phandle->scan_request->ie_len,
++			    (const t_u8 *)request->ie,
++			    request->ie_len,
+ 			    MGMT_MASK_PROBE_REQ, MOAL_IOCTL_WAIT)) {
+ 			PRINTM(MERROR, "Fail to set scan request IE\n");
+ 			ret = -EFAULT;
+@@ -5924,25 +5896,17 @@
+ 		}
+ 	}
+ 
++	ret = woal_cfg80211_scan_begin(priv, request, MFALSE,
++					priv->phandle->scan_timeout, &generation);
++	if (ret)
++		goto done;
+ 	if (MLAN_STATUS_SUCCESS != woal_do_scan(priv, scan_req)) {
+ 		PRINTM(MERROR, "woal_do_scan fails!\n");
+-		ret = -EAGAIN;
+-		goto done;
++		/* Ownership was accepted. Complete it, and return success so the
++		 * cfg80211 caller does not also free this request as rejected. */
++		woal_cfg80211_scan_complete(priv->phandle, generation, MTRUE);
+ 	}
+ done:
+-	if (ret) {
+-		spin_lock_irqsave(&priv->phandle->scan_req_lock, flags);
+-		woal_cfg80211_scan_done(request, MTRUE);
+-		priv->phandle->scan_request = NULL;
+-		priv->phandle->scan_priv = NULL;
+-		spin_unlock_irqrestore(&priv->phandle->scan_req_lock, flags);
+-	} else {
+-		PRINTM(MMSG, "wlan: %s START SCAN\n", dev->name);
+-		queue_delayed_work(
+-			priv->phandle->evt_workqueue,
+-			&priv->phandle->scan_timeout_work,
+-			msecs_to_jiffies(priv->phandle->scan_timeout));
+-	}
+ 	kfree(scan_req);
+ 	LEAVE();
+ 	return ret;
+@@ -8291,7 +8255,7 @@
+ 	PRINTM(MCMND, "<--- Enter woal_cfg80211_suspend --->\n");
+ 	for (i = 0; i < MIN(handle->priv_num, MLAN_MAX_BSS_NUM); i++) {
+ 		if (handle->priv[i]) {
+-			if (handle->scan_request) {
++			if (READ_ONCE(handle->scan_request)) {
+ 				PRINTM(MIOCTL,
+ 				       "Cancel pending scan in woal_cfg80211_suspend\n");
+ 				woal_cancel_scan(handle->priv[i],

@@ -2508,7 +2508,7 @@ static void ft_ipsec_fold(struct cdx_ipsec_sa_spec *spec,
 	spin_unlock_bh(&ft_ipsec_retired_lock);
 }
 
-static int ft_xdo_state_add(struct net_device *dev, struct xfrm_state *x,
+static int ft_xdo_state_add(CDX_XDO_DEV(dev) struct xfrm_state *x,
 			    struct netlink_ext_ack *extack)
 {
 	struct ft_ipsec_watch *watch = NULL;
@@ -2948,7 +2948,7 @@ static void ft_ipsec_follow_work(struct work_struct *work)
  * waiting for the state's final free: in-flight SEC skbs retain secpath
  * references until their input buffers complete and are reaped. The backend
  * clears its borrowed state pointer before anything can follow it again. */
-static void ft_xdo_state_delete(struct net_device *dev, struct xfrm_state *x)
+static void ft_xdo_state_delete(CDX_XDO_DEV(dev) struct xfrm_state *x)
 {
 	struct cdx_ipsec_sa *sa = (void *)xchg(&x->xso.offload_handle, 0);
 	struct ft_ipsec_retirement *retirement, *owned = NULL;
@@ -2984,7 +2984,7 @@ static void ft_xdo_state_delete(struct net_device *dev, struct xfrm_state *x)
  * the handle it took is gone. This exists so the core has something to call
  * and so a state that somehow reaches free still un-owns its SA.
  */
-static void ft_xdo_state_free(struct net_device *dev, struct xfrm_state *x)
+static void ft_xdo_state_free(CDX_XDO_DEV(dev) struct xfrm_state *x)
 {
 	WARN_ON_ONCE(x->xso.offload_handle);
 }

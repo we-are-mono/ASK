@@ -7,7 +7,7 @@
 #define GFP_KERNEL 0
 #define GFP_ATOMIC 1
 #define NF_FLOW_RULE_ACTION_MAX 16
-#define NF_FLOW_PENDING 0
+#include "allocations_types.inc"
 #define FLOW_OFFLOAD_XMIT_NEIGH 1
 enum flow_offload_tuple_dir { FLOW_OFFLOAD_DIR_ORIGINAL, FLOW_OFFLOAD_DIR_REPLY };
 enum { FLOW_CLS_REPLACE, FLOW_CLS_STATS, FLOW_CLS_DESTROY };
@@ -88,9 +88,9 @@ int main(void)
             assert(!nf_flow_offload_work_alloc(&table, &flow, cmd));
             assert(!flow.flags && handle.invalid == (int)(opted_in && cmd == FLOW_CLS_REPLACE));
             /* Pending work is coalescing, not a failed allocation. */
-            handle.invalid = allocation = 0; flow.flags = 1;
+            handle.invalid = allocation = 0; flow.flags = 1UL << WORK_PENDING;
             assert(!nf_flow_offload_work_alloc(&table, &flow, cmd));
-            assert(!allocation && !handle.invalid && flow.flags == 1);
+            assert(!allocation && !handle.invalid && flow.flags == 1UL << WORK_PENDING);
             flow.flags = allocation = fail_at = 0;
             struct flow_offload_work *work = nf_flow_offload_work_alloc(&table, &flow, cmd);
             assert(work && work->flow == &flow && work->flowtable == &table && work->cmd == cmd);

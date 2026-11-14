@@ -4,6 +4,7 @@ Run without the board fixtures:
     pytest tools/host_tests/htb_offload.py
 """
 
+from ask_orch import kernel_line
 from ask_orch.process import run_process
 
 from pathlib import Path
@@ -44,7 +45,7 @@ def test_htb_offload(tmp_path):
     exports = (ROOT / "cdx/cdx_flowtable.h").read_text()
     # The ceilings the tables are sized by: one CEETM instance's channels, and
     # the direct and leaf-class Tx queues patch 150 gives the netdev.
-    patch = (ROOT / "patches/kernel/150-sdk_dpaa-hardware-qdisc.patch").read_text()
+    patch = (kernel_line.patches() / "150-sdk_dpaa-hardware-qdisc.patch").read_text()
     (tmp_path / "htb_limits.inc").write_text(
         re.search(r"^#define\s+CDX_CEETM_MAX_CHANNELS\s.*$",
                   (ROOT / "cdx/cdx_ceetm_app.h").read_text(), re.M).group() + "\n"
@@ -174,7 +175,7 @@ def test_htb_queue_budget_matches_the_driver(tmp_path):
     out and the headroom patch 150 reserves are one number, not two that happen
     to agree.
     """
-    patch = (ROOT / "patches/kernel/150-sdk_dpaa-hardware-qdisc.patch").read_text()
+    patch = (kernel_line.patches() / "150-sdk_dpaa-hardware-qdisc.patch").read_text()
     assert "+#define DPAA_ETH_CEETM_LEAF_QUEUES\t64" in patch
     assert "+#define DPAA_ETH_TX_QUEUES\t16" in patch
     source = (ROOT / "cdx/cdx_htb.c").read_text()

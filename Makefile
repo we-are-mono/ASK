@@ -17,19 +17,37 @@ include build/deploy.mk
 #    lan    — LAN-side traffic generator (typically a libvirt VM) behind
 #             the DUT's NAT, reached through QEMU guest-agent control.
 #
+#  One checkout builds every kernel line it has a recipe for
+#  (meta-ask/recipes-kernel/linux/linux-ask_<line>.bb); LINE picks the one
+#  the image, staging and test targets are about, the newest by default.
+#
 #  Workflow (per-run):
-#    1. make ask-image     — build the Yocto test image (kas).
-#    2. make stage-image   — copy the bundled Image.gz into TFTP_ROOT
-#                            (default /srv/tftp) as $(TFTP_IMAGE_NAME).
-#    3. <U-Boot>           — at the DUT's U-Boot prompt:
-#                              tftpboot ${loadaddr} <wan_ip>:$(TFTP_IMAGE_NAME)
-#                              booti ${loadaddr} - ${fdtaddr}
-#                            Board boots into the test image in ~15s;
-#                            kernel recording starts via S70askd-agent.
+#    1. make ask-image     — build the Yocto test image (kas) for LINE.
+#    2. make stage-image   — copy LINE's bundled Image.gz and device tree
+#                            into TFTP_ROOT (default /srv/tftp) as
+#                            Image-ask-<line>.gz and mono-gateway-dk-<line>.dtb,
+#                            and point $(TFTP_IMAGE_NAME) and
+#                            $(TFTP_DTB_NAME) at them.
+#    3. <U-Boot>           — at the DUT's U-Boot prompt: run ask, which
+#                            boots the line staged last (docs/testing.md,
+#                            "Booting the image"). Board boots into the
+#                            test image in ~15s; kernel recording starts
+#                            via S70askd-agent.
 #    4. make deploy-agents — install the WAN agent and runner dependencies.
 #    5. make test          — run the test suite. Assumes agents are up;
 #                            exits non-zero on failure.
 # ============================================================================
+
+# The kernel lines this checkout builds, and the one these targets are about.
+# ASK_LINE (the harness's name for it) sets it too; meta-ask/.config.yaml and
+# tools/ask_orch/kernel_line.py default to the same newest line.
+LINES := $(sort $(patsubst linux-ask_%.bb,%,$(notdir $(wildcard $(CURDIR)/meta-ask/recipes-kernel/linux/linux-ask_*.bb))))
+DEFAULT_LINE := 6.18
+LINE ?= $(or $(ASK_LINE),$(DEFAULT_LINE))
+
+define check-line
+@case " $(LINES) " in *" $(LINE) "*) ;; *) echo "LINE=$(LINE) is not a kernel line of this checkout ($(LINES))" >&2; exit 1;; esac
+endef
 
 .PHONY: setup ask-image stage-image deploy-agent-wan deploy-agents ask-test test test-host test-dut test-startup test-release release-status test-env help
 
@@ -47,31 +65,45 @@ setup:
 	@echo "==> host ready. Now EDIT meta-ask/site.conf: point DL_DIR and SSTATE_DIR at"
 	@echo "    writable directories you create first, then run 'make ask-image'."
 
-# Build the Yocto test image via kas. Produces Image.gz with the ASK stack,
-# python3, askd-agent, and the KASAN/lockdep/kmemleak-enabled kernel.
+# Build the Yocto test image via kas, for LINE. Produces Image.gz with the
+# ASK stack, python3, askd-agent, and the KASAN/lockdep/kmemleak-enabled
+# kernel, under meta-ask/build/tmp-<line>.
 ask-image:
-	cd meta-ask && KASAN=1 kas build .config.yaml
+	$(check-line)
+	cd meta-ask && KASAN=1 ASK_LINE=$(LINE) kas build .config.yaml
 
-# Drop the bundled kernel+initramfs into the WAN host's TFTP root so
-# U-Boot on the DUT can pull it. Copies rather than symlinks because
-# tftpd (running as user `tftp`) cannot traverse into /home/<user>
+# Drop LINE's bundled kernel+initramfs and device tree into the WAN host's
+# TFTP root so U-Boot on the DUT can pull them. Copies rather than symlinks
+# because tftpd (running as user `tftp`) cannot traverse into /home/<user>
 # (mode 0700). Re-run after each ask-image rebuild.
-IMAGE_DEPLOY_DIR := $(CURDIR)/meta-ask/build/tmp/deploy/images/ask-ls1046a
-IMAGE_ARTIFACT   := $(IMAGE_DEPLOY_DIR)/Image.gz-initramfs-ask-ls1046a.bin
-IMAGE_BASENAME   := $(notdir $(IMAGE_ARTIFACT))
+IMAGE_DEPLOY_DIR := $(CURDIR)/meta-ask/build/tmp-$(LINE)/deploy/images/ask-ls1046a
+IMAGE_BASENAME   := Image.gz-initramfs-ask-ls1046a.bin
+IMAGE_ARTIFACT   := $(IMAGE_DEPLOY_DIR)/$(IMAGE_BASENAME)
 IMAGE_DTB        := $(IMAGE_DEPLOY_DIR)/mono-gateway-dk.dtb
+LINE_IMAGE_NAME  := Image-ask-$(LINE).gz
+LINE_DTB_NAME    := mono-gateway-dk-$(LINE).dtb
 stage-image:
-	@test -f $(IMAGE_ARTIFACT) || { echo "no image — run 'make ask-image' first" >&2; exit 1; }
-	@test -f $(IMAGE_DTB) || { echo "no device tree — run 'make ask-image' first" >&2; exit 1; }
+	$(check-line)
+	@test -f $(IMAGE_ARTIFACT) || { echo "no $(LINE) image — run 'make ask-image LINE=$(LINE)' first" >&2; exit 1; }
+	@test -f $(IMAGE_DTB) || { echo "no $(LINE) device tree — run 'make ask-image LINE=$(LINE)' first" >&2; exit 1; }
 	sudo install -d $(TFTP_ROOT)
-	sudo install -m 0644 $(IMAGE_ARTIFACT) $(TFTP_ROOT)/$(TFTP_IMAGE_NAME)
-	sudo install -m 0644 $(IMAGE_DTB) $(TFTP_ROOT)/mono-gateway-dk.dtb
-	# Also stage under the Yocto artifact name so a U-Boot env set to fetch
-	# the raw filename keeps working. Hard link avoids the double-copy cost.
-	sudo ln -f $(TFTP_ROOT)/$(TFTP_IMAGE_NAME) $(TFTP_ROOT)/$(IMAGE_BASENAME)
-	@echo "==> staged $(TFTP_IMAGE_NAME) and $(IMAGE_BASENAME) ($$(stat -Lc%s $(TFTP_ROOT)/$(TFTP_IMAGE_NAME)) B)"
-	@echo "    matching device tree: mono-gateway-dk.dtb"
-	@echo "    at U-Boot: tftpboot \$${loadaddr} <name>; booti ..."
+	sudo install -m 0644 $(IMAGE_ARTIFACT) $(TFTP_ROOT)/$(LINE_IMAGE_NAME)
+	sudo install -m 0644 $(IMAGE_DTB) $(TFTP_ROOT)/$(LINE_DTB_NAME)
+	# The board's `run ask` fetches the unversioned names: point them at the
+	# line just staged, so it boots that line without a saveenv. The Yocto
+	# artifact name keeps a U-Boot env set to fetch the raw filename working.
+	# Hard links avoid the double-copy cost.
+	sudo ln -f $(TFTP_ROOT)/$(LINE_IMAGE_NAME) $(TFTP_ROOT)/$(TFTP_IMAGE_NAME)
+	sudo ln -f $(TFTP_ROOT)/$(LINE_IMAGE_NAME) $(TFTP_ROOT)/$(IMAGE_BASENAME)
+	sudo ln -f $(TFTP_ROOT)/$(LINE_DTB_NAME) $(TFTP_ROOT)/$(TFTP_DTB_NAME)
+	@echo "==> staged Linux $(LINE): $(LINE_IMAGE_NAME) ($$(stat -Lc%s $(TFTP_ROOT)/$(LINE_IMAGE_NAME)) B) and $(LINE_DTB_NAME)"
+	@echo "    also as $(TFTP_IMAGE_NAME), $(IMAGE_BASENAME) and $(TFTP_DTB_NAME): U-Boot's 'run ask' boots $(LINE)"
+	@echo "    a staged line by name, after ask's bootargs and memory window (docs/testing.md):"
+	@for line in $(LINES); do \
+	    if [ -f $(TFTP_ROOT)/Image-ask-$$line.gz ] && [ -f $(TFTP_ROOT)/mono-gateway-dk-$$line.dtb ]; then \
+	        echo "      tftpboot 0xc0000000 Image-ask-$$line.gz; tftpboot 0xe0000000 mono-gateway-dk-$$line.dtb; booti 0xc0000000 - 0xe0000000"; \
+	    fi; \
+	done
 
 # Install askd-agent onto the local WAN host. The DUT copy ships in the
 # Yocto image; the LAN client uses QEMU guest-agent control.
@@ -95,7 +127,7 @@ deploy-agents: deploy-agent-wan
 # Keep environment and make-command-line settings identical. The Python
 # adapter forwards arguments through sudo without shell interpolation.
 export $(filter ASK_%,$(.VARIABLES))
-export DUT_IP WAN_IP WAN_AGENT_IP K ARGS RUN
+export DUT_IP WAN_IP WAN_AGENT_IP K ARGS RUN LINE
 
 test:
 	@"$(WAN_PREFIX)/venv/bin/python" "$(CURDIR)/tools/run_tests.py" all
@@ -127,14 +159,15 @@ test-env:
 
 help:
 	@echo "make setup         - install host build deps + locale (one-time, sudo)"
-	@echo "make ask-image     - build the Yocto test image via kas"
-	@echo "make stage-image   - copy the built image into the TFTP root"
+	@echo "make ask-image     - build the Yocto test image via kas, for LINE ($(LINES); default $(DEFAULT_LINE))"
+	@echo "make stage-image   - copy LINE's image and device tree into the TFTP root; run ask boots it"
 	@echo "make deploy-agents - install askd-agent on the WAN host"
 	@echo "make test          - host + DUT suite; DUT_IP=... WAN_IP=... K='ipsec or mcast'"
 	@echo "make test-host     - host suite without sudo or hardware; ARGS='-vv'"
 	@echo "make test-dut      - DUT suite; WAN_AGENT_IP overrides the WAN control address"
 	@echo "make test-startup  - dedicated rdinit=/bin/sh startup suite"
-	@echo "make test-release  - one release matrix run, RUN=suite|churn|...; recorded in the ledger"
-	@echo "make release-status - which release runs passed for this checkout and image"
+	@echo "make test-release  - one release matrix run, RUN=suite|churn|...; recorded in the ledger for LINE"
+	@echo "make release-status - which release runs passed for this checkout, LINE and image"
+	@echo "                     (every test target runs against LINE's sources and build tree)"
 	@echo "make test-env      - install pinned runner dependencies without deploying agents"
 	@echo "make ask-test      - alias for make test; ASK_* settings remain supported"

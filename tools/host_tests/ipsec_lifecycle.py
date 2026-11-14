@@ -7,6 +7,7 @@ import os
 import re
 from pathlib import Path
 
+from _cdx_compat import compat
 from _host_qos_lifecycle import (function)
 from _kernel_source import (kernel_source)
 
@@ -28,6 +29,7 @@ def definition(source, name):
 
 def test_ipsec_lifecycle(tmp_path):
     kernel = kernel_source()
+    compat(tmp_path, kernel)
     sg = (kernel / SDK_REL / "dpaa_eth_sg.c").read_text()
     sdk = (kernel / SDK_REL / "dpaa_eth_common.c").read_text()
     sdk = sdk.replace("__cold __attribute__((nonnull))\n", "")

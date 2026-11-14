@@ -91,8 +91,9 @@ def dmesg_allowlist():
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def bench_health(request, hardware_bench, dmesg_allowlist, dut_uart):
     """Check firmware, logging and selected release capabilities before
-    mutations. A release also needs the image this checkout builds: every
-    component and the device tree (ask_orch.manifest)."""
+    mutations. Every run needs an image of its kernel line (ASK_LINE); a
+    release also needs the image this checkout builds: every component and
+    the device tree (ask_orch.manifest)."""
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         health = await client.TARGET.health(session)
         record("dut", health, nodeid="session")
@@ -112,7 +113,12 @@ async def bench_health(request, hardware_bench, dmesg_allowlist, dut_uart):
         expected = agent_sources(Path(__file__).resolve().parents[1] / "askd_agent")
         firmware["agent_matches_checkout"] = firmware["agent_sources"] == expected
         firmware["build_problems"] = manifest.verify(Path(__file__).resolve().parents[2], firmware["image"])
+        firmware["line"] = request.config._ask_line
         record("firmware", firmware, nodeid="session")
+        # The run reads the line's sources and build tree; against another
+        # line's image it would test neither, release or not.
+        line = manifest.line_problem(firmware["image"], firmware["line"])
+        assert not line, line
         config = await client.TARGET.fs_read(session, "/proc/config.gz")
         assert config["errno"] == 0, config
         kernel_config = gzip.decompress(bytes.fromhex(config["content_hex"])).decode()

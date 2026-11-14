@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "cdx_compat.inc"
 #ifndef DPAA_FWD_TX_QUEUES
 #define DPAA_FWD_TX_QUEUES 8
 #endif
@@ -66,8 +67,7 @@ struct qman_fq {
     unsigned fqid; bool acquired, proc; enum qman_fq_state state; u32 flags;
     struct {
         enum qman_cb_dqrr_result (*dqrr)(struct qman_portal *, struct qman_fq *,
-                                       const struct qm_dqrr_entry *, bool,
-                                       struct qman_poll_ctx *);
+                                       const struct qm_dqrr_entry * CDX_DQRR_POLL);
         void (*ern)(struct qman_portal *, struct qman_fq *, const struct qm_mr_entry *);
     } cb;
 };
@@ -187,10 +187,9 @@ static void dpa_fd_release(const struct net_device *dev, const struct qm_fd *fd)
     released_frames++;
 }
 static enum qman_cb_dqrr_result rx_drain(struct qman_portal *portal,
-        struct qman_fq *fq, const struct qm_dqrr_entry *dq, bool sched_napi,
-        struct qman_poll_ctx *ctx)
+        struct qman_fq *fq, const struct qm_dqrr_entry *dq CDX_DQRR_POLL)
 {
-    (void)portal; (void)fq; (void)sched_napi; (void)ctx;
+    (void)portal; (void)fq;
     if (dq->stat & QM_DQRR_STAT_FD_VALID) dpa_fd_release(NULL, &dq->fd);
     return qman_cb_dqrr_consume;
 }
@@ -274,7 +273,7 @@ static int qman_volatile_dequeue(struct qman_fq *fq, unsigned flags, unsigned vd
             fq->flags &= ~QMAN_FQ_STATE_NE;
         }
         expected_fd = &dq.fd;
-        assert(fq->cb.dqrr(&portal, fq, &dq, false, NULL) == qman_cb_dqrr_consume);
+        assert(fq->cb.dqrr(&portal, fq, &dq CDX_DQRR_POLL_ARGS) == qman_cb_dqrr_consume);
         assert(released_frames == before + 1);
         expected_fd = NULL;
     }
@@ -287,7 +286,7 @@ static int qman_volatile_dequeue(struct qman_fq *fq, unsigned flags, unsigned vd
         dq.stat = QM_DQRR_STAT_UNSCHEDULED | QM_DQRR_STAT_FQ_EMPTY
                   | QM_DQRR_STAT_DQCR_EXPIRED;
         fq->flags &= ~QMAN_FQ_STATE_NE;
-        assert(fq->cb.dqrr(&portal, fq, &dq, false, NULL) == qman_cb_dqrr_consume);
+        assert(fq->cb.dqrr(&portal, fq, &dq CDX_DQRR_POLL_ARGS) == qman_cb_dqrr_consume);
         assert(released_frames == before);
         empty_completions++;
     }

@@ -2,9 +2,10 @@
 failed barrier or a failed allocation leaves behind in a bucket whose keys
 collide."""
 
+from ask_orch import kernel_line
 from ask_orch.process import run_process
 
-from _host_ehash_cumulative import (HEADER, PCD, ROOT, declaration, function)
+from _host_ehash_cumulative import (HEADER, PCD, declaration, function)
 
 import os
 from pathlib import Path
@@ -14,7 +15,7 @@ import re
 def test_ehash_cumulative(tmp_path):
     # Every patch that writes either file, in order, so the types are the
     # shipped ones: a later patch turns the key into a flexible array.
-    for patch in sorted((ROOT / "patches/kernel").glob("*.patch")):
+    for patch in sorted(kernel_line.patches().glob("*.patch")):
         if patch.name.startswith("999") or not re.search(
                 r"^diff --git a/(?:" + re.escape(PCD) + "|" + re.escape(HEADER) + ") ",
                 patch.read_text(), re.M):

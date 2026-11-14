@@ -1,0 +1,79 @@
+From 485ece5f80531636f5a760386ba8b75287ce5132 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sun, 20 Sep 2026 11:13:32 +0200
+Subject: [PATCH] moal: give each mlan spinlock its own lockdep class
+
+moal_init_lock() creates every lock mlan asks for, so spin_lock_init()
+at that one call site gives them all the same lockdep class. The first
+time mlan nests two of them -- wlan_request_cmd_lock() inside the TX
+list lock, on a station's first ADDBA -- lockdep reports
+
+  WARNING: possible recursive locking detected
+  kworker/u17:1/145 is trying to acquire lock:
+  (&mlock->lock){-.-.}-{2:2}, at: moal_spin_lock+0x24/0x5c [moal]
+  but task is already holding lock:
+  (&mlock->lock){-.-.}-{2:2}, at: moal_spin_lock+0x24/0x5c [moal]
+   wlan_request_cmd_lock [mlan]
+   wlan_prepare_cmd [mlan]
+   wlan_send_addba [mlan]
+   wlan_wmm_process_tx [mlan]
+
+and switches itself off for the rest of the run, so nothing after the
+first client association is checked. Register a dynamic key per lock
+and set its class from it; unregister before the free. Both are empty
+without CONFIG_LOCKDEP.
+
+Upstream-Status: Pending
+---
+ mlinux/moal_shim.c | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/mlinux/moal_shim.c b/mlinux/moal_shim.c
+index d7d1d2e..639657c 100644
+--- a/mlinux/moal_shim.c
++++ b/mlinux/moal_shim.c
+@@ -80,6 +80,8 @@ typedef struct _moal_lock {
+ 	spinlock_t lock;
+ 	/** Flags */
+ 	unsigned long flags;
++	/** Lockdep class of its own; empty without CONFIG_LOCKDEP */
++	struct lock_class_key key;
+ } moal_lock;
+ 
+ /********************************************************
+@@ -796,6 +798,15 @@ mlan_status moal_init_lock(t_void *pmoal, t_void **pplock)
+ 	if (!mlock)
+ 		return MLAN_STATUS_FAILURE;
+ 	spin_lock_init(&mlock->lock);
++	/* Every lock mlan asks for is initialised on the line above, so they
++	 * would all share the one lockdep class spin_lock_init() gives that
++	 * call site. The first time mlan then nests two of them -- the command
++	 * lock inside the TX list lock, on a station's first ADDBA -- lockdep
++	 * reports a recursive acquisition and switches itself off for the rest
++	 * of the run. A key per lock gives each its own class, which is also
++	 * what makes lockdep's ordering checks between them mean anything. */
++	lockdep_register_key(&mlock->key);
++	lockdep_set_class(&mlock->lock, &mlock->key);
+ 	*pplock = (t_void *)mlock;
+ 
+ 	atomic_inc(&handle->lock_count);
+@@ -816,9 +827,14 @@ mlan_status moal_free_lock(t_void *pmoal, t_void *plock)
+ 	moal_handle *handle = (moal_handle *)pmoal;
+ 	moal_lock *mlock = plock;
+ 
+-	kfree(mlock);
+-	if (mlock)
++	if (mlock) {
++		/* Before the free: the key's registration is what lockdep's
++		 * class for this lock hangs off. Waits for an RCU grace
++		 * period, and every caller is in process context. */
++		lockdep_unregister_key(&mlock->key);
+ 		atomic_dec(&handle->lock_count);
++	}
++	kfree(mlock);
+ 
+ 	return MLAN_STATUS_SUCCESS;
+ }
+-- 
+2.47.3
+

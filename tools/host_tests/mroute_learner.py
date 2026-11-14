@@ -7,6 +7,7 @@ the source: the three ordering rules this learner lives under cannot be
 observed from a passing test, only from code that never breaks them.
 """
 
+from ask_orch import kernel_line
 from ask_orch.process import run_process
 
 from _host_mroute_learner import (
@@ -683,7 +684,7 @@ def test_the_kernel_marks_a_commit_until_it_is_applied():
     published -- ordered by the publishing release -- until the last set
     update is in, cleared with a release the learner's acquire pairs with;
     and the mark sits beside the pair in struct net, read inline."""
-    patch = (ROOT / "patches/kernel/139-netfilter-nftables-commit-in-progress.patch").read_text()
+    patch = (kernel_line.patches() / "139-netfilter-nftables-commit-in-progress.patch").read_text()
     sections = dict(re.findall(r"\+\+\+ b/(\S+)\n(.*?)(?=\ndiff --git |\Z)", patch, re.S))
     commit = sections["net/netfilter/nf_tables_api.c"]
     assert commit.index("+\tWRITE_ONCE(net->nft.commit_applying, 1);") < \
@@ -695,7 +696,7 @@ def test_the_kernel_marks_a_commit_until_it_is_applied():
         sections["include/net/netfilter/nf_tables.h"]
     assert "+\tu8\t\t\tcommit_applying;" in sections["include/net/netns/nftables.h"]
     # Every build applies it; meta-ask lists its patches one by one.
-    recipe = (ROOT / "meta-ask/recipes-kernel/linux/linux-ask_6.18.bb").read_text()
+    recipe = kernel_line.recipe().read_text()
     listed = re.findall(r"file://(\d+)-\S+\.patch", recipe)
     assert "139" in listed and listed == sorted(listed)
 
@@ -753,8 +754,19 @@ def test_legacy_tables_and_tc_are_judged_as_well():
     assert "return !ingress && cdx_dscp_mirrored(dev, cookie);" in \
         function(htb, "cdx_tc_filter_mirrored")
 
-    patch = (ROOT / "patches/kernel/148-netfilter-port-probe.patch").read_text()
+    patch = (kernel_line.patches() / "148-netfilter-port-probe.patch").read_text()
     sections = dict(re.findall(r"\+\+\+ b/(\S+)\n(.*?)(?=\ndiff --git |\Z)", patch, re.S))
+    kernel = kernel_source()
+
+    def after(path, name, line):
+        body = function((kernel / path).read_text(), name)
+        return body[body.index(line):]
+
+    # Where a table's hooks are built and registered: by xt_register_table()
+    # itself, which also waits out a failed registration's readers (6.18), or
+    # by each family's registration, which patch 148 makes wait (6.12).
+    xt_hooks = "nf_register_net_hooks(" in function(
+        (kernel / "net/netfilter/x_tables.c").read_text(), "xt_register_table")
     for path, prefix in (("net/ipv4/netfilter/ip_tables.c", "ipt"),
                          ("net/ipv6/netfilter/ip6_tables.c", "ip6t")):
         body = sections[path]
@@ -768,20 +780,33 @@ def test_legacy_tables_and_tc_are_judged_as_well():
         # Every change to the family's tables is counted, each where nothing
         # reads what it changed any more, and nowhere else: a replacement
         # once xt_replace_table() has waited out the old table's readers, a
-        # registration once xt_register_table() has put its hooks in -- the
-        # NAT table's has none of its own -- and a removal once the table is
-        # freed. A registration that fails halfway already waits out the
-        # readers of the hooks it did register (xt_register_table()).
+        # registration once its hooks are in -- the NAT table's has none of
+        # its own -- and a removal once the table is freed. A registration
+        # that fails halfway waits out the readers of the hooks it did
+        # register before the table and its ops are freed.
         counted = "+\tnf_xt_changed(net);"
-        assert body.count("nf_xt_changed(net);") == 3, path
+        assert body.count("nf_xt_changed(net);") == (3 if xt_hooks else 4), path
         replace = _hunk_in(body, "__do_replace(")
         _ordered(replace, " \toldinfo = xt_replace_table(t, num_counters, newinfo, &ret);",
                  " \t\tgoto put_module;", counted)
-        _ordered(_hunk_in(body, f"__{prefix}_unregister_table("),
-                 " \txt_free_table_info(private);", " \tkfree(table);", counted)
-        register = next(h for head, h in _hunks(body)
-                        if f"int {prefix}_register_table(" in head)
-        _ordered(register, " \t\treturn PTR_ERR(new_table);", counted, " \treturn ret;")
+        if xt_hooks:
+            _ordered(_hunk_in(body, f"__{prefix}_unregister_table("),
+                     " \txt_free_table_info(private);", " \tkfree(table);", counted)
+            register = next(h for head, h in _hunks(body)
+                            if f"int {prefix}_register_table(" in head)
+            _ordered(register, " \t\treturn PTR_ERR(new_table);", counted, " \treturn ret;")
+        else:
+            _ordered(_hunk_in(body, f"__{prefix}_unregister_table("),
+                     " \txt_free_table_info(private);", counted)
+            register = [h for h in _hunks(body) if f"int {prefix}_register_table(" in h[0]]
+            nat = next(h for _, h in register if "template_ops" in h)
+            _ordered(nat, "+\tif (!template_ops) {", "+\t\tnf_xt_changed(net);", " \t\treturn 0;")
+            hooked = next(h for _, h in register if "nf_register_net_hooks" in h)
+            hooked = hooked[hooked.index(" \tret = nf_register_net_hooks(net, ops, num_ops);"):]
+            _ordered(hooked, " \tret = nf_register_net_hooks(net, ops, num_ops);",
+                     "+\tif (ret != 0) {", "+\t\tsynchronize_rcu();", " \t\tgoto out_free;",
+                     counted, " \treturn ret;")
+            assert "+\t\tops[i].hook_ops_type = NF_HOOK_OP_XTABLES;" in body
         hook = f"nf_{prefix}_probe_hook"
         assert f"+\trcu_assign_pointer({hook}, &{prefix}_probe_hook);" in body
         unpublish = body.index(f"+\tRCU_INIT_POINTER({hook}, NULL);")
@@ -791,9 +816,10 @@ def test_legacy_tables_and_tc_are_judged_as_well():
     # has no bucket for, connlimit and nftables' ct count one they cannot
     # count, recent one it cannot record.
     xt = sections["net/netfilter/x_tables.c"]
-    # x_tables builds a table's hooks itself and types them there, so the
-    # probe finds the table behind a hook whatever function runs it.
-    assert "+\t\t\tops[i].hook_ops_type = NF_HOOK_OP_XTABLES;" in xt
+    # Where x_tables builds a table's hooks itself it types them there, so
+    # the probe finds the table behind a hook whatever function runs it.
+    if xt_hooks:
+        assert "+\t\t\tops[i].hook_ops_type = NF_HOOK_OP_XTABLES;" in xt
     pure = xt[xt.index("+static const char *const xt_probe_pure[] = {"):]
     pure = pure[:pure.index("+};")]
     assert '"limit"' in pure
@@ -809,36 +835,44 @@ def test_legacy_tables_and_tc_are_judged_as_well():
     nat = sections["net/netfilter/nf_nat_core.c"]
     assert "+\t\t\tnat_ops[i].hook_ops_type = NF_HOOK_OP_NAT;" in nat
     assert "-struct nf_nat_lookup_hook_priv {" in nat
-    # What the probe reads under RCU goes only after a grace period, which
-    # Linux itself provides: a table registration that fails halfway waits
-    # out the readers of the hooks it did register before freeing them, the
-    # NAT core's hook ops go by RCU on unregistration and when a registration
-    # fails halfway, as their private data does, and a NAT table whose
-    # lookups failed halfway is freed only once the readers of the lookups
-    # that did register are gone.
-    kernel = kernel_source()
-
-    def after(path, name, line):
-        body = function((kernel / path).read_text(), name)
-        return body[body.index(line):]
-
-    _ordered(after("net/netfilter/x_tables.c", "xt_register_table",
-                   "ret = nf_register_net_hooks(net, ops, num_ops);"),
-             "synchronize_rcu();", "goto out;", "kfree(ops);")
-    failed = after("net/netfilter/nf_nat_core.c", "nf_nat_register_fn",
-                   "ret = nf_register_net_hooks(net, nat_ops, ops_count);")
-    _ordered(failed, "goto err_free_hooks;", "err_free_hooks:",
-             "kfree_rcu(priv, rcu_head);", "kfree_rcu(nat_ops, rcu);")
-    unregistered = after("net/netfilter/nf_nat_core.c", "nf_nat_unregister_fn",
-                         "nf_unregister_net_hooks(net, nat_ops, ops_count);")
-    _ordered(unregistered, "kfree_rcu(priv, rcu_head);", "kfree_rcu(nat_ops, rcu);")
-    assert "kfree(nat_ops)" not in failed + unregistered
-    for path, init, prefix, family in (
-            ("net/ipv4/netfilter/iptable_nat.c", "iptable_nat_table_init", "ipt", "IPV4"),
-            ("net/ipv6/netfilter/ip6table_nat.c", "ip6table_nat_table_init", "ip6t", "IPV6")):
-        _ordered(after(path, init, f"ret = {prefix}_nat_register_lookups(net);"),
-                 "if (ret < 0) {", f"xt_unregister_table_pre_exit(net, NFPROTO_{family}, \"nat\");",
-                 "synchronize_rcu();", f"{prefix}_unregister_table_exit(net, \"nat\");")
+    # What the probe reads under RCU goes only after a grace period: a table
+    # registration that fails halfway waits out the readers of the hooks it
+    # did register before freeing them, the NAT core's hook ops go by RCU on
+    # unregistration and when a registration fails halfway, as their private
+    # data does, and a NAT table whose lookups failed halfway is freed only
+    # once the readers of the lookups that did register are gone. Linux
+    # provides all of it where x_tables registers the hooks (6.18); before,
+    # patch 148 does.
+    if xt_hooks:
+        _ordered(after("net/netfilter/x_tables.c", "xt_register_table",
+                       "ret = nf_register_net_hooks(net, ops, num_ops);"),
+                 "synchronize_rcu();", "goto out;", "kfree(ops);")
+        failed = after("net/netfilter/nf_nat_core.c", "nf_nat_register_fn",
+                       "ret = nf_register_net_hooks(net, nat_ops, ops_count);")
+        _ordered(failed, "goto err_free_hooks;", "err_free_hooks:",
+                 "kfree_rcu(priv, rcu_head);", "kfree_rcu(nat_ops, rcu);")
+        unregistered = after("net/netfilter/nf_nat_core.c", "nf_nat_unregister_fn",
+                             "nf_unregister_net_hooks(net, nat_ops, ops_count);")
+        _ordered(unregistered, "kfree_rcu(priv, rcu_head);", "kfree_rcu(nat_ops, rcu);")
+        assert "kfree(nat_ops)" not in failed + unregistered
+        for path, init, prefix, family in (
+                ("net/ipv4/netfilter/iptable_nat.c", "iptable_nat_table_init", "ipt", "IPV4"),
+                ("net/ipv6/netfilter/ip6table_nat.c", "ip6table_nat_table_init", "ip6t", "IPV6")):
+            _ordered(after(path, init, f"ret = {prefix}_nat_register_lookups(net);"),
+                     "if (ret < 0) {", f"xt_unregister_table_pre_exit(net, NFPROTO_{family}, \"nat\");",
+                     "synchronize_rcu();", f"{prefix}_unregister_table_exit(net, \"nat\");")
+    else:
+        failed = next(text for head, text in _hunks(nat) if "nf_nat_register_fn(" in head and
+                      "nf_register_net_hooks" in text)
+        _ordered(failed, " \t\tret = nf_register_net_hooks(net, nat_ops, ops_count);",
+                 " \t\t\tmutex_unlock(&nf_nat_proto_mutex);", "+\t\t\tsynchronize_rcu();",
+                 " \t\t\t\tkfree(nat_ops[i].priv);", " \t\t\tkfree(nat_ops);")
+        _ordered(nat, "-\t\tkfree(nat_ops);", "+\t\tkvfree_rcu_mightsleep(nat_ops);")
+        for path, prefix in (("net/ipv4/netfilter/iptable_nat.c", "ipt"),
+                             ("net/ipv6/netfilter/ip6table_nat.c", "ip6t")):
+            _ordered(sections[path], f" \tret = {prefix}_nat_register_lookups(net);",
+                     "+\tif (ret < 0) {", "+\t\tsynchronize_rcu();",
+                     f" \t\t{prefix}_unregister_table_exit(net, \"nat\");")
     dump = sections["net/netfilter/nfnetlink_hook.c"]
     assert "+\tcase NF_HOOK_OP_XTABLES:" in dump and "+\tcase NF_HOOK_OP_NAT:" in dump
     assert "+\tatomic_t xt_seq;" in sections["include/net/netns/netfilter.h"]

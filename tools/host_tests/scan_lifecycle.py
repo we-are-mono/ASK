@@ -2,32 +2,17 @@
 
 from ask_orch.process import run_process
 
-import io
 import os
 from pathlib import Path
 import re
-import subprocess
-import tarfile
 
+import _host_mwifiex as mwifiex
 from _host_qos_lifecycle import (function)
-
-ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_scan_lifecycle(tmp_path):
-    recipe = ROOT / "meta-ask/recipes-kernel/nxp-mwifiex/nxp-mwifiex_git.bb"
-    source = Path(os.environ.get("ASK_MWIFIEX_SOURCE", ROOT /
-        "meta-ask/build/tmp/work/ask_ls1046a-oe-linux/nxp-mwifiex/git/git"))
-    revision = re.search(r'SRCREV = "([0-9a-f]+)"', recipe.read_text())[1]
-    # Apply the entire recipe series to its pinned source, independently of
-    # whether bitbake's working copy has rebuilt since the latest patch.
-    archive = subprocess.check_output(["git", "archive", revision], cwd=source)
-    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-        tar.extractall(tmp_path, filter="data")
-    for patch in re.findall(r"file://(\S+\.patch)", recipe.read_text()):
-        run_process(["git", "apply", "--whitespace=error",
-                        str(recipe.parent / "files" / patch)],
-                       cwd=tmp_path, check=True)
+    # The entire recipe series on its pinned source.
+    mwifiex.unpack(tmp_path)
 
     def read(name):
         return (tmp_path / "mlinux" / name).read_text().replace(
@@ -41,16 +26,21 @@ def test_scan_lifecycle(tmp_path):
     end = sta.index("\n#if CFG80211_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)", start)
     scan = ("static int woal_cfg80211_scan(struct wiphy *wiphy, "
             "struct cfg80211_scan_request *request)" + sta[start:end])
+    # What delivers a queued scan result: woal_send_cfg_bss_scan_result() in
+    # the release the 6.18 line pins, woal_send_bss_scan_result() before.
+    send = next(name for name in ("woal_send_cfg_bss_scan_result", "woal_send_bss_scan_result")
+                if re.search(rf"^static void {name}\(", main, re.M))
     names = ["woal_cfg80211_scan_busy", "woal_cfg80211_scan_begin",
              "woal_cfg80211_scan_complete", "woal_cfg80211_scan_stop",
              "woal_cfg80211_scan_restart", "woal_scan_timeout_handler",
-             "woal_send_cfg_bss_scan_result", "woal_terminate_workqueue"]
+             send, "woal_terminate_workqueue"]
     (tmp_path / "scan_production.inc").write_text(
         "\n".join(function(main, n) for n in names)
         + "\n".join(function(ioctl, n) for n in [
             "woal_scan_pending_start", "woal_scan_pending_complete",
             "woal_cancel_scan"])
-        + function(shim, "woal_send_bss_scan_result_event") + scan)
+        + function(shim, "woal_send_bss_scan_result_event") + scan
+        + f"\n#define send_scan_result {send}\n")
 
     # Large teardown/init functions are cross-compiled separately. Check
     # their wiring here as well as executing the actual queue teardown below.

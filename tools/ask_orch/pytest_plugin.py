@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from ask_orch import release
+from ask_orch import kernel_line, release
 from ask_orch.artifacts import artifact_dir, prune_runs, record, runs_root
 from ask_orch.lifecycle import bench_lock
 from ask_orch.provenance import checkout
@@ -42,6 +42,12 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     config._ask_broken = None
     config._ask_failed = set()
+    # Every run is about one kernel line: its sources, its build tree, and
+    # the DUT image the preflight expects.
+    try:
+        config._ask_line = kernel_line.current()
+    except ValueError as error:
+        raise pytest.UsageError(str(error)) from None
     if hasattr(config, "workerinput"):
         config._ask_run_dir = Path(config.workerinput["ask_run_dir"])
         os.environ["ASK_TEST_RUN_DIR"] = str(config._ask_run_dir)
@@ -91,6 +97,7 @@ def pytest_configure(config):
             "ASK_WAN_IP",
             "ASK_WAN_IPERF_IP",
             "ASK_WAN_INJECT_IF",
+            "ASK_LINE",
             "ASK_KERNEL_SOURCE",
             "ASK_FLOWTABLE_BASELINE",
             *release.variables(),
@@ -103,6 +110,7 @@ def pytest_configure(config):
         {
             "revision": source["revision"],
             "checkout": source,
+            "line": config._ask_line,
             "packages": versions,
             "bench": settings,
             "release": config.getoption("--release"),
@@ -329,8 +337,8 @@ def pytest_runtest_makereport(item, call):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """A release run's outcome goes to the ledger with the boot and image it
-    ran on, as the session's DUT records left them."""
+    """A release run's outcome goes to the ledger with the kernel line, boot
+    and image it ran on, as the session's DUT records left them."""
     config = session.config
     run = config.getoption("--release-run")
     # A refused invocation ran nothing, and a collection proves nothing.
@@ -348,6 +356,7 @@ def pytest_sessionfinish(session, exitstatus):
         "run": run,
         "revision": config._ask_source["revision"],
         "checkout": config._ask_source["sha256"],
+        "line": config._ask_line,
         "started": config._ask_started,
         "finished": time.time(),
         "exitstatus": int(exitstatus),

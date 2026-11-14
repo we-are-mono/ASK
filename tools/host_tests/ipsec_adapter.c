@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "cdx_compat.inc"
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -1068,12 +1069,10 @@ struct netlink_ext_ack { const char *_msg; };
 struct sk_buff;
 struct xfrmdev_ops {
 	void *owner;
-	int (*xdo_dev_state_add)(struct net_device *dev, struct xfrm_state *x,
+	int (*xdo_dev_state_add)(CDX_XDO_DEV(dev) struct xfrm_state *x,
 				 struct netlink_ext_ack *extack);
-	void (*xdo_dev_state_delete)(struct net_device *dev,
-				     struct xfrm_state *x);
-	void (*xdo_dev_state_free)(struct net_device *dev,
-				   struct xfrm_state *x);
+	void (*xdo_dev_state_delete)(CDX_XDO_DEV(dev) struct xfrm_state *x);
+	void (*xdo_dev_state_free)(CDX_XDO_DEV(dev) struct xfrm_state *x);
 	bool (*xdo_dev_offload_ok)(struct sk_buff *skb, struct xfrm_state *xs);
 	void (*xdo_dev_state_update_stats)(struct xfrm_state *x);
 	int (*xdo_dev_policy_add)(struct xfrm_policy *x,
@@ -1332,9 +1331,10 @@ static bool xfrm_flowtable_enabled(struct net *net)
 #include "ipsec_production.inc"
 
 /* xfrm calls a provider bonding cannot borrow with the state's own device
- * (xfrm_dev_state_add(), xfrm_dev_state_delete()), as the bench does. */
-#define ft_xdo_state_add(x, ack) (ft_xdo_state_add)((x)->xso.dev, (x), (ack))
-#define ft_xdo_state_delete(x) (ft_xdo_state_delete)((x)->xso.dev, (x))
+ * (xfrm_dev_state_add(), xfrm_dev_state_delete()) where the line passes one,
+ * as the bench does. */
+#define ft_xdo_state_add(x, ack) (ft_xdo_state_add)(CDX_XDO_DEV_ARG((x)->xso.dev) (x), (ack))
+#define ft_xdo_state_delete(x) (ft_xdo_state_delete)(CDX_XDO_DEV_ARG((x)->xso.dev) (x))
 
 /* --- the bench ------------------------------------------------------- */
 

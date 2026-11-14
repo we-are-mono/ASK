@@ -69,7 +69,10 @@ def test_rollback(tmp_path, request):
         identity = asyncio.run(console_python(con, image_script(), timeout=120))
         image = console_json(identity["stdout"])
         problems = manifest.verify(Path(__file__).resolve().parents[2], image)
-        record("firmware", {"image": image, "build_problems": problems}, nodeid="session")
+        line = request.config._ask_line
+        record("firmware", {"image": image, "build_problems": problems, "line": line}, nodeid="session")
+        mismatch = manifest.line_problem(image, line)
+        assert not mismatch, mismatch
         if request.config.getoption("--release"):
             assert not problems, ("DUT image was not built from this checkout ("
                                   + "; ".join(problems) + "); " + manifest.REMEDY)

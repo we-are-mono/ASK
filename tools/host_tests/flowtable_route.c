@@ -14,6 +14,7 @@
 #define RTN_UNICAST 1
 #define RTN_LOCAL 2
 #define RTCF_LOCAL 0x80000000U
+typedef uint32_t __be32;
 struct net_device { int ifindex, flags; };
 struct net { struct net_device *loopback_dev; };
 struct flowi4 {

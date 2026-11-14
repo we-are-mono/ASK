@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Build the DUT receive probe against the just-built kernel and moal headers."""
+"""Build the DUT receive probe against the just-built kernel and moal headers,
+those of the kernel line ASK_LINE names."""
 import os
 from pathlib import Path
 import shlex
@@ -9,7 +10,10 @@ import sys
 
 tests = Path(__file__).resolve().parent
 repo = tests.parents[2]
-work = repo / "meta-ask/build/tmp"
+sys.path.insert(0, str(repo / "tools"))
+from ask_orch import kernel_line  # noqa: E402
+
+work = kernel_line.tmpdir()
 driver = work / "work/ask_ls1046a-oe-linux/nxp-mwifiex/git"
 source = driver / "git"
 dest = Path(sys.argv[1]).resolve()

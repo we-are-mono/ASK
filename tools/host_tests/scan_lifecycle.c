@@ -268,7 +268,7 @@ static void deliver(void)
 {
     struct woal_event *e=queued_event;
     assert(e); queued_event=NULL;
-    woal_send_cfg_bss_scan_result(e->priv,e->scan_generation); free(e);
+    send_scan_result(e->priv,e->scan_generation); free(e);
 }
 static void flush_work(struct work_struct *w)
 {
@@ -363,7 +363,7 @@ static void completion_interleavings(void)
     firmware_report(&sta); inform_hook=reuse_during_report; deliver();
     assert(h.scan_request==&req && h.scan_generation!=old && !req.done);
     assert(h.scan_timeout_work.pending);
-    woal_send_cfg_bss_scan_result(&sta,old); /* stale event already queued */
+    send_scan_result(&sta,old); /* stale event already queued */
     assert(!req.done);
     firmware_report(&sta); deliver(); assert(req.done==1 && completions==2);
     reset(); assert(woal_cfg80211_scan(NULL,&req)==0);
@@ -440,7 +440,7 @@ static void completion_orders(void)
             switch(order[i]) {
             case 0:
                 woal_scan_pending_complete(&h);
-                woal_send_cfg_bss_scan_result(p,generation);
+                send_scan_result(p,generation);
                 break;
             case 1: woal_cancel_scan(p,MOAL_IOCTL_WAIT); break;
             case 2: timeout(); break;

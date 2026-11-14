@@ -26,8 +26,8 @@ CMM or per-flow FCI commands. CDX builds the classifier during
 
 | Responsibility | Source |
 | --- | --- |
-| Native callback context, shared handles and route integration | [Kernel patch 140](../../patches/kernel/140-ask-flowtable-context.patch) |
-| Whether an nftables commit is still being applied, for routed multicast confirmation; whether nf_tables (`nft_port_dependent()`) or iptables-legacy (`nf_xt_port_dependent()`, an ip_tables/ip6_tables walker reached through hooks typed `NF_HOOK_OP_XTABLES` and the NAT core's `NF_HOOK_OP_NAT`) could tell a routed group's streams apart by port; and `net->nf.xt_seq`, the count of x_tables table changes a caller re-asks on | [Kernel patches 139](../../patches/kernel/139-netfilter-nftables-commit-in-progress.patch) and [148](../../patches/kernel/148-netfilter-port-probe.patch) |
+| Native callback context, shared handles and route integration | [Kernel patch 140](../../patches/kernel/6.18/140-ask-flowtable-context.patch) |
+| Whether an nftables commit is still being applied, for routed multicast confirmation; whether nf_tables (`nft_port_dependent()`) or iptables-legacy (`nf_xt_port_dependent()`, an ip_tables/ip6_tables walker reached through hooks typed `NF_HOOK_OP_XTABLES` and the NAT core's `NF_HOOK_OP_NAT`) could tell a routed group's streams apart by port; and `net->nf.xt_seq`, the count of x_tables table changes a caller re-asks on | [Kernel patches 139](../../patches/kernel/6.18/139-netfilter-nftables-commit-in-progress.patch) and [148](../../patches/kernel/6.18/148-netfilter-port-probe.patch) |
 | Rule decoding, binding and admission | [ask_flowtable_core.c](../../cdx/ask_flowtable_core.c), sharing state through [ask_flowtable_internal.h](../../cdx/ask_flowtable_internal.h) |
 | Dependency watches, invalidation and the egress hook | [ask_flowtable_watch.c](../../cdx/ask_flowtable_watch.c) |
 | IPsec packet offload | [ask_flowtable_ipsec.c](../../cdx/ask_flowtable_ipsec.c) |
@@ -47,8 +47,11 @@ The private interface uses GPL-only exports in `ASK_CDX_FLOWTABLE`. It exposes
 typed rules, counters and opaque hardware handles, without CDX control/device
 structures or firmware objects. It is maintained with this repository, with no
 stable binary ABI promise. The adapter depends on `cdx` and `nf_flow_table`;
-CDX has no flowtable-module dependency. Kernel integration targets the pinned
-[6.12.112 recipe](../../meta-ask/recipes-kernel/linux/linux-ask_6.12.bb) and SDK source.
+CDX has no flowtable-module dependency. Kernel integration targets each
+pinned kernel line, [6.12](../../meta-ask/recipes-kernel/linux/linux-ask_6.12.bb) and
+[6.18](../../meta-ask/recipes-kernel/linux/linux-ask_6.18.bb), with its SDK source; the
+patch links above are the 6.18 line's, and each line carries the same numbers
+in `patches/kernel/<line>/`.
 
 ## Startup and configuration seal
 

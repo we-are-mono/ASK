@@ -106,7 +106,7 @@ Additional system dependencies depend on the selected suite:
 |---|---|
 | Python harness checks in `tools/host_tests/harness.py` | Runner environment only; no board or compiler |
 | Compiled host regressions | C/C++ compiler, headers, standard C++ library, AddressSanitizer and UndefinedBehaviorSanitizer; Debian's `build-essential` toolchain supplies these. `HOSTCC` selects a compiler instead of `cc`. |
-| SDK/FMC/FMLIB host regressions | Patched kernel and pinned vendor source trees from an image build of this checkout. `ASK_KERNEL_SOURCE` overrides the kernel tree; it must be one such a build prepared. |
+| SDK/FMC/FMLIB host regressions | Patched kernel and pinned vendor source trees from an image build of this checkout, for the run's kernel line (`LINE` / `ASK_LINE`). `ASK_KERNEL_SOURCE` overrides the kernel tree; it must be one such a build prepared for that line. |
 | DUT traffic tests | WAN agent, `ip`/`bridge`/`tc`, `iptables`, `conntrack`, `ethtool`, `iperf3`, `tcpdump`, and access to the DUT UART and LAN guest agent |
 | PPPoE tests and ISP profile | WAN-side `pppd` and `/usr/sbin/pppoe-server`, kernel PPPoE support, and the corresponding tools/modules in the DUT image |
 | Image building and booting | `make setup` build dependencies, kas, a TFTP server and the staged image/DTB |
@@ -143,8 +143,8 @@ Packages / services:
   host dependencies (see `make setup`, which installs them). The image is
   built with `kas build`, never a bare `bitbake`.
 - **A TFTP server** exporting the staged image directory, reachable from
-  the DUT's U-Boot. `make stage-image` copies the built image into the TFTP
-  root under the name U-Boot fetches.
+  the DUT's U-Boot. `make stage-image` copies the built image and device tree
+  into the TFTP root under the names U-Boot fetches.
 - **`iperf3`** — run as a server here (see [iperf3 server](#the-iperf3-server)).
 - **`libvirt` + `libvirt-clients`** — only if the client is a VM on this
   host. `virsh` reaches the client's QEMU guest agent.
@@ -301,18 +301,28 @@ the DUT throughout the run.
 From the repo root on the orchestrator:
 
 ```sh
-make setup          # one-time: install host build dependencies
-make ask-image      # kas build of the ASK test image
-make stage-image    # copy the built image into the TFTP root
+make setup                    # one-time: install host build dependencies
+make ask-image LINE=6.18      # kas build of the ASK test image for one kernel line
+make stage-image LINE=6.18    # copy that line's image and device tree into the TFTP root
 ```
 
+One checkout builds every kernel line it has a recipe for, side by side:
+6.12 (Linux 6.12 with NXP's lf-6.12 SDK, the line OpenWrt ships) and 6.18.
+`LINE` picks one and defaults to the newest; the harness's name for it,
+`ASK_LINE`, sets it too. A line is its recipe
+(`meta-ask/recipes-kernel/linux/linux-ask_<line>.bb`, over the shared
+`linux-ask.inc`), its patch series (`patches/kernel/<line>/`) and its SDK pin
+(`pins/<line>/nxp-sdk-srcrev.inc`). Each builds in a tree of its own,
+`meta-ask/build/tmp-<line>`, so switching lines rebuilds neither.
+
 `make ask-image` is a thin wrapper around `kas build` against the meta-ask
-manifest; `make stage-image` places the image where U-Boot fetches it.
+manifest, passing the line as `ASK_LINE`; `make stage-image` places the image
+where U-Boot fetches it.
 
 Always prefer KASAN for testing and debugging. `make ask-image` always enables
 KASAN memory-error instrumentation. The DUT
 suite refuses to run on a kernel without `CONFIG_KASAN=y`. Direct kas builds
-must also set `KASAN=1`.
+must also set `KASAN=1`, and `ASK_LINE` for a line other than the newest.
 
 ## Booting the image
 
@@ -321,6 +331,23 @@ the DUT's U-Boot prompt (interrupt autoboot over the serial console), run
 the board's `ask` boot flow, which TFTPs the image from the orchestrator and
 boots it in RAM. Point U-Boot's environment at your TFTP server's address
 and the staged image name.
+
+`make stage-image` stages each line as `Image-ask-<line>.gz` and
+`mono-gateway-dk-<line>.dtb`, and points `Image-ask-test.gz` and
+`mono-gateway-dk.dtb` (hard links) at the line just staged, so a flow that
+fetches those two boots that line without an environment change. The KASAN
+initramfs is about 360 MiB uncompressed, so the flow loads it high, above the
+kernel's final footprint and its decompression window:
+
+```
+ask=setenv bootargs console=ttyS0,115200 earlycon=uart8250,mmio,0x21c0500 panic=10; run askbody
+askbody=setenv kernel_comp_size 0x18000000; setenv kernel_comp_addr_r 0xa8000000; setenv fdt_high 0xffffffff; setenv initrd_high 0xffffffff; tftpboot 0xc0000000 Image-ask-test.gz; tftpboot 0xe0000000 mono-gateway-dk.dtb; booti 0xc0000000 - 0xe0000000
+```
+
+To boot a staged line by name, set `bootargs` and the memory window as `ask`
+does, then load that line's pair:
+`tftpboot 0xc0000000 Image-ask-6.12.gz; tftpboot 0xe0000000 mono-gateway-dk-6.12.dtb; booti 0xc0000000 - 0xe0000000`.
+`make stage-image` prints these for every line it finds staged.
 
 The root filesystem is an initramfs, so **every boot is clean** — on-DUT
 changes do not persist across a reboot. The boot service retains the kernel
@@ -337,6 +364,7 @@ without shell interpolation, including values with spaces.
 
 | Variable | What it points at | Setting |
 |---|---|---|
+| `LINE` / `ASK_LINE` | Kernel line the run is about: the patch series and build tree host tests read, the image the DUT must run, the line the release ledger records | Default: the newest line (`6.18`); a DUT booted into another line's image fails preflight |
 | `DUT_IP` / `ASK_TARGET_IP` | DUT address used by traffic tests | Optional; tests usually discover interface addresses |
 | `ASK_TARGET_DEV` | DUT serial device | Required |
 | `ASK_TARGET_AGENT_DEV` | DUT's USB serial port (`ttyGS0` on its USB-C data port), e.g. `/dev/serial/by-id/usb-Mono_ASK_test_agent_<eth4 MAC>-if00` | Optional; carries the agent instead of the UART, without its line rate |
@@ -627,15 +655,17 @@ C compiler and run without the board:
 pytest -c tools/pyproject.toml tools/host_tests -k qos
 ```
 
-The SDK regression uses the patched kernel source from the build tree.
+The SDK regression uses the patched kernel source from the line's build tree,
+`meta-ask/build/tmp-<line>/work-shared/ask-ls1046a/kernel-source`.
 Set `ASK_KERNEL_SOURCE` to test another tree an image build prepared. Missing
 SDK or vendor sources fail the host suite with an actionable error; no SDK
 tests silently skip. Build the image first to fetch and patch the required
-sources. The tree follows `patches/kernel/` only once a build has run since
-the series changed, so it carries the build record of the kernel inputs it
+sources. The tree follows `patches/kernel/<line>/` only once a build has run
+since the series changed, so it carries the build record of the kernel inputs it
 was prepared from (`.ask-provenance.json`). A tree whose record differs from
-the checkout fails every test that compiles from it until the image is
-rebuilt, rather than testing the previous patches.
+the checkout, or that another line's build prepared, fails every test that
+compiles from it until the image is rebuilt, rather than testing the previous
+patches.
 Forced-drain cases hold frames in a queue until timeout or fail its query,
 then verify that pool buffers and skb-backed frames are reclaimed before
 the interface context is released. Persistent hardware errors and prefetch
@@ -751,8 +781,8 @@ against one checkout and one DUT image:
 | `startup` | `startup_tests` | `rdinit=/bin/sh`; ends its boot |
 
 ```sh
-make test-release RUN=suite      # one entry, exactly as declared
-make release-status              # what passed for this checkout, what is left
+make test-release RUN=suite LINE=6.18   # one entry, exactly as declared, on one kernel line
+make release-status LINE=6.18           # what passed for this checkout and line, what is left
 ```
 
 `make test-release` sets the entry's variables and clears the other entries'.
@@ -769,7 +799,9 @@ A release also refuses an image this checkout did not build, before any case
 runs. Every recipe in `meta-ask` inherits `ask-provenance`, which records the
 checkout files it builds from, each by content: the recipe, its local sources,
 its external source tree and the directories it declares. The kernel declares
-`patches/kernel/` and `dts/`, and the image declares the whole layer. A file
+its line's `patches/kernel/<line>/` and `pins/<line>/nxp-sdk-srcrev.inc`, the
+shared `linux-ask.inc` its recipe requires, and `dts/`; the image declares the
+whole layer. A file
 counts if git would commit it, under the checkout's own ignore rules. The
 record is taken before configure, and any change to that set of files takes
 it again and rebuilds what depends on it. A local source that changes while
@@ -783,19 +815,22 @@ device tree from another kernel build. Where the build tree still holds the
 image's record, the refusal names the files that changed; otherwise it says
 the build tree did not last build that part of the image. Rebuilding, staging
 and booting the image clears all of them. Outside a release the same differences are a warning, because
-testing an older image on purpose is legitimate. The test agent's installed
+testing an older image on purpose is legitimate. An image of another kernel
+line than the run's, which the kernel record names by its recipe, fails
+preflight in every run: the run would read one line's sources against the
+other's kernel. The test agent's installed
 sources are compared separately, which also catches an agent patched in place
 on the DUT.
 
-Each finished run appends its outcome, boot ID and DUT image identity (the
-kernel's build notes, a digest of `/lib/modules/<release>`, the build records
-and the device tree's property) to
+Each finished run appends its outcome, kernel line, boot ID and DUT image
+identity (the kernel's build notes, a digest of `/lib/modules/<release>`, the
+build records and the device tree's property) to
 `release-ledger.jsonl` beside the run directories, or to
 `ASK_RELEASE_LEDGER`. Set `ASK_TEST_ARTIFACTS` to durable storage for a release:
-the default root is a tmpfs. `make release-status` takes each entry's latest
-run against the current checkout fingerprint and exits 0 only when all of them
-passed on the same image as `suite`. Any edit to the checkout starts the matrix
-again.
+the default root is a tmpfs. Each line qualifies on its own: `make
+release-status LINE=<line>` takes each entry's latest run of that line against
+the current checkout fingerprint and exits 0 only when all of them passed on
+the same image as `suite`. Any edit to the checkout starts the matrix again.
 
 Run the entries that end their boot last on each boot, then boot the staged
 image again. The transit-off run needs a boot with `cdx.transit=0` added to

@@ -29,7 +29,7 @@ still open.
 
 | Instrument | What it answers |
 | --- | --- |
-| `patches/kernel/141-ask-flowtable-teardown-attribution.patch` | Which of the flowtable GC's four teardown conditions fired |
+| `patches/kernel/<line>/141-ask-flowtable-teardown-attribution.patch` | Which of the flowtable GC's four teardown conditions fired |
 | `CONFIG_NF_FLOW_TABLE_PROCFS` (`meta-ask/recipes-kernel/linux/files/ask.cfg`) | Offload work-queue backlog, and the host for the counters above |
 | `flowtable_work()` / `work_peak()` in the churn proof | Backlog peak while a retirement drains, and exact cumulative causes per round |
 | `settled()` absences, `hardware_window` `missing`/`unexpected` | Flows caught between teardown and readmission |

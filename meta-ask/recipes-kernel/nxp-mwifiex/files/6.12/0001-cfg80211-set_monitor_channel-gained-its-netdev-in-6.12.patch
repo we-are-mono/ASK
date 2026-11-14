@@ -1,0 +1,51 @@
+From: Tomaz Zaman <tomaz@mono.si>
+Subject: [PATCH] cfg80211: set_monitor_channel gained its netdev in 6.12, not 6.13
+
+The driver adds the struct net_device * argument to .set_monitor_channel
+only from 6.13, but the prototype changed in 6.12:
+
+  4dae80dd259b ("wifi: cfg80211: pass net_device to .set_monitor_channel")
+  authored 2024-10-09, released in v6.12
+
+Building against a native 6.12 cfg80211 therefore assigns a function of the
+wrong type into cfg80211_ops and fails:
+
+  moal_sta_cfg80211.c:524:32: error: initialization of
+  'int (*)(struct wiphy *, struct net_device *, struct cfg80211_chan_def *)'
+  from incompatible pointer type
+  'int (*)(struct wiphy *, struct cfg80211_chan_def *)'
+
+This does not show up in builds that use the backports package, because
+there CFG80211_VERSION_CODE reports the backport's own base version rather
+than the running kernel's, and that base predates the change. Comparing
+against 6.12.0 is right for both: a backport older than 6.12 still selects
+the old signature.
+
+Upstream-Status: Pending [sent to NXP; the guard is wrong for any native
+6.12 cfg80211, not only for this build]
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ mlinux/moal_sta_cfg80211.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+--- a/mlinux/moal_sta_cfg80211.c
++++ b/mlinux/moal_sta_cfg80211.c
+@@ -127,7 +127,7 @@
+ #ifdef UAP_SUPPORT
+ #if CFG80211_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
+ static int woal_cfg80211_set_monitor_channel(struct wiphy *wiphy,
+-#if CFG80211_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++#if CFG80211_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+ 					     struct net_device *dev,
+ #endif
+ 					     struct cfg80211_chan_def *chandef);
+@@ -699,7 +699,7 @@
+ #ifdef UAP_SUPPORT
+ #if CFG80211_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
+ static int woal_cfg80211_set_monitor_channel(struct wiphy *wiphy,
+-#if CFG80211_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++#if CFG80211_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+ 					     struct net_device *dev,
+ #endif
+ 					     struct cfg80211_chan_def *chandef)

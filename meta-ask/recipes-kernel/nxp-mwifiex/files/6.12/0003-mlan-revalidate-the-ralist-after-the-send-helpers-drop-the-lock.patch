@@ -1,0 +1,72 @@
+From 651ac1109320fc2a6ab7d21c6cbb18880ca52214 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sun, 20 Sep 2026 03:59:10 +0200
+Subject: [PATCH 3/4] mlan: revalidate the ralist after the send helpers drop
+ the lock
+
+wlan_dequeue_tx_packet() receives ptr from wlan_wmm_get_next_priolist_ptr()
+with ra_list_spinlock held and passes it to wlan_11n_aggregate_pkt() or
+wlan_send_single_packet(), both of which release the lock around the
+host write and return with it released. It then reads ptr->sta and
+ptr->sta->ps_sleep without the lock.
+
+wlan_wmm_delete_peer_ralist() -- hostapd's del_station, through
+woal_deauth_station() -- frees the ralist and its sta table under that
+same lock, so a station leaving while its queue is being drained is a
+use-after-free of a 96-byte raListTbl. KASAN, on an AP with one client
+under a UDP flood that made hostapd deauthenticate it:
+
+  BUG: KASAN: slab-use-after-free in wlan_wmm_process_tx+0x1fb4 [mlan]
+  Read of size 8 at addr ffff00080c9ee2c8 by task kworker/u17:0/324
+  Freed by task 242: wlan_wmm_delete_peer_ralist <- wlan_ops_uap_ioctl
+    <- woal_deauth_station <- woal_cfg80211_del_station
+
+The read is offset 72 of the ralist: ptr->sta.
+
+Take the lock again, confirm the ralist is still on its tid list with
+wlan_is_ralist_valid() -- the same check the senders make after they
+re-lock -- and copy the address out before calling
+wlan_update_ralist_tx_pause(), which takes the lock itself.
+
+Upstream-Status: Pending
+---
+ mlan/mlan_wmm.c | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/mlan/mlan_wmm.c b/mlan/mlan_wmm.c
+index 52c6e8a..ba00509 100644
+--- a/mlan/mlan_wmm.c
++++ b/mlan/mlan_wmm.c
+@@ -1955,8 +1955,27 @@ static int wlan_dequeue_tx_packet(pmlan_adapter pmadapter)
+ 		}
+ 	}
+ 
+-	if (ptr->sta && ptr->sta->ps_sleep) {
+-		wlan_update_ralist_tx_pause(priv, ptr->ra, 1);
++	/* The send helpers above return with ra_list_spinlock released, and
++	 * wlan_wmm_delete_peer_ralist() frees both the ralist and its sta
++	 * table under that lock. Re-validate ptr before reading it again and
++	 * copy out what is needed: wlan_update_ralist_tx_pause() takes the
++	 * lock itself, so it cannot be called while holding it.
++	 */
++	{
++		t_u8 ps_sleep = MFALSE;
++
++		pmadapter->callbacks.moal_spin_lock(pmadapter->pmoal_handle,
++						    priv->wmm.ra_list_spinlock);
++		if (wlan_is_ralist_valid(priv, ptr, ptrindex) && ptr->sta &&
++		    ptr->sta->ps_sleep) {
++			memcpy_ext(pmadapter, ra, ptr->ra, MLAN_MAC_ADDR_LENGTH,
++				   MLAN_MAC_ADDR_LENGTH);
++			ps_sleep = MTRUE;
++		}
++		pmadapter->callbacks.moal_spin_unlock(pmadapter->pmoal_handle,
++						      priv->wmm.ra_list_spinlock);
++		if (ps_sleep)
++			wlan_update_ralist_tx_pause(priv, ra, 1);
+ 	}
+ 
+ 	LEAVE();
+-- 
+2.47.3
+

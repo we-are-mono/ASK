@@ -1,13 +1,13 @@
 """The release matrix: every run a release needs, and the ledger of how each
-one went against a checkout and a DUT image.
+one went against a checkout, a kernel line and a DUT image.
 
 One invocation cannot hold the whole qualification. Soaks take an hour,
 some cases run in a mode chosen for the run, and some end the boot they run
 on. Each of those is an entry here with the settings that select it; the
 plugin refuses a release run that narrows or changes its entry, and appends
 its outcome to the ledger. `python -m ask_orch.release status` then says,
-for the current checkout, which entries passed on one image and which are
-still missing.
+for the current checkout and the kernel line ASK_LINE names, which entries
+passed on one image and which are still missing.
 """
 
 import argparse
@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ask_orch import kernel_line
 from ask_orch.artifacts import runs_root
 from ask_orch.provenance import checkout
 
@@ -133,12 +134,14 @@ def read(path):
     return [json.loads(line) for line in lines if line.strip()]
 
 
-def status(entries, source):
-    """One row per matrix entry for checkout `source`: its latest run there,
-    and whether it passed on the same DUT image as the others."""
+def status(entries, source, line):
+    """One row per matrix entry for checkout `source` and kernel line `line`:
+    its latest run there, and whether it passed on the same DUT image as the
+    others. Each line qualifies on its own."""
     latest = {}
     for entry in entries:
-        if entry.get("checkout") == source["sha256"] and entry.get("run") in MATRIX:
+        if (entry.get("checkout") == source["sha256"] and entry.get("line") == line
+                and entry.get("run") in MATRIX):
             if entry["run"] not in latest or entry["finished"] >= latest[entry["run"]]["finished"]:
                 latest[entry["run"]] = entry
     passed = [entry for entry in latest.values() if entry["exitstatus"] == 0]
@@ -165,14 +168,20 @@ def _when(seconds):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(seconds))
 
 
-def report(rows, source, ledger, out=sys.stdout):
-    print(f"release matrix for {source['revision'][:12]} (checkout {source['sha256'][:12]}); "
-          f"ledger {ledger}", file=out)
+def report(rows, source, line, ledger, out=sys.stdout, released=None):
+    print(f"release matrix for {source['revision'][:12]} (checkout {source['sha256'][:12]}), "
+          f"kernel line {line}; ledger {ledger}", file=out)
+    if line in (kernel_line.released() if released is None else released):
+        print(f"kernel line {line} is released: RELEASED_LINES lists it, so a release tag covers it",
+              file=out)
+    else:
+        print(f"kernel line {line} is not released: a release tag covers it once RELEASED_LINES "
+              "lists it, in the release commit, after this matrix qualifies", file=out)
     width = max(len(name) for name in MATRIX)
     for row in rows:
         name, state, entry = row["run"], row["state"], row["entry"]
         if entry is None:
-            detail = f"make test-release RUN={name}  (on {MATRIX[name].boot})"
+            detail = f"make test-release LINE={line} RUN={name}  (on {MATRIX[name].boot})"
         else:
             detail = f"{_when(entry['finished'])}  boot {str(entry.get('boot_id'))[:8]}  {entry['run_dir']}"
             if state == "failed":
@@ -191,9 +200,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("command", choices=("status",))
     parser.parse_args(argv)
+    try:
+        line = kernel_line.current()
+    except ValueError as error:
+        parser.error(str(error))
     source = checkout(TOOLS.parent)
     ledger = ledger_path()
-    return 0 if report(status(read(ledger), source), source, ledger) else 1
+    return 0 if report(status(read(ledger), source, line), source, line, ledger) else 1
 
 
 if __name__ == "__main__":

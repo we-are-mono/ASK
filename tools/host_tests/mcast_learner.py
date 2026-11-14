@@ -1,5 +1,6 @@
 """The bridged multicast learner's decision logic."""
 
+from ask_orch import kernel_line
 from ask_orch.process import run_process
 
 import os
@@ -9,8 +10,15 @@ import re
 from _host_pppoe_hm import (declaration)
 from _host_flowtable import (flowtable_source)
 from _host_qos_lifecycle import (function)
+from _kernel_source import (kernel_source)
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def bridge_header():
+    """include/linux/if_bridge.h as the line's series leaves it, with the
+    reasons patch 161 reports a bridge hands a group's frames up for."""
+    return (kernel_source() / "include/linux/if_bridge.h").read_text()
 
 
 def test_mcast_learner(tmp_path):
@@ -19,6 +27,9 @@ def test_mcast_learner(tmp_path):
     counters = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     taps = source.index("#define FT_MC_TAPS")
     state = source.index("LIST_HEAD(ft_mc_routes);")
+    flags = re.findall(r"^#define BR_MCAST_\w+\s+\(1U << \d+\)", bridge_header(), re.M)
+    assert flags
+    (tmp_path / "mcast_bridge_flags.inc").write_text("\n".join(flags) + "\n")
     # The real membership, flow and route descriptions, not restatements: a
     # field added or resized on any has to fail here rather than compile into
     # a harness that no longer matches what the adapter keeps.
@@ -322,7 +333,7 @@ def test_patch_160_replays_what_it_notifies():
     port group replayed as a member; and a replay was elided when a deferred
     event merely shared its MAC and VID -- which a group's (*,G) and (S,G)
     entries always do -- though that event restated something else."""
-    patch = (ROOT / "patches/kernel/160-bridge-switchdev-mdb-group.patch").read_text()
+    patch = (kernel_line.patches() / "160-bridge-switchdev-mdb-group.patch").read_text()
     added = "\n".join(line[1:] for line in patch.splitlines()
                       if line.startswith("+") and not line.startswith("+++"))
     # One translation of a port group's flags, used by both paths.
@@ -508,7 +519,7 @@ def test_an_idle_entry_ages_on_the_bridges_clock():
     worker = function(source, "ft_mc_work_fn")
     added = worker[worker.index("if (added) {"):]
     assert "target->active = jiffies;" in added[:added.index("}")]
-    patch = (ROOT / "patches/kernel/161-bridge-multicast-egress-snapshot.patch").read_text()
+    patch = (kernel_line.patches() / "161-bridge-multicast-egress-snapshot.patch").read_text()
     assert "+EXPORT_SYMBOL_GPL(br_multicast_membership_interval);" in patch
     assert "+	interval = br_multicast_gmi(brmctx);" in patch
 
@@ -587,14 +598,19 @@ def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
     # takes away: a host that joined, or flooding, refuses the flow anyway.
     hands_up = derive[:derive.index("ft_mc_soft_on(soft, f->bridge")]
     assert "if (local & FT_MC_TO_HOST_UP)" in hands_up
-    # Every reason the bridge hands up a snooped frame for: a router, a
-    # promiscuous device, or an all-multicast one (a VIF on the bridge).
-    up = source[source.index("#define FT_MC_TO_HOST_UP"):]
-    up = up[:up.index("\n\n")]
-    for reason in ("ROUTER", "PROMISC", "ALLMULTI"):
-        assert f"BR_MCAST_TO_HOST_{reason}" in up, reason
+    # Every reason the line's bridge hands up a snooped frame for: a router,
+    # a promiscuous device, and where it hands up an all-multicast one's too
+    # (a VIF on the bridge; patch 161 says so on 6.18), that one.
+    allmulti = bool(re.search(r"^#define BR_MCAST_TO_HOST_ALLMULTI\b", bridge_header(), re.M))
+    up = source[source.index("#ifdef BR_MCAST_TO_HOST_ALLMULTI\n"):]
+    up = up[:up.index("#endif")].split("#else\n")[0 if allmulti else 1]
+    reasons = re.search(r"#define FT_MC_TO_HOST_UP (.*?)\n#define", up, re.S)[1]
+    assert set(re.findall(r"BR_MCAST_TO_HOST_(\w+)", reasons)) == \
+        {"ROUTER", "PROMISC", *(["ALLMULTI"] if allmulti else [])}
+    flags = re.search(r"#define FT_MC_BRIDGE_UP_FLAGS (.*)", up)[1]
+    assert set(re.findall(r"IFF_\w+", flags)) == {"IFF_PROMISC", *(["IFF_ALLMULTI"] if allmulti else [])}
     hands = function(source, "ft_mc_bridge_hands_up")
-    assert "br_multicast_router(bridge)" in hands and "IFF_PROMISC | IFF_ALLMULTI" in hands
+    assert "br_multicast_router(bridge)" in hands and "& FT_MC_BRIDGE_UP_FLAGS" in hands
     # A changed answer is one the install pass has to hear of.
     unchanged = derive[derive.index("if (same && error == f->error"):]
     unchanged = unchanged[:unchanged.index("return;")]
@@ -674,7 +690,7 @@ def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
         state.index('return "refused-tc";') < state.index("if (ft_mc_discardable(f))")
     # Patch 148's bridged probe: netdev hooks alone, no conntrack, no
     # x_tables, and a stream the bridge forwards nowhere still asked about.
-    patch = (ROOT / "patches/kernel/148-netfilter-port-probe.patch").read_text()
+    patch = (kernel_line.patches() / "148-netfilter-port-probe.patch").read_text()
     sections = dict(re.findall(r"\+\+\+ b/(\S+)\n(.*?)(?=\ndiff --git |\Z)", patch, re.S))
     assert "+\tbool\t\t\t\tbridged;" in sections["include/net/netfilter/nf_port_probe.h"]
     walk = sections["net/netfilter/nf_tables_port_probe.c"]
@@ -690,10 +706,13 @@ def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
     # forwarded frame, which the learner asks itself.
     assert "+\t\tif (!ctx->steady && ctx->bridged && !ctx->probe->bridged) {" in walk
     # A netdev chain's hook a chain update adds is typed as the chain's
-    # first ones are, one registration per device it matches, so the
-    # learner's type check finds it.
-    assert "+\t\t\t\t\tops->hook_ops_type = basechain->ops.hook_ops_type;" in \
-        sections["net/netfilter/nf_tables_api.c"]
+    # first ones are -- each registration of it where a hook holds one per
+    # device its name matches (6.16) -- so the learner's type check finds it.
+    tables = (kernel_source() / "include/net/netfilter/nf_tables.h").read_text()
+    per_device = "\tstruct list_head\tops_list;" in declaration(tables, "nft_hook")
+    typed = ("+\t\t\t\t\tops->hook_ops_type = basechain->ops.hook_ops_type;" if per_device else
+             "+\t\t\t\th->ops.hook_ops_type = basechain->ops.hook_ops_type;")
+    assert typed in sections["net/netfilter/nf_tables_api.c"]
     assert "f->dirty = true;" in function(source, "ft_mc_refresh_fn")
 
 

@@ -5,8 +5,9 @@
  * (nf_flow_table_listed(), over the real nf_flow_table_iterate()), the check a
  * flow added after its walk makes against the list
  * (nft_flow_offload_check_unlisted()), a device renamed to match a hook
- * joining from the netdev notifier (nft_flowtable_event()), and a device going
- * down retiring the flows that recorded it (nf_flow_table_do_cleanup()). The
+ * joining from the netdev notifier (nft_flowtable_event()) where hooks match
+ * devices by name (6.16, NFT_HOOK_PER_DEVICE), and a device going down
+ * retiring the flows that recorded it (nf_flow_table_do_cleanup()). The
  * flowtable's types, the flow and its tuples, the route and nf_tables' hook
  * and flowtable are the kernel's own declarations; the rhashtable walk, the
  * lists, the barrier, the allocator, the hook registration and the teardown
@@ -188,12 +189,17 @@ static void list_del(struct list_head *entry)
 	entry->next->prev = entry->prev;
 	entry->next = entry->prev = (struct list_head *)0x100;
 }
-/* The first device a hook's name matched: the one a publish is recorded by. */
+/* The first device a hook's name matched, or the one it names where a hook
+ * names one: the one a publish is recorded by. */
 static const struct net_device *first_dev(const struct nft_hook *hook)
 {
+#ifdef NFT_HOOK_PER_DEVICE
 	if (list_empty(&hook->ops_list))
 		return NULL;
 	return container_of(hook->ops_list.next, struct nf_hook_ops, list)->dev;
+#else
+	return hook->ops.dev;
+#endif
 }
 /* Only hooks are published here. */
 static void list_add_rcu(struct list_head *new, struct list_head *head)
@@ -204,6 +210,7 @@ static void list_add_rcu(struct list_head *new, struct list_head *head)
 	head->next = new;
 	record(PUBLISH, first_dev(container_of(new, struct nft_hook, list)));
 }
+#ifdef NFT_HOOK_PER_DEVICE
 /* Only a device's registration is added to a hook's tail, which publishes
  * the device to a walk as a hook's publication does. */
 static void list_add_tail_rcu(struct list_head *new, struct list_head *head)
@@ -215,6 +222,7 @@ static void list_del_rcu(struct list_head *entry)
 {
 	list_del(entry);
 }
+#endif
 /* The flowtable nf_tables owns, with the ports it lists and the flows it
  * holds. */
 static struct nft_flowtable ft;
@@ -284,6 +292,7 @@ static void dst_release(struct dst_entry *dst)
 	assert(!"a NEIGH route keeps its destination");
 }
 
+#ifdef NFT_HOOK_PER_DEVICE
 static void *kzalloc(size_t size, int flags)
 {
 	return calloc(1, size);
@@ -311,6 +320,7 @@ static void nft_unregister_flowtable_ops(struct net *net, struct nft_flowtable *
 	assert(registered);
 	registered--;
 }
+#endif
 
 #include "listed_production.inc"
 
@@ -323,13 +333,16 @@ static struct net_device eth3 = { ETH3, &net_a, "eth3" }, eth4 = { ETH4, &net_a,
 static struct nf_conn ct_a = { &net_a }, ct_b = { &net_b };
 static struct dst_entry dst;
 
-/* The flowtable's hooks, each with one registration per device its name
- * matches: a name ending in '*' matches more than one. */
+/* The flowtable's hooks: each with one registration per device its name
+ * matches, a name ending in '*' matching more than one (6.16), or each with
+ * the one device it names. */
 static struct nft_hook hooks[4];
-static struct nf_hook_ops registrations[ARRAY_LEN(hooks)][2];
 static const struct nf_flowtable_type listed_type = { .listed = nf_flow_table_listed };
 /* act_ct's type, say, which has no use for the op. */
 static const struct nf_flowtable_type plain_type = { .listed = NULL };
+
+#ifdef NFT_HOOK_PER_DEVICE
+static struct nf_hook_ops registrations[ARRAY_LEN(hooks)][2];
 
 /* Hook i, naming a device by its whole name, none registered yet. */
 static struct nft_hook *named(unsigned int i, const char *name)
@@ -342,20 +355,39 @@ static struct nft_hook *named(unsigned int i, const char *name)
 	return &hooks[i];
 }
 
-/* Hook i, naming dev alone. */
-static struct nft_hook *hook(unsigned int i, struct net_device *dev)
-{
-	named(i, dev->name);
-	registrations[i][0].dev = dev;
-	list_add_tail(&registrations[i][0].list, &hooks[i].ops_list);
-	return &hooks[i];
-}
-
 /* Hook i's name matches dev as well. */
 static void also(unsigned int i, struct net_device *dev)
 {
 	registrations[i][1].dev = dev;
 	list_add_tail(&registrations[i][1].list, &hooks[i].ops_list);
+}
+#endif
+
+/* Hook i, naming dev alone. */
+static struct nft_hook *hook(unsigned int i, struct net_device *dev)
+{
+#ifdef NFT_HOOK_PER_DEVICE
+	named(i, dev->name);
+	registrations[i][0].dev = dev;
+	list_add_tail(&registrations[i][0].list, &hooks[i].ops_list);
+#else
+	memset(&hooks[i], 0, sizeof(hooks[i]));
+	hooks[i].ops.dev = dev;
+#endif
+	return &hooks[i];
+}
+
+/* Whether hook h takes dev. */
+static bool takes(const struct nft_hook *h, const struct net_device *dev)
+{
+#ifdef NFT_HOOK_PER_DEVICE
+	for (const struct list_head *reg = h->ops_list.next; reg != &h->ops_list; reg = reg->next)
+		if (container_of(reg, struct nf_hook_ops, list)->dev == dev)
+			return true;
+	return false;
+#else
+	return h->ops.dev == dev;
+#endif
 }
 
 static void table(const struct nf_flowtable_type *type, struct net_device *const *listed,
@@ -410,14 +442,9 @@ static void add(struct flow_offload *flow)
 static bool on_list(const struct net_device *dev)
 {
 	for (struct list_head *pos = ft.hook_list.next; pos != &ft.hook_list;
-	     pos = pos->next) {
-		struct nft_hook *h = container_of(pos, struct nft_hook, list);
-
-		for (struct list_head *reg = h->ops_list.next; reg != &h->ops_list;
-		     reg = reg->next)
-			if (container_of(reg, struct nf_hook_ops, list)->dev == dev)
-				return true;
-	}
+	     pos = pos->next)
+		if (takes(container_of(pos, struct nft_hook, list), dev))
+			return true;
 	return false;
 }
 
@@ -551,6 +578,7 @@ static void publish_cases(void)
 		}
 	}
 
+#ifdef NFT_HOOK_PER_DEVICE
 	/* One hook whose name matches both ports is published once, behind one
 	 * barrier, and the flowtable is told of each device it matches. */
 	table(&recording_type, listed, ARRAY_LEN(listed));
@@ -563,6 +591,7 @@ static void publish_cases(void)
 	HAPPENED(PUBLISH, BARRIER, LISTED, LISTED);
 	assert(events[0].dev == &eth3 && events[2].dev == &eth3 && events[3].dev == &eth5);
 	assert(torn(&flows[VLAN_CLIENT]) && torn(&flows[BRIDGE_CLIENT]) && teardowns == 2);
+#endif
 	printf("flowtable listed publish checks passed\n");
 }
 
@@ -618,6 +647,7 @@ static void check_cases(void)
 	HAPPENED(BARRIER, READ);
 	assert(torn(&flow));
 
+#ifdef NFT_HOOK_PER_DEVICE
 	/* Listed through a hook whose name matches another port first. */
 	table(&listed_type, wan_only, ARRAY_LEN(wan_only));
 	also(0, &eth3);
@@ -625,6 +655,7 @@ static void check_cases(void)
 	nft_flow_offload_check_unlisted(&ft, &flow);
 	HAPPENED(BARRIER, READ);
 	assert(torn(&flow));
+#endif
 
 	/* Ports are listed, but not the one recorded. */
 	table(&listed_type, listed, ARRAY_LEN(listed));
@@ -667,6 +698,7 @@ static void race_cases(void)
 	printf("flowtable listed race checks passed\n");
 }
 
+#ifdef NFT_HOOK_PER_DEVICE
 /* A device renamed to match a hook's name joins the table from the netdev
  * notifier -- nft_flowtable_event() with NETDEV_REGISTER, on NETDEV_CHANGENAME
  * -- not from a commit. It can be up, with flows that walked to it while it
@@ -674,7 +706,8 @@ static void race_cases(void)
  * barrier, as a commit's publish does. A type without the op is only
  * registered; a name matching nothing, a device registered already and a
  * registration the core refuses change nothing. Renamed away, the device's
- * registration goes. */
+ * registration goes. A hook that names its one device (before 6.16) is never
+ * joined by a rename. */
 static void rename_cases(void)
 {
 	struct net_device *listed[] = { &eth4 };
@@ -724,6 +757,7 @@ static void rename_cases(void)
 	assert(!nevents && !registered && !teardowns && list_empty(&hooks[1].ops_list));
 	printf("flowtable listed rename checks passed\n");
 }
+#endif
 
 /* A device going down -- nf_flow_table_gc_cleanup()'s pass, on NETDEV_DOWN --
  * retires the flows that arrive on it and those that recorded it unlisted, in
@@ -765,7 +799,9 @@ int main(void)
 	publish_cases();
 	check_cases();
 	race_cases();
+#ifdef NFT_HOOK_PER_DEVICE
 	rename_cases();
+#endif
 	cleanup_cases();
 	return 0;
 }

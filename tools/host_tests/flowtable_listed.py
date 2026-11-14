@@ -26,13 +26,12 @@ def test_a_joining_port_retires_the_flows_that_walked_to_it(tmp_path):
     list_splice_rcu() put them, one at a time, each before a full barrier and
     the sweep for it, and a flow added after its walk looks at the list again
     behind a barrier of its own, so that a sweep run before the flow was in
-    the table cannot miss it. A flow that recorded no port pays nothing. A
-    port renamed to match a hook joins from the netdev notifier rather than a
-    commit, and is told to the flowtable behind the same barrier once
-    registered. The port going down retires the flows that recorded it as
-    well: one
-    registered again comes back under another index, which nothing
-    recorded."""
+    the table cannot miss it. A flow that recorded no port pays nothing.
+    Where hooks match devices by name (6.16), a port renamed to match one
+    joins from the netdev notifier rather than a commit, and is told to the
+    flowtable behind the same barrier once registered. The port going down
+    retires the flows that recorded it as well: one registered again comes
+    back under another index, which nothing recorded."""
     kernel = kernel_source()
     header = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
     tables = (kernel / "include/net/netfilter/nf_tables.h").read_text()
@@ -40,8 +39,12 @@ def test_a_joining_port_retires_the_flows_that_walked_to_it(tmp_path):
     offload = (kernel / "net/netfilter/nft_flow_offload.c").read_text()
     api = (kernel / "net/netfilter/nf_tables_api.c").read_text()
     inet = (kernel / "net/netfilter/nf_flow_table_inet.c").read_text()
+    # A hook holds a registration per device its name matches, and a renamed
+    # device joins from the notifier, since 6.16; before, a hook names one.
+    per_device = "\tstruct list_head\tops_list;" in _declaration(tables, "struct nft_hook {")
 
     (tmp_path / "listed_types.inc").write_text(
+        ("#define NFT_HOOK_PER_DEVICE\n" if per_device else "") +
         "".join(_declaration(header, start) for start in (
             "enum flow_offload_tuple_dir {", "enum flow_offload_xmit_type {",
             "enum nf_flow_flags {", "enum flow_offload_type {",
@@ -63,8 +66,8 @@ def test_a_joining_port_retires_the_flows_that_walked_to_it(tmp_path):
         + function(api, "nft_flowtable_hooks_publish")
         + function(offload, "nft_flowtable_find_ifindex")
         + function(offload, "nft_flow_offload_check_unlisted")
-        + function(api, "nft_hook_find_ops")
-        + function(api, "nft_flowtable_event"))
+        + (function(api, "nft_hook_find_ops") + function(api, "nft_flowtable_event")
+           if per_device else ""))
     binary = tmp_path / "flowtable_listed"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
@@ -88,10 +91,14 @@ def test_a_joining_port_retires_the_flows_that_walked_to_it(tmp_path):
     assert "list_splice_rcu" not in update
     # A rename reaches a flowtable as a registration under the new name, then
     # an unregistration under the old one: the compiled event is what runs.
+    # Where a hook names one device, only its unregistration is heard.
     notifier = function(api, "nf_tables_flowtable_event")
-    assert re.search(r"if \(event == NETDEV_CHANGENAME\) \{\s*"
-                     r"if \(__nf_tables_flowtable_event\(NETDEV_REGISTER, dev, true\)\)",
-                     notifier)
+    if per_device:
+        assert re.search(r"if \(event == NETDEV_CHANGENAME\) \{\s*"
+                         r"if \(__nf_tables_flowtable_event\(NETDEV_REGISTER, dev, true\)\)",
+                         notifier)
+    else:
+        assert re.search(r"if \(event != NETDEV_UNREGISTER\)\s*return 0;", notifier)
     # A flow checks the list once it is in the table, and only then.
     evaluate = function(offload, "nft_flow_offload_eval")
     assert re.search(r"ret = flow_offload_add\(flowtable, flow\);\s*if \(ret < 0\)\s*"

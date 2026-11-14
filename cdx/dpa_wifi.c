@@ -416,8 +416,7 @@ static void vwd_send_to_vap(struct sk_buff* skb)
 }
 
 static enum qman_cb_dqrr_result vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq,
-		const struct qm_dqrr_entry *dq, bool sched_napi,
-		struct qman_poll_ctx *ctx)
+		const struct qm_dqrr_entry *dq CDX_DQRR_POLL)
 {
 	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
 		return qman_cb_dqrr_consume;

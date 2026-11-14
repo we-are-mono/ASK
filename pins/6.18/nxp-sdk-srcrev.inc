@@ -1,8 +1,9 @@
-# Canonical NXP DPAA/FMan/QBMan SDK pin (NXP tag lf-6.18.37-2.1.0).
+# Canonical NXP DPAA/FMan/QBMan SDK pin for the 6.18 kernel line (NXP tag
+# lf-6.18.37-2.1.0). Each kernel line has its own, at pins/<line>/.
 #
 # Format-neutral single source of truth for the SDK SRCREV, shared by every
 # consumer of the ASK release so none has to parse another's build format:
-#   - meta-ask (bitbake):  require ${ASK_SRCROOT}/pins/nxp-sdk-srcrev.inc
+#   - meta-ask (bitbake):  linux-ask.inc requires pins/<line>/nxp-sdk-srcrev.inc
 #   - OpenWrt sync (sh):   sed -n 's/^NXP_SDK_SRCREV = "\(.*\)"/\1/p' <this file>
 #   - Armbian (bash):      same sed
 #

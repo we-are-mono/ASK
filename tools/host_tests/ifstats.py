@@ -2,6 +2,7 @@
 records into a net device's counters, and the packet counts carried past the
 firmware's 32 bits, against a simulated MURAM and workqueue."""
 
+from ask_orch import kernel_line
 from ask_orch.process import run_process
 
 from _host_ifstats import (HEADER, ROOT, declaration, stats_fields)
@@ -17,7 +18,7 @@ def test_ifstats(tmp_path):
     # The shipped patch, so this does not depend on a previously built kernel.
     run_process([
         "git", "apply", f"--include={HEADER}",
-        str(ROOT / "patches/kernel/010-ask-fman-dpaa-ehash.patch"),
+        str(kernel_line.patches() / "010-ask-fman-dpaa-ehash.patch"),
     ], cwd=tmp_path, check=True)
     header = (tmp_path / HEADER).read_text()
     common = (ROOT / "cdx/cdx_common.h").read_text()
