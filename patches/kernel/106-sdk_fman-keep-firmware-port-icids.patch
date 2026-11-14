@@ -42,10 +42,10 @@ consumer relying on that identity can check it rather than assume it.
  9 files changed, 82 insertions(+), 12 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
-index 224ecc0b8d9a3..98f01fa4778f0 100644
+index e26867334ce20..35d20638a2b57 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
-@@ -435,6 +435,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+@@ -437,6 +437,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
      fmPortParam.specificParams.nonRxParams.errFqid      = p_FmHcParams->params.errFqid;
      fmPortParam.specificParams.nonRxParams.dfltFqid     = p_FmHcParams->params.confFqid;
      fmPortParam.specificParams.nonRxParams.qmChannel    = p_FmHcParams->params.qmChannel;
@@ -229,10 +229,10 @@ index 37f8e8da49429..6733208a380c9 100644
  u64 *fm_port_get_buffer_time_stamp(const struct fm_port *port,
  		const void *data)
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
-index 53c4eaf2637ca..318559e301e9d 100644
+index c7eb08a2dc90c..f7011043d7c34 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
-@@ -1073,6 +1073,8 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
+@@ -1105,6 +1105,8 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
  			p_LnxWrpFmPortDev->settings.param.portId;
  		fmPcdParams.hc.liodnBase =
  			p_LnxWrpFmPortDev->settings.param.liodnBase;
@@ -271,7 +271,7 @@ index a44e26aff9459..a5029f6caf128 100644
  int qm_set_wpm(int wpm)
  {
 diff --git a/include/linux/fsl_qman.h b/include/linux/fsl_qman.h
-index 963da25aae819..7e328d77ede7d 100644
+index b729923a2d45d..1c01b9c4fc87b 100644
 --- a/include/linux/fsl_qman.h
 +++ b/include/linux/fsl_qman.h
 @@ -2122,6 +2122,15 @@ const cpumask_t *qman_affine_cpus(void);

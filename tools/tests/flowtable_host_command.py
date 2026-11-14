@@ -125,10 +125,13 @@ async def test_late_sync_reopens_the_host_command_channel(rig):
     assert count(after, TIMED_OUT) > count(log, TIMED_OUT), stall
     assert count(after, RESUMED) > count(log, RESUMED), stall
     # The timeout said where its frame was: never on the port's queue, the
-    # port having taken it, and the answer counted where it waited.
+    # port having taken it, and the answer counted where it waited. QMan
+    # itself answered the description's queries, and every CPU's enqueue
+    # ring is accounted for.
     timeout = [line for line in after.splitlines() if TIMED_OUT in line][-1]
     r.record("stall-timeout", {"line": timeout})
     assert "frames queued: command 0," in timeout and "its portal holds" in timeout, timeout
+    assert "did not answer" not in timeout and "enqueue rings hold" in timeout, timeout
     # So the barriers the retirement still owes complete by themselves, and
     # the next flow goes to hardware.
     state = await settled(r)

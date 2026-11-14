@@ -32,10 +32,10 @@ Upstream-Status: Pending
  3 files changed, 92 insertions(+), 8 deletions(-)
 
 diff --git a/drivers/staging/fsl_qbman/qman_high.c b/drivers/staging/fsl_qbman/qman_high.c
-index 531ace1b5c71d..00952178087d6 100644
+index 56805f4a66894..334ca80c9ca03 100644
 --- a/drivers/staging/fsl_qbman/qman_high.c
 +++ b/drivers/staging/fsl_qbman/qman_high.c
-@@ -1590,6 +1590,27 @@ u32 qman_p_poll_slow(struct qman_portal *p)
+@@ -1604,6 +1604,27 @@ u32 qman_p_poll_slow(struct qman_portal *p)
  }
  EXPORT_SYMBOL(qman_p_poll_slow);
  
@@ -63,7 +63,7 @@ index 531ace1b5c71d..00952178087d6 100644
  void qman_p_stop_dequeues(struct qman_portal *p)
  {
  	qman_stop_dequeues_ex(p);
-@@ -2553,7 +2574,7 @@ int qman_eqcr_is_empty(void)
+@@ -2629,7 +2650,7 @@ int qman_eqcr_is_empty(void)
  
  	PORTAL_IRQ_LOCK(p, irqflags);
  	update_eqcr_ci(p, 0);
@@ -72,7 +72,7 @@ index 531ace1b5c71d..00952178087d6 100644
  	PORTAL_IRQ_UNLOCK(p, irqflags);
  	put_affine_portal();
  	return avail == 0;
-@@ -3623,10 +3644,10 @@ static int qman_ceetm_cq_peek_pop_xsfdrread(struct qm_ceetm_cq *cq,
+@@ -3699,10 +3720,10 @@ static int qman_ceetm_cq_peek_pop_xsfdrread(struct qm_ceetm_cq *cq,
  	switch (command_type) {
  	case 0:
  	case 1:
@@ -85,7 +85,7 @@ index 531ace1b5c71d..00952178087d6 100644
  		break;
  	default:
  		break;
-@@ -3639,15 +3660,17 @@ static int qman_ceetm_cq_peek_pop_xsfdrread(struct qm_ceetm_cq *cq,
+@@ -3715,15 +3736,17 @@ static int qman_ceetm_cq_peek_pop_xsfdrread(struct qm_ceetm_cq *cq,
  	DPA_ASSERT((mcr->verb & QM_MCR_VERB_MASK) ==
  				QM_CEETM_VERB_CQ_PEEK_POP_XFDRREAD);
  
@@ -105,7 +105,7 @@ index 531ace1b5c71d..00952178087d6 100644
  	return 0;
  }
  
-@@ -5286,6 +5309,26 @@ int qman_ceetm_cq_get_dequeue_statistics(struct qm_ceetm_cq *cq, u32 flags,
+@@ -5362,6 +5385,26 @@ int qman_ceetm_cq_get_dequeue_statistics(struct qm_ceetm_cq *cq, u32 flags,
  }
  EXPORT_SYMBOL(qman_ceetm_cq_get_dequeue_statistics);
  
@@ -132,7 +132,7 @@ index 531ace1b5c71d..00952178087d6 100644
  int qman_ceetm_drain_cq(struct qm_ceetm_cq *cq)
  {
  	struct qm_mcr_ceetm_cq_peek_pop_xsfdrread ppxr;
-@@ -5328,8 +5371,10 @@ int qman_ceetm_lfq_claim(struct qm_ceetm_lfq **lfq,
+@@ -5404,8 +5447,10 @@ int qman_ceetm_lfq_claim(struct qm_ceetm_lfq **lfq,
  		return -ENODEV;
  	}
  	p = kmalloc(sizeof(*p), GFP_KERNEL);
@@ -145,7 +145,7 @@ index 531ace1b5c71d..00952178087d6 100644
  	memset(&lfqmt_config, 0, sizeof(struct qm_mcc_ceetm_lfqmt_config));
  	p->idx = lfqid;
  	p->dctidx = (u16)(lfqid & CEETM_LFQMT_LFQID_LSB);
-@@ -5346,10 +5391,18 @@ int qman_ceetm_lfq_claim(struct qm_ceetm_lfq **lfq,
+@@ -5422,10 +5467,18 @@ int qman_ceetm_lfq_claim(struct qm_ceetm_lfq **lfq,
  				lfqid, cq->idx);
  		list_del(&p->node);
  		kfree(p);
@@ -166,10 +166,10 @@ index 531ace1b5c71d..00952178087d6 100644
  EXPORT_SYMBOL(qman_ceetm_lfq_claim);
  
 diff --git a/drivers/staging/fsl_qbman/qman_low.h b/drivers/staging/fsl_qbman/qman_low.h
-index 0e6fdf8d30c1d..529f4fbf959af 100644
+index 32ae9f9b55458..7af70c5c6081f 100644
 --- a/drivers/staging/fsl_qbman/qman_low.h
 +++ b/drivers/staging/fsl_qbman/qman_low.h
-@@ -517,6 +517,17 @@ static inline u8 qm_eqcr_get_avail(struct qm_portal *portal)
+@@ -522,6 +522,17 @@ static inline u8 qm_eqcr_get_avail(struct qm_portal *portal)
  	return eqcr->available;
  }
  
@@ -188,10 +188,10 @@ index 0e6fdf8d30c1d..529f4fbf959af 100644
  {
  	register struct qm_eqcr *eqcr = &portal->eqcr;
 diff --git a/include/linux/fsl_qman.h b/include/linux/fsl_qman.h
-index 56143338da0cb..963da25aae819 100644
+index 78cc32254f178..b729923a2d45d 100644
 --- a/include/linux/fsl_qman.h
 +++ b/include/linux/fsl_qman.h
-@@ -2137,6 +2137,15 @@ void *qman_get_affine_portal(int cpu);
+@@ -2145,6 +2145,15 @@ int qman_affine_portal_eqcr_fill(int cpu);
   */
  int qman_affine_portal_dqrr_pending(int cpu);
  
@@ -207,7 +207,7 @@ index 56143338da0cb..963da25aae819 100644
  /**
   * qman_stop_dequeues - Stop h/w dequeuing to the s/w portal
   *
-@@ -3582,6 +3591,17 @@ int qman_ceetm_cq_get_dequeue_statistics(struct qm_ceetm_cq *cq, u32 flags,
+@@ -3603,6 +3612,17 @@ int qman_ceetm_cq_get_dequeue_statistics(struct qm_ceetm_cq *cq, u32 flags,
   */
  int qman_ceetm_drain_cq(struct qm_ceetm_cq *cq);
  
