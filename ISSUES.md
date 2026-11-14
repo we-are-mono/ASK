@@ -160,6 +160,19 @@ result independently of those temporary files.
   not seen on the rig. Fix direction: fall back to `neigh_xmit()`, or give the packet back to the stack, unless the
   entry is `NUD_VALID`.
 
+- [ ] **A439 — a host-command timeout can wedge a CPU in its own diagnostic.** Seen once on 6.18.63 (KASAN),
+  `flowtable_wireguard::test_rate[1T-upload]` after nine `mcast_e2e` cases; the same order replayed on a fresh boot
+  passed, and the test passed alone. At 456 s `qman_enqueue()` of the HC frame was refused on CPU 0 (`hc.c` "HC
+  enqueue failed", portal ring full); at ~461 s an ehash barrier on CPU 3 (`ft_invalidate_work` → `cdx_ft_recover`
+  → `ehash_barrier` → `FmHcPcdSync`) timed out, and `EnQFrm()`'s `QmDescribeCB()` (_ebf88aad_) sent
+  `qman_query_fq_np()` on CPU 3's portal, whose result never came: CPU 3 spun in `qm_mc_result()` with interrupts
+  masked (RCU stalls, timer frozen), holding the flowtable transaction, so RTNL users and the DUT agent hung and the
+  datapath stopped. QMan itself was healthy (ERR_ISR 0, ~524k free PFDRs). Evidence: the stack was read from
+  `/proc/kcore` (no NMI on this GIC). Why it matters: a recoverable HC timeout became a dead box. Open: why the
+  portal's ring and management command stopped (an order restoration point holding the WireGuard steer queue is the
+  lead), and whether 6.12 can do it too (same code; not seen there). Fix direction: no unbounded management command
+  from the timeout path; find the stall.
+
 - [ ] **A438 — a port's queues to the CPU are bounded by its probe order, not its own share.** Where:
   `dpaa_eth_priv_ingress_cgrs_init()` (patch 111) scales `priv->dpa_bp->config_count`, the shared pool's running
   total, which every port after the first raises by `CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT` once its groups are set up:
