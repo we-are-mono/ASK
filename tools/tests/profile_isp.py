@@ -438,20 +438,26 @@ async def _download_cpu_counter(ctx, *, peer, dport):
     The WAN port's own receive counter also moves for everything else on the
     office LAN behind it, in bursts larger than a burst's whole budget, so it
     cannot say whether a download stayed in hardware. A netdev ingress chain
-    on the port can: a frame the classifier forwards never gets there, and the
-    kernel has taken the carrier VLAN's tag off before it, which leaves the
-    PPPoE session header at the network header. Matched there, by the PPP
-    protocol, UDP and the far end's port, which NAT leaves alone; the
-    software flowtable's own hook comes after this one, so every CPU frame of
-    the download is counted, whichever path then forwards it.
+    on the port can: a frame the classifier forwards never gets there. Matched
+    there by the PPPoE session type, the PPP protocol, UDP and the far end's
+    port, which NAT leaves alone; the software flowtable's own hook comes
+    after this one, so every CPU frame of the download is counted, whichever
+    path then forwards it.
+
+    Matched at wire offsets from the link-layer header, with the carrier
+    VLAN's tag, which nftables puts back for reads past the addresses: Linux
+    6.18.61 (stable 9b02841c69dc5) makes `meta protocol` look through PPPoE
+    and moves `@nh` to the inner IP header once it has, while 6.12 leaves
+    both at the session header.
 
     Installed before the connection is admitted, so the commit cannot
     readmit anything under the measurement."""
-    if ":" in peer:     # PPP IPv6, next header, UDP source port after 40 bytes
-        match = ["@nh,48,16", "0x0057", "@nh,112,8", "17", "@nh,384,16", str(dport)]
-    else:               # PPP IPv4 with a 20-byte header, protocol, source port
-        match = ["@nh,48,16", "0x0021", "@nh,64,8", "0x45", "@nh,136,8", "17",
-                 "@nh,224,16", str(dport)]
+    session = ["@ll,128,16", "0x8864"]   # behind 12 address bytes and the 4-byte tag
+    if ":" in peer:     # PPP IPv6 at 26, next header, UDP source port after 40 bytes
+        match = [*session, "@ll,192,16", "0x0057", "@ll,256,8", "17", "@ll,528,16", str(dport)]
+    else:               # PPP IPv4 at 26 with a 20-byte header, protocol, source port
+        match = [*session, "@ll,192,16", "0x0021", "@ll,208,8", "0x45", "@ll,280,8", "17",
+                 "@ll,368,16", str(dport)]
     await command(ctx.target, ctx.session, "nft", "delete", "table", "netdev", DOWNLOAD_CPU_TABLE,
                   check=False)
     await command(ctx.target, ctx.session, "nft", "add", "table", "netdev", DOWNLOAD_CPU_TABLE)
@@ -460,7 +466,7 @@ async def _download_cpu_counter(ctx, *, peer, dport):
                       TARGET_WAN_IF, "{", "type", "filter", "hook", "ingress", "device",
                       TARGET_WAN_IF, "priority", "-500", ";", "policy", "accept", ";", "}")
         await command(ctx.target, ctx.session, "nft", "add", "rule", "netdev", DOWNLOAD_CPU_TABLE,
-                      TARGET_WAN_IF, "meta", "protocol", "0x8864", *match, "counter")
+                      TARGET_WAN_IF, *match, "counter")
 
         async def frames():
             listed = json.loads((await command(ctx.target, ctx.session, "nft", "-j", "list",
