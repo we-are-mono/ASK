@@ -682,8 +682,9 @@ def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
     # forwarded frame, which the learner asks itself.
     assert "+\t\tif (!ctx->steady && ctx->bridged && !ctx->probe->bridged) {" in walk
     # A netdev chain's hook a chain update adds is typed as the chain's
-    # first ones are, so the learner's type check finds it.
-    assert "+\t\t\t\th->ops.hook_ops_type = basechain->ops.hook_ops_type;" in \
+    # first ones are, one registration per device it matches, so the
+    # learner's type check finds it.
+    assert "+\t\t\t\t\tops->hook_ops_type = basechain->ops.hook_ops_type;" in \
         sections["net/netfilter/nf_tables_api.c"]
     assert "f->dirty = true;" in function(source, "ft_mc_refresh_fn")
 

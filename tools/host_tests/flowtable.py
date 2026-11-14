@@ -234,6 +234,7 @@ def test_teardown_stats(tmp_path):
 
     (tmp_path / "teardown_stats_types.inc").write_text(
         declaration(table, "enum flow_offload_xmit_type {")
+        + declaration(table, "enum nf_flow_flags {")
         + declaration(header, "enum flow_cls_command {")
         + declaration(header, "struct flow_stats {")
         + declaration(header, "struct flow_cls_common_offload {")
@@ -288,6 +289,7 @@ def test_teardown_hands_back_the_timeout(tmp_path):
     (tmp_path / "teardown_ct_types.inc").write_text(
         declaration(common, "enum ip_conntrack_status {")
         + declaration(tcp, "enum tcp_conntrack {")
+        + "".join(re.findall(r"^#define IP_CT_TCP_FLAG_\w+\s+0x\w+\n", tcp, re.M))
         + "".join(declaration(netns, start) for start in (
             "struct nf_generic_net {", "struct nf_tcp_net {", "enum udp_conntrack {",
             "struct nf_udp_net {"))

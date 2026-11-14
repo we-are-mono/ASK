@@ -256,7 +256,9 @@ static int cdx_detour_frame_ingress(const struct sk_buff *skb)
 /* A frame the offline port handed back: to Linux, on the port it arrived by. */
 static enum qman_cb_dqrr_result cdx_detour_rx(struct qman_portal *portal,
 					      struct qman_fq *fq,
-					      const struct qm_dqrr_entry *dq)
+					      const struct qm_dqrr_entry *dq,
+					      bool sched_napi,
+					      struct qman_poll_ctx *ctx)
 {
 	struct net_device *dev;
 	struct sk_buff *skb;
@@ -290,7 +292,9 @@ static enum qman_cb_dqrr_result cdx_detour_rx(struct qman_portal *portal,
  * see has nothing Linux could do with it. */
 static enum qman_cb_dqrr_result cdx_detour_error(struct qman_portal *portal,
 						 struct qman_fq *fq,
-						 const struct qm_dqrr_entry *dq)
+						 const struct qm_dqrr_entry *dq,
+						 bool sched_napi,
+						 struct qman_poll_ctx *ctx)
 {
 	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
 		return qman_cb_dqrr_consume;
@@ -302,7 +306,9 @@ static enum qman_cb_dqrr_result cdx_detour_error(struct qman_portal *portal,
 /* What the queue into the port still holds when it is torn down. */
 static enum qman_cb_dqrr_result cdx_detour_drain(struct qman_portal *portal,
 						 struct qman_fq *fq,
-						 const struct qm_dqrr_entry *dq)
+						 const struct qm_dqrr_entry *dq,
+						 bool sched_napi,
+						 struct qman_poll_ctx *ctx)
 {
 	if (dq->stat & QM_DQRR_STAT_FD_VALID)
 		dpa_fd_release(NULL, &dq->fd);
@@ -534,7 +540,7 @@ bool cdx_ft_detour_ready(void)
 {
 	return smp_load_acquire(&cdx_detour.ready) && READ_ONCE(cdx_detour_enabled);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_detour_ready, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_detour_ready, "ASK_CDX_FLOWTABLE");
 
 u32 cdx_detour_fqid(void)
 {
@@ -570,4 +576,4 @@ void cdx_detour_counters(struct cdx_detour_counters *counters)
 	counters->failed = atomic64_read(&cdx_detour.failed);
 	counters->errors = atomic64_read(&cdx_detour.errors);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_detour_counters, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_detour_counters, "ASK_CDX_FLOWTABLE");

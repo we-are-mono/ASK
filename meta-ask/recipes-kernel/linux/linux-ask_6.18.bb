@@ -1,5 +1,5 @@
 SUMMARY = "Linux kernel for ASK LS1046A test target"
-DESCRIPTION = "Stock mainline 6.12.112 kernel with the NXP DPAA/FMan/QBMan \
+DESCRIPTION = "Stock mainline 6.18.63 kernel with the NXP DPAA/FMan/QBMan \
 SDK overlaid on top and the ASK patch bundle applied. This is the Yocto \
 twin of the OpenWrt-first build (scripts/mono-sync-ask-kernel.sh): the \
 same mainline base + NXP SDK overlay + ASK hooks, producing a bootable \
@@ -25,7 +25,7 @@ FILESEXTRAPATHS:prepend := "${ASK_SRCROOT}/patches/kernel:"
 # drifting copy under files/.
 FILESEXTRAPATHS:prepend := "${ASK_SRCROOT}/dts:"
 
-LINUX_VERSION = "6.12.112"
+LINUX_VERSION = "6.18.63"
 PV = "${LINUX_VERSION}+git${SRCPV}"
 
 # ============================================================================
@@ -36,15 +36,14 @@ PV = "${LINUX_VERSION}+git${SRCPV}"
 # ============================================================================
 
 # --- Pin 1: mainline kernel base (kernel.org stable) ---
-# NB: this is the COMMIT v6.12.112 points at, not the tag object. The
-# annotated tag v6.12.112 is object 1092ff6640e9..., which `git rev-parse
-# v6.12.112` prints; the commit it peels to (`v6.12.112^{commit}`) is the
-# value below. bitbake's SRCREV must be a commit (checkout -B / branch
-# --contains operate on commits), so pin the peeled commit.
+# NB: this is the COMMIT v6.18.63 points at, not the annotated tag object
+# `git rev-parse v6.18.63` prints; it is `v6.18.63^{commit}`. bitbake's
+# SRCREV must be a commit (checkout -B / branch --contains operate on
+# commits), so pin the peeled commit.
 KERNEL_SRC = "git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git;protocol=https"
-KERNEL_BRANCH = "linux-6.12.y"
-# v6.12.112 (the annotated tag object is 1092ff66...; this is its peeled commit).
-KERNEL_SRCREV = "7aba70ab2e8d8ab3cd45abcaa15e1119a00dc42a"
+KERNEL_BRANCH = "linux-6.18.y"
+# v6.18.63, peeled.
+KERNEL_SRCREV = "1cdda838e8475edf89b73ff0cc952005dd0b1fa7"
 
 # --- Pin 2: NXP DPAA/FMan/QBMan SDK overlay ---
 # The SDK SRCREV lives in a canonical, format-neutral pin file
@@ -54,7 +53,7 @@ KERNEL_SRCREV = "7aba70ab2e8d8ab3cd45abcaa15e1119a00dc42a"
 # extract the value with a one-line sed. ASK_VERSION stays the single pin — the
 # SDK ref rides inside the pinned ASK tree.
 NXP_SDK_SRC = "git://github.com/nxp-qoriq/linux.git;protocol=https"
-NXP_SDK_BRANCH = "lf-6.12.y"
+NXP_SDK_BRANCH = "lf-6.18.y"
 require ${ASK_SRCROOT}/pins/nxp-sdk-srcrev.inc
 
 SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
@@ -65,7 +64,6 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://ask-perf.cfg \
            file://mono-gateway-dk.dts \
            file://010-ask-fman-dpaa-ehash.patch \
-           file://030-ipv6-addrconf-modified-prefix-route-expiry.patch \
            file://040-ask-xfrm-ipsec-offload.patch \
            file://070-ask-ppp-hooks.patch \
            file://080-wext-core-restore-ndo_do_ioctl.patch \
@@ -85,12 +83,11 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://105-sdk_dpaa-buffer-seed-failure.patch \
            file://106-sdk_fman-keep-firmware-port-icids.patch \
            file://107-sdk_dpaa-offload-hooks-under-rcu.patch \
-           file://108-xfrm-validate-xmit-einprogress.patch \
            file://109-sdk_dpaa-rx-max-frame-follows-mtu.patch \
            file://110-sdk-mainline-build-compat.patch \
            file://111-sdk_dpaa-cpu-queues-bounded-by-pool-share.patch \
+           file://112-sdk_dpaa-jumbo-rx-buffers.patch \
            file://120-emc2305-dt-fan-control.patch \
-           file://125-usb-typec-hd3ss3220-port-configuration.patch \
            file://130-thermal-linear-governor.patch \
            file://139-netfilter-nftables-commit-in-progress.patch \
            file://140-ask-flowtable-context.patch \
@@ -104,7 +101,6 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://149-netfilter-ipv6-prefix-translation.patch \
            file://150-sdk_dpaa-hardware-qdisc.patch \
            file://151-netfilter-flowtable-pppoe-peer.patch \
-           file://152-netfilter-nftables-device-hook-transactions.patch \
            file://160-bridge-switchdev-mdb-group.patch \
            file://161-bridge-multicast-egress-snapshot.patch \
            file://162-bridge-forward-path-forwarding-state.patch \
@@ -147,6 +143,7 @@ NXP_SDK_PATHS = "\
     include/linux/fsl_bman.h \
     include/linux/fsl_qman.h \
     include/linux/fsl_usdpaa.h \
+    include/dt-bindings/soc/fsl,qoriq-rcpm.h \
     arch/arm64/boot/dts/freescale/qoriq-qman-portals-sdk.dtsi \
     arch/arm64/boot/dts/freescale/qoriq-bman-portals-sdk.dtsi \
     arch/arm64/boot/dts/freescale/qoriq-dpaa-eth.dtsi \

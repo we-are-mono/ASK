@@ -1,4 +1,4 @@
-From aada52a7db63ad7968b9e73bb77682c40c60a4c7 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 25 Apr 2026 17:55:41 +0200
 Subject: [PATCH] sdk_fman: annotate FmPcdLockTryLockAll inner lock as nested
@@ -43,7 +43,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  4 files changed, 54 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
-index 816a444eae54..977e7e16c186 100644
+index d201031cbaa09..308e903309cae 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
 @@ -703,7 +703,13 @@ bool FmPcdLockTryLockAll(t_Handle h_FmPcd)
@@ -62,7 +62,7 @@ index 816a444eae54..977e7e16c186 100644
              p_SavedPos = p_Pos;
              break;
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.h
-index 9420a85c87b6..d187866f9cb7 100644
+index 9420a85c87b63..d187866f9cb70 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.h
 @@ -518,6 +518,28 @@ static __inline__ bool FmPcdLockTryLock(t_FmPcdLock *p_Lock)
@@ -95,7 +95,7 @@ index 9420a85c87b6..d187866f9cb7 100644
  {
      ASSERT_COND(p_Lock);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/xx_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/xx_ext.h
-index 21b62d0a2b1b..b7aa3e24b21f 100644
+index 21b62d0a2b1b3..b7aa3e24b21f4 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/xx_ext.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/xx_ext.h
 @@ -368,6 +368,24 @@ void XX_UnlockSpinlock(t_Handle h_Spinlock);
@@ -124,7 +124,7 @@ index 21b62d0a2b1b..b7aa3e24b21f 100644
   @Function      XX_UnlockIntrSpinlock
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/xx/xx_arm_linux.c b/drivers/net/ethernet/freescale/sdk_fman/src/xx/xx_arm_linux.c
-index 8c677e254aff..c9c13e8897aa 100644
+index 8c677e254affe..c9c13e8897aa2 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/xx/xx_arm_linux.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/xx/xx_arm_linux.c
 @@ -514,6 +514,13 @@ uint32_t XX_LockIntrSpinlock(t_Handle h_Spinlock)

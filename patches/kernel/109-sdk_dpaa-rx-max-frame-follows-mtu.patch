@@ -1,4 +1,4 @@
-From ee77c46ebf613480d9f797bd0336acb01ed4b4d4 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 5 Oct 2026 00:45:28 +0200
 Subject: [PATCH] sdk_dpaa: size the MAC max frame length to the port's MTU
@@ -43,7 +43,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  11 files changed, 251 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
-index 063302116911..c5a23f36b7d7 100644
+index 6db67c5210e11..1c36bfa12f465 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 @@ -664,6 +664,73 @@ static int __cold dpa_eth_priv_stop(struct net_device *net_dev)
@@ -120,7 +120,7 @@ index 063302116911..c5a23f36b7d7 100644
  #ifdef CONFIG_NET_POLL_CONTROLLER
  static void dpaa_eth_poll_controller(struct net_device *net_dev)
  {
-@@ -698,6 +765,7 @@ static const struct net_device_ops dpa_private_ops = {
+@@ -696,6 +763,7 @@ static const struct net_device_ops dpa_private_ops = {
  	.ndo_set_rx_mode = dpa_set_rx_mode,
  	.ndo_init = dpa_ndo_init,
  	.ndo_eth_ioctl = dpa_ioctl,
@@ -128,7 +128,7 @@ index 063302116911..c5a23f36b7d7 100644
  #ifdef CONFIG_NET_POLL_CONTROLLER
  	.ndo_poll_controller = dpaa_eth_poll_controller,
  #endif
-@@ -750,6 +818,25 @@ void dpa_private_napi_del(struct net_device *net_dev)
+@@ -732,6 +800,25 @@ void dpa_private_napi_del(struct net_device *net_dev)
  }
  EXPORT_SYMBOL(dpa_private_napi_del);
  
@@ -154,7 +154,7 @@ index 063302116911..c5a23f36b7d7 100644
  static int dpa_private_netdev_init(struct net_device *net_dev)
  {
  	int i;
-@@ -773,7 +860,7 @@ static int dpa_private_netdev_init(struct net_device *net_dev)
+@@ -755,7 +842,7 @@ static int dpa_private_netdev_init(struct net_device *net_dev)
  
  	/* Configure the maximum MTU according to the FMan's MAXFRM */
  	net_dev->min_mtu = ETH_MIN_MTU;
@@ -163,7 +163,7 @@ index 063302116911..c5a23f36b7d7 100644
  
  	net_dev->hw_features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
  				NETIF_F_RXCSUM;
-@@ -1179,12 +1266,56 @@ static struct platform_driver dpa_driver = {
+@@ -1168,12 +1255,56 @@ static struct platform_driver dpa_driver = {
  	.remove		= dpa_remove
  };
  
@@ -220,7 +220,7 @@ index 063302116911..c5a23f36b7d7 100644
  #ifdef CONFIG_FSL_DPAA_DBG_LOOP
  	dpa_debugfs_module_init();
  #endif /* CONFIG_FSL_DPAA_DBG_LOOP */
-@@ -1203,6 +1334,7 @@ static int __init __cold dpa_load(void)
+@@ -1192,6 +1323,7 @@ static int __init __cold dpa_load(void)
  		pr_err(KBUILD_MODNAME
  			": %s:%hu:%s(): platform_driver_register() = %d\n",
  			KBUILD_BASENAME".c", __LINE__, __func__, _errno);
@@ -228,7 +228,7 @@ index 063302116911..c5a23f36b7d7 100644
  	}
  
  	pr_debug(KBUILD_MODNAME ": %s:%s() ->\n",
-@@ -1230,6 +1362,7 @@ static void __exit __cold dpa_unload(void)
+@@ -1219,6 +1351,7 @@ static void __exit __cold dpa_unload(void)
  #endif
  
  	platform_driver_unregister(&dpa_driver);
@@ -237,7 +237,7 @@ index 063302116911..c5a23f36b7d7 100644
  #ifdef CONFIG_FSL_DPAA_DBG_LOOP
  	dpa_debugfs_module_exit();
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c b/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c
-index 73ecec1f9d5a..6a9511873fb4 100644
+index 73ecec1f9d5a1..6a9511873fb4b 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c
 @@ -151,6 +151,10 @@ static int __cold memac_init(struct mac_device *mac_dev)
@@ -260,7 +260,7 @@ index 73ecec1f9d5a..6a9511873fb4 100644
  	mac_dev->fm_rtc_disable		= fm_rtc_disable;
  	mac_dev->fm_rtc_get_cnt		= fm_rtc_get_cnt;
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/mac.h b/drivers/net/ethernet/freescale/sdk_dpaa/mac.h
-index de5ffc0ab9c5..cffaec5949f7 100644
+index de5ffc0ab9c5e..cffaec5949f77 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/mac.h
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/mac.h
 @@ -88,6 +88,7 @@ struct mac_device {
@@ -272,7 +272,7 @@ index de5ffc0ab9c5..cffaec5949f7 100644
  	int (*fm_rtc_disable)(struct fm *fm_dev);
  	int (*fm_rtc_get_cnt)(struct fm *fm_dev, uint64_t *ts);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c
-index ce7b97605c7c..d540f4d2aa37 100644
+index ce7b97605c7c2..d540f4d2aa37e 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c
 @@ -621,6 +621,20 @@ t_Error FM_MAC_RestartAutoneg(t_Handle h_FmMac)
@@ -297,7 +297,7 @@ index ce7b97605c7c..d540f4d2aa37 100644
  {
      t_FmMacControllerDriver *p_FmMacControllerDriver = (t_FmMacControllerDriver *)h_FmMac;
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.h
-index d859fbbcad62..24e8792108e7 100644
+index d859fbbcad620..24e8792108e71 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.h
 @@ -115,6 +115,7 @@ typedef struct {
@@ -309,7 +309,7 @@ index d859fbbcad62..24e8792108e7 100644
      t_Error (*f_FM_MAC_SetWakeOnLan)   (t_Handle h_FmMac, bool en);
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fman_memac.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fman_memac.c
-index 78d1f4d97445..5110fff3e2c1 100644
+index 78d1f4d974453..5110fff3e2c1e 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fman_memac.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fman_memac.c
 @@ -275,6 +275,16 @@ uint16_t fman_memac_get_max_frame_len(struct memac_regs *regs)
@@ -330,7 +330,7 @@ index 78d1f4d97445..5110fff3e2c1 100644
  void fman_memac_set_tx_pause_frames(struct memac_regs *regs,
                  uint8_t priority,
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c
-index 6b66035c6b6f..836e53e14594 100644
+index 6b66035c6b6f0..836e53e145945 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/memac.c
 @@ -881,6 +881,34 @@ static uint16_t MemacGetMaxFrameLength(t_Handle h_Memac)
@@ -377,7 +377,7 @@ index 6b66035c6b6f..836e53e14594 100644
      p_FmMacControllerDriver->f_FM_MAC_MII_WritePhyReg           = MEMAC_MII_WritePhyReg;
      p_FmMacControllerDriver->f_FM_MAC_MII_ReadPhyReg            = MEMAC_MII_ReadPhyReg;
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_mac_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_mac_ext.h
-index abb0706798b2..e880f15ee481 100644
+index abb0706798b27..e880f15ee4810 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_mac_ext.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_mac_ext.h
 @@ -803,6 +803,23 @@ t_Error FM_MAC_AdjustLink(t_Handle h_FmMac, e_EnetSpeed speed, bool fullDuplex);
@@ -405,7 +405,7 @@ index abb0706798b2..e880f15ee481 100644
   @Function      FM_MAC_GetId
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman_memac.h b/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman_memac.h
-index eca57b9792f2..28da08f15cdd 100644
+index eca57b9792f25..28da08f15cdd8 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman_memac.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman_memac.h
 @@ -400,6 +400,9 @@ void fman_memac_set_tx_pause_frames(struct memac_regs *regs,
@@ -419,10 +419,10 @@ index eca57b9792f2..28da08f15cdd 100644
  	bool enable);
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_fsl_fman.h b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_fsl_fman.h
-index 5e83f83af211..fbe745f2476a 100644
+index 14fc5d9b10d2b..8e820caca4ef7 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_fsl_fman.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_fsl_fman.h
-@@ -566,6 +566,20 @@ struct fm_mac_dev *fm_mac_config(t_FmMacParams *params);
+@@ -564,6 +564,20 @@ struct fm_mac_dev *fm_mac_config(t_FmMacParams *params);
  int fm_mac_config_max_frame_length(struct fm_mac_dev *fm_mac_dev,
  		int len);
  
@@ -444,10 +444,10 @@ index 5e83f83af211..fbe745f2476a 100644
  
  int fm_mac_config_half_duplex(struct fm_mac_dev *fm_mac_dev, bool enable);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
-index a6bdd18c0f2e..c3f8cd6ba06a 100644
+index 6733208a380c9..c29236cf30a43 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
-@@ -1534,6 +1534,29 @@ int fm_mac_config_max_frame_length(struct fm_mac_dev *fm_mac_dev,
+@@ -1532,6 +1532,29 @@ int fm_mac_config_max_frame_length(struct fm_mac_dev *fm_mac_dev,
  }
  EXPORT_SYMBOL(fm_mac_config_max_frame_length);
  

@@ -1,5 +1,6 @@
 /* The forward-path walk and the route builder around it are production code
- * (nft_flow_offload.c, from nft_xmit_type to nft_flow_offload_skip), and so
+ * (nf_flow_table_path.c, from nft_xmit_type to nft_flow_route, and the hook
+ * lookup it asks, nft_hook_find_ops_rcu()), and so
  * are the walker and the hooks it calls: dev_fill_forward_path() and the VLAN,
  * bridge, sit, ip6_tnl, ppp and PPPoE hooks. The FIB, the neighbour table, the
  * bridge's FDB, port and VLAN state, and the ppp unit, its channel and the
@@ -211,7 +212,7 @@ struct nf_conn {
 struct flowi4 {
 	__be32 daddr, saddr;
 	u32 flowi4_mark;
-	int flowi4_oif, flowi4_iif, flowi4_tos, flowi4_flags, flowi4_proto;
+	int flowi4_oif, flowi4_iif, flowi4_dscp, flowi4_flags, flowi4_proto;
 };
 struct flowi6 {
 	struct in6_addr daddr, saddr;
@@ -257,7 +258,9 @@ struct nf_flow_route {
 	} tuple[2];
 };
 struct nf_flowtable { bool use_neigh, hw; };
-struct nft_hook { struct list_head list; struct { struct net_device *dev; } ops; };
+/* A hook holds one registration per device its name matches. */
+struct nf_hook_ops { struct list_head list; struct net_device *dev; };
+struct nft_hook { struct list_head list; struct list_head ops_list; };
 struct nft_flowtable { struct nf_flowtable data; struct list_head hook_list; };
 
 struct iphdr { u8 tos, ttl; __be16 frag_off; __be32 saddr, daddr; };
@@ -303,6 +306,7 @@ struct net_bridge {
 struct setup {
 	struct nft_flowtable ft;
 	struct nft_hook hooks[2];
+	struct nf_hook_ops registrations[2];
 	struct neighbour lan_neigh, wan_neigh, outer_neigh;
 	struct dst_entry lan_dst, wan_dst;
 	struct rtable outer4;
@@ -330,6 +334,7 @@ static struct dst_entry *reverse_dst;
 #define nft_in(pkt) ((pkt)->in)
 #define nft_net(pkt) NULL
 #define ip_hdr(skb) (&header)
+#define ip4h_dscp(iph) ((iph)->tos & INET_DSCP_MASK)
 #define ipv6_hdr(skb) NULL
 #define ip6_flowinfo(hdr) 0
 #define read_lock_bh(l) ((*(l))++)
@@ -351,6 +356,10 @@ static inline bool is_valid_ether_addr(const u8 *a)
 static inline void ether_addr_copy(u8 *dst, const u8 *src)
 {
 	memcpy(dst, src, ETH_ALEN);
+}
+static inline void eth_zero_addr(u8 *addr)
+{
+	memset(addr, 0, ETH_ALEN);
 }
 static inline bool nf_flowtable_hw_offload(struct nf_flowtable *ft)
 {
@@ -411,7 +420,7 @@ static inline void flowi4_init_output(struct flowi4 *fl4, int oif, u32 mark,
 	memset(fl4, 0, sizeof(*fl4));
 	fl4->flowi4_oif = oif;
 	fl4->flowi4_mark = mark;
-	fl4->flowi4_tos = tos;
+	fl4->flowi4_dscp = tos & INET_DSCP_MASK;
 	fl4->flowi4_proto = proto;
 	fl4->daddr = daddr;
 	fl4->saddr = saddr;
@@ -647,8 +656,12 @@ static void prepare(struct setup *s, bool use_neigh, struct net_device *lan,
 	s->ft.hook_list.next = &s->hooks[0].list;
 	s->hooks[0].list.next = &s->hooks[1].list;
 	s->hooks[1].list.next = &s->ft.hook_list;
-	s->hooks[0].ops.dev = &eth3;
-	s->hooks[1].ops.dev = &eth4;
+	s->registrations[0].dev = &eth3;
+	s->registrations[1].dev = &eth4;
+	for (int i = 0; i < 2; i++) {
+		s->hooks[i].ops_list.next = &s->registrations[i].list;
+		s->registrations[i].list.next = &s->hooks[i].ops_list;
+	}
 	s->lan_neigh.nud_state = lan_state;
 	if (lan_state & NUD_VALID)
 		memcpy(s->lan_neigh.ha, client_mac, ETH_ALEN);
@@ -699,7 +712,7 @@ static void unlist(struct setup *s, const struct net_device *dev)
 	while (prev->next != &s->ft.hook_list) {
 		struct nft_hook *hook = container_of(prev->next, struct nft_hook, list);
 
-		if (hook->ops.dev == dev) {
+		if (container_of(hook->ops_list.next, struct nf_hook_ops, list)->dev == dev) {
 			prev->next = hook->list.next;
 			return;
 		}

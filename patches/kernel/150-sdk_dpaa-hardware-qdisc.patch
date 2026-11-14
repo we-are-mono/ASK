@@ -1,4 +1,4 @@
-From 3e9ccdd8392f1d6d45bcb6e7ade984b237d56290 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 19:08:09 +0200
 Subject: [PATCH] sdk_dpaa: let this netdev host a hardware qdisc
@@ -104,7 +104,7 @@ PREEMPT_RCU is no reader -- and the unregister waits for a grace period.
  5 files changed, 374 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
-index 3d56598a4bf2..e371e7755664 100644
+index b1c9fb846841d..edadc749c9d90 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 @@ -57,6 +57,7 @@
@@ -115,7 +115,7 @@ index 3d56598a4bf2..e371e7755664 100644
  #include <linux/dma-mapping.h>
  #include <linux/fsl_bman.h>
  #ifdef CONFIG_SOC_BUS
-@@ -758,6 +759,141 @@ static void dpaa_eth_poll_controller(struct net_device *net_dev)
+@@ -760,6 +761,141 @@ static void dpaa_eth_poll_controller(struct net_device *net_dev)
  }
  #endif
  
@@ -257,7 +257,7 @@ index 3d56598a4bf2..e371e7755664 100644
  static const struct net_device_ops dpa_private_ops = {
  	.ndo_open = dpa_eth_priv_start,
  	.ndo_start_xmit = dpa_tx,
-@@ -766,8 +902,13 @@ static const struct net_device_ops dpa_private_ops = {
+@@ -768,8 +904,13 @@ static const struct net_device_ops dpa_private_ops = {
  	.ndo_get_stats64 = dpa_get_stats64,
  	.ndo_set_mac_address = dpa_set_mac_address,
  	.ndo_validate_addr = eth_validate_addr,
@@ -272,7 +272,7 @@ index 3d56598a4bf2..e371e7755664 100644
  #endif
  	.ndo_set_rx_mode = dpa_set_rx_mode,
  	.ndo_init = dpa_ndo_init,
-@@ -778,6 +919,9 @@ static const struct net_device_ops dpa_private_ops = {
+@@ -780,6 +921,9 @@ static const struct net_device_ops dpa_private_ops = {
  #endif
  	.ndo_set_features = dpa_set_features,
  	.ndo_fix_features = dpa_fix_features,
@@ -282,7 +282,7 @@ index 3d56598a4bf2..e371e7755664 100644
  };
  
  static int dpa_private_napi_add(struct net_device *net_dev)
-@@ -873,6 +1017,15 @@ static int dpa_private_netdev_init(struct net_device *net_dev)
+@@ -859,6 +1003,15 @@ static int dpa_private_netdev_init(struct net_device *net_dev)
  				NETIF_F_RXCSUM;
  	net_dev->lltx               = true;
  
@@ -298,7 +298,7 @@ index 3d56598a4bf2..e371e7755664 100644
  	/* Advertise S/G and HIGHDMA support for private interfaces */
  	net_dev->hw_features |= NETIF_F_SG | NETIF_F_HIGHDMA;
  	/* Recent kernels enable GSO automatically, if
-@@ -1061,11 +1214,25 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
+@@ -1066,11 +1219,25 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
  	/* Allocate this early, so we can store relevant information in
  	 * the private area (needed by 1588 code in dpa_mac_probe)
  	 */
@@ -325,7 +325,7 @@ index 3d56598a4bf2..e371e7755664 100644
  
  	/* Do this here, so we can be verbose early */
  	SET_NETDEV_DEV(net_dev, dev);
-@@ -1260,6 +1427,8 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
+@@ -1271,6 +1438,8 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
  alloc_failed:
  mac_probe_failed:
  	dev_set_drvdata(dev, NULL);
@@ -335,10 +335,10 @@ index 3d56598a4bf2..e371e7755664 100644
  alloc_etherdev_mq_failed:
  	if (atomic_read(&dpa_bp->refs) == 0)
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
-index 2b852d0fc6f3..3240deb375af 100644
+index 6ef96e0b3200d..bb7a6b3fa81ed 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
-@@ -189,13 +189,50 @@ increased buffer size from 2048 to 2176, to accomodate them in contiguous fd */
+@@ -187,13 +187,50 @@ static inline void DPA_BUG_ON(bool cond)
  #define fm_l4_frame_is_tcp(parse_result_ptr) \
  	((parse_result_ptr)->l4r & FM_L4_PARSE_RESULT_TCP)
  
@@ -392,7 +392,7 @@ index 2b852d0fc6f3..3240deb375af 100644
  #define DPAA_IP_VERSION_4  4
  
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
-index af081ef33edc..bcf16fa1f8cf 100644
+index c567ceeba2f99..e3a891e63d534 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
 @@ -111,6 +111,75 @@ typedef struct qman_fq *(*cdx_get_ceetm_egressfq)(void *, uint32_t chnl_id, uint
@@ -472,10 +472,10 @@ index af081ef33edc..bcf16fa1f8cf 100644
  
  
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index c8af7b8ad379..1833c50014b2 100644
+index 60faf7ed7886a..651f8c3e1b994 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-@@ -1443,9 +1443,9 @@ EXPORT_SYMBOL(skb_to_sg_fd);
+@@ -1513,9 +1513,9 @@ EXPORT_SYMBOL(skb_to_sg_fd);
  #define EMAC_QUEUENUM_MASK 0xff
  
  #ifdef CONFIG_CPE_FAST_PATH
@@ -488,7 +488,7 @@ index c8af7b8ad379..1833c50014b2 100644
   */
  static int pfe_eth_get_queuenum( struct sk_buff *skb )
  {
-@@ -2080,9 +2080,22 @@ static int __cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -2150,9 +2150,22 @@ static int __cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
  		egress_fq = NULL;
  		get_ceetm_cm_egress_fq = 1; /* This becomes 0 when the frame names
  						no class and the DSCP map answers */
@@ -512,7 +512,7 @@ index c8af7b8ad379..1833c50014b2 100644
  			skb_nh = dpa_get_skb_nh(skb, &l3_proto, &l3_offset);
  			if (skb_nh)
  			{
-@@ -2124,7 +2137,14 @@ static int __cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -2194,7 +2207,14 @@ static int __cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
  			queuenum = queuenum % DPAA_ETH_TX_QUEUES;
  		egress_fq = priv->egress_fqs[queuenum];
  	}
@@ -529,7 +529,7 @@ index c8af7b8ad379..1833c50014b2 100644
  }
  
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
-index 95f6db29416b..a68061e4ae7f 100644
+index 0b7ab00fa9bd4..03953b674e3a3 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
 @@ -93,6 +93,50 @@ static char dpa_stats_global[][ETH_GSTRING_LEN] = {
@@ -583,7 +583,7 @@ index 95f6db29416b..a68061e4ae7f 100644
  static int __cold dpa_get_ksettings(struct net_device *net_dev,
  		struct ethtool_link_ksettings *cmd)
  {
-@@ -359,7 +403,8 @@ static int dpa_get_sset_count(struct net_device *net_dev, int type)
+@@ -357,7 +401,8 @@ static int dpa_get_sset_count(struct net_device *net_dev, int type)
  	unsigned int total_stats, num_stats;
  
  	num_stats   = num_online_cpus() + 1;
@@ -593,7 +593,7 @@ index 95f6db29416b..a68061e4ae7f 100644
  
  	switch (type) {
  	case ETH_SS_STATS:
-@@ -482,6 +527,14 @@ static void dpa_get_ethtool_stats(struct net_device *net_dev,
+@@ -480,6 +525,14 @@ static void dpa_get_ethtool_stats(struct net_device *net_dev,
  	data[offset++] = cg_time;
  	data[offset++] = cg_num;
  	data[offset++] = cg_status;
@@ -608,7 +608,7 @@ index 95f6db29416b..a68061e4ae7f 100644
  }
  
  static void dpa_get_strings(struct net_device *net_dev, u32 stringset, u8 *data)
-@@ -505,6 +558,22 @@ static void dpa_get_strings(struct net_device *net_dev, u32 stringset, u8 *data)
+@@ -503,6 +556,22 @@ static void dpa_get_strings(struct net_device *net_dev, u32 stringset, u8 *data)
  		strings += ETH_GSTRING_LEN;
  	}
  	memcpy(strings, dpa_stats_global, size);

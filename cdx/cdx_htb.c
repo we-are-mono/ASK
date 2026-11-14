@@ -3002,7 +3002,7 @@ int cdx_register_ft_egress(const struct cdx_ft_egress_ops *ops)
 	mutex_unlock(&cdx_ft_egress_lock);
 	return rc;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_register_ft_egress, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_register_ft_egress, "ASK_CDX_FLOWTABLE");
 
 /* Returns once no call is inside either op, so the registrant's text can go. */
 void cdx_unregister_ft_egress(void)
@@ -3012,7 +3012,7 @@ void cdx_unregister_ft_egress(void)
 	mutex_unlock(&cdx_ft_egress_lock);
 	synchronize_srcu(&cdx_ft_egress_srcu);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_egress, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_egress, "ASK_CDX_FLOWTABLE");
 
 /* The CEETM channel and class queue a leaf class names, for a filter that
  * wants to send something to it.
@@ -3172,7 +3172,7 @@ void cdx_qos_budget(struct cdx_qos_budget *b)
 	b->policers = CDX_FT_QOS_MAX_POLICER;
 	b->policers_used = cdx_police_pool_used();
 }
-EXPORT_SYMBOL_NS_GPL(cdx_qos_budget, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_qos_budget, "ASK_CDX_FLOWTABLE");
 
 int cdx_qos_port_next(unsigned int *index, struct cdx_qos_port *p,
 		      struct cdx_qos_class *classes, unsigned int max)
@@ -3192,7 +3192,7 @@ int cdx_qos_port_next(unsigned int *index, struct cdx_qos_port *p,
 	mutex_unlock(&cdx_htb_mutex);
 	return rc;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_qos_port_next, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_qos_port_next, "ASK_CDX_FLOWTABLE");
 
 void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
 {
@@ -3335,7 +3335,7 @@ int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn, bool remarks)
 	WRITE_ONCE(cdx_ft_qos_remarks, remarks);
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_register_ft_qos_class, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_register_ft_qos_class, "ASK_CDX_FLOWTABLE");
 
 /* Finishes the readers that may be inside the classifier before its module
  * goes. Each takes its own rcu_read_lock() around the pointer and the call
@@ -3347,7 +3347,7 @@ void cdx_unregister_ft_qos_class(void)
 	synchronize_net();
 	WRITE_ONCE(cdx_ft_qos_remarks, false);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_qos_class, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_qos_class, "ASK_CDX_FLOWTABLE");
 
 /* A datagram an IP fragment belongs to: the fields every fragment of it
  * repeats, which is how a later fragment is matched to the first. */
@@ -3661,7 +3661,7 @@ u64 cdx_ft_qos_control_overruns(void)
 {
 	return atomic64_read(&cdx_htb_control_overruns);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_qos_control_overruns, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_qos_control_overruns, "ASK_CDX_FLOWTABLE");
 
 /* The class of the connection a frame belongs to: -1 with no classifier
  * registered, 0 when no connection is known, with *class zero, and 1 when one
@@ -3852,7 +3852,7 @@ u64 cdx_ft_qos_remark_failures(void)
 {
 	return atomic64_read(&cdx_htb_remark_failures);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_qos_remark_failures, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_qos_remark_failures, "ASK_CDX_FLOWTABLE");
 
 /* Rewrite the DSCP of the IP header at `at' to the codepoint its class
  * carries, keeping the two ECN bits, as the hardware rule for the same flow
@@ -4110,7 +4110,7 @@ int cdx_register_ft_setup_tc(cdx_ft_setup_tc_handler handler)
 		return -EBUSY;
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_register_ft_setup_tc, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_register_ft_setup_tc, "ASK_CDX_FLOWTABLE");
 
 /* Returns once no bind or unbind is inside the adapter's handler, so the
  * adapter's text may go after it. Not from inside the handler, nor holding
@@ -4122,7 +4122,7 @@ void cdx_unregister_ft_setup_tc(void)
 	 * it; the caller's module text has to outlive that call. */
 	synchronize_srcu(&cdx_ft_handler_srcu);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_setup_tc, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_setup_tc, "ASK_CDX_FLOWTABLE");
 
 static int cdx_setup_tc(struct net_device *dev, enum tc_setup_type type,
 			void *type_data)
@@ -4186,7 +4186,7 @@ bool cdx_tc_filter_mirrored(struct net_device *dev, bool ingress,
 {
 	return !ingress && cdx_dscp_mirrored(dev, cookie);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_tc_filter_mirrored, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_tc_filter_mirrored, "ASK_CDX_FLOWTABLE");
 
 int cdx_htb_init(void)
 {

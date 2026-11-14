@@ -120,7 +120,6 @@ struct flow_offload_tuple {
     };
 };
 struct flow_offload_tuple_rhash { struct flow_offload_tuple tuple; };
-enum { NF_FLOW_HW_BIDIRECTIONAL = 4 };
 struct flow_offload {
     struct flow_offload_tuple_rhash tuplehash[FLOW_OFFLOAD_DIR_MAX];
     struct nf_conn *ct;

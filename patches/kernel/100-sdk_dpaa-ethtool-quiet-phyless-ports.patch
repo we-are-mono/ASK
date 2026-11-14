@@ -1,4 +1,4 @@
-From bc07e4ac2b1c914705fd114c77a82e27389da3bd Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 12 Aug 2026 14:14:02 +0200
 Subject: [PATCH] sdk_dpaa: quiet benign "phy device not initialized" ethtool
@@ -22,7 +22,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  1 file changed, 6 insertions(+), 6 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
-index a15d31c7bf7b..95f6db29416b 100644
+index bb40724f3ce0c..0b7ab00fa9bd4 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
 @@ -127,7 +127,7 @@ static int __cold dpa_set_ksettings(struct net_device *net_dev,
@@ -61,7 +61,7 @@ index a15d31c7bf7b..95f6db29416b 100644
  		return -ENODEV;
  	}
  
-@@ -329,7 +329,7 @@ static int dpa_get_eee(struct net_device *net_dev, struct ethtool_keee *et_eee)
+@@ -327,7 +327,7 @@ static int dpa_get_eee(struct net_device *net_dev, struct ethtool_keee *et_eee)
  	}
  
  	if (unlikely(priv->mac_dev->phy_dev == NULL)) {
@@ -70,7 +70,7 @@ index a15d31c7bf7b..95f6db29416b 100644
  		return -ENODEV;
  	}
  
-@@ -347,7 +347,7 @@ static int dpa_set_eee(struct net_device *net_dev, struct ethtool_keee *et_eee)
+@@ -345,7 +345,7 @@ static int dpa_set_eee(struct net_device *net_dev, struct ethtool_keee *et_eee)
  	}
  
  	if (unlikely(priv->mac_dev->phy_dev == NULL)) {

@@ -29,7 +29,7 @@ MODULE_PARM_DESC(flowtable_observe, "Validate requests but decline hardware inst
  * through the exported symbol. Writable at runtime (0644) on purpose -- the
  * question it answers usually arrives after the interesting boot. */
 unsigned int cdx_ft_debug_mask;
-EXPORT_SYMBOL_NS_GPL(cdx_ft_debug_mask, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_debug_mask, "ASK_CDX_FLOWTABLE");
 module_param_named(ask_debug, cdx_ft_debug_mask, uint, 0644);
 MODULE_PARM_DESC(ask_debug, "ASK-DEBUG admission tracing: 1=refusals 2=accepts 4=devices");
 
@@ -41,7 +41,7 @@ MODULE_PARM_DESC(ask_debug, "ASK-DEBUG admission tracing: 1=refusals 2=accepts 4
  * offers none of them to a flowtable unless told to. Read when the classifier
  * is built, so fixed while the module is loaded. */
 bool cdx_ft_transit;
-EXPORT_SYMBOL_NS_GPL(cdx_ft_transit, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_transit, "ASK_CDX_FLOWTABLE");
 module_param_named(transit, cdx_ft_transit, bool, 0444);
 MODULE_PARM_DESC(transit, "Offload transit ESP, GRE, IPIP and 6in4; costs bridged minimum frames up to 18% (default off)");
 
@@ -196,7 +196,7 @@ bool cdx_ft_observing(void)
 {
 	return ft_observe;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_observing, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_observing, "ASK_CDX_FLOWTABLE");
 
 /* The SDK's normal ndo_open enables FMAN ports. A failed hardware unlink
  * belongs to the provider even after adapter detach, so guard that open here
@@ -299,7 +299,7 @@ void cdx_ft_begin(void)
 	atomic_dec(&cdx_ft_waiting);
 	cdx_ft_taken();
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_begin, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_begin, "ASK_CDX_FLOWTABLE");
 
 /* The longest a job between two of its batches waits for others' turns. */
 #define CDX_FT_LET_WAITERS_MS 100
@@ -322,7 +322,7 @@ void cdx_ft_let_waiters(void)
 		usleep_range(500, 1000);
 	cond_resched();
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_let_waiters, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_let_waiters, "ASK_CDX_FLOWTABLE");
 
 bool cdx_ft_trybegin(void)
 {
@@ -331,54 +331,54 @@ bool cdx_ft_trybegin(void)
 	cdx_ft_taken();
 	return true;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_trybegin, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_trybegin, "ASK_CDX_FLOWTABLE");
 
 void cdx_ft_end(void)
 {
 	WRITE_ONCE(ft_held_since, 0);
 	mutex_unlock(&cdx_info->ctrl.mutex);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_end, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_end, "ASK_CDX_FLOWTABLE");
 
 void cdx_ft_assert_held(void)
 {
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_assert_held, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_assert_held, "ASK_CDX_FLOWTABLE");
 
 void cdx_ft_assert_not_held(void)
 {
 	lockdep_assert_not_held(&cdx_info->ctrl.mutex);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_assert_not_held, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_assert_not_held, "ASK_CDX_FLOWTABLE");
 
 bool cdx_ft_failed(void)
 {
 	cdx_ft_assert_held();
 	return ft_failed;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_failed, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_failed, "ASK_CDX_FLOWTABLE");
 
 bool cdx_ft_bypassed(void)
 {
 	cdx_ft_assert_held();
 	return dpa_cfg_bypassed();
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_bypassed, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_bypassed, "ASK_CDX_FLOWTABLE");
 
 unsigned int cdx_ft_restarts(void)
 {
 	cdx_ft_assert_held();
 	return ft_restarts;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_restarts, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_restarts, "ASK_CDX_FLOWTABLE");
 
 unsigned int cdx_ft_resume_failures(void)
 {
 	cdx_ft_assert_held();
 	return ft_resume_failures;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_resume_failures, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_resume_failures, "ASK_CDX_FLOWTABLE");
 
 u32 cdx_ft_epoch(void)
 {
@@ -739,7 +739,7 @@ void cdx_ft_fatal(void)
 	 * the attempt not yet due no more than a look at when it is. */
 	mod_delayed_work(system_wq, &ft_fatal_work, 0);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_fatal, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_fatal, "ASK_CDX_FLOWTABLE");
 
 /* Unload stops the ports itself; the work must not outlive the module or run
  * against a freed cdx_info. Disabled rather than cancelled: the deinit chain
@@ -756,7 +756,7 @@ unsigned int cdx_ft_pending(void)
 	cdx_ft_assert_held();
 	return cdx_ft_hw_pending() + cdx_ehash_quarantine_pending();
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_pending, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_pending, "ASK_CDX_FLOWTABLE");
 
 /* An unlink is out of the hardware's reach only once a barrier has completed
  * behind it: until then a walk begun before it may still be inside what it
@@ -777,7 +777,7 @@ int cdx_ft_proven(void)
 		cdx_ft_hw_retry();
 	return cdx_ft_pending() ? -EAGAIN : 0;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_proven, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_proven, "ASK_CDX_FLOWTABLE");
 
 bool cdx_ft_idle(void)
 {
@@ -821,7 +821,7 @@ int cdx_ft_claim(void)
 	ft_claimed = true;
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_claim, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_claim, "ASK_CDX_FLOWTABLE");
 
 int cdx_ft_release(void)
 {
@@ -831,7 +831,7 @@ int cdx_ft_release(void)
 	ft_claimed = false;
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_release, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_release, "ASK_CDX_FLOWTABLE");
 
 int cdx_ft_admission_begin(void)
 {
@@ -839,14 +839,14 @@ int cdx_ft_admission_begin(void)
 	/* RTNL holders can wait for callbacks needing this transaction. */
 	return rtnl_trylock() ? 0 : -EAGAIN;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_admission_begin, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_admission_begin, "ASK_CDX_FLOWTABLE");
 
 void cdx_ft_admission_end(void)
 {
 	cdx_ft_assert_held();
 	rtnl_unlock();
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_admission_end, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_admission_end, "ASK_CDX_FLOWTABLE");
 
 /* The devices cdx_ft_port_supported() can admit are exactly the physical
  * Ethernet onifs, and cdx_add_eth_onif() takes a phy_port slot for each one
@@ -861,7 +861,7 @@ static bool cdx_ft_switch_port(struct net_device *dev)
 {
 	struct netdev_phys_item_id ppid;
 
-	return dev_get_port_parent_id(dev, &ppid, false) != -EOPNOTSUPP;
+	return netif_get_port_parent_id(dev, &ppid, false) != -EOPNOTSUPP;
 }
 
 /* Everything both predicates below require, which is every check that is
@@ -905,7 +905,7 @@ bool cdx_ft_port_supported(struct net_device *dev)
 {
 	return cdx_ft_onif_type(dev) == (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_port_supported, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_port_supported, "ASK_CDX_FLOWTABLE");
 
 /* What a finished frame may be handed to, which is a strictly wider set than
  * what may originate one.
@@ -942,7 +942,7 @@ bool cdx_ft_egress_supported(struct net_device *dev)
 	return type == (IF_TYPE_WLAN | IF_TYPE_PHYSICAL) &&
 	       dpaa_vwd_vap_is_open(dev);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_egress_supported, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_egress_supported, "ASK_CDX_FLOWTABLE");
 
 /* A deletion waiting on its barrier refuses every new entry in cdx_ft_add(),
  * and while no invalidation is in progress nothing else retries it: least of
@@ -997,7 +997,7 @@ int cdx_ft_add(const struct cdx_ft_rule *rule,
 		ft_live++;
 	return rc;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_add, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_add, "ASK_CDX_FLOWTABLE");
 
 int cdx_ft_l2_add(const struct cdx_ft_l2_rule *rule, struct cdx_ft_hw **result)
 {
@@ -1029,7 +1029,7 @@ int cdx_ft_l2_add(const struct cdx_ft_l2_rule *rule, struct cdx_ft_hw **result)
 		ft_live++;
 	return rc;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_l2_add, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_l2_add, "ASK_CDX_FLOWTABLE");
 
 /* Ownership, not encoding: a statistics slot is claimed and returned by the
  * adapter's own policy, so these are transaction-scoped like every other
@@ -1042,21 +1042,21 @@ int cdx_ft_stats_alloc(enum cdx_ft_stats_kind kind, struct cdx_ft_stats_slot **s
 		return -EOPNOTSUPP;
 	return cdx_ft_ifstats_alloc(kind, slot);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_alloc, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_alloc, "ASK_CDX_FLOWTABLE");
 
 void cdx_ft_stats_free(struct cdx_ft_stats_slot **slot)
 {
 	cdx_ft_assert_held();
 	cdx_ft_ifstats_free(slot);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_free, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_free, "ASK_CDX_FLOWTABLE");
 
 void cdx_ft_stats_retention(unsigned int *retained, u64 *deferred)
 {
 	cdx_ft_assert_held();
 	cdx_ft_ifstats_retention(retained, deferred);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_retention, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_retention, "ASK_CDX_FLOWTABLE");
 
 void cdx_ft_stats_read(const struct cdx_ft_stats_slot *slot,
 		       struct cdx_ft_stats *rx, struct cdx_ft_stats *tx)
@@ -1064,7 +1064,7 @@ void cdx_ft_stats_read(const struct cdx_ft_stats_slot *slot,
 	cdx_ft_assert_held();
 	cdx_ft_ifstats_read(slot, rx, tx);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_read, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_read, "ASK_CDX_FLOWTABLE");
 
 void cdx_ft_stats_publish(struct cdx_ft_stats_slot *slot, int ifindex,
 			  unsigned int rx_overhead, unsigned int tx_overhead)
@@ -1072,7 +1072,7 @@ void cdx_ft_stats_publish(struct cdx_ft_stats_slot *slot, int ifindex,
 	cdx_ft_assert_held();
 	cdx_ft_ifstats_publish(slot, ifindex, rx_overhead, tx_overhead);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_publish, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_publish, "ASK_CDX_FLOWTABLE");
 
 /* No transaction: the caller is a netdev notifier, and the slot's owner --
  * who alone can free it -- is serialized against that notifier by its own lock. */
@@ -1080,14 +1080,14 @@ void cdx_ft_stats_unpublish(struct cdx_ft_stats_slot *slot)
 {
 	cdx_ft_ifstats_unpublish(slot);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_unpublish, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_unpublish, "ASK_CDX_FLOWTABLE");
 
 void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats)
 {
 	cdx_ft_assert_held();
 	cdx_ft_hw_stats(hw, stats);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_stats, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats, "ASK_CDX_FLOWTABLE");
 
 int cdx_ft_del(struct cdx_ft_hw **hw)
 {
@@ -1104,7 +1104,7 @@ int cdx_ft_del(struct cdx_ft_hw **hw)
 		cdx_ft_fatal();
 	return rc;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_del, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_del, "ASK_CDX_FLOWTABLE");
 
 int cdx_ft_unlink(struct cdx_ft_hw **hw, struct cdx_ft_counters *final)
 {
@@ -1122,21 +1122,21 @@ int cdx_ft_unlink(struct cdx_ft_hw **hw, struct cdx_ft_counters *final)
 		cdx_ft_fatal();
 	return rc;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_unlink, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_unlink, "ASK_CDX_FLOWTABLE");
 
 unsigned int cdx_ft_owed(void)
 {
 	cdx_ft_assert_held();
 	return cdx_ft_hw_owed();
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_owed, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_owed, "ASK_CDX_FLOWTABLE");
 
 int cdx_ft_settle(unsigned int *unproven)
 {
 	cdx_ft_assert_held();
 	return cdx_ft_hw_settle(unproven);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_settle, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_settle, "ASK_CDX_FLOWTABLE");
 
 int cdx_ft_recover(void)
 {
@@ -1166,7 +1166,7 @@ int cdx_ft_recover(void)
 	}
 	return cdx_ft_hw_retry();
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ft_recover, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ft_recover, "ASK_CDX_FLOWTABLE");
 
 /* CDX's final shutdown has already stopped and detached every classifier port.
  * It can reclaim backend storage after the adapter and its work are gone. */

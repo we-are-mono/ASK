@@ -1,4 +1,4 @@
-From 80a0372eef726240292ba8e84552408269a1a9c9 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 13:56:19 +0200
 Subject: [PATCH] netfilter: keep IPv6 prefix translation in conntrack and
@@ -22,7 +22,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  2 files changed, 50 insertions(+)
 
 diff --git a/net/ipv6/netfilter/ip6t_NPT.c b/net/ipv6/netfilter/ip6t_NPT.c
-index 787c74aa85e3..a63cd09c5440 100644
+index 787c74aa85e33..a63cd09c54407 100644
 --- a/net/ipv6/netfilter/ip6t_NPT.c
 +++ b/net/ipv6/netfilter/ip6t_NPT.c
 @@ -11,6 +11,9 @@
@@ -82,10 +82,10 @@ index 787c74aa85e3..a63cd09c5440 100644
  }
  
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index 042b8de49c4d..ec5d7eae5406 100644
+index 2989f601ee017..8f4fd2601088d 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -139,6 +139,21 @@ struct flow_offload *flow_offload_alloc(struct nf_conn *ct)
+@@ -240,6 +240,21 @@ struct flow_offload *flow_offload_alloc(struct nf_conn *ct)
  	if (ct->status & IPS_DST_NAT)
  		__set_bit(NF_FLOW_DNAT, &flow->flags);
  

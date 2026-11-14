@@ -62,7 +62,6 @@ struct sk_buff_head { int unused; };
 typedef struct { int unused; } wait_queue_head_t;
 typedef struct { int refs; } refcount_t;
 typedef struct { bool held; } spinlock_t;
-typedef struct { bool held; } rwlock_t;
 struct rw_semaphore { int unused; };
 typedef struct { int unused; } netns_tracker;
 struct rcu_head { int unused; };
@@ -163,14 +162,16 @@ static void spin_unlock_bh(spinlock_t *l)
 	if (watched && l == &watched->wlock)
 		record(PPP_UNLOCK);
 }
-static void write_lock_bh(rwlock_t *l) { assert(!l->held); l->held = true; spinning++; }
-static void write_unlock_bh(rwlock_t *l) { assert(l->held); l->held = false; spinning--; }
+static void spin_lock(spinlock_t *l) { assert(!l->held); l->held = true; spinning++; }
+static void spin_unlock(spinlock_t *l) { assert(l->held); l->held = false; spinning--; }
 static void mutex_lock(struct mutex *m) { assert(!m->held && !spinning); m->held = true; }
 static void mutex_unlock(struct mutex *m) { assert(m->held); m->held = false; record(MUTEX_UNLOCK); }
 static void rtnl_lock(void) { assert(!rtnl_held && !spinning); rtnl_held = true; record(RTNL_LOCK); }
 static void rtnl_unlock(void) { assert(rtnl_held); rtnl_held = false; record(RTNL_UNLOCK); }
 #define ASSERT_RTNL() assert(rtnl_held)
 #define rcu_dereference_protected(p, c) (p)
+#define rcu_assign_pointer(p, v) ((p) = (v))
+#define rcu_replace_pointer(p, v, c) ({ typeof(p) old_ = (p); (p) = (v); old_; })
 #define lockdep_is_held(l) 1
 
 static void list_add_tail_rcu(struct list_head *e, struct list_head *h)

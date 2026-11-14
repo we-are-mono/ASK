@@ -1,4 +1,4 @@
-From 04c590f98ceb7f55cc98907a425b2dc1399fb5fa Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 18:26:25 +0200
 Subject: [PATCH] xfrm: route a cross-family packet-offload tunnel by the flow
@@ -41,10 +41,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  4 files changed, 139 insertions(+), 21 deletions(-)
 
 diff --git a/include/net/xfrm.h b/include/net/xfrm.h
-index bd5a813c82ad..a255f85fd353 100644
+index b73e7af6295f7..01308795b9c3b 100644
 --- a/include/net/xfrm.h
 +++ b/include/net/xfrm.h
-@@ -1877,12 +1877,19 @@ struct sk_buff *xfrm6_gro_udp_encap_rcv(struct sock *sk, struct list_head *head,
+@@ -1950,12 +1950,19 @@ struct sk_buff *xfrm6_gro_udp_encap_rcv(struct sock *sk, struct list_head *head,
  					struct sk_buff *skb);
  int xfrm_user_policy(struct sock *sk, int optname, sockptr_t optval,
  		     int optlen);
@@ -65,7 +65,7 @@ index bd5a813c82ad..a255f85fd353 100644
  
  struct dst_entry *__xfrm_dst_lookup(int family, const struct xfrm_dst_lookup_params *params);
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index c6efada53d3f..73323775f4ce 100644
+index 0281f828b0789..c75d39e217ee5 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -296,6 +296,7 @@ static int flow_offload_eth_dst(struct net *net,
@@ -101,10 +101,10 @@ index c6efada53d3f..73323775f4ce 100644
  			return -ENOENT;
  
 diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
-index c23cc825fabd..e0eb9ded16a9 100644
+index 2d63b9f4b4f25..e5f4e2cd8a565 100644
 --- a/net/xfrm/xfrm_output.c
 +++ b/net/xfrm/xfrm_output.c
-@@ -659,8 +659,15 @@ static bool xfrm_dev_sec_next_hop(struct xfrm_state *x, struct dst_entry *path)
+@@ -661,8 +661,15 @@ static bool xfrm_dev_sec_next_hop(struct xfrm_state *x, struct dst_entry *path)
  {
  	struct neighbour *n = NULL;
  
@@ -122,7 +122,7 @@ index c23cc825fabd..e0eb9ded16a9 100644
  		neigh_event_send(n, NULL);
  		neigh_release(n);
 diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
-index 5c1f38162dae..2b424b4ec32e 100644
+index f9a8315c68bc9..306e877295a55 100644
 --- a/net/xfrm/xfrm_policy.c
 +++ b/net/xfrm/xfrm_policy.c
 @@ -295,13 +295,35 @@ struct dst_entry *__xfrm_dst_lookup(int family,
@@ -152,7 +152,7 @@ index 5c1f38162dae..2b424b4ec32e 100644
 +}
 +
  static inline struct dst_entry *xfrm_dst_lookup(struct xfrm_state *x,
- 						int tos, int oif,
+ 						dscp_t dscp, int oif,
  						xfrm_address_t *prev_saddr,
  						xfrm_address_t *prev_daddr,
  						int family, u32 mark)
@@ -163,7 +163,7 @@ index 5c1f38162dae..2b424b4ec32e 100644
  	xfrm_address_t *saddr = &x->props.saddr;
  	xfrm_address_t *daddr = &x->id.daddr;
 @@ -322,21 +344,7 @@ static inline struct dst_entry *xfrm_dst_lookup(struct xfrm_state *x,
- 	params.tos = tos;
+ 	params.dscp = dscp;
  	params.oif = oif;
  	params.mark = mark;
 -	params.ipproto = x->id.proto;
@@ -185,7 +185,7 @@ index 5c1f38162dae..2b424b4ec32e 100644
  
  	dst = __xfrm_dst_lookup(family, &params);
  
-@@ -2673,6 +2681,90 @@ static inline int xfrm_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
+@@ -2674,6 +2682,90 @@ static inline int xfrm_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
  	return err;
  }
  
@@ -276,7 +276,7 @@ index 5c1f38162dae..2b424b4ec32e 100644
  
  /* Allocate chain of dst_entry's, attach known xfrm's, calculate
   * all the metrics... Shortly, bundle a bundle.
-@@ -2740,7 +2832,8 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
+@@ -2741,7 +2833,8 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
  		xdst->route = dst;
  		dst_copy_metrics(dst1, dst);
  
@@ -286,7 +286,7 @@ index 5c1f38162dae..2b424b4ec32e 100644
  			__u32 mark = 0;
  			int oif;
  
-@@ -2756,6 +2849,12 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
+@@ -2757,6 +2850,12 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
  			err = PTR_ERR(dst);
  			if (IS_ERR(dst))
  				goto put_states;

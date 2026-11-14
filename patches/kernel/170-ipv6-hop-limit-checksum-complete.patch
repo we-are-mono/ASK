@@ -1,4 +1,4 @@
-From ea7fe2b711338d2d820fafba932db2c85f1343e3 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 10 Oct 2026 21:38:37 +0200
 Subject: [PATCH] ipv6: keep CHECKSUM_COMPLETE valid across hop-limit rewrites
@@ -36,10 +36,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  8 files changed, 30 insertions(+), 8 deletions(-)
 
 diff --git a/include/net/ipv6.h b/include/net/ipv6.h
-index 3f3e312bced4..aab96f69538d 100644
+index d001d6046c280..c548027f6b45b 100644
 --- a/include/net/ipv6.h
 +++ b/include/net/ipv6.h
-@@ -910,6 +910,23 @@ static inline int ip6_sk_dst_hoplimit(struct ipv6_pinfo *np, struct flowi6 *fl6,
+@@ -916,6 +916,23 @@ static inline int ip6_sk_dst_hoplimit(struct ipv6_pinfo *np, struct flowi6 *fl6,
  	return hlimit;
  }
  
@@ -64,7 +64,7 @@ index 3f3e312bced4..aab96f69538d 100644
   * Equivalent to :	flow->v6addrs.src = iph->saddr;
   *			flow->v6addrs.dst = iph->daddr;
 diff --git a/net/ipv6/exthdrs.c b/net/ipv6/exthdrs.c
-index 5d1e98ae1818..19d24bf7a959 100644
+index 1cd9e800746bd..e14288bdca257 100644
 --- a/net/ipv6/exthdrs.c
 +++ b/net/ipv6/exthdrs.c
 @@ -470,7 +470,8 @@ static int ipv6_srh_rcv(struct sk_buff *skb, struct inet6_dev *idev)
@@ -88,20 +88,20 @@ index 5d1e98ae1818..19d24bf7a959 100644
  		skb_pull(skb, sizeof(struct ipv6hdr));
  		goto looped_back;
 diff --git a/net/ipv6/ip6mr.c b/net/ipv6/ip6mr.c
-index ac0120b75ff2..70f06faa6575 100644
+index 7b60e4b2a8179..87965f470869d 100644
 --- a/net/ipv6/ip6mr.c
 +++ b/net/ipv6/ip6mr.c
-@@ -2090,7 +2090,7 @@ static int ip6mr_forward2(struct net *net, struct mr_table *mrt,
- 		goto out_free;
+@@ -2095,7 +2095,7 @@ static int ip6mr_prepare_xmit(struct net *net, struct mr_table *mrt,
+ 		return -1;
  
  	ipv6h = ipv6_hdr(skb);
 -	ipv6h->hop_limit--;
 +	ipv6_set_hop_limit(skb, ipv6h, ipv6h->hop_limit - 1);
- 
- 	IP6CB(skb)->flags |= IP6SKB_FORWARDED;
+ 	return 0;
+ }
  
 diff --git a/net/ipv6/netfilter/nf_dup_ipv6.c b/net/ipv6/netfilter/nf_dup_ipv6.c
-index a8bb04bd94cf..0a84d3cc99c7 100644
+index 6da3102b7c1b3..8a69812d99328 100644
 --- a/net/ipv6/netfilter/nf_dup_ipv6.c
 +++ b/net/ipv6/netfilter/nf_dup_ipv6.c
 @@ -61,7 +61,7 @@ void nf_dup_ipv6(struct net *net, struct sk_buff *skb, unsigned int hooknum,
@@ -112,12 +112,12 @@ index a8bb04bd94cf..0a84d3cc99c7 100644
 +		ipv6_set_hop_limit(skb, iph, iph->hop_limit - 1);
  	}
  	if (nf_dup_ipv6_route(net, skb, gw, oif)) {
- 		__this_cpu_write(nf_skb_duplicated, true);
+ 		current->in_nf_duplicate = true;
 diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
-index 89d941523bac..cde4a3f73d7e 100644
+index 96368f839dab6..051b91b88ff24 100644
 --- a/net/netfilter/nf_flow_table_ip.c
 +++ b/net/netfilter/nf_flow_table_ip.c
-@@ -753,7 +753,7 @@ static int nf_flow_offload_ipv6_forward(struct nf_flowtable_ctx *ctx,
+@@ -776,7 +776,7 @@ static int nf_flow_offload_ipv6_forward(struct nf_flowtable_ctx *ctx,
  	ip6h = ipv6_hdr(skb);
  	nf_flow_nat_ipv6(flow, skb, dir, ip6h);
  
@@ -127,7 +127,7 @@ index 89d941523bac..cde4a3f73d7e 100644
  
  	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
 diff --git a/net/netfilter/nft_fwd_netdev.c b/net/netfilter/nft_fwd_netdev.c
-index 4bce36c3a6a0..9f7b0a35df99 100644
+index eceab479bd8c4..2ab288a2af52e 100644
 --- a/net/netfilter/nft_fwd_netdev.c
 +++ b/net/netfilter/nft_fwd_netdev.c
 @@ -16,6 +16,7 @@
@@ -138,7 +138,7 @@ index 4bce36c3a6a0..9f7b0a35df99 100644
  
  struct nft_fwd_netdev {
  	u8	sreg_dev;
-@@ -142,7 +143,7 @@ static void nft_fwd_neigh_eval(const struct nft_expr *expr,
+@@ -143,7 +144,7 @@ static void nft_fwd_neigh_eval(const struct nft_expr *expr,
  			goto out;
  		}
  
@@ -148,7 +148,7 @@ index 4bce36c3a6a0..9f7b0a35df99 100644
  		break;
  		}
 diff --git a/net/netfilter/xt_HL.c b/net/netfilter/xt_HL.c
-index 7873b834c300..9a31adccbd4d 100644
+index 7873b834c3004..9a31adccbd4d6 100644
 --- a/net/netfilter/xt_HL.c
 +++ b/net/netfilter/xt_HL.c
 @@ -12,6 +12,7 @@
@@ -169,10 +169,10 @@ index 7873b834c300..9a31adccbd4d 100644
  	return XT_CONTINUE;
  }
 diff --git a/net/openvswitch/actions.c b/net/openvswitch/actions.c
-index de126616d1cb..2360a89487fb 100644
+index 9d9697cf63298..33122334c910d 100644
 --- a/net/openvswitch/actions.c
 +++ b/net/openvswitch/actions.c
-@@ -1229,7 +1229,8 @@ static int execute_dec_ttl(struct sk_buff *skb, struct sw_flow_key *key)
+@@ -1195,7 +1195,8 @@ static int execute_dec_ttl(struct sk_buff *skb, struct sw_flow_key *key)
  		if (nh->hop_limit <= 1)
  			return -EHOSTUNREACH;
  

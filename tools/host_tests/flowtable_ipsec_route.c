@@ -37,7 +37,7 @@ struct flowi {
 	union {
 		struct {
 			uint32_t daddr, saddr, flowi4_mark;
-			int flowi4_oif, flowi4_iif, flowi4_tos, flowi4_flags;
+			int flowi4_oif, flowi4_iif, flowi4_dscp, flowi4_flags;
 		} ip4;
 		struct {
 			struct in6_addr daddr, saddr;
@@ -68,6 +68,7 @@ static struct net_device logical_lan = { 281 }, physical_lan = { 3 }, wan = { 4 
 #define nft_in(pkt) ((pkt)->in)
 #define nft_net(pkt) NULL
 #define ip_hdr(skb) (&header)
+#define ip4h_dscp(iph) ((iph)->tos & INET_DSCP_MASK)
 #define ipv6_hdr(skb) NULL
 #define ip6_flowinfo(hdr) 0
 
@@ -119,9 +120,11 @@ static void check_route(int family, enum ip_conntrack_dir dir,
 	struct nft_flowtable ft = { { use_neigh } };
 	struct nf_conn ct = {};
 	struct nf_flow_route route = {};
-	bool any_xfrm = this_xfrm || other_xfrm;
-	bool walk_this = !this_xfrm && (use_neigh || !any_xfrm);
-	bool walk_other = !other_xfrm && (use_neigh || !any_xfrm);
+	/* Each NEIGH direction is walked on its own, for every table: a
+	 * transform in one direction hides neither the other's bridge/VLAN
+	 * path nor its physical ingress. */
+	bool walk_this = !this_xfrm;
+	bool walk_other = !other_xfrm;
 
 	memset(walks, 0, sizeof(walks));
 	reverse_dst = &there;

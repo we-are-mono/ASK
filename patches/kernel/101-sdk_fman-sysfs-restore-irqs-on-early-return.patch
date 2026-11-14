@@ -1,4 +1,4 @@
-From a1bdddb802a64e1fc89e7d284983282e6a86a9e8 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 17 Aug 2026 20:17:28 +0200
 Subject: [PATCH] sdk_fman: fix IRQ handling in FMan sysfs show handlers
@@ -32,7 +32,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  2 files changed, 104 insertions(+), 166 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c
-index ee473326b9e7..60f2f450ca20 100644
+index ee473326b9e7a..60f2f450ca204 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c
 @@ -235,7 +235,6 @@ static ssize_t show_fm_risc_load(struct device *dev,
@@ -602,7 +602,7 @@ index ee473326b9e7..60f2f450ca20 100644
  #endif /* (defined(DEBUG_ERRORS) && ... */
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm_port.c
-index ee0ada81f0ea..05a4a6a88438 100644
+index ee0ada81f0ea3..05a4a6a884381 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm_port.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm_port.c
 @@ -255,17 +255,18 @@ static ssize_t show_fm_port_regs(struct device *dev,

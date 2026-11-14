@@ -1,7 +1,7 @@
-From bd6e1d896485e807ad30fe8a194c3d6b153e9278 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 20 Sep 2026 03:59:10 +0200
-Subject: [PATCH 4/4] moal: do not copy every transmitted skb by default
+Subject: [PATCH] moal: do not copy every transmitted skb by default
 
 tx_skb_clone defaulted to 1 on every platform, which sets
 EXT_TX_SKB_CLONE and makes woal_start_xmit() take
@@ -22,13 +22,13 @@ Upstream-Status: Pending
  1 file changed, 7 insertions(+), 1 deletion(-)
 
 diff --git a/mlinux/moal_init.c b/mlinux/moal_init.c
-index 5e1bfb1..e96e067 100644
+index 7e46fe3..6002b36 100644
 --- a/mlinux/moal_init.c
 +++ b/mlinux/moal_init.c
-@@ -208,7 +208,13 @@ static int rps = 0x0F;
+@@ -207,7 +207,13 @@ static int rps = 0x0F;
   * Default value of 0 keeps edmac disabled by default
   */
- static int edmac_ctrl = 0;
+ static int edmac_ctrl;
 -static int tx_skb_clone = 1;
 +/* Off: woal_start_xmit() already copies an skb that is cloned or short of
 + * headroom, which is the case this flag was added for. Set, it forces a

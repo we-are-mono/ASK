@@ -40,7 +40,6 @@ static struct rtable route;
 static int lookup_error, lookups, builds, selections;
 static bool ipv4_is_multicast(uint32_t ip) { return (ntohl(ip) & 0xf0000000) == 0xe0000000; }
 static bool ipv4_is_lbcast(uint32_t ip) { return ip == UINT32_MAX; }
-static bool ipv4_is_zeronet(uint32_t ip) { return !(ntohl(ip) & 0xff000000); }
 static bool ipv4_is_local_multicast(uint32_t ip) { return (ntohl(ip) & 0xffffff00) == 0xe0000000; }
 static struct net_device *__ip_dev_find(struct net *net, uint32_t ip, bool hold) { return &device; }
 static struct net_device *dev_get_by_index_rcu(struct net *net, int index)

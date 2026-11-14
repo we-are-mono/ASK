@@ -1,4 +1,4 @@
-From 76dd6f34a596cb39f9447248aecc854794003492 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 25 Apr 2026 17:55:41 +0200
 Subject: [PATCH] netlink: name every cb_mutex lock class up to MAX_LINKS
@@ -20,7 +20,7 @@ Name the whole range; the sentinel stays last, at index MAX_LINKS.
  1 file changed, 36 insertions(+)
 
 diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
-index e250d4a3d030..69d5684887ab 100644
+index fec8b52ed05e7..9dd18ceabe4a0 100644
 --- a/net/netlink/af_netlink.c
 +++ b/net/netlink/af_netlink.c
 @@ -127,6 +127,42 @@ static const char *const nlk_cb_mutex_key_strings[MAX_LINKS + 1] = {

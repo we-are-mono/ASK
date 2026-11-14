@@ -1,4 +1,4 @@
-From bd0bcd3add1e9358b9a265ba63354631655d5cef Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 02:14:51 +0200
 Subject: [PATCH] netfilter: walk the forwarding path through sit and ip6_tnl
@@ -53,14 +53,14 @@ Context version 13 adds the two tunnel records.
  net/ipv6/sit.c                        |  84 ++++++++++++++++++++
  net/netfilter/nf_flow_table_core.c    |   1 +
  net/netfilter/nf_flow_table_offload.c |   2 +
- net/netfilter/nft_flow_offload.c      |  38 +++++++++
+ net/netfilter/nf_flow_table_path.c    |  38 +++++++++
  8 files changed, 313 insertions(+), 2 deletions(-)
 
 diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
-index 1d0a3ff4e88c..1c92244baebf 100644
+index 150600035342e..6f24ba03291cb 100644
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
-@@ -841,8 +841,21 @@ enum net_device_path_type {
+@@ -878,8 +878,21 @@ enum net_device_path_type {
  	DEV_PATH_PPPOE,
  	DEV_PATH_DSA,
  	DEV_PATH_MTK_WDMA,
@@ -82,7 +82,7 @@ index 1d0a3ff4e88c..1c92244baebf 100644
  struct net_device_path {
  	enum net_device_path_type	type;
  	const struct net_device		*dev;
-@@ -873,6 +886,25 @@ struct net_device_path {
+@@ -910,6 +923,25 @@ struct net_device_path {
  			u8 bss;
  			u8 amsdu;
  		} mtk_wdma;
@@ -109,10 +109,10 @@ index 1d0a3ff4e88c..1c92244baebf 100644
  };
  
 diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
-index cf62dca18c9e..1624a45cbca7 100644
+index b43a62ba67139..4dde68e417a1b 100644
 --- a/include/net/flow_offload.h
 +++ b/include/net/flow_offload.h
-@@ -690,6 +690,7 @@ struct flow_cls_common_offload {
+@@ -691,6 +691,7 @@ struct flow_cls_common_offload {
  
  struct nf_flow_offload_handle;
  struct nf_flow_session;
@@ -120,7 +120,7 @@ index cf62dca18c9e..1624a45cbca7 100644
  
  /* Context is borrowed for the callback and NULL for other producers. Drivers
   * must not retain nf_ct, either dst or either session. nf_dst is this
-@@ -720,14 +721,32 @@ struct nf_flow_session;
+@@ -721,14 +722,32 @@ struct nf_flow_session;
   * from other producers. Each direction is offered to every device bound to
   * the table, and a STATS or DESTROY carries no rule, so this is how a driver
   * tells the device that owns the direction from the others without looking
@@ -156,7 +156,7 @@ index cf62dca18c9e..1624a45cbca7 100644
  	u64 nf_xfrm_genid;
  	u32 nf_dst_cookie;
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index 894e2afa06bd..806cd953022a 100644
+index bd465ac646d5a..c733e490b32a1 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
 @@ -133,6 +133,32 @@ struct nf_flow_session {
@@ -200,7 +200,7 @@ index 894e2afa06bd..806cd953022a 100644
  	/* The port this direction arrives on, when the walk reached one the
  	 * table did not list: iifidx then names a device above it, which the
  	 * port's hook never matches. Zero otherwise. The port joining the
-@@ -263,6 +290,8 @@ struct nf_flow_route {
+@@ -265,6 +292,8 @@ struct nf_flow_route {
  		 * out.h_dest would otherwise be the only record of -- and that
  		 * member is not carried over to a NEIGH tuple. */
  		struct nf_flow_session		session;
@@ -210,10 +210,10 @@ index 894e2afa06bd..806cd953022a 100644
  	} tuple[FLOW_OFFLOAD_DIR_MAX];
  };
 diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
-index 7eb2e67842f4..df8cdff8b3db 100644
+index a6499f654e85a..6d52c5c89e586 100644
 --- a/net/ipv6/ip6_tunnel.c
 +++ b/net/ipv6/ip6_tunnel.c
-@@ -1416,6 +1416,111 @@ ipxip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev,
+@@ -1420,6 +1420,111 @@ ipxip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev,
  	return 0;
  }
  
@@ -325,7 +325,7 @@ index 7eb2e67842f4..df8cdff8b3db 100644
  static netdev_tx_t
  ip6_tnl_start_xmit(struct sk_buff *skb, struct net_device *dev)
  {
-@@ -1825,6 +1930,7 @@ static const struct net_device_ops ip6_tnl_netdev_ops = {
+@@ -1840,6 +1945,7 @@ static const struct net_device_ops ip6_tnl_netdev_ops = {
  	.ndo_change_mtu = ip6_tnl_change_mtu,
  	.ndo_get_stats64 = dev_get_tstats64,
  	.ndo_get_iflink = ip6_tnl_get_iflink,
@@ -334,10 +334,10 @@ index 7eb2e67842f4..df8cdff8b3db 100644
  
  #define IPXIPX_FEATURES (NETIF_F_SG |		\
 diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
-index 1f980e827d04..94c32d3d762c 100644
+index ae39e4c5d463a..eae4b1bd7f36c 100644
 --- a/net/ipv6/sit.c
 +++ b/net/ipv6/sit.c
-@@ -1066,6 +1066,89 @@ static netdev_tx_t sit_tunnel_xmit__(struct sk_buff *skb,
+@@ -1058,6 +1058,89 @@ static netdev_tx_t sit_tunnel_xmit__(struct sk_buff *skb,
  	return NETDEV_TX_OK;
  }
  
@@ -427,7 +427,7 @@ index 1f980e827d04..94c32d3d762c 100644
  static netdev_tx_t sit_tunnel_xmit(struct sk_buff *skb,
  				   struct net_device *dev)
  {
-@@ -1406,6 +1489,7 @@ static const struct net_device_ops ipip6_netdev_ops = {
+@@ -1398,6 +1481,7 @@ static const struct net_device_ops ipip6_netdev_ops = {
  	.ndo_siocdevprivate = ipip6_tunnel_siocdevprivate,
  	.ndo_get_iflink = ip_tunnel_get_iflink,
  	.ndo_tunnel_ctl = ipip6_tunnel_ctl,
@@ -436,10 +436,10 @@ index 1f980e827d04..94c32d3d762c 100644
  
  static void ipip6_dev_free(struct net_device *dev)
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index 7c1fdfbaede3..230e235b5ad0 100644
+index 910a55b44c6c1..ab1a01715e5ef 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -261,6 +261,7 @@ static int flow_offload_fill_route(struct flow_offload *flow,
+@@ -293,6 +293,7 @@ static int flow_offload_fill_route(struct flow_offload *flow,
  	 * path, not to how the path is transmitted, and a DIRECT tuple has no
  	 * room for it once the union holds its cached addresses. */
  	flow_tuple->session = route->tuple[dir].session;
@@ -448,7 +448,7 @@ index 7c1fdfbaede3..230e235b5ad0 100644
  	switch (route->tuple[dir].xmit_type) {
  	case FLOW_OFFLOAD_XMIT_DIRECT:
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 5228df2a0d28..e3c4cb3fb74c 100644
+index 98b266f2f83e3..0281f828b0789 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -1002,6 +1002,8 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
@@ -460,11 +460,11 @@ index 5228df2a0d28..e3c4cb3fb74c 100644
  		.nf_handle = flow->hw_handle,
  		.nf_xfrm_genid = flow->xfrm_genid,
  		.nf_dst_cookie = nf_flow_offload_dst_cookie(&flow->tuplehash[dir].tuple),
-diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
-index 2f2bcae721bf..ddec0850159f 100644
---- a/net/netfilter/nft_flow_offload.c
-+++ b/net/netfilter/nft_flow_offload.c
-@@ -114,6 +114,8 @@ struct nft_forward_info {
+diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_path.c
+index 09519d5e3607e..02f7b88982a79 100644
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -110,6 +110,8 @@ struct nft_forward_info {
  	 * implicit in h_dest and the encap slot: a hardware adapter cannot
  	 * re-derive any of it, and h_dest is not carried to a NEIGH tuple. */
  	struct nf_flow_session session;
@@ -473,7 +473,7 @@ index 2f2bcae721bf..ddec0850159f 100644
  	enum flow_offload_xmit_type xmit_type;
  };
  
-@@ -209,6 +211,41 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+@@ -206,6 +208,41 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
  			if (!READ_ONCE(flowtable->use_neigh))
  				info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
  			break;
@@ -515,7 +515,7 @@ index 2f2bcae721bf..ddec0850159f 100644
  		default:
  			goto refuse;
  		}
-@@ -301,6 +338,7 @@ static int nft_dev_forward_path(struct nf_flow_route *route,
+@@ -296,6 +333,7 @@ static int nft_dev_forward_path(struct nf_flow_route *route,
  	/* Belongs to this direction's egress path, as out.h_dest does, and
  	 * unlike out.h_dest it survives NEIGH output. */
  	route->tuple[dir].session = info.session;

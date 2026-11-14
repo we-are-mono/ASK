@@ -1,8 +1,8 @@
 SUMMARY = "NXP 88W9098 (moal/mlan) PCIe Wi-Fi driver"
 DESCRIPTION = "NXP's MXM Wi-Fi driver for the 88W9098 (u-blox JODY-W3) over \
 PCIe, as a cfg80211 full-MAC driver. This is the radio the Mono Gateway DK \
-carries, and the same driver and commit the OpenWrt production build ships, \
-so the test image exercises the shipping datapath rather than an approximation."
+carries, from NXP's driver release for this image's kernel line \
+(lf-6.18.37_2.1.0), the counterpart of the release the OpenWrt build ships."
 
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=ab04ac0f249af12befccb94447c08b77"
@@ -11,18 +11,14 @@ inherit module ask-provenance
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
-SRC_URI = "git://github.com/nxp-imx/mwifiex.git;protocol=https;branch=hotfix/lf-6.12.49_2.2.0_hotfix \
-           file://0001-cfg80211-set_monitor_channel-gained-its-netdev-in-6.12.patch \
-           file://0002-moal-do-not-free-an-skb-already-handed-to-the-stack.patch \
-           file://0003-mlan-revalidate-the-ralist-after-the-send-helpers-drop-the-lock.patch \
-           file://0004-moal-do-not-copy-every-transmitted-skb-by-default.patch \
-           file://0005-moal-report-scan-results-outside-scan_req_lock.patch \
-           file://0006-moal-give-each-mlan-spinlock-its-own-lockdep-class.patch \
-           file://0007-mlan-aggregate-an-A-MSDU-under-one-hold-of-the-ralis.patch \
-           file://0008-moal-own-scan-requests-through-completion-and-teardown.patch \
-           file://0009-mlan-take-INT_MAX-and-UINT_MAX-from-the-kernel.patch \
+SRC_URI = "git://github.com/nxp-imx/mwifiex.git;protocol=https;branch=lf-6.18.37_2.1.0 \
+           file://0001-mlan-revalidate-the-ralist-after-the-send-helpers-drop-the-lock.patch \
+           file://0002-moal-do-not-copy-every-transmitted-skb-by-default.patch \
+           file://0003-moal-report-cached-scan-results-to-cfg80211-outside-scan_req_lock.patch \
+           file://0004-mlan-aggregate-an-A-MSDU-under-one-hold-of-the-ralist-lock.patch \
+           file://0005-moal-own-cfg80211-scans-through-admission-completion-and-teardown.patch \
 "
-SRCREV = "09f41e1423e4806a127507d5fa284cd02c46772f"
+SRCREV = "44f90628e368de23e9991de424fc2a1799c81044"
 
 S = "${WORKDIR}/git"
 
@@ -39,13 +35,14 @@ NXP_CHIP_FLAGS = " \
 "
 
 # cfg80211 full-MAC, STA and AP, with the legacy wireless-extensions paths off.
-# Set on the command line because the driver's own Makefile autodetects these
-# by reading CPP macros as make variables, which does not work here; a
-# command-line variable is the one thing it cannot override.
+# Set on the command line: the driver's Makefile derives these from the
+# kernel's CONFIG_WIRELESS_EXT and CONFIG_WEXT_PRIV (y in this kernel) and
+# would build WEXT in; a command-line variable is the one thing it cannot
+# override.
 #
 # Unlike the OpenWrt build this needs no backports headers: that tree carries
 # cfg80211 as a backported package, while this kernel provides it natively at
-# 6.12, so the driver builds against the in-tree headers directly.
+# 6.18, so the driver builds against the in-tree headers directly.
 NXP_FEATURE_FLAGS = " \
     CONFIG_NXP_WLAN_DRIVER=m \
     CONFIG_STA_SUPPORT=y \

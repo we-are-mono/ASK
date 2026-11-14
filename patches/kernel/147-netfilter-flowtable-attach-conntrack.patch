@@ -1,4 +1,4 @@
-From 25051f2e7c67729924caded7e9c48704c4b766f9 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 23:04:04 +0200
 Subject: [PATCH] netfilter: flowtable: attach the conntrack to
@@ -36,7 +36,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  1 file changed, 36 insertions(+)
 
 diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
-index ff35d601699a..97b5afbf87bb 100644
+index 2858c00eb8a1e..7c5f4c13f97c9 100644
 --- a/net/netfilter/nf_flow_table_ip.c
 +++ b/net/netfilter/nf_flow_table_ip.c
 @@ -15,6 +15,7 @@
@@ -47,7 +47,7 @@ index ff35d601699a..97b5afbf87bb 100644
  #include <net/netfilter/nf_conntrack_acct.h>
  /* For layer 4 checksum field offset. */
  #include <linux/tcp.h>
-@@ -272,6 +273,39 @@ static inline bool nf_flow_dst_check(const struct nf_flowtable *flowtable,
+@@ -276,6 +277,39 @@ static inline bool nf_flow_dst_check(const struct nf_flowtable *flowtable,
  	return dst_check(tuple->dst_cache, tuple->dst_cookie);
  }
  
@@ -87,7 +87,7 @@ index ff35d601699a..97b5afbf87bb 100644
  static unsigned int nf_flow_xmit_xfrm(struct sk_buff *skb,
  				      const struct nf_hook_state *state,
  				      struct dst_entry *dst)
-@@ -415,6 +449,7 @@ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
+@@ -428,6 +462,7 @@ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
  
  	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
  		nf_ct_acct_update(flow->ct, tuplehash->tuple.dir, skb->len);
@@ -95,7 +95,7 @@ index ff35d601699a..97b5afbf87bb 100644
  
  	return 1;
  }
-@@ -700,6 +735,7 @@ static int nf_flow_offload_ipv6_forward(struct nf_flowtable_ctx *ctx,
+@@ -723,6 +758,7 @@ static int nf_flow_offload_ipv6_forward(struct nf_flowtable_ctx *ctx,
  
  	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
  		nf_ct_acct_update(flow->ct, tuplehash->tuple.dir, skb->len);

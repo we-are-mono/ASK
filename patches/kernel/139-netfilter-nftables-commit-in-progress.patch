@@ -1,4 +1,4 @@
-From 218fd3ec20e85e320c0ca4b65dbbd99dcc8a4156 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 24 Sep 2026 01:55:38 +0200
 Subject: [PATCH] netfilter: nf_tables: say when a commit is still being
@@ -28,10 +28,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  3 files changed, 31 insertions(+)
 
 diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
-index 923b2c0d6e84..9cbad535ddc4 100644
+index ac04b4eb17d78..6c440ff30e463 100644
 --- a/include/net/netfilter/nf_tables.h
 +++ b/include/net/netfilter/nf_tables.h
-@@ -1935,4 +1935,23 @@ static inline u64 nft_net_tstamp(const struct net *net)
+@@ -1968,4 +1968,23 @@ static inline u64 nft_net_tstamp(const struct net *net)
  	return nft_pernet(net)->tstamp;
  }
  
@@ -56,7 +56,7 @@ index 923b2c0d6e84..9cbad535ddc4 100644
 +
  #endif /* _NET_NF_TABLES_H */
 diff --git a/include/net/netns/nftables.h b/include/net/netns/nftables.h
-index 99dd166c5d07..9fb5adf835f0 100644
+index 99dd166c5d07c..9fb5adf835f09 100644
 --- a/include/net/netns/nftables.h
 +++ b/include/net/netns/nftables.h
 @@ -5,6 +5,8 @@
@@ -69,10 +69,10 @@ index 99dd166c5d07..9fb5adf835f0 100644
  
  #endif
 diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
-index e4325686953e..63c141040997 100644
+index 76876761698eb..c5cd01f0e5ab5 100644
 --- a/net/netfilter/nf_tables_api.c
 +++ b/net/netfilter/nf_tables_api.c
-@@ -10325,6 +10325,11 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
+@@ -10965,6 +10965,11 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
  	while (++base_seq == 0)
  		;
  
@@ -84,7 +84,7 @@ index e4325686953e..63c141040997 100644
  	/* pairs with smp_load_acquire in nft_lookup_eval */
  	smp_store_release(&net->nft.base_seq, base_seq);
  
-@@ -10556,6 +10561,11 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
+@@ -11174,6 +11179,11 @@ static int nf_tables_commit(struct net *net, struct sk_buff *skb)
  
  	nft_set_commit_update(&set_update_list);
  

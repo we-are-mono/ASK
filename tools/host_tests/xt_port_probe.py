@@ -84,10 +84,18 @@ def test_xt_port_probe(tmp_path):
     # What the harness takes as given about the patch around the walkers:
     # the device name both read for a hook without a device is the file's,
     # and each family's tables are typed for the walk to find them, mangle's
-    # wrapper included.
+    # wrapper included. x_tables builds every table's hooks from the template
+    # ops the family's registration hands it, and types each one there.
     for name, text in (("ip_tables", v4), ("ip6_tables", v6)):
         assert "static const char nulldevname[IFNAMSIZ] __aligned(sizeof(long));" in text, name
-        assert "ops[i].hook_ops_type = NF_HOOK_OP_XTABLES;" in text, name
+    assert ("ops[i].priv = table;\n\t\t\tops[i].hook_ops_type = NF_HOOK_OP_XTABLES;"
+            in braced((kernel / "net/netfilter/x_tables.c").read_text(),
+                      r"^struct xt_table \*xt_register_table\("))
+    for path, head in ((ip_tables, r"^int ipt_register_table\("),
+                       (kernel / "net/ipv6/netfilter/ip6_tables.c",
+                        r"^int ip6t_register_table\(")):
+        registration = braced(path.read_text(), head)
+        assert "xt_register_table(net, table, template_ops," in registration, path.name
 
     binary = tmp_path / "xt_port_probe"
     run_process([

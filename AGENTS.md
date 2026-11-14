@@ -69,7 +69,7 @@ they conflict with modern kernel APIs or clean design, prefer the modern approac
 
 ## Build & deploy
 
-- **Build only through kas/Yocto** (`meta-ask/.config.yaml`): the kernel (v6.12.112 +
+- **Build only through kas/Yocto** (`meta-ask/.config.yaml`): the kernel (v6.18.63 +
   `patches/kernel/`), cdx, ask_flowtable and the flowtable daemon. Never raw
   `bitbake`, never standalone `make modules` / GCC-15 recipes — those use different
   toolchains/defines and don't prove the shipped build is clean. A GCC 15 cross
@@ -100,10 +100,10 @@ they conflict with modern kernel APIs or clean design, prefer the modern approac
 
 - **`patches/kernel/*.patch` is the single source of truth**; any kernel checkout is
   only a place to regenerate from. The series order is the explicit per-patch
-  `SRC_URI` list in `meta-ask/recipes-kernel/linux/linux-ask_6.12.bb` — hand-edit it for
+  `SRC_URI` list in `meta-ask/recipes-kernel/linux/linux-ask_6.18.bb` — hand-edit it for
   every new patch (old `0*`/`0[1-9]*` globs silently dropped patches numbered ≥100).
 - **Changing a patch:** in a scratch clone, check out the base — the recipe's
-  `KERNEL_SRCREV` (v6.12.112) with the NXP SDK overlay at `pins/nxp-sdk-srcrev.inc`
+  `KERNEL_SRCREV` (v6.18.63) with the NXP SDK overlay at `pins/nxp-sdk-srcrev.inc`
   applied as `do_overlay_sdk` does. `git am` the current series in `SRC_URI` order,
   change the patch's commit (fixup + `git rebase --autosquash`), regenerate with
   `git format-patch --no-numbered` (subjects stay `[PATCH] subsystem: …`; the filename

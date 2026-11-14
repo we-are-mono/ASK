@@ -58,12 +58,14 @@ typedef unsigned long cpumask_t;
 struct net_device { int unused; };
 struct qman_portal;
 struct qm_dqrr_entry;
+struct qman_poll_ctx;
 enum qman_cb_dqrr_result { qman_cb_dqrr_consume, qman_cb_dqrr_stop };
 struct qman_fq {
     u32 fqid;
     struct {
         enum qman_cb_dqrr_result (*dqrr)(struct qman_portal *, struct qman_fq *,
-                                         const struct qm_dqrr_entry *);
+                                         const struct qm_dqrr_entry *, bool,
+                                         struct qman_poll_ctx *);
     } cb;
     /* The model's own: created, scheduled, the group it joined. */
     bool live, sched;
@@ -201,9 +203,10 @@ static void cdx_create_type_fqid_info_in_procfs(struct qman_fq *fq, int dir, voi
     assert(fq->live);
 }
 static enum qman_cb_dqrr_result vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq,
-                                               const struct qm_dqrr_entry *dq)
+                                               const struct qm_dqrr_entry *dq, bool sched_napi,
+                                               struct qman_poll_ctx *ctx)
 {
-    (void)portal; (void)fq; (void)dq;
+    (void)portal; (void)fq; (void)dq; (void)sched_napi; (void)ctx;
     return qman_cb_dqrr_consume;
 }
 

@@ -72,10 +72,12 @@ void cdx_reset_offline_ports(void)
 }
 
 static enum qman_cb_dqrr_result ofport_rx_defa(struct qman_portal *portal, struct qman_fq *fq,
-		const struct qm_dqrr_entry *dq);
+		const struct qm_dqrr_entry *dq, bool sched_napi,
+		struct qman_poll_ctx *ctx);
 
 static enum qman_cb_dqrr_result ofport_rx_err(struct qman_portal *portal, struct qman_fq *fq,
-		const struct qm_dqrr_entry *dq);
+		const struct qm_dqrr_entry *dq, bool sched_napi,
+		struct qman_poll_ctx *ctx);
 
 int get_ofport_fman_and_portindex(uint32_t fm_index, uint32_t handle, uint32_t* fm_idx, uint32_t* port_idx,
 		uint32_t *portid)
@@ -373,7 +375,8 @@ static void ofport_rx_report(const char *handler, const struct qm_fd *fd,
 }
 
 static enum qman_cb_dqrr_result ofport_rx_defa(struct qman_portal *portal, struct qman_fq *fq,
-		const struct qm_dqrr_entry *dq)
+		const struct qm_dqrr_entry *dq, bool sched_napi,
+		struct qman_poll_ctx *ctx)
 {
 	ofport_rx_report(__func__, &dq->fd, dq->fqid);
 	if (dq->fd.bpid)
@@ -382,7 +385,8 @@ static enum qman_cb_dqrr_result ofport_rx_defa(struct qman_portal *portal, struc
 }
 
 static enum qman_cb_dqrr_result ofport_rx_err(struct qman_portal *portal, struct qman_fq *fq,
-		const struct qm_dqrr_entry *dq) 
+		const struct qm_dqrr_entry *dq, bool sched_napi,
+		struct qman_poll_ctx *ctx)
 {
 	ofport_rx_report(__func__, &dq->fd, fq->fqid);
 	if (dq->fd.bpid)

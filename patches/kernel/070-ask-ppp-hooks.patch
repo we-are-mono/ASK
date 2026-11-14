@@ -1,4 +1,4 @@
-From 764e953aa02bf3bae9e290b667217f6ebd909385 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:42:47 +0200
 Subject: [PATCH] ask: PPP/PPPoE fast-path hooks
@@ -57,10 +57,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  3 files changed, 173 insertions(+), 17 deletions(-)
 
 diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
-index 5d6d69632c84..7e17c7c7756c 100644
+index 61c240d846ee2..ac698fef6757f 100644
 --- a/drivers/net/ppp/ppp_generic.c
 +++ b/drivers/net/ppp/ppp_generic.c
-@@ -137,6 +137,9 @@ struct ppp {
+@@ -142,6 +142,9 @@ struct ppp {
  	unsigned long	last_recv;	/* jiffies when last pkt rcvd a0 */
  	struct net_device *dev;		/* network interface device a4 */
  	int		closing;	/* is device closing down? a8 */
@@ -70,7 +70,7 @@ index 5d6d69632c84..7e17c7c7756c 100644
  #ifdef CONFIG_PPP_MULTILINK
  	int		nxchan;		/* next channel to send something on */
  	u32		nxseq;		/* next sequence number to send */
-@@ -306,6 +309,51 @@ static inline struct ppp_net *ppp_pernet(struct net *net)
+@@ -311,6 +314,51 @@ static inline struct ppp_net *ppp_pernet(struct net *net)
  	return net_generic(net, ppp_net_id);
  }
  
@@ -130,9 +130,9 @@ index 5d6d69632c84..7e17c7c7756c 100644
 +	INIT_WORK(&ppp->link_work, ppp_link_work);
 +#endif
  
- 	ppp->xmit_recursion = alloc_percpu(int);
+ 	ppp->xmit_recursion = alloc_percpu(struct ppp_xmit_recursion);
  	if (!ppp->xmit_recursion) {
-@@ -1406,6 +1457,12 @@ static int __init ppp_init(void)
+@@ -1414,6 +1465,12 @@ static int __init ppp_init(void)
  
  	pr_info("PPP generic driver version " PPP_VERSION "\n");
  
@@ -145,7 +145,7 @@ index 5d6d69632c84..7e17c7c7756c 100644
  	err = register_pernet_device(&ppp_net_ops);
  	if (err) {
  		pr_err("failed to register PPP pernet device (%d)\n", err);
-@@ -1440,6 +1497,9 @@ static int __init ppp_init(void)
+@@ -1448,6 +1505,9 @@ static int __init ppp_init(void)
  out_net:
  	unregister_pernet_device(&ppp_net_ops);
  out:
@@ -155,7 +155,7 @@ index 5d6d69632c84..7e17c7c7756c 100644
  	return err;
  }
  
-@@ -1598,13 +1658,21 @@ static int ppp_fill_forward_path(struct net_device_path_ctx *ctx,
+@@ -1606,13 +1666,21 @@ static int ppp_fill_forward_path(struct net_device_path_ctx *ctx,
  	if (ppp->flags & SC_MULTILINK)
  		return -EOPNOTSUPP;
  
@@ -179,7 +179,7 @@ index 5d6d69632c84..7e17c7c7756c 100644
  
  	if (!chan->ops->fill_forward_path)
  		return -EOPNOTSUPP;
-@@ -3498,6 +3566,9 @@ ppp_connect_channel(struct channel *pch, int unit)
+@@ -3544,6 +3612,9 @@ ppp_connect_channel(struct channel *pch, int unit)
  	struct ppp_net *pn;
  	int ret = -ENXIO;
  	int hdrlen;
@@ -189,10 +189,10 @@ index 5d6d69632c84..7e17c7c7756c 100644
  
  	pn = ppp_pernet(pch->chan_net);
  
-@@ -3539,8 +3610,27 @@ ppp_connect_channel(struct channel *pch, int unit)
+@@ -3585,8 +3656,27 @@ ppp_connect_channel(struct channel *pch, int unit)
  
   outl:
- 	write_unlock_bh(&pch->upl);
+ 	spin_unlock(&pch->upl);
 +#if defined(CONFIG_CPE_FAST_PATH)
 +	/* Only take a device reference here; the notification
 +	 * (ppp_link_changed()) is raised after all_ppp_mutex is dropped.
@@ -217,7 +217,7 @@ index 5d6d69632c84..7e17c7c7756c 100644
  	return ret;
  }
  
-@@ -3565,6 +3655,21 @@ ppp_disconnect_channel(struct channel *pch)
+@@ -3610,6 +3700,21 @@ ppp_disconnect_channel(struct channel *pch)
  			wake_up_interruptible(&ppp->file.rwait);
  		ppp_unlock(ppp);
  		synchronize_net();
@@ -239,7 +239,7 @@ index 5d6d69632c84..7e17c7c7756c 100644
  		if (refcount_dec_and_test(&ppp->file.refcnt))
  			ppp_destroy_interface(ppp);
  		err = 0;
-@@ -3612,6 +3717,11 @@ static void __exit ppp_cleanup(void)
+@@ -3657,6 +3762,11 @@ static void __exit ppp_cleanup(void)
  	device_destroy(&ppp_class, MKDEV(PPP_MAJOR, 0));
  	class_unregister(&ppp_class);
  	unregister_pernet_device(&ppp_net_ops);
@@ -252,19 +252,19 @@ index 5d6d69632c84..7e17c7c7756c 100644
  }
  
 diff --git a/drivers/net/ppp/pppoe.c b/drivers/net/ppp/pppoe.c
-index 8ff2024dde60..0df598159293 100644
+index 7ee63051a1619..91c485c640282 100644
 --- a/drivers/net/ppp/pppoe.c
 +++ b/drivers/net/ppp/pppoe.c
-@@ -282,7 +282,7 @@ static void pppoe_flush_dev(struct net_device *dev)
+@@ -284,7 +284,7 @@ static void pppoe_flush_dev(struct net_device *dev)
  		struct sock *sk;
  
  		while (po) {
 -			while (po && po->pppoe_dev != dev) {
 +			while (po && READ_ONCE(po->pppoe_dev) != dev) {
- 				po = po->next;
+ 				po = rcu_dereference_protected(po->next,
+ 							       lockdep_is_held(&pn->hash_lock));
  			}
- 
-@@ -307,7 +307,7 @@ static void pppoe_flush_dev(struct net_device *dev)
+@@ -310,7 +310,7 @@ static void pppoe_flush_dev(struct net_device *dev)
  			    sk->sk_state & (PPPOX_CONNECTED | PPPOX_BOUND)) {
  				pppox_unbind_sock(sk);
  				sk->sk_state_change(sk);
@@ -273,7 +273,7 @@ index 8ff2024dde60..0df598159293 100644
  				dev_put(dev);
  			}
  
-@@ -471,7 +471,7 @@ static void pppoe_unbind_sock_work(struct work_struct *work)
+@@ -467,7 +467,7 @@ static void pppoe_unbind_sock_work(struct work_struct *work)
  	lock_sock(sk);
  	if (po->pppoe_dev) {
  		dev_put(po->pppoe_dev);
@@ -282,7 +282,7 @@ index 8ff2024dde60..0df598159293 100644
  	}
  	pppox_unbind_sock(sk);
  	release_sock(sk);
-@@ -584,7 +584,7 @@ static int pppoe_release(struct socket *sock)
+@@ -587,7 +587,7 @@ static int pppoe_release(struct socket *sock)
  
  	if (po->pppoe_dev) {
  		dev_put(po->pppoe_dev);
@@ -291,7 +291,7 @@ index 8ff2024dde60..0df598159293 100644
  	}
  
  	pppox_unbind_sock(sk);
-@@ -655,7 +655,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+@@ -657,7 +657,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
  			    po->pppoe_pa.remote, po->pppoe_ifindex);
  		if (po->pppoe_dev) {
  			dev_put(po->pppoe_dev);
@@ -300,7 +300,7 @@ index 8ff2024dde60..0df598159293 100644
  		}
  
  		po->pppoe_ifindex = 0;
-@@ -663,7 +663,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+@@ -665,7 +665,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
  		memset(&po->pppoe_relay, 0, sizeof(po->pppoe_relay));
  		memset(&po->chan, 0, sizeof(po->chan));
  		po->next = NULL;
@@ -309,7 +309,7 @@ index 8ff2024dde60..0df598159293 100644
  
  		sk->sk_state = PPPOX_NONE;
  	}
-@@ -676,7 +676,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+@@ -678,7 +678,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
  		if (!dev)
  			goto err_put;
  
@@ -318,7 +318,7 @@ index 8ff2024dde60..0df598159293 100644
  		po->pppoe_ifindex = dev->ifindex;
  		pn = pppoe_pernet(net);
  		if (!(dev->flags & IFF_UP)) {
-@@ -711,7 +711,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+@@ -713,7 +713,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
  		sk->sk_state = PPPOX_CONNECTED;
  	}
  
@@ -327,7 +327,7 @@ index 8ff2024dde60..0df598159293 100644
  
  end:
  	release_sock(sk);
-@@ -719,7 +719,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+@@ -721,7 +721,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
  err_put:
  	if (po->pppoe_dev) {
  		dev_put(po->pppoe_dev);
@@ -336,7 +336,7 @@ index 8ff2024dde60..0df598159293 100644
  	}
  	goto end;
  }
-@@ -920,7 +920,7 @@ static int pppoe_sendmsg(struct socket *sock, struct msghdr *m,
+@@ -923,7 +923,7 @@ static int pppoe_sendmsg(struct socket *sock, struct msghdr *m,
  static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
  {
  	struct pppox_sock *po = pppox_sk(sk);
@@ -345,7 +345,7 @@ index 8ff2024dde60..0df598159293 100644
  	struct pppoe_hdr *ph;
  	int data_len = skb->len;
  
-@@ -930,6 +930,13 @@ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
+@@ -933,6 +933,13 @@ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
  	 * But, we also can't do a lock_sock since that introduces a potential
  	 * deadlock as we'd reverse the lock ordering used when calling
  	 * ppp_unregister_channel().
@@ -359,7 +359,7 @@ index 8ff2024dde60..0df598159293 100644
  	 */
  
  	if (sock_flag(sk, SOCK_DEAD) || !(sk->sk_state & PPPOX_CONNECTED))
-@@ -951,7 +958,7 @@ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
+@@ -954,7 +961,7 @@ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
  	ph->ver	= 1;
  	ph->type = 1;
  	ph->code = 0;
@@ -368,7 +368,7 @@ index 8ff2024dde60..0df598159293 100644
  	ph->length = htons(data_len);
  
  	skb->protocol = cpu_to_be16(ETH_P_PPP_SES);
-@@ -980,21 +987,38 @@ static int pppoe_xmit(struct ppp_channel *chan, struct sk_buff *skb)
+@@ -983,21 +990,38 @@ static int pppoe_xmit(struct ppp_channel *chan, struct sk_buff *skb)
  	return __pppoe_xmit(sk, skb);
  }
  
@@ -410,7 +410,7 @@ index 8ff2024dde60..0df598159293 100644
  	memcpy(path->encap.h_dest, po->pppoe_pa.remote, ETH_ALEN);
  	memcpy(ctx->daddr, po->pppoe_pa.remote, ETH_ALEN);
  	path->dev = ctx->dev;
-@@ -1038,17 +1062,32 @@ static int pppoe_seq_show(struct seq_file *seq, void *v)
+@@ -1041,17 +1065,32 @@ static int pppoe_seq_show(struct seq_file *seq, void *v)
  {
  	struct pppox_sock *po;
  	char *dev_name;
@@ -444,10 +444,10 @@ index 8ff2024dde60..0df598159293 100644
  	return 0;
  }
 diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
-index 6ad562621f7d..84b97b6b30a5 100644
+index ccc07611e61d8..800042f25cc8b 100644
 --- a/net/core/rtnetlink.c
 +++ b/net/core/rtnetlink.c
-@@ -6837,12 +6837,19 @@ static int rtnetlink_event(struct notifier_block *this, unsigned long event, voi
+@@ -7078,12 +7078,19 @@ static int rtnetlink_event(struct notifier_block *this, unsigned long event, voi
  	case NETDEV_NOTIFY_PEERS:
  	case NETDEV_CHANGEUPPER:
  	case NETDEV_RESEND_IGMP:

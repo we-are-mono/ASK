@@ -1,4 +1,4 @@
-From 056048d6a07ad8bc28117828aa4f860b03444081 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Fri, 3 Jul 2026 20:34:41 +0200
 Subject: [PATCH] sdk_fman: use C99 flexible arrays in ehash descriptor structs
@@ -32,7 +32,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  1 file changed, 7 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-index 288ea0ded74c..4a1837d67bb6 100644
+index dd605b8748a7f..87bdb3f190b64 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 @@ -60,7 +60,7 @@ struct en_ehash_entry {

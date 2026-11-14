@@ -11,7 +11,7 @@ from _kernel_source import (kernel_source)
 def test_xfrm_provider(tmp_path):
     kernel = kernel_source()
     units = {
-        "include/net/xfrm.h": ["xfrm_dev_ops_get", "xfrm_dev_ops_put",
+        "include/net/xfrm.h": ["xfrm_unset_type_offload", "xfrm_dev_ops_get", "xfrm_dev_ops_put",
             "xfrm_dev_state_update_stats", "xfrm_dev_state_advance_esn",
             "xfrm_dev_policy_delete", "xfrm_dev_policy_free"],
         "net/xfrm/xfrm_device.c": ["xfrm_dev_state_add", "xfrm_dev_policy_add"],

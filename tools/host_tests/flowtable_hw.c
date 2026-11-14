@@ -192,12 +192,12 @@ struct net_device {
     int ifindex;
     const struct rtnl_link_ops *rtnl_link_ops;
 };
-/* A DPAA MAC reports no switch parent, which is what dev_get_port_parent_id()
+/* A DPAA MAC reports no switch parent, which is what netif_get_port_parent_id()
  * signals by leaving -EOPNOTSUPP as the answer. A port that does report one
  * belongs to a switch ASIC, whose bridge VLANs the gate has to exclude. */
 struct netdev_phys_item_id { unsigned char id[32]; unsigned char id_len; };
-static int dev_get_port_parent_id(struct net_device *d, struct netdev_phys_item_id *ppid,
-                                  bool recurse)
+static int netif_get_port_parent_id(struct net_device *d, struct netdev_phys_item_id *ppid,
+                                    bool recurse)
 {
     if (!d->switch_port) return -EOPNOTSUPP;
     *ppid = (struct netdev_phys_item_id){ .id = {1}, .id_len = 1 };

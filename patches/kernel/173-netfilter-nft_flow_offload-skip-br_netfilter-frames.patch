@@ -1,4 +1,4 @@
-From 42727aea3803110ed518d1f4f28af19130c5c45a Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 17 Oct 2026 01:14:39 +0200
 Subject: [PATCH] netfilter: nft_flow_offload: skip frames br_netfilter bridges
@@ -21,10 +21,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  1 file changed, 10 insertions(+)
 
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
-index 95d631ab80be..8af60003fb3a 100644
+index 1372afab839a6..2544d302107f2 100644
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
-@@ -407,9 +407,19 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
+@@ -23,9 +23,19 @@ struct nft_flow_offload {
  
  static bool nft_flow_offload_skip(struct sk_buff *skb, int family)
  {

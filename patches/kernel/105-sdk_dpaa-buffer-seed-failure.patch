@@ -1,4 +1,4 @@
-From 5668d035a9b71f060820d44f7596289028f0aa0a Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 19 Oct 2026 11:13:14 +0200
 Subject: [PATCH] sdk_dpaa: report buffer seed failures and free each head once
@@ -19,7 +19,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  1 file changed, 7 insertions(+), 4 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 957015324970..f38e20bd018a 100644
+index e1d669e6e7bc4..1706f4d91108f 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -158,6 +158,7 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool

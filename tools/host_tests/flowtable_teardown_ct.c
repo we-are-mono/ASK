@@ -38,9 +38,14 @@ static u32 jiffies = 7 * 86400 * HZ;
 #define nfct_time_stamp jiffies
 #define nf_flowtable_time_stamp jiffies
 
-struct ip_ct_tcp_state { u32 td_maxwin; };
+struct ip_ct_tcp_state { u32 td_maxwin; u8 flags; };
 struct ip_ct_tcp { struct ip_ct_tcp_state seen[2]; u8 state; };
-struct nf_conn { unsigned long status; u32 timeout; u8 protonum; union { struct ip_ct_tcp tcp; } proto; };
+struct nf_conn { int lock; unsigned long status; u32 timeout; u8 protonum;
+                 union { struct ip_ct_tcp tcp; } proto; };
+static void spin_lock_bh(int *l) { assert(!*l); *l = 1; }
+static void spin_unlock_bh(int *l) { assert(*l); *l = 0; }
+static void nf_ct_refresh(struct nf_conn *ct, u32 extra_jiffies)
+{ WRITE_ONCE(ct->timeout, nfct_time_stamp + extra_jiffies); }
 struct net { struct nf_generic_net generic; struct nf_tcp_net tcp; struct nf_udp_net udp; };
 static struct net net;
 static struct net *nf_ct_net(const struct nf_conn *ct) { return &net; }
@@ -66,9 +71,13 @@ static s32 handed_back(u8 proto, unsigned long status, u8 tcp_state, s32 flow_le
     flow_offload_teardown(&flow);
     assert(test_bit(NF_FLOW_TEARDOWN, &flow.flags) && !test_bit(IPS_OFFLOAD_BIT, &ct.status));
     given = (s32)(ct.timeout - jiffies);
+    /* A tuple reopened meanwhile gave the conntrack to a new flow, which took
+     * IPS_OFFLOAD and the day's timeout back; the old flow's repeat teardown
+     * must take neither. */
     ct.timeout = jiffies + 12345 * HZ;
+    ct.status |= 1UL << IPS_OFFLOAD_BIT;
     flow_offload_teardown(&flow);
-    assert(ct.timeout == jiffies + 12345 * HZ);
+    assert(ct.timeout == jiffies + 12345 * HZ && test_bit(IPS_OFFLOAD_BIT, &ct.status));
     return given;
 }
 

@@ -481,7 +481,7 @@ void cdx_police_profile_ref(u8 profile)
 	cdx_police_profile_refs[profile]++;
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_police_profile_ref, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_police_profile_ref, "ASK_CDX_FLOWTABLE");
 
 void cdx_police_profile_unref(u8 profile)
 {
@@ -503,7 +503,7 @@ void cdx_police_profile_unref(u8 profile)
 	}
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_police_profile_unref, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_police_profile_unref, "ASK_CDX_FLOWTABLE");
 
 /* The report's view of the pool. A pending profile is still set in the pool's
  * bitmap, so it counts as used here, as it does in a refusal. */
@@ -626,7 +626,7 @@ u8 cdx_police_lookup(const struct cdx_ft_rule *rule)
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
 	return profile;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_police_lookup, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_police_lookup, "ASK_CDX_FLOWTABLE");
 
 /* The filter tc means by a cookie. Runs under cdx_police_lock. */
 static struct cdx_police_filter *cdx_police_filter_find(struct net_device *dev,
@@ -990,7 +990,7 @@ unsigned int cdx_police_reaches(struct net_device *dev, unsigned long cookie)
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
 	return reach;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_police_reaches, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_police_reaches, "ASK_CDX_FLOWTABLE");
 
 static LIST_HEAD(cdx_police_block_list);
 

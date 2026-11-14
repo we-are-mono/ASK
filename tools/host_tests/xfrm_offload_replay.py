@@ -44,11 +44,11 @@ def test_migrate_publishes_before_it_clones():
     publishes first, under x->lock."""
     source = (kernel_source() / "net/xfrm/xfrm_state.c").read_text()
     body = function(source, "xfrm_state_migrate")
-    clone = body.index("xc = xfrm_state_clone(x, encap);")
+    clone = body.index("xc = xfrm_state_clone_and_setup(x, encap, m);")
     refresh = body.index(REFRESH)
     assert body.index("spin_lock_bh(&x->lock);") < refresh < body.index("spin_unlock_bh(&x->lock);") < clone, body
     # And the clone copies exactly the two shapes xfrm keeps it in.
-    clone_body = function(source, "xfrm_state_clone")
+    clone_body = function(source, "xfrm_state_clone_and_setup")
     assert "x->replay = orig->replay;" in clone_body and "xfrm_replay_clone(x, orig)" in clone_body
 
 

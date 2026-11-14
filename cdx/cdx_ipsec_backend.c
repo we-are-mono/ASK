@@ -85,7 +85,7 @@ unsigned int cdx_ipsec_sa_count(void)
 	cdx_ft_assert_held();
 	return cdx_ipsec_sa_owned;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_count, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_count, "ASK_CDX_FLOWTABLE");
 
 /* Find a handle no live SA holds.
  *
@@ -152,19 +152,19 @@ bool cdx_ipsec_port_supported(struct net_device *dev)
 	       dev->type == ARPHRD_ETHER && dev->addr_len == ETH_ALEN &&
 	       dpa_netdev_is_physical(dev) && cdx_ipsec_ready();
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ipsec_port_supported, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_port_supported, "ASK_CDX_FLOWTABLE");
 
 bool cdx_ipsec_auth_supported(u16 alg, unsigned int icv_bits)
 {
 	return cdx_ipsec_auth_op(alg, icv_bits) >= 0;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ipsec_auth_supported, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_auth_supported, "ASK_CDX_FLOWTABLE");
 
 unsigned int cdx_ipsec_sa_cache_entries(void)
 {
 	return M_ipsec_sa_cache_entries();
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_cache_entries, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_cache_entries, "ASK_CDX_FLOWTABLE");
 
 /* Build the outer header a tunnel-mode SA prepends.
  *
@@ -483,7 +483,7 @@ err_free_owner:
 	kfree(owner);
 	return rc;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_add, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_add, "ASK_CDX_FLOWTABLE");
 
 /* How many times, and how many microseconds apart, a deletion looks for SEC
  * to have stopped taking an SA's frames. */
@@ -552,7 +552,7 @@ void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa, struct cdx_ipsec_counters *last)
 	}
 	kfree(owner);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_del, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_del, "ASK_CDX_FLOWTABLE");
 
 int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac,
 			      u16 path_mtu)
@@ -633,7 +633,7 @@ int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac,
 	}
 	return -EIO;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_set_next_hop, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_set_next_hop, "ASK_CDX_FLOWTABLE");
 
 /* The datapath restarted: every classifier key a failed delete may have left
  * linked has been settled, so an SA stranded by one gets its entry back, on the
@@ -665,7 +665,7 @@ u16 cdx_ipsec_sa_handle(const struct cdx_ipsec_sa *sa)
 {
 	return sa ? sa->handle : 0;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_handle, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_handle, "ASK_CDX_FLOWTABLE");
 
 /* How many times to read SEC's counters again before giving up on a clean
  * reading of them. */
@@ -786,7 +786,7 @@ bool cdx_ipsec_sa_replay_state(const struct cdx_ipsec_sa *sa,
 	memset(state->seen, 0, sizeof(state->seen));
 	return false;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_replay_state, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_replay_state, "ASK_CDX_FLOWTABLE");
 
 void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 			struct cdx_ipsec_counters *counters)
@@ -813,7 +813,7 @@ void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 	counters->bytes = sa->bytes;
 	cdx_ipsec_sa_replay_state(sa, counters);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_stats, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_stats, "ASK_CDX_FLOWTABLE");
 
 int cdx_ipsec_sec_refusals(struct cdx_sec_refusals *refusals)
 {
@@ -855,6 +855,6 @@ int cdx_ipsec_sec_refusals(struct cdx_sec_refusals *refusals)
 	refusals->input_refused = cdx_dpa_ipsec_input_refused();
 	return 0;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sec_refusals, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sec_refusals, "ASK_CDX_FLOWTABLE");
 
 #endif /* DPA_IPSEC_OFFLOAD */

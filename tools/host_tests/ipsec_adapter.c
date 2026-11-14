@@ -503,6 +503,9 @@ struct ipv6hdr { u8 bytes[40]; };
 #define ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
 struct xfrm_selector { bool mismatch; };
+struct xfrm_state;
+/* A mode beyond transport, tunnel and BEET answers its own inner MTU. */
+struct xfrm_mode_cbs { u32 (*get_inner_mtu)(struct xfrm_state *x, int outer_mtu); };
 struct xfrm_state {
 	struct xfrm_selector sel;
 	u32 if_id;
@@ -519,6 +522,7 @@ struct xfrm_state {
 		int header_len;
 	} props;
 	const struct xfrm_type *type;
+	const struct xfrm_mode_cbs *mode_cbs;
 	void *data;
 	struct { u32 v, m; } mark;
 	struct { u8 state; u8 dying; } km;
@@ -1064,10 +1068,12 @@ struct netlink_ext_ack { const char *_msg; };
 struct sk_buff;
 struct xfrmdev_ops {
 	void *owner;
-	int (*xdo_dev_state_add)(struct xfrm_state *x,
+	int (*xdo_dev_state_add)(struct net_device *dev, struct xfrm_state *x,
 				 struct netlink_ext_ack *extack);
-	void (*xdo_dev_state_delete)(struct xfrm_state *x);
-	void (*xdo_dev_state_free)(struct xfrm_state *x);
+	void (*xdo_dev_state_delete)(struct net_device *dev,
+				     struct xfrm_state *x);
+	void (*xdo_dev_state_free)(struct net_device *dev,
+				   struct xfrm_state *x);
 	bool (*xdo_dev_offload_ok)(struct sk_buff *skb, struct xfrm_state *xs);
 	void (*xdo_dev_state_update_stats)(struct xfrm_state *x);
 	int (*xdo_dev_policy_add)(struct xfrm_policy *x,
@@ -1324,6 +1330,11 @@ static bool xfrm_flowtable_enabled(struct net *net)
 }
 
 #include "ipsec_production.inc"
+
+/* xfrm calls a provider bonding cannot borrow with the state's own device
+ * (xfrm_dev_state_add(), xfrm_dev_state_delete()), as the bench does. */
+#define ft_xdo_state_add(x, ack) (ft_xdo_state_add)((x)->xso.dev, (x), (ack))
+#define ft_xdo_state_delete(x) (ft_xdo_state_delete)((x)->xso.dev, (x))
 
 /* --- the bench ------------------------------------------------------- */
 

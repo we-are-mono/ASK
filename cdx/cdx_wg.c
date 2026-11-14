@@ -909,7 +909,9 @@ release:
 
 static enum qman_cb_dqrr_result cdx_wg_rxq_dqrr(struct qman_portal *portal,
 						struct qman_fq *fq,
-						const struct qm_dqrr_entry *dq)
+						const struct qm_dqrr_entry *dq,
+						bool sched_napi,
+						struct qman_poll_ctx *ctx)
 {
 	struct cdx_wg_rxq *q = container_of(fq, struct cdx_wg_rxq, fq);
 	struct cdx_wg_seq s;
@@ -1359,7 +1361,9 @@ static void cdx_wg_seal_slow(struct cdx_wg_dev *w, struct net_device *dev,
 
 static enum qman_cb_dqrr_result cdx_wg_seal_dqrr(struct qman_portal *portal,
 						 struct qman_fq *fq,
-						 const struct qm_dqrr_entry *dq)
+						 const struct qm_dqrr_entry *dq,
+						 bool sched_napi,
+						 struct qman_poll_ctx *ctx)
 {
 	struct cdx_wg_sealq *sq = container_of(fq, struct cdx_wg_sealq, fq);
 	struct cdx_wg_dev *w = sq->w;
@@ -1455,7 +1459,7 @@ bool cdx_wg_dev_supported(struct net_device *dev)
 	       READ_ONCE(cdx_wg_ready) && dev &&
 	       net_eq(dev_net(dev), &init_net) && cdx_ft_wg_dev(dev);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_wg_dev_supported, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_wg_dev_supported, "ASK_CDX_FLOWTABLE");
 
 /* The order is the one the failure handling unwinds: the queues the encoder
  * will name, the logical interface and the devman record that name them, and
@@ -1527,7 +1531,7 @@ err_bind:
 	cdx_wg_unbind();
 	return rc;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_wg_dev_add, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_wg_dev_add, "ASK_CDX_FLOWTABLE");
 
 /* Always consumes *wdev. The caller has retired every flow egressing through
  * the device, so nothing in the classifier enqueues to its seal queues; valid
@@ -1555,7 +1559,7 @@ void cdx_wg_dev_del(struct cdx_wg_dev **wdev)
 	/* Last: nothing of this device's calls into WireGuard any more. */
 	cdx_wg_unbind();
 }
-EXPORT_SYMBOL_NS_GPL(cdx_wg_dev_del, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_wg_dev_del, "ASK_CDX_FLOWTABLE");
 
 /* For cdx_ft_egress_supported(): the frame queues an entry would name exist.
  * Flowtable transaction held. */

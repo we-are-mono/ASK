@@ -3,6 +3,7 @@
 from ask_orch.process import run_process
 import os
 from pathlib import Path
+import re
 
 from _host_qos_lifecycle import (function)
 from _kernel_source import (kernel_source)
@@ -13,6 +14,9 @@ def test_lifecycle(tmp_path):
     source = (kernel / "net/netfilter/nf_flow_table_core.c").read_text()
     offload = (kernel / "net/netfilter/nf_flow_table_offload.c").read_text()
     header = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
+    # The flow's flags as the kernel numbers them.
+    (tmp_path / "handle_types.inc").write_text(
+        re.search(r"^enum nf_flow_flags \{.*?^\};\n", header, re.M | re.S).group())
     (tmp_path / "handle_production.inc").write_text(
         source[source.index("struct nf_flow_offload_handle {"):
                source.index("static void\nflow_offload_fill_dir")]

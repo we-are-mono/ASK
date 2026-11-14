@@ -1,4 +1,4 @@
-From 08cdea33c946077e98743aed1d69c891da162a60 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Tue, 22 Sep 2026 04:09:54 +0200
 Subject: [PATCH] sdk_dpaa: preserve SEC buffer ownership through receive and
@@ -13,10 +13,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  2 files changed, 164 insertions(+), 232 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
-index 7d2c99af6319..2b852d0fc6f3 100644
+index a05fa5ab9be80..37585e72dc48b 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
-@@ -666,4 +666,7 @@ static inline void _dpa_bp_free_pf(void *addr)
+@@ -640,4 +640,7 @@ static inline void _dpa_bp_free_pf(void *addr)
  int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs,
  			      bool act_skb);
  
@@ -25,7 +25,7 @@ index 7d2c99af6319..2b852d0fc6f3 100644
 +
  #endif	/* __DPA_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index f877d2ce6c25..28998254ccc9 100644
+index bba91ca35a9b3..22db20630e51b 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -135,7 +135,11 @@ static void dpa_bp_recycle_frag(struct dpa_bp *dpa_bp, unsigned long vaddr,
@@ -98,7 +98,7 @@ index f877d2ce6c25..28998254ccc9 100644
  						__func__,__LINE__,ii,buffs2fill);
  				if (act_skb)
  				{
-@@ -1073,7 +1088,7 @@ static void dma_unmap_skb_sg_addrs(struct device *dev, struct sk_buff *skb,
+@@ -1063,7 +1078,7 @@ static void dma_unmap_skb_sg_addrs(struct device *dev, struct sk_buff *skb,
  		sgt_idx++;
  
  		nr_frags = skb_shinfo(cur_skb)->nr_frags;
@@ -107,7 +107,7 @@ index f877d2ce6c25..28998254ccc9 100644
  		{
  			addr = qm_sg_addr(&sgt[sgt_idx]);
  			dma_unmap_page(dev, addr, qm_sg_entry_get_len(&sgt[sgt_idx]), dma_dir);
-@@ -1107,169 +1122,162 @@ static inline void prepare_qm_sg_entry(struct qm_sg_entry *sgt, int sgt_idx,
+@@ -1097,169 +1112,162 @@ static inline void prepare_qm_sg_entry(struct qm_sg_entry *sgt, int sgt_idx,
  	return;
  }
  
@@ -411,7 +411,7 @@ index f877d2ce6c25..28998254ccc9 100644
  }
  
  int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
-@@ -1698,47 +1706,8 @@ static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_dev
+@@ -1686,47 +1694,8 @@ static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_dev
  		}
  
  		if (unlikely(err < 0)) {
@@ -461,7 +461,7 @@ index f877d2ce6c25..28998254ccc9 100644
  			goto sec_submit_failed;
  		}
  
-@@ -1988,48 +1957,8 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+@@ -1976,48 +1945,8 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
  		}
  
  		if (unlikely(err < 0)) {

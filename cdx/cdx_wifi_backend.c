@@ -119,7 +119,7 @@ bool cdx_wifi_vap_supported(struct net_device *dev)
 	 * arrived too early. */
 	return dpaa_vwd_ready();
 }
-EXPORT_SYMBOL_NS_GPL(cdx_wifi_vap_supported, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_wifi_vap_supported, "ASK_CDX_FLOWTABLE");
 
 int cdx_wifi_vap_add(struct net_device *dev, struct cdx_wifi_vap **result)
 {
@@ -215,7 +215,7 @@ err_free:
 	kfree(vap);
 	return rc;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_wifi_vap_add, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_wifi_vap_add, "ASK_CDX_FLOWTABLE");
 
 void cdx_wifi_vap_del(struct cdx_wifi_vap **vap)
 {
@@ -251,4 +251,4 @@ void cdx_wifi_vap_del(struct cdx_wifi_vap **vap)
 	cdx_wifi_slot[v->vapid] = NULL;
 	kfree(v);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_wifi_vap_del, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_wifi_vap_del, "ASK_CDX_FLOWTABLE");

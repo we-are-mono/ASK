@@ -52,7 +52,7 @@ reference:
 |-----------|--------|
 | `cdx`, `ask_flowtable` (kernel modules) | `meta-ask/recipes-ask/cdx/` |
 | `ask-flowtable` (userspace) | `meta-ask/recipes-ask/flowtable/` |
-| kernel + ASK patch stack | `meta-ask/recipes-kernel/linux/linux-ask_6.12.bb` |
+| kernel + ASK patch stack | `meta-ask/recipes-kernel/linux/linux-ask_6.18.bb` |
 | bootable showcase image | `meta-ask/recipes-core/images/ask-image.bb` |
 
 For example, OpenWrt consumes ASK by mirroring these as `package/ask/*` Makefiles

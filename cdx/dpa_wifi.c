@@ -251,11 +251,7 @@ static struct sk_buff *__hot contig_fd_to_vwd_skb(const struct dpa_priv_s *priv,
 #endif
 
 	/* The Ethernet pool uses the SDK's truesize accounting. */
-#ifdef FM_ERRATUM_A050385
 	if (likely(!fm_has_errata_a050385())) {
-#else
-	if (likely(!dpaa_errata_a010022)) {
-#endif
 		skb->truesize = SKB_TRUESIZE(dpa_fd_length(fd));
 	}
 	skb->data = vaddr;
@@ -420,7 +416,8 @@ static void vwd_send_to_vap(struct sk_buff* skb)
 }
 
 static enum qman_cb_dqrr_result vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq,
-		const struct qm_dqrr_entry *dq)
+		const struct qm_dqrr_entry *dq, bool sched_napi,
+		struct qman_poll_ctx *ctx)
 {
 	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
 		return qman_cb_dqrr_consume;

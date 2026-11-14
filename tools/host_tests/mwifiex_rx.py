@@ -1,4 +1,8 @@
-"""Exercise the patched receive epilogue with descriptor/skb shared storage."""
+"""Exercise the driver's receive epilogue with descriptor/skb shared storage.
+
+The fix ASK once carried for it (a skb freed after the stack had it) is in
+NXP's own release now (lf-6.18.37_2.1.0), so the pinned source is tested as
+it ships."""
 
 from ask_orch.process import run_process
 import os
@@ -18,8 +22,6 @@ def test_cleanup(tmp_path):
     path = tmp_path / "mlinux/moal_shim.c"
     path.parent.mkdir()
     path.write_bytes(subprocess.check_output(["git", "show", revision + ":mlinux/moal_shim.c"], cwd=source))
-    run_process(["git", "apply", "--whitespace=error", str(recipe.parent / "files" /
-        "0002-moal-do-not-free-an-skb-already-handed-to-the-stack.patch")], cwd=tmp_path, check=True)
     epilogue = function(path.read_text(), "moal_recv_packet").split("\ndone:\n")[1]
     harness = '''
 #include <assert.h>

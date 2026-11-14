@@ -14,6 +14,7 @@
  * consumers ask for are reported as the tables themselves. Every check runs
  * and is reported, so a run against a broken build says which ones broke. */
 #include <assert.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,9 +27,11 @@
 struct qman_portal;
 struct qm_dqrr_entry;
 struct qman_fq;
+struct qman_poll_ctx;
 enum qman_cb_dqrr_result { qman_cb_dqrr_consume };
 typedef enum qman_cb_dqrr_result (*qman_cb_dqrr)(struct qman_portal *, struct qman_fq *,
-						 const struct qm_dqrr_entry *);
+						 const struct qm_dqrr_entry *, bool,
+						 struct qman_poll_ctx *);
 struct qman_fq { struct { qman_cb_dqrr dqrr; } cb; };
 struct dpa_fq { struct qman_fq fq_base; };
 struct oh_iface_info { uint32_t portid; };
@@ -41,11 +44,13 @@ struct cdx_fman_info *fman_info;
 
 /* devoh.c's own handlers, which a released port's queues go back to. */
 static enum qman_cb_dqrr_result ofport_rx_defa(struct qman_portal *p, struct qman_fq *fq,
-					       const struct qm_dqrr_entry *dq)
-{ (void)p; (void)fq; (void)dq; return qman_cb_dqrr_consume; }
+					       const struct qm_dqrr_entry *dq, bool sched_napi,
+					       struct qman_poll_ctx *ctx)
+{ (void)p; (void)fq; (void)dq; (void)sched_napi; (void)ctx; return qman_cb_dqrr_consume; }
 static enum qman_cb_dqrr_result ofport_rx_err(struct qman_portal *p, struct qman_fq *fq,
-					      const struct qm_dqrr_entry *dq)
-{ (void)p; (void)fq; (void)dq; return qman_cb_dqrr_consume; }
+					      const struct qm_dqrr_entry *dq, bool sched_napi,
+					      struct qman_poll_ctx *ctx)
+{ (void)p; (void)fq; (void)dq; (void)sched_napi; (void)ctx; return qman_cb_dqrr_consume; }
 
 #include "ofport_tables.inc"
 #include "ofport_config.inc"

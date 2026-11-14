@@ -1,4 +1,4 @@
-From 07dc4cc57fab0cf5f508fe0d414077dc43f81127 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 9 Nov 2026 12:00:00 +0100
 Subject: [PATCH] wireguard, netfilter: fast path for offloaded tunnels
@@ -34,16 +34,14 @@ Offload entry points (include/net/wg_fastpath.h):
   once it has set is_dead. They run ChaCha20-Poly1305 in one NEON
   section a message, the Poly1305 key from the first five-block ChaCha
   call, and in none at 128 bytes or less (ACKs); arm64 exports
-  chacha_4block_xor_neon and a poly1305_blocks_arm64() wrapper for it.
+  chacha_4block_xor_neon and a poly1305_blocks_wg() wrapper for it.
   A boot self-test against the library guards it.
 ---
- arch/arm64/crypto/chacha-neon-glue.c  |   3 +
- arch/arm64/crypto/poly1305-glue.c     |  14 +
  drivers/net/wireguard/Makefile        |   1 +
  drivers/net/wireguard/allowedips.c    |  35 ++
  drivers/net/wireguard/allowedips.h    |   5 +
  drivers/net/wireguard/device.c        |   8 +
- drivers/net/wireguard/fastpath.c      | 587 ++++++++++++++++++++++++++
+ drivers/net/wireguard/fastpath.c      | 611 ++++++++++++++++++++++++++
  drivers/net/wireguard/main.c          |   1 +
  drivers/net/wireguard/netlink.c       |   6 +-
  drivers/net/wireguard/peer.c          |  18 +-
@@ -53,56 +51,19 @@ Offload entry points (include/net/wg_fastpath.h):
  drivers/net/wireguard/queueing.h      |  40 +-
  drivers/net/wireguard/receive.c       |  52 ++-
  drivers/net/wireguard/send.c          |  52 ++-
- include/crypto/poly1305.h             |   3 +
+ include/crypto/poly1305.h             |   7 +
  include/net/netfilter/nf_flow_table.h |  17 +
  include/net/wg_fastpath.h             |  58 +++
+ lib/crypto/arm64/chacha.h             |   3 +
+ lib/crypto/arm64/poly1305.h           |  15 +
  net/netfilter/nf_flow_table_inet.c    |  18 +
  net/netfilter/nf_flow_table_ip.c      |  92 ++++
- 21 files changed, 1041 insertions(+), 24 deletions(-)
+ 21 files changed, 1073 insertions(+), 21 deletions(-)
  create mode 100644 drivers/net/wireguard/fastpath.c
  create mode 100644 include/net/wg_fastpath.h
 
-diff --git a/arch/arm64/crypto/chacha-neon-glue.c b/arch/arm64/crypto/chacha-neon-glue.c
-index af2bbca38e70..ef8b511cfd44 100644
---- a/arch/arm64/crypto/chacha-neon-glue.c
-+++ b/arch/arm64/crypto/chacha-neon-glue.c
-@@ -37,6 +37,9 @@ asmlinkage void chacha_4block_xor_neon(u32 *state, u8 *dst, const u8 *src,
- 				       int nrounds, int bytes);
- asmlinkage void hchacha_block_neon(const u32 *state, u32 *out, int nrounds);
- 
-+/* For WireGuard's fast path, which opens one NEON section a packet. */
-+EXPORT_SYMBOL_GPL(chacha_4block_xor_neon);
-+
- static __ro_after_init DEFINE_STATIC_KEY_FALSE(have_neon);
- 
- static void chacha_doneon(u32 *state, u8 *dst, const u8 *src,
-diff --git a/arch/arm64/crypto/poly1305-glue.c b/arch/arm64/crypto/poly1305-glue.c
-index 18883ea438f3..183e9d52af18 100644
---- a/arch/arm64/crypto/poly1305-glue.c
-+++ b/arch/arm64/crypto/poly1305-glue.c
-@@ -36,6 +36,20 @@ void poly1305_init_arch(struct poly1305_desc_ctx *dctx, const u8 key[POLY1305_KE
- }
- EXPORT_SYMBOL(poly1305_init_arch);
- 
-+/* For WireGuard's fast path, which holds one NEON section a packet: @len (a
-+ * multiple of 16) bytes into the accumulator, on NEON inside the caller's
-+ * kernel_neon_begin() when @neon, else on general registers. A C wrapper,
-+ * so a caller in another module lands on a BTI pad. */
-+void poly1305_blocks_arm64(struct poly1305_desc_ctx *dctx, const u8 *src,
-+			   u32 len, bool neon)
-+{
-+	if (neon)
-+		poly1305_blocks_neon(&dctx->h, src, len, 1);
-+	else
-+		poly1305_blocks(&dctx->h, src, len, 1);
-+}
-+EXPORT_SYMBOL_GPL(poly1305_blocks_arm64);
-+
- static int neon_poly1305_init(struct shash_desc *desc)
- {
- 	struct poly1305_desc_ctx *dctx = shash_desc_ctx(desc);
 diff --git a/drivers/net/wireguard/Makefile b/drivers/net/wireguard/Makefile
-index dbe1f8514efc..83042ce3033d 100644
+index dbe1f8514efc3..83042ce3033d2 100644
 --- a/drivers/net/wireguard/Makefile
 +++ b/drivers/net/wireguard/Makefile
 @@ -14,4 +14,5 @@ wireguard-y += allowedips.o
@@ -112,7 +73,7 @@ index dbe1f8514efc..83042ce3033d 100644
 +wireguard-y += fastpath.o
  obj-$(CONFIG_WIREGUARD) := wireguard.o
 diff --git a/drivers/net/wireguard/allowedips.c b/drivers/net/wireguard/allowedips.c
-index 4b8528206cc8..b19f4c1caa28 100644
+index 09f7fcd7da78b..17188adc13945 100644
 --- a/drivers/net/wireguard/allowedips.c
 +++ b/drivers/net/wireguard/allowedips.c
 @@ -146,6 +146,23 @@ static struct wg_peer *lookup(struct allowedips_node __rcu *root, u8 bits,
@@ -139,7 +100,7 @@ index 4b8528206cc8..b19f4c1caa28 100644
  static bool node_placement(struct allowedips_node __rcu *trie, const u8 *key,
  			   u8 cidr, u8 bits, struct allowedips_node **rnode,
  			   struct mutex *lock)
-@@ -363,6 +380,24 @@ struct wg_peer *wg_allowedips_lookup_dst(struct allowedips *table,
+@@ -403,6 +420,24 @@ struct wg_peer *wg_allowedips_lookup_dst(struct allowedips *table,
  	return NULL;
  }
  
@@ -165,10 +126,10 @@ index 4b8528206cc8..b19f4c1caa28 100644
  struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
  					 struct sk_buff *skb)
 diff --git a/drivers/net/wireguard/allowedips.h b/drivers/net/wireguard/allowedips.h
-index 2346c797eb4d..768bc03e33e0 100644
+index 931958cb6e100..cf25f288c4adb 100644
 --- a/drivers/net/wireguard/allowedips.h
 +++ b/drivers/net/wireguard/allowedips.h
-@@ -48,6 +48,11 @@ struct wg_peer *wg_allowedips_lookup_dst(struct allowedips *table,
+@@ -52,6 +52,11 @@ struct wg_peer *wg_allowedips_lookup_dst(struct allowedips *table,
  					 struct sk_buff *skb);
  struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
  					 struct sk_buff *skb);
@@ -181,7 +142,7 @@ index 2346c797eb4d..768bc03e33e0 100644
  #ifdef DEBUG
  bool wg_allowedips_selftest(void);
 diff --git a/drivers/net/wireguard/device.c b/drivers/net/wireguard/device.c
-index 45e9b908dbfb..377b59dfd4b7 100644
+index 67b07ee2d6600..b84ca47783ebe 100644
 --- a/drivers/net/wireguard/device.c
 +++ b/drivers/net/wireguard/device.c
 @@ -233,6 +233,14 @@ static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -201,10 +162,10 @@ index 45e9b908dbfb..377b59dfd4b7 100644
  	.ndo_stop		= wg_stop,
 diff --git a/drivers/net/wireguard/fastpath.c b/drivers/net/wireguard/fastpath.c
 new file mode 100644
-index 000000000000..870a5f29d2c3
+index 0000000000000..cb79cc9308413
 --- /dev/null
 +++ b/drivers/net/wireguard/fastpath.c
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,611 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Seal a forwarded IPv4 packet for its peer in place, in the buffer a NIC
@@ -242,14 +203,16 @@ index 000000000000..870a5f29d2c3
 +
 +#define WG_FP_HLEN (ETH_HLEN + sizeof(struct iphdr) + sizeof(struct udphdr))
 +
-+#if IS_ENABLED(CONFIG_ARM64) && IS_ENABLED(CONFIG_KERNEL_MODE_NEON)
++#if IS_ENABLED(CONFIG_ARM64) && IS_ENABLED(CONFIG_CRYPTO_LIB_CHACHA_ARCH) && \
++	IS_ENABLED(CONFIG_CRYPTO_LIB_POLY1305_ARCH)
 +#include <asm/cpufeature.h>
 +#include <asm/neon.h>
 +#include <asm/simd.h>
 +#include <crypto/internal/simd.h>
 +
-+/* arch/arm64/crypto exports it, and poly1305_blocks_arm64(), for this file. */
-+asmlinkage void chacha_4block_xor_neon(u32 *state, u8 *dst, const u8 *src,
++/* lib/crypto/arm64 exports it, and poly1305_blocks_wg(), for this file. */
++asmlinkage void chacha_4block_xor_neon(const struct chacha_state *state,
++				       u8 *dst, const u8 *src,
 +				       int nrounds, int bytes);
 +
 +/* Messages longer than this pay for a NEON section; ACKs and other short
@@ -259,14 +222,33 @@ index 000000000000..870a5f29d2c3
 +/* Set once wg_fastpath_init()'s self-test has matched the library. */
 +static bool wg_fp_aead_ready __read_mostly;
 +
++/* XOR @len bytes at @data with ChaCha20's keystream on general registers, as
++ * the library's generic fallback does. */
++static void wg_fp_chacha_generic(struct chacha_state *state, u8 *data,
++				 unsigned int len)
++{
++	u8 stream[CHACHA_BLOCK_SIZE] __aligned(sizeof(long));
++	unsigned int n;
++
++	while (len) {
++		n = min(len, CHACHA_BLOCK_SIZE);
++		chacha_block_generic(state, stream, 20);
++		crypto_xor(data, stream, n);
++		data += n;
++		len -= n;
++	}
++	memzero_explicit(stream, sizeof(stream));
++}
++
 +/* XOR @len bytes at @data with the keystream from block 1 on: @ks holds
 + * blocks 1 to 4 after a NEON start, @state the rest. */
-+static void wg_fp_xor(u32 *state, u8 *data, unsigned int len, const u8 *ks, bool neon)
++static void wg_fp_xor(struct chacha_state *state, u8 *data, unsigned int len,
++		      const u8 *ks, bool neon)
 +{
 +	unsigned int n;
 +
 +	if (!neon) {
-+		chacha_crypt_generic(state, data, data, len, 20);
++		wg_fp_chacha_generic(state, data, len);
 +		return;
 +	}
 +	n = min(len, 4 * CHACHA_BLOCK_SIZE);
@@ -277,12 +259,12 @@ index 000000000000..870a5f29d2c3
 +	while (len > CHACHA_BLOCK_SIZE) {
 +		n = min(len, 5 * CHACHA_BLOCK_SIZE);
 +		chacha_4block_xor_neon(state, data, data, 20, n);
-+		state[12] += DIV_ROUND_UP(n, CHACHA_BLOCK_SIZE);
++		state->x[12] += DIV_ROUND_UP(n, CHACHA_BLOCK_SIZE);
 +		data += n;
 +		len -= n;
 +	}
 +	if (len)
-+		chacha_crypt_generic(state, data, data, len, 20);
++		wg_fp_chacha_generic(state, data, len);
 +}
 +
 +/*
@@ -302,43 +284,46 @@ index 000000000000..870a5f29d2c3
 +	const bool neon = len > WG_FP_NEON_MIN && crypto_simd_usable();
 +	__le64 lens[2] = { 0, cpu_to_le64(len) }, iv[2] = { 0, cpu_to_le64(nonce) };
 +	u8 ks[5 * CHACHA_BLOCK_SIZE], tail[POLY1305_BLOCK_SIZE], mac[POLY1305_DIGEST_SIZE];
-+	u32 state[CHACHA_STATE_WORDS], k[CHACHA_KEY_SIZE / sizeof(u32)];
++	u32 k[CHACHA_KEY_WORDS];
 +	struct poly1305_desc_ctx poly;
++	struct chacha_state state;
 +	bool ok = true;
 +	unsigned int i;
 +
 +	for (i = 0; i < ARRAY_SIZE(k); i++)
 +		k[i] = get_unaligned_le32(key + i * sizeof(u32));
-+	chacha_init_generic(state, k, (u8 *)iv);
++	chacha_init(&state, k, (u8 *)iv);
 +	if (neon) {
 +		kernel_neon_begin();
 +		/* Block 0 keys Poly1305; blocks 1 to 4 cover the first 256 bytes. */
-+		chacha_4block_xor_neon(state, ks, zero, 20, sizeof(ks));
-+		state[12] += 5;
++		chacha_4block_xor_neon(&state, ks, zero, 20, sizeof(ks));
++		state.x[12] += 5;
 +	} else {
-+		chacha_crypt_generic(state, ks, zero, CHACHA_BLOCK_SIZE, 20);
++		chacha_block_generic(&state, ks, 20);
 +	}
-+	poly1305_init_arch(&poly, ks);
++	/* Whole blocks go straight to the block function, so the context
++	 * buffers nothing and the final call only emits the tag. */
++	poly1305_init(&poly, ks);
 +	if (seal)
-+		wg_fp_xor(state, data, len, ks, neon);
++		wg_fp_xor(&state, data, len, ks, neon);
 +	if (full)
-+		poly1305_blocks_arm64(&poly, data, full, neon);
++		poly1305_blocks_wg(&poly.state, data, full, neon);
 +	if (len != full) {
 +		memset(tail, 0, sizeof(tail));
 +		memcpy(tail, data + full, len - full);
-+		poly1305_blocks_arm64(&poly, tail, sizeof(tail), neon);
++		poly1305_blocks_wg(&poly.state, tail, sizeof(tail), neon);
 +	}
-+	poly1305_blocks_arm64(&poly, (u8 *)lens, sizeof(lens), neon);
-+	poly1305_final_arch(&poly, seal ? data + len : mac);
++	poly1305_blocks_wg(&poly.state, (u8 *)lens, sizeof(lens), neon);
++	poly1305_final(&poly, seal ? data + len : mac);
 +	if (!seal) {
 +		ok = !crypto_memneq(mac, data + len, sizeof(mac));
 +		if (ok)
-+			wg_fp_xor(state, data, len, ks, neon);
++			wg_fp_xor(&state, data, len, ks, neon);
 +	}
 +	if (neon)
 +		kernel_neon_end();
 +	memzero_explicit(ks, sizeof(ks));
-+	memzero_explicit(state, sizeof(state));
++	chacha_zeroize_state(&state);
 +	memzero_explicit(k, sizeof(k));
 +	return ok;
 +}
@@ -793,7 +778,7 @@ index 000000000000..870a5f29d2c3
 +}
 +EXPORT_SYMBOL_GPL(wg_fastpath_open);
 diff --git a/drivers/net/wireguard/main.c b/drivers/net/wireguard/main.c
-index a00671b58701..01e1a850711c 100644
+index a00671b58701f..01e1a850711c5 100644
 --- a/drivers/net/wireguard/main.c
 +++ b/drivers/net/wireguard/main.c
 @@ -32,6 +32,7 @@ static int __init wg_mod_init(void)
@@ -805,10 +790,10 @@ index a00671b58701..01e1a850711c 100644
  	ret = wg_peer_init();
  	if (ret < 0)
 diff --git a/drivers/net/wireguard/netlink.c b/drivers/net/wireguard/netlink.c
-index f7055180ba4a..6bc27985046a 100644
+index 67f962eb8b46d..d87da9813761e 100644
 --- a/drivers/net/wireguard/netlink.c
 +++ b/drivers/net/wireguard/netlink.c
-@@ -138,9 +138,11 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
+@@ -139,9 +139,11 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
  			    sizeof(last_handshake), &last_handshake) ||
  		    nla_put_u16(skb, WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL,
  				peer->persistent_keepalive_interval) ||
@@ -823,7 +808,7 @@ index f7055180ba4a..6bc27985046a 100644
  		    nla_put_u32(skb, WGPEER_A_PROTOCOL_VERSION, 1))
  			goto err;
 diff --git a/drivers/net/wireguard/peer.c b/drivers/net/wireguard/peer.c
-index 1cb502a932e0..af5dbecd0794 100644
+index 1cb502a932e07..af5dbecd07948 100644
 --- a/drivers/net/wireguard/peer.c
 +++ b/drivers/net/wireguard/peer.c
 @@ -24,6 +24,7 @@ struct wg_peer *wg_peer_create(struct wg_device *wg,
@@ -869,7 +854,7 @@ index 1cb502a932e0..af5dbecd0794 100644
  	/* The final zeroing takes care of clearing any remaining handshake key
  	 * material and other potentially sensitive information.
 diff --git a/drivers/net/wireguard/peer.h b/drivers/net/wireguard/peer.h
-index 76e4d3128ad4..09e68ee080f7 100644
+index 718fb42bdac7e..2e3c1c50d5265 100644
 --- a/drivers/net/wireguard/peer.h
 +++ b/drivers/net/wireguard/peer.h
 @@ -34,9 +34,23 @@ struct endpoint {
@@ -934,7 +919,7 @@ index 76e4d3128ad4..09e68ee080f7 100644
  
  int wg_peer_init(void);
 diff --git a/drivers/net/wireguard/peerlookup.c b/drivers/net/wireguard/peerlookup.c
-index f2783aa7a88f..194e213081eb 100644
+index f2783aa7a88f1..194e213081ebf 100644
 --- a/drivers/net/wireguard/peerlookup.c
 +++ b/drivers/net/wireguard/peerlookup.c
 @@ -224,3 +224,23 @@ wg_index_hashtable_lookup(struct index_hashtable *table,
@@ -962,7 +947,7 @@ index f2783aa7a88f..194e213081eb 100644
 +	return NULL;
 +}
 diff --git a/drivers/net/wireguard/peerlookup.h b/drivers/net/wireguard/peerlookup.h
-index ced811797680..17b5fc2feeaf 100644
+index ced8117976800..17b5fc2feeaf4 100644
 --- a/drivers/net/wireguard/peerlookup.h
 +++ b/drivers/net/wireguard/peerlookup.h
 @@ -60,5 +60,9 @@ struct index_hashtable_entry *
@@ -976,7 +961,7 @@ index ced811797680..17b5fc2feeaf 100644
  
  #endif /* _WG_PEERLOOKUP_H */
 diff --git a/drivers/net/wireguard/queueing.h b/drivers/net/wireguard/queueing.h
-index 7eb76724b3ed..fce8893725be 100644
+index 663b19b783953..245752a6f30e4 100644
 --- a/drivers/net/wireguard/queueing.h
 +++ b/drivers/net/wireguard/queueing.h
 @@ -32,6 +32,10 @@ void wg_packet_receive(struct wg_device *wg, struct sk_buff *skb);
@@ -998,7 +983,7 @@ index 7eb76724b3ed..fce8893725be 100644
  };
  
  #define PACKET_CB(skb) ((struct packet_cb *)((skb)->cb))
-@@ -102,16 +107,29 @@ static inline void wg_reset_packet(struct sk_buff *skb, bool encapsulating)
+@@ -104,12 +109,31 @@ static inline void wg_reset_packet(struct sk_buff *skb, bool encapsulating)
  	skb_reset_inner_headers(skb);
  }
  
@@ -1012,15 +997,13 @@ index 7eb76724b3ed..fce8893725be 100644
 +
  static inline int wg_cpumask_choose_online(int *stored_cpu, unsigned int id)
  {
--	unsigned int cpu = *stored_cpu, cpu_index, i;
-+	unsigned int cpu = *stored_cpu;
+ 	unsigned int cpu = *stored_cpu;
  
- 	if (unlikely(cpu >= nr_cpu_ids ||
- 		     !cpumask_test_cpu(cpu, cpu_online_mask))) {
--		cpu_index = id % cpumask_weight(cpu_online_mask);
--		cpu = cpumask_first(cpu_online_mask);
--		for (i = 0; i < cpu_index; ++i)
--			cpu = cpumask_next(cpu, cpu_online_mask);
+-	while (unlikely(cpu >= nr_cpu_ids || !cpu_online(cpu)))
+-		cpu = *stored_cpu = cpumask_nth(id % num_online_cpus(), cpu_online_mask);
++	/* Repeated until the choice is online: a CPU can go offline between
++	 * reading the mask and choosing from it. */
++	while (unlikely(cpu >= nr_cpu_ids || !cpu_online(cpu))) {
 +		const struct cpumask *mask = cpu_online_mask;
 +		struct cpumask allowed;
 +
@@ -1029,11 +1012,12 @@ index 7eb76724b3ed..fce8893725be 100644
 +		/* An empty or offline-only mask keeps the stock choice. */
 +		if (cpumask_and(&allowed, &allowed, cpu_online_mask))
 +			mask = &allowed;
-+		cpu = cpumask_nth(id % cpumask_weight(mask), mask);
- 		*stored_cpu = cpu;
- 	}
++		cpu = *stored_cpu = cpumask_nth(id % cpumask_weight(mask), mask);
++	}
+ 
  	return cpu;
-@@ -156,7 +174,7 @@ static inline void wg_prev_queue_drop_peeked(struct prev_queue *queue)
+ }
+@@ -153,7 +177,7 @@ static inline void wg_prev_queue_drop_peeked(struct prev_queue *queue)
  
  static inline int wg_queue_enqueue_per_device_and_peer(
  	struct crypt_queue *device_queue, struct prev_queue *peer_queue,
@@ -1042,7 +1026,7 @@ index 7eb76724b3ed..fce8893725be 100644
  {
  	int cpu;
  
-@@ -171,6 +189,10 @@ static inline int wg_queue_enqueue_per_device_and_peer(
+@@ -168,6 +192,10 @@ static inline int wg_queue_enqueue_per_device_and_peer(
  	 * packet as soon as it can.
  	 */
  	cpu = wg_cpumask_next_online(&device_queue->last_cpu);
@@ -1053,7 +1037,7 @@ index 7eb76724b3ed..fce8893725be 100644
  	if (unlikely(ptr_ring_produce_bh(&device_queue->ring, skb)))
  		return -EPIPE;
  	queue_work_on(cpu, wq, &per_cpu_ptr(device_queue->worker, cpu)->work);
-@@ -183,10 +205,12 @@ static inline void wg_queue_enqueue_per_peer_tx(struct sk_buff *skb, enum packet
+@@ -180,10 +208,12 @@ static inline void wg_queue_enqueue_per_peer_tx(struct sk_buff *skb, enum packet
  	 * peer can be freed from below us.
  	 */
  	struct wg_peer *peer = wg_peer_get(PACKET_PEER(skb));
@@ -1069,7 +1053,7 @@ index 7eb76724b3ed..fce8893725be 100644
  }
  
 diff --git a/drivers/net/wireguard/receive.c b/drivers/net/wireguard/receive.c
-index eb8851113654..403e7a209874 100644
+index eb8851113654f..403e7a2098749 100644
 --- a/drivers/net/wireguard/receive.c
 +++ b/drivers/net/wireguard/receive.c
 @@ -15,6 +15,7 @@
@@ -1152,7 +1136,7 @@ index eb8851113654..403e7a209874 100644
 +	keep_key_fresh(peer);
 +}
 diff --git a/drivers/net/wireguard/send.c b/drivers/net/wireguard/send.c
-index 67d01478eb76..3f2f98942824 100644
+index 67d01478eb76d..3f2f989428242 100644
 --- a/drivers/net/wireguard/send.c
 +++ b/drivers/net/wireguard/send.c
 @@ -261,15 +261,16 @@ static void wg_packet_create_data_done(struct wg_peer *peer, struct sk_buff *fir
@@ -1235,24 +1219,28 @@ index 67d01478eb76..3f2f98942824 100644
  
  out_invalid:
 diff --git a/include/crypto/poly1305.h b/include/crypto/poly1305.h
-index 090692ec3bc7..628b1e04d014 100644
+index d4daeec8da19d..823b6adef07bf 100644
 --- a/include/crypto/poly1305.h
 +++ b/include/crypto/poly1305.h
-@@ -86,6 +86,9 @@ static inline void poly1305_update(struct poly1305_desc_ctx *desc,
- }
+@@ -58,6 +58,13 @@ struct poly1305_desc_ctx {
+ 	struct poly1305_block_state state;
+ };
  
- void poly1305_final_arch(struct poly1305_desc_ctx *desc, u8 *digest);
-+/* arm64 only: blocks with no NEON section of their own (poly1305-glue.c). */
-+void poly1305_blocks_arm64(struct poly1305_desc_ctx *desc, const u8 *src,
-+			   u32 len, bool neon);
- void poly1305_final_generic(struct poly1305_desc_ctx *desc, u8 *digest);
- 
- static inline void poly1305_final(struct poly1305_desc_ctx *desc, u8 *digest)
++/* arm64 only: @len (a multiple of 16) bytes into @state's accumulator with no
++ * NEON section of its own (lib/crypto/arm64/poly1305.h), for WireGuard's
++ * fast path.
++ */
++void poly1305_blocks_wg(struct poly1305_block_state *state, const u8 *src,
++			u32 len, bool neon);
++
+ void poly1305_init(struct poly1305_desc_ctx *desc,
+ 		   const u8 key[POLY1305_KEY_SIZE]);
+ void poly1305_update(struct poly1305_desc_ctx *desc,
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index 2f90ebb0a6cd..10ba097dbcf0 100644
+index 44df191892097..25497fcf93676 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
-@@ -467,6 +467,23 @@ unsigned int nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
+@@ -475,6 +475,23 @@ unsigned int nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
  unsigned int nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
  				       const struct nf_hook_state *state);
  
@@ -1278,7 +1266,7 @@ index 2f90ebb0a6cd..10ba097dbcf0 100644
  extern int nf_flow_register_bpf(void);
 diff --git a/include/net/wg_fastpath.h b/include/net/wg_fastpath.h
 new file mode 100644
-index 000000000000..66574110a61b
+index 0000000000000..66574110a61b9
 --- /dev/null
 +++ b/include/net/wg_fastpath.h
 @@ -0,0 +1,58 @@
@@ -1340,8 +1328,48 @@ index 000000000000..66574110a61b
 +		     unsigned int len, u8 **inner, unsigned int *inner_len);
 +
 +#endif /* _NET_WG_FASTPATH_H */
+diff --git a/lib/crypto/arm64/chacha.h b/lib/crypto/arm64/chacha.h
+index ba6c22d460863..88570d23ec147 100644
+--- a/lib/crypto/arm64/chacha.h
++++ b/lib/crypto/arm64/chacha.h
+@@ -34,6 +34,9 @@ asmlinkage void chacha_4block_xor_neon(const struct chacha_state *state,
+ asmlinkage void hchacha_block_neon(const struct chacha_state *state,
+ 				   u32 out[HCHACHA_OUT_WORDS], int nrounds);
+ 
++/* For WireGuard's fast path, which opens one NEON section a packet. */
++EXPORT_SYMBOL_GPL(chacha_4block_xor_neon);
++
+ static __ro_after_init DEFINE_STATIC_KEY_FALSE(have_neon);
+ 
+ static void chacha_doneon(struct chacha_state *state, u8 *dst, const u8 *src,
+diff --git a/lib/crypto/arm64/poly1305.h b/lib/crypto/arm64/poly1305.h
+index aed5921ccd9a1..d228c1fb57d11 100644
+--- a/lib/crypto/arm64/poly1305.h
++++ b/lib/crypto/arm64/poly1305.h
+@@ -24,6 +24,21 @@ asmlinkage void poly1305_emit(const struct poly1305_state *state,
+ 
+ static __ro_after_init DEFINE_STATIC_KEY_FALSE(have_neon);
+ 
++/* For WireGuard's fast path, which holds one NEON section a packet: @len (a
++ * multiple of 16) bytes into the accumulator, on NEON inside the caller's
++ * kernel_neon_begin() when @neon, else on general registers. A C wrapper,
++ * so a caller in another module lands on a BTI pad.
++ */
++void poly1305_blocks_wg(struct poly1305_block_state *state, const u8 *src,
++			u32 len, bool neon)
++{
++	if (neon)
++		poly1305_blocks_neon(state, src, len, 1);
++	else
++		poly1305_blocks_arm64(state, src, len, 1);
++}
++EXPORT_SYMBOL_GPL(poly1305_blocks_wg);
++
+ static void poly1305_blocks(struct poly1305_block_state *state, const u8 *src,
+ 			    unsigned int len, u32 padbit)
+ {
 diff --git a/net/netfilter/nf_flow_table_inet.c b/net/netfilter/nf_flow_table_inet.c
-index 4bdcc4f33339..e13311369e27 100644
+index 4bdcc4f333391..e13311369e276 100644
 --- a/net/netfilter/nf_flow_table_inet.c
 +++ b/net/netfilter/nf_flow_table_inet.c
 @@ -98,6 +98,24 @@ static struct nf_flowtable_type flowtable_ipv6 = {
@@ -1370,7 +1398,7 @@ index 4bdcc4f33339..e13311369e27 100644
  {
  	nft_register_flowtable_type(&flowtable_ipv4);
 diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
-index 47b521670e6c..7efb7bb7f919 100644
+index e515522baebee..b2d0477333e31 100644
 --- a/net/netfilter/nf_flow_table_ip.c
 +++ b/net/netfilter/nf_flow_table_ip.c
 @@ -14,6 +14,7 @@
@@ -1381,7 +1409,7 @@ index 47b521670e6c..7efb7bb7f919 100644
  #include <net/xfrm.h>
  #include <net/netfilter/nf_flow_table.h>
  #include <net/netfilter/nf_conntrack.h>
-@@ -557,6 +558,97 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
+@@ -580,6 +581,97 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
  }
  EXPORT_SYMBOL_GPL(nf_flow_offload_ip_hook);
  

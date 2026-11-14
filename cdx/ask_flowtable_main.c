@@ -1410,6 +1410,6 @@ static void __exit ask_flowtable_exit(void)
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("ASK Linux flowtable adapter using the CDX hardware backend");
-MODULE_IMPORT_NS(ASK_CDX_FLOWTABLE);
+MODULE_IMPORT_NS("ASK_CDX_FLOWTABLE");
 module_init(ask_flowtable_init);
 module_exit(ask_flowtable_exit);

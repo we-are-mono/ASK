@@ -1,6 +1,7 @@
 """Compile a port joining a flowtable: nf_tables publishing the hook, the
 flowtable retiring the flows that walked to the port while it was unlisted,
-and the check a flow added after its walk makes against the list."""
+the check a flow added after its walk makes against the list, and a port
+renamed into a hook from the netdev notifier."""
 
 import os
 import re
@@ -25,8 +26,11 @@ def test_a_joining_port_retires_the_flows_that_walked_to_it(tmp_path):
     list_splice_rcu() put them, one at a time, each before a full barrier and
     the sweep for it, and a flow added after its walk looks at the list again
     behind a barrier of its own, so that a sweep run before the flow was in
-    the table cannot miss it. A flow that recorded no port pays nothing. The
-    port going down retires the flows that recorded it as well: one
+    the table cannot miss it. A flow that recorded no port pays nothing. A
+    port renamed to match a hook joins from the netdev notifier rather than a
+    commit, and is told to the flowtable behind the same barrier once
+    registered. The port going down retires the flows that recorded it as
+    well: one
     registered again comes back under another index, which nothing
     recorded."""
     kernel = kernel_source()
@@ -58,7 +62,9 @@ def test_a_joining_port_retires_the_flows_that_walked_to_it(tmp_path):
         + function(core, "nf_flow_table_listed")
         + function(api, "nft_flowtable_hooks_publish")
         + function(offload, "nft_flowtable_find_ifindex")
-        + function(offload, "nft_flow_offload_check_unlisted"))
+        + function(offload, "nft_flow_offload_check_unlisted")
+        + function(api, "nft_hook_find_ops")
+        + function(api, "nft_flowtable_event"))
     binary = tmp_path / "flowtable_listed"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
@@ -80,6 +86,12 @@ def test_a_joining_port_retires_the_flows_that_walked_to_it(tmp_path):
                      r"nft_flowtable_hooks_publish\(nft_trans_flowtable\(trans\),\s*"
                      r"&nft_trans_flowtable_hooks\(trans\)\);\s*\} else \{", update, re.S)
     assert "list_splice_rcu" not in update
+    # A rename reaches a flowtable as a registration under the new name, then
+    # an unregistration under the old one: the compiled event is what runs.
+    notifier = function(api, "nf_tables_flowtable_event")
+    assert re.search(r"if \(event == NETDEV_CHANGENAME\) \{\s*"
+                     r"if \(__nf_tables_flowtable_event\(NETDEV_REGISTER, dev, true\)\)",
+                     notifier)
     # A flow checks the list once it is in the table, and only then.
     evaluate = function(offload, "nft_flow_offload_eval")
     assert re.search(r"ret = flow_offload_add\(flowtable, flow\);\s*if \(ret < 0\)\s*"

@@ -1,4 +1,4 @@
-From 65f90b79362c99cea6e417dd1ff688356e20c8e3 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 23 Apr 2026 17:55:41 +0200
 Subject: [PATCH] wireless: restore ndo_do_ioctl dispatch in wext-core
@@ -9,18 +9,18 @@ offload stack; carried here because the ASK tree's out-of-tree wifi
 driver (ath10k vendor fork) still uses the old hook. Downstream
 integrators using a different wifi stack can drop this patch.
 
-Also enables WEXT_SPY / WEXT_PRIV by default in net/wireless/Kconfig so
-the out-of-tree driver's iwstats interface works without manual Kconfig
-surgery.
+Also enables WEXT_PRIV by default in net/wireless/Kconfig so the
+out-of-tree driver's iwstats interface works without manual Kconfig
+surgery (Linux 6.18 removed WEXT_SPY).
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- net/wireless/Kconfig     | 6 +++---
+ net/wireless/Kconfig     | 4 ++--
  net/wireless/wext-core.c | 3 +++
- 2 files changed, 6 insertions(+), 3 deletions(-)
+ 2 files changed, 5 insertions(+), 2 deletions(-)
 
 diff --git a/net/wireless/Kconfig b/net/wireless/Kconfig
-index 10345388ad13..722332d6dcc9 100644
+index 2d67b5f2010ed..5e142e5a1923d 100644
 --- a/net/wireless/Kconfig
 +++ b/net/wireless/Kconfig
 @@ -1,6 +1,6 @@
@@ -31,12 +31,8 @@ index 10345388ad13..722332d6dcc9 100644
  
  config WEXT_CORE
  	def_bool y
-@@ -12,10 +12,10 @@ config WEXT_PROC
+@@ -12,7 +12,7 @@ config WEXT_PROC
  	depends on WEXT_CORE
- 
- config WEXT_SPY
--	bool
-+	def_bool y
  
  config WEXT_PRIV
 -	bool
@@ -45,10 +41,10 @@ index 10345388ad13..722332d6dcc9 100644
  config CFG80211
  	tristate "cfg80211 - wireless configuration API"
 diff --git a/net/wireless/wext-core.c b/net/wireless/wext-core.c
-index 73a29ee3eff2..df9477c05485 100644
+index 7b8e94214b072..ce7dfce6d9445 100644
 --- a/net/wireless/wext-core.c
 +++ b/net/wireless/wext-core.c
-@@ -984,6 +984,9 @@ static int wireless_process_ioctl(struct net *net, struct iwreq *iwr,
+@@ -982,6 +982,9 @@ static int wireless_process_ioctl(struct net *net, struct iwreq *iwr,
  		else if (private)
  			return private(dev, iwr, cmd, info, handler);
  	}

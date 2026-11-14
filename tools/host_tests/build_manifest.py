@@ -14,7 +14,7 @@ from ask_orch import build_record, manifest
 from ask_orch.provenance import IMAGE
 
 ROOT = Path(__file__).resolve().parents[2]
-KERNEL_RECIPE = "meta-ask/recipes-kernel/linux/linux-ask_6.12.bb"
+KERNEL_RECIPE = "meta-ask/recipes-kernel/linux/linux-ask_6.18.bb"
 CDX_RECIPE = "meta-ask/recipes-ask/cdx/cdx_1.0.bb"
 # What each recipe of the fixture layer records, as the class derives it: the
 # recipe, its local sources, its external tree, its declared directories.

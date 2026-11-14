@@ -40,7 +40,7 @@ target:
 # env *before* parsing local.conf, so a `BB_ENV_PASSTHROUGH_ADDITIONS`
 # set inside local_conf_header is too late — by then env-import has
 # already happened with the default whitelist and KASAN has been
-# dropped (defaulting to KASAN ??= "0" in linux-ask_6.12.bb). Listing
+# dropped (defaulting to KASAN ??= "0" in linux-ask_6.18.bb). Listing
 # it in kas's `env:` block makes kas inject it into the bitbake env
 # *and* add it to BB_ENV_PASSTHROUGH_ADDITIONS before bitbake starts.
 # Default value "" so unset → recipe sees "" → falsy → image stays

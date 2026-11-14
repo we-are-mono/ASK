@@ -897,7 +897,7 @@ bool cdx_mc_port_supported(struct net_device *dev)
 	 * device that could not carry a flow cannot carry a replica either. */
 	return cdx_ft_port_supported(dev);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_mc_port_supported, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_mc_port_supported, "ASK_CDX_FLOWTABLE");
 
 bool cdx_mc_port_identity(struct net_device *dev)
 {
@@ -909,7 +909,7 @@ bool cdx_mc_port_identity(struct net_device *dev)
 	       dev->reg_state == NETREG_REGISTERED &&
 	       !netif_is_l3_slave(dev) && dpa_netdev_is_physical(dev);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_mc_port_identity, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_mc_port_identity, "ASK_CDX_FLOWTABLE");
 
 /* The group address, as the classifier requires it and as the contract narrows
  * it. Link-local scope is refused rather than carried: 224.0.0.0/24 and IPv6
@@ -1237,7 +1237,7 @@ unsigned int cdx_mc_group_ids(u8 family, unsigned int *slots)
 		*slots = n;
 	return held;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_mc_group_ids, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_mc_group_ids, "ASK_CDX_FLOWTABLE");
 
 /* Fill in everything about a group its root entry is built from: the family,
  * the addresses, the ingress and what the group's frames arrive as. Shared by
@@ -1400,7 +1400,7 @@ err_unlock:
 	kfree(group);
 	return rc;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_mc_group_add, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_mc_group_add, "ASK_CDX_FLOWTABLE");
 
 /* Whether a spec describes the group already installed. The key is what a
  * replace may not change: a different one is a different entry in a different
@@ -1607,7 +1607,7 @@ err_unlock:
 	kfree(fresh);
 	return rc;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_mc_group_replace, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_mc_group_replace, "ASK_CDX_FLOWTABLE");
 
 void cdx_mc_group_del(struct cdx_mc_group **group)
 {
@@ -1643,7 +1643,7 @@ void cdx_mc_group_del(struct cdx_mc_group **group)
 	mutex_unlock(&mc_mutators_mutex);
 	cdx_mcast_group_destroy(grp);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_mc_group_del, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_mc_group_del, "ASK_CDX_FLOWTABLE");
 
 bool cdx_mc_group_stats(const struct cdx_mc_group *group,
 			struct cdx_ft_counters *stats)
@@ -1673,4 +1673,4 @@ bool cdx_mc_group_stats(const struct cdx_mc_group *group,
 	stats->lastused = grp->pCtEntry->ct->timestamp;
 	return read;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_mc_group_stats, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_mc_group_stats, "ASK_CDX_FLOWTABLE");

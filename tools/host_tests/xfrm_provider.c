@@ -38,11 +38,13 @@ struct netlink_ext_ack { int unused; };
 struct module { int state, refs; bool refuse; };
 struct xfrm_state;
 struct xfrm_policy;
+struct net_device;
 struct xfrmdev_ops {
     struct module *owner;
-    int (*xdo_dev_state_add)(struct xfrm_state *, struct netlink_ext_ack *);
-    void (*xdo_dev_state_delete)(struct xfrm_state *);
-    void (*xdo_dev_state_free)(struct xfrm_state *);
+    int (*xdo_dev_state_add)(struct net_device *, struct xfrm_state *,
+                             struct netlink_ext_ack *);
+    void (*xdo_dev_state_delete)(struct net_device *, struct xfrm_state *);
+    void (*xdo_dev_state_free)(struct net_device *, struct xfrm_state *);
     void (*xdo_dev_state_advance_esn)(struct xfrm_state *);
     void (*xdo_dev_state_update_stats)(struct xfrm_state *);
     int (*xdo_dev_policy_add)(struct xfrm_policy *, struct netlink_ext_ack *);
@@ -55,11 +57,13 @@ struct xfrm_dev_offload {
     const struct xfrmdev_ops *ops;
     int dev_tracker, dir, type;
 };
+struct xfrm_type_offload { struct module *owner; };
 struct xfrm_state {
     struct xfrm_dev_offload xso;
     struct { xfrm_address_t saddr; int family, flags; } props;
     struct { xfrm_address_t daddr; } id;
-    int type_offload, dir, tfcpad, dev_gclist;
+    const struct xfrm_type_offload *type_offload;
+    int dir, if_id, tfcpad, dev_gclist;
 };
 struct xfrm_policy { struct xfrm_dev_offload xdo; };
 struct xfrm_user_offload { int flags, ifindex; };
@@ -103,16 +107,27 @@ static void kmem_cache_free(int c, void *p) { free(p); }
 
 #include "xfrm_provider_production.inc"
 
+/* ESP's offload type, pinned the way xfrm_set_type_offload() pins it when
+ * a state asks for offload; the state's destruction unpins it. */
+static struct module esp_offload;
+static const struct xfrm_type_offload esp_type = {.owner = &esp_offload};
+static struct xfrm_state *typed(struct xfrm_state *x)
+{
+    assert(try_module_get(esp_type.owner));
+    x->type_offload = &esp_type;
+    return x;
+}
+
 static void pinned(const struct xfrmdev_ops *ops)
 { assert(ops && (!ops->owner || ops->owner->refs > 0)); }
-static int state_add(struct xfrm_state *x, struct netlink_ext_ack *e)
-{ pinned(x->xso.ops); state_adds++; return add_error; }
+static int state_add(struct net_device *d, struct xfrm_state *x, struct netlink_ext_ack *e)
+{ assert(d == x->xso.dev); pinned(x->xso.ops); state_adds++; return add_error; }
 static int policy_add(struct xfrm_policy *x, struct netlink_ext_ack *e)
 { pinned(x->xdo.ops); policy_adds++; return add_error; }
-static void state_delete(struct xfrm_state *x)
-{ pinned(x->xso.ops); state_deletes++; }
-static void state_free(struct xfrm_state *x)
-{ pinned(x->xso.ops); state_frees++; }
+static void state_delete(struct net_device *d, struct xfrm_state *x)
+{ assert(d == x->xso.dev); pinned(x->xso.ops); state_deletes++; }
+static void state_free(struct net_device *d, struct xfrm_state *x)
+{ assert(d == x->xso.dev); pinned(x->xso.ops); state_frees++; }
 static void policy_delete(struct xfrm_policy *x)
 { pinned(x->xdo.ops); policy_deletes++; }
 static void policy_free(struct xfrm_policy *x)
@@ -141,24 +156,31 @@ int main(void)
     for (int unavailable = 0; unavailable < 3; unavailable++) {
         owner.state = unavailable < 2 ? unavailable + 1 : MODULE_STATE_LIVE;
         owner.refuse = unavailable == 2;
-        struct xfrm_state x = {.type_offload = 1};
+        struct xfrm_state x = {0};
         struct xfrm_policy p = {0};
-        assert(xfrm_dev_state_add(&net, &x, &request, NULL) == -EINVAL);
+        assert(xfrm_dev_state_add(&net, typed(&x), &request, NULL) == -EINVAL);
         assert(xfrm_dev_policy_add(&net, &p, &request, XFRM_POLICY_OUT, NULL) == -EINVAL);
         assert(!owner.refs && !device.refs && !state_adds && !policy_adds);
+        xfrm_unset_type_offload(&x);
+        assert(!esp_offload.refs);
     }
     owner.state = MODULE_STATE_LIVE;
     owner.refuse = false;
     /* Callback failures, unsupported callbacks, and invalid directions
      * release both the provider and the device, permitting later unload. */
     for (int err = 0; err < 3; err++) {
-        struct xfrm_state x = {.type_offload = 1};
+        struct xfrm_state x = {0};
         struct xfrm_policy p = {0};
         add_error = err == 0 ? -ENOMEM : -EOPNOTSUPP;
         if (err == 2) ops.xdo_dev_state_add = NULL;
-        assert(xfrm_dev_state_add(&net, &x, &request, NULL) < 0);
+        assert(xfrm_dev_state_add(&net, typed(&x), &request, NULL) < 0);
         assert(xfrm_dev_policy_add(&net, &p, &request, XFRM_POLICY_OUT, NULL) < 0);
         assert(!owner.refs && !device.refs && !x.xso.ops && !p.xdo.ops);
+        /* A callback that refused the state drops its offload type too; a
+         * provider with no callback leaves it to the state's destruction. */
+        assert(x.type_offload == (err == 2 ? &esp_type : NULL));
+        xfrm_unset_type_offload(&x);
+        assert(!esp_offload.refs);
     }
     ops.xdo_dev_state_add = state_add;
     add_error = 0;
@@ -169,8 +191,8 @@ int main(void)
 
     struct xfrm_state *x = calloc(1, sizeof(*x));
     struct xfrm_policy p = {0};
-    x->type_offload = 1;
-    assert(!xfrm_dev_state_add(&net, x, &request, NULL));
+    assert(!xfrm_dev_state_add(&net, typed(x), &request, NULL));
+    assert(x->type_offload == &esp_type);
     assert(!xfrm_dev_policy_add(&net, &p, &request, XFRM_POLICY_OUT, NULL));
     assert(owner.refs == 2 && device.refs == 2);
     /* Device detachment must not redirect callbacks or release code while
@@ -188,8 +210,9 @@ int main(void)
     xfrm_dev_policy_free(&p);
     assert(policy_deletes == 1 && policy_frees == 1);
     assert(owner.refs == 1 && !device.refs);
+    xfrm_unset_type_offload(x);
     xfrm_state_free(x);
-    assert(!owner.refs && !read_depth);
+    assert(!owner.refs && !esp_offload.refs && !read_depth);
 
     /* Permanent providers retain the existing device-owned contract. */
     ops.owner = NULL;

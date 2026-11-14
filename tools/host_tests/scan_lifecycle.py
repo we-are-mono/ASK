@@ -44,7 +44,7 @@ def test_scan_lifecycle(tmp_path):
     names = ["woal_cfg80211_scan_busy", "woal_cfg80211_scan_begin",
              "woal_cfg80211_scan_complete", "woal_cfg80211_scan_stop",
              "woal_cfg80211_scan_restart", "woal_scan_timeout_handler",
-             "woal_send_bss_scan_result", "woal_terminate_workqueue"]
+             "woal_send_cfg_bss_scan_result", "woal_terminate_workqueue"]
     (tmp_path / "scan_production.inc").write_text(
         "\n".join(function(main, n) for n in names)
         + "\n".join(function(ioctl, n) for n in [
@@ -59,7 +59,11 @@ def test_scan_lifecycle(tmp_path):
     assert "INIT_DELAYED_WORK(&handle->scan_timeout_work," in function(main, "woal_init_sw")
     assert "woal_cfg80211_scan_restart(handle);" in function(main, "woal_post_reset")
     assert "woal_cfg80211_scan_stop(handle);" in function(main, "woal_switch_drv_mode")
-    assert "evt->scan_generation" in function(main, "woal_evt_work_queue")
+    # woal_evt_work_queue() opens a brace in both arms of an #if/#else, which
+    # the brace-counting extractor cannot follow: take it to the closing brace
+    # at column 0 instead.
+    evt = main[main.index("\nvoid woal_evt_work_queue("):]
+    assert "evt->scan_generation" in evt[:evt.index("\n}\n")]
 
     binary = tmp_path / "scan_lifecycle"
     run_process([

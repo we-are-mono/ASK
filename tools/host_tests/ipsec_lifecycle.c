@@ -136,6 +136,7 @@ struct qm_dqrr_entry { unsigned stat, fqid; struct qm_fd fd; };
 struct qm_mr_entry { struct { unsigned rc; struct qm_fd fd; } ern; };
 enum qman_cb_dqrr_result { qman_cb_dqrr_consume, qman_cb_dqrr_stop };
 struct qman_portal { int unused; };
+struct qman_poll_ctx;
 typedef struct { int counter; } atomic_t;
 #define ATOMIC_INIT(n) { (n) }
 static int atomic_inc_return(atomic_t *v) { return ++v->counter; }
@@ -182,7 +183,8 @@ struct qman_fq {
     enum qman_fq_state state;
     struct {
         enum qman_cb_dqrr_result (*dqrr)(struct qman_portal *, struct qman_fq *,
-                                         const struct qm_dqrr_entry *);
+                                         const struct qm_dqrr_entry *, bool,
+                                         struct qman_poll_ctx *);
         void (*ern)(struct qman_portal *, struct qman_fq *, const struct qm_mr_entry *);
     } cb;
 };
@@ -389,8 +391,10 @@ static void dpa_fd_release(const struct net_device *dev, const struct qm_fd *fd)
  * resolve any more: it marked itself SA_DELETE first. */
 static U16 *releasing_flags;
 static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *qm,
-        struct qman_fq *fq, const struct qm_dqrr_entry *dq)
+        struct qman_fq *fq, const struct qm_dqrr_entry *dq, bool sched_napi,
+        struct qman_poll_ctx *ctx)
 {
+    (void)sched_napi; (void)ctx;
     if (dq->stat & QM_DQRR_STAT_FD_VALID) {
         assert(releasing_flags && (*releasing_flags & SA_DELETE));
         cp_drops++;
@@ -504,12 +508,12 @@ static void vdq_deliver(struct qman_fq *fq)
     assert(fq->flags & QMAN_FQ_STATE_VDQCR);
     for (unsigned i = 0; i < fq->held; i++) {
         dq.stat = QM_DQRR_STAT_FD_VALID; dq.fd = fq->frames[i];
-        assert(fq->cb.dqrr(NULL, fq, &dq) == qman_cb_dqrr_consume);
+        assert(fq->cb.dqrr(NULL, fq, &dq, false, NULL) == qman_cb_dqrr_consume);
     }
     fq->held = 0;
     dq.stat = QM_DQRR_STAT_FQ_EMPTY | QM_DQRR_STAT_DQCR_EXPIRED;
     memset(&dq.fd, 0, sizeof(dq.fd));
-    assert(fq->cb.dqrr(NULL, fq, &dq) == qman_cb_dqrr_consume);
+    assert(fq->cb.dqrr(NULL, fq, &dq, false, NULL) == qman_cb_dqrr_consume);
     fq->flags &= ~(QMAN_FQ_STATE_NE | QMAN_FQ_STATE_VDQCR);
     callbacks++;
 }

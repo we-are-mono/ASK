@@ -1,4 +1,4 @@
-From b775c92816da84e4dc7feb56f408acaffbed8e34 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Fri, 9 Oct 2026 16:39:25 +0200
 Subject: [PATCH] sdk_dpaa: bound a port's queues to the CPU by its share of
@@ -12,11 +12,13 @@ whatever it received, forwarding in hardware included.
 
 Count frames instead, at half of what the port seeds the pool with
 (fsl_dpa.ingress_quarters, one to four quarters), and drop the per-frame
-byte overhead and the Kconfig threshold that only meant bytes. A quarter
+byte overhead and the Kconfig thresholds that only meant bytes. A quarter
 refused about one frame in a hundred of the CPU's own forwarding while
 16,384 connections were admitted at a measured pace; half refused none,
 and a flood the CPU cannot keep up with still held no more than 1,329
-buffers. Congestion state changes stay off, now explicitly.
+buffers. Congestion state changes stay off, now explicitly. The high
+priority PCD queues' group of their own gets the same bound, so their
+traffic is never refused for the other's backlog.
 
 The pool is one (dpa_priv_common_bpid), but each port counted its own
 per-CPU fill of it: a frame received on one port and sent out of another
@@ -27,9 +29,16 @@ fill is now one per-CPU count shared by every private port, each adding
 its share (CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT) to what the pool is kept
 at, so it holds as many buffers as before.
 ---
+ .../net/ethernet/freescale/sdk_dpaa/Kconfig   | 20 -----
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    | 76 ++++++++++++++-----
+ .../freescale/sdk_dpaa/dpaa_eth_common.c      | 25 +++---
+ 3 files changed, 70 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/Kconfig b/drivers/net/ethernet/freescale/sdk_dpaa/Kconfig
+index 4c769f0a38ed4..c133153b92a5c 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/Kconfig
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/Kconfig
-@@ -146,14 +146,6 @@
+@@ -133,26 +133,6 @@ config FSL_DPAA_CS_THRESHOLD_10G
  	help
  	  The size in bytes of the egress Congestion State notification threshold on 10G ports.
  
@@ -38,15 +47,29 @@ at, so it holds as many buffers as before.
 -	depends on FSL_SDK_DPAA_ETH
 -	default "0x10000000"
 -	help
--	  The size in bytes of the ingress tail-drop threshold on FMan ports.
--	  Traffic piling up above this value will be rejected by QMan and discarded by FMan.
+-	  The size in bytes of the ingress tail-drop threshold on FMan ports,
+-	  excluding high priority PCD queues. Traffic piling up above this
+-	  value will be rejected by QMan and discarded by FMan. The default
+-	  value likely needs to be customized in order to trigger.
+-
+-config FSL_DPAA_INGRESS_HI_PRIO_CS_THRESHOLD
+-	hex "Ingress congestion threshold on FMan port high priority RX PCD queues"
+-	depends on FSL_SDK_DPAA_ETH
+-	default "0x10000000"
+-	help
+-	  The size in bytes of the tail-drop threshold on all high priority RX
+-	  PCD queues of an FMan port. Traffic piling up above this value will
+-	  be rejected by QMan and discarded by FMan. The default value likely
+-	  needs to be customized in order to trigger.
 -
  config FSL_DPAA_ETH_DEBUGFS
  	bool "DPAA Ethernet debugfs interface"
  	depends on DEBUG_FS && FSL_SDK_DPAA_ETH
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
+index 1c36bfa12f465..9f61e1ed56816 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
-@@ -100,6 +100,13 @@
+@@ -100,6 +100,13 @@ static uint8_t debug = -1;
  module_param(debug, byte, S_IRUGO);
  MODULE_PARM_DESC(debug, "Module/Driver verbosity level");
  
@@ -60,7 +83,7 @@ at, so it holds as many buffers as before.
  /* This has to work in tandem with the DPA_CS_THRESHOLD_xxx values. */
  static uint16_t tx_timeout = 1000;
  module_param(tx_timeout, ushort, S_IRUGO);
-@@ -110,6 +117,10 @@
+@@ -110,6 +117,10 @@ MODULE_PARM_DESC(tx_timeout, "The Tx timeout in ms");
  #define DPAA_ETH_MAX_PAD (L1_CACHE_BYTES * 8)
  
  static uint8_t dpa_priv_common_bpid;
@@ -71,8 +94,22 @@ at, so it holds as many buffers as before.
  
  #ifdef CONFIG_FSL_DPAA_DBG_LOOP
  struct net_device *dpa_loop_netdevs[20];
-@@ -898,10 +909,23 @@
- 	return dpa_bp;
+@@ -891,10 +902,10 @@ static int dpaa_eth_priv_ingress_cgr_init(struct qman_cgr *cgr, u64 cs_th)
+ 		return err;
+ 	}
+ 
+-	/* Enable CS TD, but disable Congestion State Change Notifications. */
+ 	memset(&initcgr, 0, sizeof(initcgr));
+-	initcgr.we_mask = QM_CGR_WE_CS_THRES;
+-	initcgr.cgr.cscn_en = QM_CGR_EN;
++	initcgr.we_mask = QM_CGR_WE_MODE | QM_CGR_WE_CS_THRES | QM_CGR_WE_CSCN_EN;
++	initcgr.cgr.mode = QMAN_CGR_MODE_FRAME;
++	initcgr.cgr.cscn_en = 0;
+ 	qm_cgr_cs_thres_set64(&initcgr.cgr.cs_thres, cs_th, 1);
+ 
+ 	initcgr.we_mask |= QM_CGR_WE_CSTD_EN;
+@@ -914,22 +925,38 @@ static int dpaa_eth_priv_ingress_cgr_init(struct qman_cgr *cgr, u64 cs_th)
+ 	return 0;
  }
  
 -/* Place all ingress FQs (Rx Default, Rx Error, PCD FQs) in a dedicated CGR.
@@ -80,7 +117,8 @@ at, so it holds as many buffers as before.
 - * this CGR to generate enqueue rejections to FMan in order to drop the frames
 - * before they reach our ingress queues and eat up memory.
 +/* Place all ingress FQs (Rx Default, Rx Error, PCD FQs) in a dedicated CGR,
-+ * which refuses FMan's enqueue past its threshold, so FMan drops the frame.
++ * and the high priority PCD FQs in one of their own, each of which refuses
++ * FMan's enqueue past its threshold, so FMan drops the frame.
 + *
 + * A frame waiting on these queues for the CPU holds a buffer of the pool
 + * every port receives into, and only the CPU taking it puts one back
@@ -94,29 +132,30 @@ at, so it holds as many buffers as before.
 + * the CPU's own forwarding -- some one frame in a hundred refused while 16,384
 + * connections were admitted at a measured pace, where half refused none -- and
 + * a whole share lost no less of a mass re-admission in hardware while leaving
-+ * the pool less to receive into. Nothing consumes congestion state changes, so
-+ * none are raised.
++ * the pool less to receive into. The high priority group gets the same bound,
++ * so its traffic is never refused for the other's backlog. Nothing consumes
++ * congestion state changes, so none are raised.
   */
- static int dpaa_eth_priv_ingress_cgr_init(struct dpa_priv_s *priv)
+ static int dpaa_eth_priv_ingress_cgrs_init(struct dpa_priv_s *priv)
  {
-@@ -915,11 +939,12 @@
- 		goto out_error;
- 	}
++	u64 cs_th = max_t(u64, (u64)priv->dpa_bp->config_count *
++			       num_possible_cpus() *
++			       clamp_t(uint, ingress_quarters, 1, 4) / 4, 1);
+ 	int ret;
  
--	/* Enable CS TD, but disable Congestion State Change Notifications. */
- 	memset(&initcgr, 0, sizeof(initcgr));
--	initcgr.we_mask = QM_CGR_WE_CS_THRES;
--	initcgr.cgr.cscn_en = QM_CGR_EN;
--	cs_th = CONFIG_FSL_DPAA_INGRESS_CS_THRESHOLD;
-+	initcgr.we_mask = QM_CGR_WE_MODE | QM_CGR_WE_CS_THRES | QM_CGR_WE_CSCN_EN;
-+	initcgr.cgr.mode = QMAN_CGR_MODE_FRAME;
-+	initcgr.cgr.cscn_en = 0;
-+	cs_th = max_t(u32, priv->dpa_bp->config_count * num_possible_cpus() *
-+			   clamp_t(uint, ingress_quarters, 1, 4) / 4, 1);
- 	qm_cgr_cs_thres_set64(&initcgr.cgr.cs_thres, cs_th, 1);
+-	ret = dpaa_eth_priv_ingress_cgr_init(&priv->ingress_cgr,
+-					     CONFIG_FSL_DPAA_INGRESS_CS_THRESHOLD);
++	ret = dpaa_eth_priv_ingress_cgr_init(&priv->ingress_cgr, cs_th);
+ 	if (ret)
+ 		return ret;
  
- 	initcgr.we_mask |= QM_CGR_WE_CSTD_EN;
-@@ -1180,17 +1205,24 @@
+-	ret = dpaa_eth_priv_ingress_cgr_init(&priv->ingress_cgr_hi_prio,
+-					     CONFIG_FSL_DPAA_INGRESS_HI_PRIO_CS_THRESHOLD);
++	ret = dpaa_eth_priv_ingress_cgr_init(&priv->ingress_cgr_hi_prio, cs_th);
+ 	if (ret) {
+ 		dpa_destroy_cgr(&priv->ingress_cgr);
+ 		return ret;
+@@ -1170,17 +1197,24 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
  		memset(percpu_priv, 0, sizeof(*percpu_priv));
  	}
  
@@ -151,24 +190,67 @@ at, so it holds as many buffers as before.
  
  	/* Initialize NAPI */
  	err = dpa_private_napi_add(net_dev);
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
+index 2a8241c26b41f..6ee57db29b176 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
-@@ -1317,14 +1317,8 @@
- 			initfq.we_mask |= QM_INITFQ_WE_CGID;
- 			initfq.fqd.fq_ctrl |= QM_FQCTRL_CGE;
- 			initfq.fqd.cgid = (uint8_t)priv->ingress_cgr.cgrid;
+@@ -1215,12 +1215,17 @@ void dpa_fq_setup(struct dpa_priv_s *priv, const struct dpa_fq_cbs_t *fq_cbs,
+ }
+ EXPORT_SYMBOL(dpa_fq_setup);
+ 
+-static void dpa_fq_init_cgr(struct qm_mcc_initfq *initfq, uint8_t cgid,
+-			    signed char oal)
++static void dpa_fq_init_cgr(struct qm_mcc_initfq *initfq, uint8_t cgid)
+ {
+ 	initfq->we_mask |= QM_INITFQ_WE_CGID;
+ 	initfq->fqd.fq_ctrl |= QM_FQCTRL_CGE;
+ 	initfq->fqd.cgid = cgid;
++}
++
++static void dpa_fq_init_cgr_oac(struct qm_mcc_initfq *initfq, uint8_t cgid,
++				signed char oal)
++{
++	dpa_fq_init_cgr(initfq, cgid);
+ 	initfq->we_mask |= QM_INITFQ_WE_OAC;
+ 	initfq->fqd.oac_init.oac = QM_OAC_CG;
+ 	initfq->fqd.oac_init.oal = oal;
+@@ -1289,7 +1294,8 @@ int dpa_fq_init(struct dpa_fq *dpa_fq, bool td_enable)
+ 			 * insufficient value, but even that is better than
+ 			 * no overhead accounting at all.
+ 			 */
+-			dpa_fq_init_cgr(&initfq, priv->cgr_data.cgr.cgrid, oal);
++			dpa_fq_init_cgr_oac(&initfq, priv->cgr_data.cgr.cgrid,
++					    oal);
+ 
+ 		if (td_enable) {
+ 			initfq.we_mask |= QM_INITFQ_WE_TDTHRESH;
+@@ -1320,20 +1326,19 @@ int dpa_fq_init(struct dpa_fq *dpa_fq, bool td_enable)
+ 			}
+ 		}
+ 
+-		/* Put all *private* ingress queues in our "ingress CGR". */
++		/* Put all *private* ingress queues in our "ingress CGRs".
++		 * The groups count frames, so no per-frame byte overhead is
++		 * accounted.
++		 */
+ 		if (priv->use_ingress_cgr &&
+ 		    (dpa_fq->fq_type == FQ_TYPE_RX_DEFAULT ||
+ 		     dpa_fq->fq_type == FQ_TYPE_RX_ERROR ||
+ 		     dpa_fq->fq_type == FQ_TYPE_RX_PCD))
 -			/* Set a fixed overhead accounting, just like for the
 -			 * egress CGR.
 -			 */
--			initfq.we_mask |= QM_INITFQ_WE_OAC;
--			initfq.fqd.oac_init.oac = QM_OAC_CG;
--			initfq.fqd.oac_init.oal =
--				(signed char)(min(sizeof(struct sk_buff) +
--				priv->tx_headroom, (size_t)FSL_QMAN_MAX_OAL));
-+			/* The group counts frames, so no per-frame byte
-+			 * overhead is accounted. */
- 		}
+-			dpa_fq_init_cgr(&initfq, priv->ingress_cgr.cgrid, oal);
++			dpa_fq_init_cgr(&initfq, priv->ingress_cgr.cgrid);
+ 
+ 		if (priv->use_ingress_cgr &&
+ 		    dpa_fq->fq_type == FQ_TYPE_RX_PCD_HI_PRIO)
+-			dpa_fq_init_cgr(&initfq, priv->ingress_cgr_hi_prio.cgrid,
+-					oal);
++			dpa_fq_init_cgr(&initfq, priv->ingress_cgr_hi_prio.cgrid);
  
  		/* Initialization common to all ingress queues */
+ 		if (dpa_fq->flags & QMAN_FQ_FLAG_NO_ENQUEUE) {
 -- 
 2.47.3
+

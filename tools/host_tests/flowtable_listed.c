@@ -4,11 +4,13 @@
  * flowtable retiring the flows that walked to the port while it was unlisted
  * (nf_flow_table_listed(), over the real nf_flow_table_iterate()), the check a
  * flow added after its walk makes against the list
- * (nft_flow_offload_check_unlisted()), and a device going down retiring the
- * flows that recorded it (nf_flow_table_do_cleanup()). The flowtable's types,
- * the flow and its tuples, the route and nf_tables' hook and flowtable are the
- * kernel's own declarations; the rhashtable walk, the lists, the barrier and
- * the teardown are simulated.
+ * (nft_flow_offload_check_unlisted()), a device renamed to match a hook
+ * joining from the netdev notifier (nft_flowtable_event()), and a device going
+ * down retiring the flows that recorded it (nf_flow_table_do_cleanup()). The
+ * flowtable's types, the flow and its tuples, the route and nf_tables' hook
+ * and flowtable are the kernel's own declarations; the rhashtable walk, the
+ * lists, the barrier, the allocator, the hook registration and the teardown
+ * are simulated.
  *
  * The LAN port is eth3, the WAN port eth4; eth5 joins beside eth3. A client
  * sits behind a VLAN or a bridge on eth3, a PPPoE session runs over eth4, and
@@ -20,6 +22,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef uint8_t u8;
@@ -30,9 +33,12 @@ typedef uint16_t __be16;
 typedef uint32_t __be32;
 
 #define ETH_ALEN 6
+#define IFNAMSIZ 16
 #define NF_FLOW_TABLE_ENCAP_MAX 2
 #define NFPROTO_IPV4 2
+#define NFPROTO_NETDEV 5
 #define NFPROTO_IPV6 10
+#define GFP_KERNEL_ACCOUNT 0
 #define BIT(n) (1UL << (n))
 #define likely(x) (x)
 #define ____cacheline_aligned
@@ -51,7 +57,7 @@ struct list_head { struct list_head *next, *prev; };
 struct rcu_head { int unused; };
 struct rhash_head { int unused; };
 struct net { int id; };
-struct net_device { int ifindex; struct net *net; };
+struct net_device { int ifindex; struct net *net; char name[IFNAMSIZ]; };
 struct nf_conn { struct net *net; };
 struct dst_entry { int unused; };
 struct nf_flowtable;
@@ -66,7 +72,18 @@ typedef unsigned int nf_hookfn(void *priv, struct sk_buff *skb,
 			       const struct nf_hook_state *state);
 enum flow_block_command { FLOW_BLOCK_BIND, FLOW_BLOCK_UNBIND };
 union nf_inet_addr { __be32 all[4]; struct in6_addr in6; };
-struct nf_hook_ops { struct net_device *dev; };
+enum nf_hook_ops_type { NF_HOOK_OP_UNDEFINED, NF_HOOK_OP_NF_TABLES, NF_HOOK_OP_NFT_FT };
+struct nf_hook_ops {
+	struct list_head list;
+	nf_hookfn *hook;
+	struct net_device *dev;
+	void *priv;
+	u8 pf;
+	enum nf_hook_ops_type hook_ops_type:8;
+	unsigned int hooknum;
+	int priority;
+};
+enum netdev_cmd { NETDEV_REGISTER = 5, NETDEV_UNREGISTER = 6 };
 struct delayed_work { int unused; };
 struct flow_block { struct list_head cb_list; };
 struct rw_semaphore { int unused; };
@@ -171,6 +188,13 @@ static void list_del(struct list_head *entry)
 	entry->next->prev = entry->prev;
 	entry->next = entry->prev = (struct list_head *)0x100;
 }
+/* The first device a hook's name matched: the one a publish is recorded by. */
+static const struct net_device *first_dev(const struct nft_hook *hook)
+{
+	if (list_empty(&hook->ops_list))
+		return NULL;
+	return container_of(hook->ops_list.next, struct nf_hook_ops, list)->dev;
+}
 /* Only hooks are published here. */
 static void list_add_rcu(struct list_head *new, struct list_head *head)
 {
@@ -178,12 +202,37 @@ static void list_add_rcu(struct list_head *new, struct list_head *head)
 	new->prev = head;
 	head->next->prev = new;
 	head->next = new;
-	record(PUBLISH, container_of(new, struct nft_hook, list)->ops.dev);
+	record(PUBLISH, first_dev(container_of(new, struct nft_hook, list)));
 }
-/* Every walk of a hook list the production code makes is a read of it. */
+/* Only a device's registration is added to a hook's tail, which publishes
+ * the device to a walk as a hook's publication does. */
+static void list_add_tail_rcu(struct list_head *new, struct list_head *head)
+{
+	list_add_tail(new, head);
+	record(PUBLISH, container_of(new, struct nf_hook_ops, list)->dev);
+}
+static void list_del_rcu(struct list_head *entry)
+{
+	list_del(entry);
+}
+/* The flowtable nf_tables owns, with the ports it lists and the flows it
+ * holds. */
+static struct nft_flowtable ft;
+/* Every walk of the flowtable's hook list the production code makes is a
+ * read of it; the walk of each hook's own registrations is part of that
+ * read. */
+static void read_of(const struct list_head *head)
+{
+	if (head == &ft.hook_list)
+		record(READ, NULL);
+}
 #define list_for_each_entry_rcu(pos, head, member)				\
-	for (record(READ, NULL),						\
+	for (read_of(head),							\
 	     pos = container_of((head)->next, typeof(*pos), member);		\
+	     &pos->member != (head);						\
+	     pos = container_of(pos->member.next, typeof(*pos), member))
+#define list_for_each_entry(pos, head, member)					\
+	for (pos = container_of((head)->next, typeof(*pos), member);		\
 	     &pos->member != (head);						\
 	     pos = container_of(pos->member.next, typeof(*pos), member))
 #define list_for_each_entry_safe(pos, n, head, member)				\
@@ -235,24 +284,79 @@ static void dst_release(struct dst_entry *dst)
 	assert(!"a NEIGH route keeps its destination");
 }
 
+static void *kzalloc(size_t size, int flags)
+{
+	return calloc(1, size);
+}
+static void kfree(void *p)
+{
+	free(p);
+}
+#define kfree_rcu(p, field) free(p)
+
+/* The device's hook registered with the core: fails when told to. */
+static bool register_fails;
+static unsigned int registered;
+static int nft_register_flowtable_ops(struct net *net, struct nft_flowtable *flowtable,
+				      struct nf_hook_ops *ops)
+{
+	if (register_fails)
+		return -ENOMEM;
+	registered++;
+	return 0;
+}
+static void nft_unregister_flowtable_ops(struct net *net, struct nft_flowtable *flowtable,
+					 struct nf_hook_ops *ops)
+{
+	assert(registered);
+	registered--;
+}
+
 #include "listed_production.inc"
 
 /* Device indices; the VLAN, the bridge and the ppp device only ever appear
  * as the device a flow is cached on. */
 enum { ETH3 = 3, ETH4 = 4, ETH5 = 5, WLAN = 8, VLAN = 30, BRIDGE = 40, PPP = 50 };
 static struct net net_a = { 1 }, net_b = { 2 };
-static struct net_device eth3 = { ETH3, &net_a }, eth4 = { ETH4, &net_a },
-	eth5 = { ETH5, &net_a };
+static struct net_device eth3 = { ETH3, &net_a, "eth3" }, eth4 = { ETH4, &net_a, "eth4" },
+	eth5 = { ETH5, &net_a, "eth5" };
 static struct nf_conn ct_a = { &net_a }, ct_b = { &net_b };
 static struct dst_entry dst;
 
-/* The flowtable nf_tables owns, with the ports it lists and the flows it
- * holds. */
-static struct nft_flowtable ft;
+/* The flowtable's hooks, each with one registration per device its name
+ * matches: a name ending in '*' matches more than one. */
 static struct nft_hook hooks[4];
+static struct nf_hook_ops registrations[ARRAY_LEN(hooks)][2];
 static const struct nf_flowtable_type listed_type = { .listed = nf_flow_table_listed };
 /* act_ct's type, say, which has no use for the op. */
 static const struct nf_flowtable_type plain_type = { .listed = NULL };
+
+/* Hook i, naming a device by its whole name, none registered yet. */
+static struct nft_hook *named(unsigned int i, const char *name)
+{
+	memset(&hooks[i], 0, sizeof(hooks[i]));
+	memset(registrations[i], 0, sizeof(registrations[i]));
+	INIT_LIST_HEAD(&hooks[i].ops_list);
+	strcpy(hooks[i].ifname, name);
+	hooks[i].ifnamelen = strlen(name) + 1;
+	return &hooks[i];
+}
+
+/* Hook i, naming dev alone. */
+static struct nft_hook *hook(unsigned int i, struct net_device *dev)
+{
+	named(i, dev->name);
+	registrations[i][0].dev = dev;
+	list_add_tail(&registrations[i][0].list, &hooks[i].ops_list);
+	return &hooks[i];
+}
+
+/* Hook i's name matches dev as well. */
+static void also(unsigned int i, struct net_device *dev)
+{
+	registrations[i][1].dev = dev;
+	list_add_tail(&registrations[i][1].list, &hooks[i].ops_list);
+}
 
 static void table(const struct nf_flowtable_type *type, struct net_device *const *listed,
 		  size_t n)
@@ -260,11 +364,8 @@ static void table(const struct nf_flowtable_type *type, struct net_device *const
 	memset(&ft, 0, sizeof(ft));
 	ft.data.type = type;
 	INIT_LIST_HEAD(&ft.hook_list);
-	for (size_t i = 0; i < n; i++) {
-		memset(&hooks[i], 0, sizeof(hooks[i]));
-		hooks[i].ops.dev = listed[i];
-		list_add_tail(&hooks[i].list, &ft.hook_list);
-	}
+	for (size_t i = 0; i < n; i++)
+		list_add_tail(&hook(i, listed[i])->list, &ft.hook_list);
 	nevents = teardowns = 0;
 }
 
@@ -309,9 +410,14 @@ static void add(struct flow_offload *flow)
 static bool on_list(const struct net_device *dev)
 {
 	for (struct list_head *pos = ft.hook_list.next; pos != &ft.hook_list;
-	     pos = pos->next)
-		if (container_of(pos, struct nft_hook, list)->ops.dev == dev)
-			return true;
+	     pos = pos->next) {
+		struct nft_hook *h = container_of(pos, struct nft_hook, list);
+
+		for (struct list_head *reg = h->ops_list.next; reg != &h->ops_list;
+		     reg = reg->next)
+			if (container_of(reg, struct nf_hook_ops, list)->dev == dev)
+				return true;
+	}
 	return false;
 }
 
@@ -411,11 +517,8 @@ static void publish_cases(void)
 		table(with_op ? &recording_type : &plain_type, listed, ARRAY_LEN(listed));
 		populate();
 		INIT_LIST_HEAD(&trans);
-		for (size_t i = 0; i < ARRAY_LEN(joining); i++) {
-			memset(&hooks[1 + i], 0, sizeof(hooks[1 + i]));
-			hooks[1 + i].ops.dev = joining[i];
-			list_add_tail(&hooks[1 + i].list, &trans);
-		}
+		for (size_t i = 0; i < ARRAY_LEN(joining); i++)
+			list_add_tail(&hook(1 + i, joining[i])->list, &trans);
 		expect_later = &eth5;
 		nft_flowtable_hooks_publish(&ft, &trans);
 		expect_later = NULL;
@@ -447,6 +550,19 @@ static void publish_cases(void)
 			assert(!teardowns);
 		}
 	}
+
+	/* One hook whose name matches both ports is published once, behind one
+	 * barrier, and the flowtable is told of each device it matches. */
+	table(&recording_type, listed, ARRAY_LEN(listed));
+	populate();
+	INIT_LIST_HEAD(&trans);
+	list_add_tail(&hook(1, &eth3)->list, &trans);
+	also(1, &eth5);
+	nft_flowtable_hooks_publish(&ft, &trans);
+	assert(list_empty(&trans) && ft.hook_list.next == &hooks[1].list);
+	HAPPENED(PUBLISH, BARRIER, LISTED, LISTED);
+	assert(events[0].dev == &eth3 && events[2].dev == &eth3 && events[3].dev == &eth5);
+	assert(torn(&flows[VLAN_CLIENT]) && torn(&flows[BRIDGE_CLIENT]) && teardowns == 2);
 	printf("flowtable listed publish checks passed\n");
 }
 
@@ -502,6 +618,14 @@ static void check_cases(void)
 	HAPPENED(BARRIER, READ);
 	assert(torn(&flow));
 
+	/* Listed through a hook whose name matches another port first. */
+	table(&listed_type, wan_only, ARRAY_LEN(wan_only));
+	also(0, &eth3);
+	build(&flow, &ct_a, (int[]){ ETH4, VLAN }, (int[]){ 0, ETH3 });
+	nft_flow_offload_check_unlisted(&ft, &flow);
+	HAPPENED(BARRIER, READ);
+	assert(torn(&flow));
+
 	/* Ports are listed, but not the one recorded. */
 	table(&listed_type, listed, ARRAY_LEN(listed));
 	build(&flow, &ct_a, (int[]){ BRIDGE, ETH4 }, (int[]){ WLAN, 0 });
@@ -525,9 +649,7 @@ static void race_cases(void)
 		table(&listed_type, listed, ARRAY_LEN(listed));
 		build(&flow, &ct_a, (int[]){ ETH4, VLAN }, (int[]){ 0, ETH3 });
 		INIT_LIST_HEAD(&trans);
-		memset(&hooks[1], 0, sizeof(hooks[1]));
-		hooks[1].ops.dev = &eth3;
-		list_add_tail(&hooks[1].list, &trans);
+		list_add_tail(&hook(1, &eth3)->list, &trans);
 
 		if (added_first) {
 			add(&flow);
@@ -545,6 +667,64 @@ static void race_cases(void)
 	printf("flowtable listed race checks passed\n");
 }
 
+/* A device renamed to match a hook's name joins the table from the netdev
+ * notifier -- nft_flowtable_event() with NETDEV_REGISTER, on NETDEV_CHANGENAME
+ * -- not from a commit. It can be up, with flows that walked to it while it
+ * was unlisted, so once registered the flowtable is told of it behind a full
+ * barrier, as a commit's publish does. A type without the op is only
+ * registered; a name matching nothing, a device registered already and a
+ * registration the core refuses change nothing. Renamed away, the device's
+ * registration goes. */
+static void rename_cases(void)
+{
+	struct net_device *listed[] = { &eth4 };
+	struct nf_hook_ops *ops;
+
+	for (int with_op = 0; with_op < 2; with_op++) {
+		table(with_op ? &recording_type : &plain_type, listed, ARRAY_LEN(listed));
+		ft.data.priority = 10;
+		populate();
+		list_add_tail(&named(1, "eth3")->list, &ft.hook_list);
+
+		assert(!nft_flowtable_event(NETDEV_REGISTER, &eth3, &ft, true));
+		ops = nft_hook_find_ops(&hooks[1], &eth3);
+		assert(ops && registered == 1 && !nft_hook_find_ops(&hooks[0], &eth3));
+		assert(ops->pf == NFPROTO_NETDEV && ops->hooknum == (unsigned int)ft.hooknum &&
+		       ops->priority == 10 && ops->priv == &ft.data &&
+		       ops->hook_ops_type == NF_HOOK_OP_NFT_FT && ops->dev == &eth3);
+		if (with_op) {
+			HAPPENED(PUBLISH, BARRIER, LISTED);
+			assert(events[0].dev == &eth3 && events[2].dev == &eth3);
+			for (size_t i = 0; i < ARRAY_LEN(flows); i++)
+				assert(torn(&flows[i]) == (i == VLAN_CLIENT || i == BRIDGE_CLIENT));
+			assert(teardowns == 2);
+		} else {
+			HAPPENED(PUBLISH);
+			assert(events[0].dev == &eth3 && !teardowns);
+		}
+
+		nevents = 0;
+		assert(!nft_flowtable_event(NETDEV_REGISTER, &eth3, &ft, true));
+		assert(!nevents && registered == 1);
+
+		strcpy(eth3.name, "lan0");
+		assert(!nft_flowtable_event(NETDEV_UNREGISTER, &eth3, &ft, true));
+		strcpy(eth3.name, "eth3");
+		assert(!nft_hook_find_ops(&hooks[1], &eth3) && !registered);
+		assert(list_empty(&hooks[1].ops_list));
+	}
+
+	table(&recording_type, listed, ARRAY_LEN(listed));
+	populate();
+	list_add_tail(&named(1, "eth3")->list, &ft.hook_list);
+	assert(!nft_flowtable_event(NETDEV_REGISTER, &eth5, &ft, true));
+	register_fails = true;
+	assert(nft_flowtable_event(NETDEV_REGISTER, &eth3, &ft, true) == 1);
+	register_fails = false;
+	assert(!nevents && !registered && !teardowns && list_empty(&hooks[1].ops_list));
+	printf("flowtable listed rename checks passed\n");
+}
+
 /* A device going down -- nf_flow_table_gc_cleanup()'s pass, on NETDEV_DOWN --
  * retires the flows that arrive on it and those that recorded it unlisted, in
  * its own namespace. Otherwise a port unregistered and registered again, as a
@@ -554,7 +734,7 @@ static void race_cases(void)
 static void cleanup_cases(void)
 {
 	struct net_device *listed[] = { &eth4 };
-	struct net_device eth3_again = { 12, &net_a };
+	struct net_device eth3_again = { 12, &net_a, "eth3" };
 
 	table(&listed_type, listed, ARRAY_LEN(listed));
 	populate();
@@ -585,6 +765,7 @@ int main(void)
 	publish_cases();
 	check_cases();
 	race_cases();
+	rename_cases();
 	cleanup_cases();
 	return 0;
 }

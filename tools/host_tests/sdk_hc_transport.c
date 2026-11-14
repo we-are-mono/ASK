@@ -43,6 +43,7 @@ enum qm_fd_format { qm_fd_contig, qm_fd_last = 7 };
 #define ___constant_swab32 __builtin_bswap32
 struct qman_portal { int unused; };
 struct qman_fq { int unused; };
+struct qman_poll_ctx;
 struct qm_dqrr_entry { struct qm_fd fd; };
 enum qman_cb_dqrr_result { qman_cb_dqrr_consume };
 typedef struct { t_Handle h_PcdDev; struct qman_fq *hc_tx_fq; } t_LnxWrpFmDev;
@@ -112,7 +113,8 @@ t_Error FM_PORT_Free(t_Handle p) { port_frees++; return E_OK; }
 void FM_PCD_HcTxConf(t_Handle p, t_DpaaFD *fd) { FmHcTxConf(p, fd); }
 static void confirm(void)
 {
-    assert(qm_tx_conf_dqrr_cb(NULL, &confirmation_queue.fq, &pending) == qman_cb_dqrr_consume);
+    assert(qm_tx_conf_dqrr_cb(NULL, &confirmation_queue.fq, &pending, false, NULL) ==
+           qman_cb_dqrr_consume);
 }
 void XX_UDelay(uint32_t usecs)
 {

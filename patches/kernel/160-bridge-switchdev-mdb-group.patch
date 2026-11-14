@@ -1,4 +1,4 @@
-From bdc5da8d894f9d5cf4b15c32047671364740c1da Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Fri, 18 Sep 2026 13:20:00 +0200
 Subject: [PATCH] bridge: carry the multicast group into the MDB switchdev
@@ -45,7 +45,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  3 files changed, 65 insertions(+), 4 deletions(-)
 
 diff --git a/include/net/switchdev.h b/include/net/switchdev.h
-index 8346b0d29542..da9e6370ed0f 100644
+index 8346b0d29542c..da9e6370ed0f6 100644
 --- a/include/net/switchdev.h
 +++ b/include/net/switchdev.h
 @@ -10,6 +10,8 @@
@@ -105,10 +105,10 @@ index 8346b0d29542..da9e6370ed0f 100644
  
  #define SWITCHDEV_OBJ_PORT_MDB(OBJ) \
 diff --git a/net/bridge/br_switchdev.c b/net/bridge/br_switchdev.c
-index f10bd6a233dc..8c97125d45c8 100644
+index b5c6e314204f9..0413c00e4a22f 100644
 --- a/net/bridge/br_switchdev.c
 +++ b/net/bridge/br_switchdev.c
-@@ -540,6 +540,21 @@ static void br_switchdev_mdb_populate(struct switchdev_obj_port_mdb *mdb,
+@@ -544,6 +544,21 @@ static void br_switchdev_mdb_populate(struct switchdev_obj_port_mdb *mdb,
  		ether_addr_copy(mdb->addr, mp->addr.dst.mac_addr);
  
  	mdb->vid = mp->addr.vid;
@@ -130,7 +130,7 @@ index f10bd6a233dc..8c97125d45c8 100644
  }
  
  static void br_switchdev_host_mdb_one(struct net_device *dev,
-@@ -602,6 +617,7 @@ static int br_switchdev_mdb_queue_one(struct list_head *mdb_list,
+@@ -606,6 +621,7 @@ static int br_switchdev_mdb_queue_one(struct list_head *mdb_list,
  				      unsigned long action,
  				      enum switchdev_obj_id id,
  				      const struct net_bridge_mdb_entry *mp,
@@ -138,7 +138,7 @@ index f10bd6a233dc..8c97125d45c8 100644
  				      struct net_device *orig_dev)
  {
  	struct switchdev_obj_port_mdb mdb = {
-@@ -613,6 +629,8 @@ static int br_switchdev_mdb_queue_one(struct list_head *mdb_list,
+@@ -617,6 +633,8 @@ static int br_switchdev_mdb_queue_one(struct list_head *mdb_list,
  	struct switchdev_obj_port_mdb *pmdb;
  
  	br_switchdev_mdb_populate(&mdb, mp);
@@ -147,7 +147,7 @@ index f10bd6a233dc..8c97125d45c8 100644
  
  	if (action == SWITCHDEV_PORT_OBJ_ADD &&
  	    switchdev_port_obj_act_is_deferred(dev, action, &mdb.obj)) {
-@@ -652,7 +670,7 @@ void br_switchdev_mdb_notify(struct net_device *dev,
+@@ -656,7 +674,7 @@ void br_switchdev_mdb_notify(struct net_device *dev,
  		return br_switchdev_host_mdb(dev, mp, type);
  
  	br_switchdev_mdb_populate(&mdb, mp);
@@ -156,7 +156,7 @@ index f10bd6a233dc..8c97125d45c8 100644
  	mdb.obj.orig_dev = pg->key.port->dev;
  	switch (type) {
  	case RTM_NEWMDB:
-@@ -720,7 +738,7 @@ br_switchdev_mdb_replay(struct net_device *br_dev, struct net_device *dev,
+@@ -724,7 +742,7 @@ br_switchdev_mdb_replay(struct net_device *br_dev, struct net_device *dev,
  		if (mp->host_joined) {
  			err = br_switchdev_mdb_queue_one(&mdb_list, dev, action,
  							 SWITCHDEV_OBJ_ID_HOST_MDB,
@@ -165,7 +165,7 @@ index f10bd6a233dc..8c97125d45c8 100644
  			if (err) {
  				spin_unlock_bh(&br->multicast_lock);
  				goto out_free_mdb;
-@@ -734,7 +752,7 @@ br_switchdev_mdb_replay(struct net_device *br_dev, struct net_device *dev,
+@@ -738,7 +756,7 @@ br_switchdev_mdb_replay(struct net_device *br_dev, struct net_device *dev,
  
  			err = br_switchdev_mdb_queue_one(&mdb_list, dev, action,
  							 SWITCHDEV_OBJ_ID_PORT_MDB,
@@ -175,7 +175,7 @@ index f10bd6a233dc..8c97125d45c8 100644
  				spin_unlock_bh(&br->multicast_lock);
  				goto out_free_mdb;
 diff --git a/net/switchdev/switchdev.c b/net/switchdev/switchdev.c
-index 4d5fbacef496..3c94766bfcc1 100644
+index 4d5fbacef496f..3c94766bfcc12 100644
 --- a/net/switchdev/switchdev.c
 +++ b/net/switchdev/switchdev.c
 @@ -39,8 +39,14 @@ static bool switchdev_obj_eq(const struct switchdev_obj *a,

@@ -1,8 +1,8 @@
-From 651ac1109320fc2a6ab7d21c6cbb18880ca52214 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 20 Sep 2026 03:59:10 +0200
-Subject: [PATCH 3/4] mlan: revalidate the ralist after the send helpers drop
- the lock
+Subject: [PATCH] mlan: revalidate the ralist after the send helpers drop the
+ lock
 
 wlan_dequeue_tx_packet() receives ptr from wlan_wmm_get_next_priolist_ptr()
 with ra_list_spinlock held and passes it to wlan_11n_aggregate_pkt() or
@@ -30,18 +30,18 @@ wlan_update_ralist_tx_pause(), which takes the lock itself.
 
 Upstream-Status: Pending
 ---
- mlan/mlan_wmm.c | 23 +++++++++++++++++++++--
- 1 file changed, 21 insertions(+), 2 deletions(-)
+ mlan/mlan_wmm.c | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
 
 diff --git a/mlan/mlan_wmm.c b/mlan/mlan_wmm.c
-index 52c6e8a..ba00509 100644
+index 842a20d..89cef29 100644
 --- a/mlan/mlan_wmm.c
 +++ b/mlan/mlan_wmm.c
-@@ -1955,8 +1955,27 @@ static int wlan_dequeue_tx_packet(pmlan_adapter pmadapter)
+@@ -1979,8 +1979,28 @@ static int wlan_dequeue_tx_packet(pmlan_adapter pmadapter)
  		}
  	}
  
--	if (ptr->sta && ptr->sta->ps_sleep) {
+-	if (ptr->sta && ptr->sta->ps_sleep)
 -		wlan_update_ralist_tx_pause(priv, ptr->ra, 1);
 +	/* The send helpers above return with ra_list_spinlock released, and
 +	 * wlan_wmm_delete_peer_ralist() frees both the ralist and its sta
@@ -64,9 +64,10 @@ index 52c6e8a..ba00509 100644
 +						      priv->wmm.ra_list_spinlock);
 +		if (ps_sleep)
 +			wlan_update_ralist_tx_pause(priv, ra, 1);
- 	}
++	}
  
  	LEAVE();
+ 	return MLAN_STATUS_SUCCESS;
 -- 
 2.47.3
 

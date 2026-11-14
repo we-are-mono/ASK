@@ -26,7 +26,7 @@ def _run(tmp_path, harness, includes, flags=()):
     })
 
 
-def _source(path="net/netfilter/nft_flow_offload.c"):
+def _source(path="net/netfilter/nf_flow_table_path.c"):
     return (kernel_source() / path).read_text()
 
 
@@ -64,8 +64,9 @@ def test_flowtable_forward_path_unresolved_hops(tmp_path):
             + function(_source("drivers/net/ppp/ppp_generic.c"), "ppp_fill_forward_path")
             + function(_source("drivers/net/ppp/pppoe.c"), "pppoe_fill_forward_path"),
         "forward_path_production.inc":
-            source[source.index("static enum flow_offload_xmit_type nft_xmit_type"):
-                   source.index("static bool nft_flow_offload_skip")],
+            function(_source("net/netfilter/nf_tables_api.c"), "nft_hook_find_ops_rcu")
+            + source[source.index("static enum flow_offload_xmit_type nft_xmit_type"):
+                     source.index("EXPORT_SYMBOL_GPL(nft_flow_route);")],
     # The hooks compare an int count with ARRAY_SIZE(), as the kernel, which
     # builds without this warning, lets them.
     }, flags=("-Wno-sign-compare",))

@@ -21,7 +21,8 @@ def function(source, name):
                       r"struct xfrm_state ?\* ?|struct ft_ipsec_watch ?\* ?|const struct xfrmdev_ops ?\* ?|"
                       r"struct ft_ipsec_retirement ?\* ?|"
                       r"struct rtable ?\* ?|struct dst_entry ?\* ?|struct tcf_block ?\* ?|"
-                      r"enum ft_mr_state |enum qman_cb_dqrr_result )"
+                      r"struct xt_table ?\* ?|struct nf_hook_ops ?\* ?|"
+                      r"enum ft_mr_state |enum qman_cb_dqrr_result |enum nft_probe_res )"
                       # __init/__exit sit between the return type and the name.
                       r"(?:__init |__exit )?"
                       + name + r"\([^;]*?\)\s*\{", source, re.M)

@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 
 FILES = Path(__file__).resolve().parents[2] / "meta-ask/recipes-kernel/linux/files"
-RECIPE = FILES.parent / "linux-ask_6.12.bb"
+RECIPE = FILES.parent / "linux-ask_6.18.bb"
 WERROR = re.compile(r"^(?:CONFIG_WERROR=\S*|# CONFIG_WERROR is not set)$", re.M)
 
 
