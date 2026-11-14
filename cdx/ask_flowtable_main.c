@@ -664,7 +664,8 @@ static int ft_status_show(struct seq_file *seq, void *v)
 	 * past the classifier meanwhile, the datapath forwarding in software,
 	 * restarts counts the restarts done, and resume_failures the classifier
 	 * ports they could not start again. What a restart waits for is CDX's
-	 * flowtable_degraded_reason. */
+	 * flowtable_degraded_reason; restart_budget_ms, how long a spent restart
+	 * budget may still hold it back. */
 	ft_kv(seq, "fatal", cdx_ft_failed());
 	/* Retirements whose barrier failed, or that wait on CDX's own proof;
 	 * one merely owed a barrier is counted apart, and for no longer than
@@ -676,6 +677,7 @@ static int ft_status_show(struct seq_file *seq, void *v)
 	ft_kv(seq, "bypassed", cdx_ft_bypassed());
 	ft_kv(seq, "restarts", cdx_ft_restarts());
 	ft_kv(seq, "resume_failures", cdx_ft_resume_failures());
+	ft_kv(seq, "restart_budget_ms", cdx_ft_restart_budget_ms());
 	/* The SAs this adapter installed, and every SA cdx's cache holds: an
 	 * install refused part-way has to leave both where they were. */
 	ft_kv(seq, "ipsec_sas", cdx_ipsec_sa_count());

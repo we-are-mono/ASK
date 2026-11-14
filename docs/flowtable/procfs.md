@@ -164,6 +164,7 @@ read under the QoS mutex, one port at a time.
 | `rearm_ready` | admission may be rearmed |
 | `bypassed` | the classifier ports run past the classifier, forwarding in software |
 | `restarts`, `resume_failures` | datapath restarts, and ports one could not start again |
+| `restart_budget_ms` | while the restart budget is spent, what is left of the 10-minute window that spent it: how long a restart waits at most; `0` while it would allow one, and at a limit of `0`, which waits until it is raised |
 | `ipsec_sas`, `ipsec_sa_cache` | SAs the adapter installed; SAs CDX's cache holds |
 | `stats_retained`, `stats_deferred` | device records held back from the pool, and how often a release has had to wait |
 | `session_records`, `session_slots`, `vlan_records`, `vlan_slots`, `tunnel_records`, `tunnel_slots` | device records of each kind, and how many of them have a hardware counter slot |

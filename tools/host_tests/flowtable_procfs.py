@@ -16,6 +16,7 @@ PARAMETERS = ("observe", "transit", "mcast_enabled", "multicast", "qos_mark_mask
               "qos_default_class", "route_mark_mask")
 # The CDX accessors that assert the transaction is held.
 HELD = ("cdx_ft_failed(", "cdx_ft_bypassed(", "cdx_ft_restarts(", "cdx_ft_resume_failures(",
+        "cdx_ft_restart_budget_ms(",
         "cdx_ft_pending(", "cdx_ft_owed(", "cdx_ft_stats_retention(", "cdx_mc_group_ids(",
         "ft_can_rearm(", "cdx_ft_begin(")
 

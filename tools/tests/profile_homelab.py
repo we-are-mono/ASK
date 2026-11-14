@@ -762,8 +762,13 @@ async def _install_ipsec(ctx, spi_out, spi_in):
     await dut("ip", "xfrm", "policy", "add", *s["rev_sel"], "dir", "fwd", *s["rev_tmpl"])
     # A conntrack entry surviving an earlier scenario carries IPS_OFFLOAD and is
     # never offered to the flowtable again, so the flow would be judged on that
-    # scenario's decision rather than on this one's.
+    # scenario's decision rather than on this one's. The flush does not take
+    # the entries with it: they go on the flowtable's next garbage-collection
+    # pass, and until then the hardware forwards the same tuples through them,
+    # so the flush is waited out (Rig.clear_ct()).
+    held = {f["cookie"] for f in (await ctx.state()).get("flows", ())}
     await dut("conntrack", "-F", check=False)
+    await ctx.wait(lambda s: not held & {f["cookie"] for f in s.get("flows", ())})
     ctx.ipsec_spis = (spi_out, spi_in)
 
 

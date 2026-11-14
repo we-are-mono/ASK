@@ -1027,6 +1027,29 @@ async def _latch_waiting(con, r, why: str) -> dict:
         await asyncio.sleep(0.2)
 
 
+# How much of the restart budget's window a latch waiting on it must have left
+# to wait out a whole case: its software window and the raise after it.
+BUDGET_HOLD_MS = 120_000
+
+
+async def _budget_renewed(con, r, waiting: dict, why: str) -> dict:
+    """A latch the budget holds back for less than a case lasts: the window
+    that spent the budget -- an earlier case's, counted from its first restart
+    -- runs out, and gives the classifier back. Under a limit of one that
+    restart opens a window of its own, which the next unproven deletion finds
+    spent for its whole span; that latch is returned."""
+    from _flowtable_restart import RESTART_BOUND, proc
+    deadline = time.monotonic() + waiting["restart_budget_ms"] / 1000 + RESTART_BOUND + 5
+    while (state := await proc(con))["fatal"]:
+        assert time.monotonic() < deadline, (waiting, state)
+        await asyncio.sleep(0.5)
+    assert state["restarts"] == waiting["restarts"] + 1, (waiting, state)
+    await r.clear_ct()
+    renewed = await _latch_waiting(con, r, why)
+    assert renewed and renewed["restart_budget_ms"] >= BUDGET_HOLD_MS, (waiting, renewed)
+    return renewed
+
+
 async def _in_software(con, r, traffic, waiting: dict, classifying: dict, label: str):
     """While a restart waits: the stream crosses the DUT -- through the CPU,
     the classifier bypassed and every flow declined -- the receive ports run,
@@ -1068,7 +1091,9 @@ async def test_restart_budget_waits_in_software(rig):
     hardware once the limit allows.
 
     With a budget of one the boot's window is spent within at most two
-    unproven deletions, and the next finds it so: its key is settled at once,
+    unproven deletions, and the next finds it so (a window an earlier case
+    spent, ending before this case would, is let run out first, and the
+    restart it allows opens a fresh one): its key is settled at once,
     but the classifier stays bypassed, the ports running past it, so the
     stream still crosses the DUT through the CPU; the platform's probe passes,
     a port taken down and up opens as usual, the wait is published, and no
@@ -1096,6 +1121,8 @@ async def test_restart_budget_waits_in_software(rig):
             if waiting:
                 break
         assert waiting, f"no latch waited for {why}"
+        if 0 < waiting["restart_budget_ms"] < BUDGET_HOLD_MS:
+            waiting = await _budget_renewed(con, r, waiting, why)
         baseline = len(r.echo.received)
         traffic = asyncio.create_task(terminal_stream(r, duration=60))
         try:

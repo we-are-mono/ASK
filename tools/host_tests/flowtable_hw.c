@@ -1064,6 +1064,18 @@ static void expect_bypassed(struct netdev_notifier_info *info)
 }
 
 /* For `span`: the work tries again and again, and the episode stays as it is. */
+/* What status publishes of the budget: the milliseconds left of the window
+ * that spent it, 0 while it holds nothing back. */
+static unsigned budget_ms(void)
+{
+    unsigned ms;
+
+    cdx_ft_begin();
+    ms = cdx_ft_restart_budget_ms();
+    cdx_ft_end();
+    return ms;
+}
+
 static void stay_bypassed(struct netdev_notifier_info *info, unsigned long span)
 {
     unsigned long until = jiffies + span;
@@ -1326,11 +1338,18 @@ static void test_restart_root(struct net_device *in, struct net_device *out,
      * allows it, asked again every half minute at most. */
     jiffies += FT_RESTART_WINDOW + 1;
     assert(ft_restart_limit == 3);
+    /* No later than the first restart's budget check, which opens the window. */
+    unsigned long window = jiffies;
     for (unsigned i = 0; i < 3; i++) {
+        assert(!budget_ms());
         latch_root();
         run_until_idle();
         expect_restored(&restarts, &told);
     }
+    /* Spent: status says how long a restart would wait, counted from the
+     * window's first restart. */
+    assert(budget_ms() && budget_ms() <= jiffies_to_msecs(FT_RESTART_WINDOW + 1));
+    assert(budget_ms() >= jiffies_to_msecs(window + FT_RESTART_WINDOW + 1 - jiffies));
     stalls = stall_lines;
     latch_root();
     run_work();
@@ -1338,8 +1357,10 @@ static void test_restart_root(struct net_device *in, struct net_device *out,
     assert(!key && !nabandoned);
     stay_bypassed(info, FT_RESTART_WINDOW / 2);
     assert(stall_lines == stalls + 1 && strstr(stall_line, "restart budget exhausted"));
+    assert(budget_ms() && budget_ms() <= jiffies_to_msecs(FT_RESTART_WINDOW / 2 + 1));
     run_until_idle();
     expect_restored(&restarts, &told);
+    assert(!budget_ms());
     /* A limit of zero allows none until it is raised: offload suspended, the
      * datapath in software, the tables settled meanwhile, and what it waits
      * for published. Raising the limit asks again at once. A write while
@@ -1353,6 +1374,8 @@ static void test_restart_root(struct net_device *in, struct net_device *out,
     stay_bypassed(info, 2 * FT_RESTART_WINDOW);
     assert(!key && stall_lines == stalls + 1 && strstr(stall_line, "datapath restarts are disabled"));
     assert(!strcmp(ft_degraded_reason, "datapath restarts are disabled"));
+    /* Not the budget: a limit of zero waits until it is raised. */
+    assert(!budget_ms());
     assert(ft_fatal_work.delay == FT_RESTART_BACKOFF_MAX);
     assert(!flowtable_restart_limit_ops->set("3", &flowtable_restart_limit_param));
     assert(ft_restart_limit == 3 && ft_fatal_work.queued && !ft_fatal_work.delay);

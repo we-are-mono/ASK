@@ -499,6 +499,9 @@ unsigned int cdx_ft_restarts(void);
  * a receive port starts again with its netdev, an offline port only with
  * CDX's reload or a reboot. */
 unsigned int cdx_ft_resume_failures(void);
+/* While the restart budget is spent, the milliseconds left of the window that
+ * spent it; 0 while it would allow a restart, and at a limit of zero. */
+unsigned int cdx_ft_restart_budget_ms(void);
 /* Latch the failure for a root outside the unicast delete path -- a multicast
  * group's or an IPsec SA's -- that could not be provably unlinked and may
  * still forward in hardware. Refuses new entries and groups; stops the ports

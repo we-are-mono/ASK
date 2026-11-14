@@ -380,6 +380,23 @@ unsigned int cdx_ft_resume_failures(void)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_resume_failures, "ASK_CDX_FLOWTABLE");
 
+/* While the restart budget is spent, what is left of the window that spent
+ * it, in milliseconds: how long a restart waits at most, the limit unchanged.
+ * 0 while the budget would allow one, and at a limit of zero, which waits
+ * until it is raised. */
+unsigned int cdx_ft_restart_budget_ms(void)
+{
+	unsigned int limit = READ_ONCE(ft_restart_limit);
+	unsigned long end;
+
+	cdx_ft_assert_held();
+	if (!limit || !ft_window_start || ft_window_restarts < limit)
+		return 0;
+	end = ft_window_start + FT_RESTART_WINDOW + 1;
+	return time_before(jiffies, end) ? jiffies_to_msecs(end - jiffies) : 0;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_restart_budget_ms, "ASK_CDX_FLOWTABLE");
+
 u32 cdx_ft_epoch(void)
 {
 	cdx_ft_assert_held();

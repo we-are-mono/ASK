@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import itertools
 import json
 import os
@@ -232,10 +233,35 @@ class Rig:
                       check=False, timeout_ms=max(15000, timeout * 1000))
         return await self.wait(lambda s: not s["bindings"] and not s["entries"], timeout=timeout)
 
+    def held_entries(self, state) -> set:
+        """The cookies of the entries the adapter holds for the rig's own
+        connection, either direction, before or after NAT."""
+        ends = {(ipaddress.ip_address(self.lan_ip), SPORT),
+                (ipaddress.ip_address(WAN_IP), DPORT)}
+
+        def endpoint(text):
+            host, _, port = (text or "").rpartition(":")
+            try:
+                return ipaddress.ip_address(host.strip("[]")), int(port)
+            except ValueError:
+                return None
+
+        return {f["cookie"] for f in state.get("flows", ())
+                if {endpoint(f.get("src")), endpoint(f.get("dst"))} == ends
+                or {endpoint(f.get("new_src")), endpoint(f.get("new_dst"))} == ends}
+
     async def clear_ct(self):
+        """Delete the rig's connection, and wait until the adapter has retired
+        the entries it held for it. The flowtable takes a flow out on its next
+        garbage-collection pass, not with the connection, and until then the
+        hardware forwards the same tuple through the old entries: traffic sent
+        at once would pass for a new flow's while Linux makes none."""
+        held = self.held_entries(await self.state())
         await command(self.target, self.session, "conntrack", "-D", "-p", self.proto,
                       "--orig-src", self.lan_ip, "--orig-dst", WAN_IP,
                       "--sport", str(SPORT), "--dport", str(DPORT), check=False)
+        if held:
+            await self.wait(lambda s: not self.held_entries(s) & held)
 
     async def run_peer(self, script, **kwargs):
         netns = getattr(self, "peer_netns", None)
