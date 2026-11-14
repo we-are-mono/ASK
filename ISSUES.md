@@ -152,6 +152,16 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A444 — a DHCP renewal's unicast ACK was lost once on its way to the DUT.** Seen once on 6.18.63 (KASAN),
+  `flowtable_dhcp::test_renewal_and_address_change` in the full suite after `flowtable_masquerade`: udhcpc sent its
+  T1 renew to the server, dnsmasq logged the DHCPREQUEST and its DHCPACK, and the DUT's client never saw the ACK,
+  while the case's offloaded UDP stream crossed the same WAN port (VLAN 3900) with no loss. The client's next try
+  comes 22.5 s later, past the case's 75 s window. Alone, and replayed after `flowtable_masquerade`, it passed. Why
+  it matters: a datagram for the DUT itself dropped while hardware forwards beside it would be a receive-path loss
+  no counter has shown. Next: on a recurrence, `ip -s link`, `ethtool -S` and the port's discard counters for eth4
+  and eth4.3900 around the renew, and a `tcpdump -w` under `timeout` on eth4 during the renewal window, to tell the
+  switch from the DUT.
+
 - [ ] **A442 — under WireGuard upload, QMan stopped answering a CPU's portal.** Seen once on 6.18.63 (KASAN),
   `flowtable_wireguard::test_rate[1T-upload]` after nine `mcast_e2e` cases (1 of 3 tries). The test's iperf had
   stalled from ~426 s; at 456 s CPU 0's HC enqueue found its ring full; at ~461 s CPU 3's accepted HC sync went
