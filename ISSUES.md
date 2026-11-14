@@ -152,6 +152,15 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A441 — `test_restart_budget_waits_in_software`'s second window can arm a fault nothing trips.** On the
+  6.18.63 KASAN image with _:/^netfilter: send an ASK table's software flows_ it failed 3 of 5 runs (twice in
+  module order, once right after `test_partial_accounting` alone) and passed alone; it passed the one run on the
+  image before that change, so the change is suspected, not shown. The budget window behaves (unproven deletions,
+  restart, bypass, restore); in the disabled window the table is deleted with both entries in hardware (`admit()`
+  saw `entries == 2`), yet the armed unicast-delete fault logs no unproven deletion and `_latch_waiting()` times
+  out. Why it matters: a retirement path the fault misses, or a race, makes a release gate flaky. Fix direction:
+  record which path retired the entries (the restore's invalidation pass is the lead), then cover it.
+
 - [ ] **A440 — 6.18's software flowtable sends a NEIGH direction to whatever address its neighbour holds.** Where:
   `nf_flow_offload_ip_hook()` / `nf_flow_offload_ipv6_hook()` (upstream b5964aac51e0, in 6.18.y) take `neigh->ha`
   from `ip_neigh_gw4()`/`ip_neigh_gw6()` without checking `nud_state` or starting resolution, then
