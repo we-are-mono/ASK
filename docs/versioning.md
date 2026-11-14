@@ -83,9 +83,24 @@ never a different fix on one line.
 - **Shared code** (cdx, ask_flowtable, the daemon, the tests) has nothing to
   backport: it is one commit for every line. A kernel interface that differs
   goes behind `cdx/compat.h`, keyed on the release that changed it.
-- **A kernel patch** is a file in each line's series: the same change is made
-  in each line's copy, regenerated from each line's base -- the two copies may
-  differ only where the kernels do.
+- **A kernel patch** is a file in each line's series, so it is changed in a git
+  history generated from that series. The work repository
+  (`meta-ask/build/kernel-series`) holds every line's branches side by side:
+
+  ```sh
+  make kernel-series-prepare LINE=6.18   # base-6.18, and series-6.18 on top of it
+  make kernel-series-prepare LINE=6.12
+  # In meta-ask/build/kernel-series: commit the fix on series-6.18 as a
+  # fixup of the patch that owns its concern (git commit --fixup=<commit>),
+  # then carry the same commit to the other line:
+  git checkout series-6.12 && git cherry-pick -x <fixup commit>
+  # Resolve conflicts where the kernels differ, then on each branch:
+  git rebase -i --autosquash base-<line>
+  make kernel-series-regen LINE=<line>   # writes back only the patches that changed
+  make kernel-series-check LINE=<line>   # the files reproduce the branch on a fresh base
+  ```
+
+  The two copies of a patch may differ only where the kernels do.
 - **An upstream fix** a line lacks comes, by preference, with a stable bump
   that carries it (below). If none does, it is cherry-picked with `-x` onto
   the line's series as a patch of its own -- its upstream subject, a
@@ -111,6 +126,7 @@ version they have.
 
 A line follows its kernel's stable releases. A bump moves the line's
 `KERNEL_SRCREV`, regenerates its series against the new base, and is reviewed
-against the upstream changes to the files the series touches: stable backports
-have changed behaviour the patches rely on before (the 6.18 flowtable's
-transmit path, its TCP close).
+against the upstream changes to the files the series touches
+(`make kernel-stable-review LINE=<line> TO=<tag>` lists them): stable
+backports have changed behaviour the patches rely on before (the 6.18
+flowtable's transmit path, its TCP close, nft's reading of PPPoE frames).

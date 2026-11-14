@@ -50,6 +50,7 @@ define check-line
 endef
 
 .PHONY: setup ask-image stage-image deploy-agent-wan deploy-agents ask-test test test-host test-dut test-startup test-release release-status test-env help
+.PHONY: kernel-series-prepare kernel-series-regen kernel-series-check kernel-stable-review
 
 # Install the host tools the kas build needs: kas itself, BitBake's host
 # dependencies, and the en_US.UTF-8 locale BitBake requires. Debian 13
@@ -153,6 +154,20 @@ test-env:
 	sudo python3 -m venv "$(WAN_PREFIX)/venv"
 	sudo "$(WAN_PREFIX)/venv/bin/pip" install -r "$(CURDIR)/tools/requirements.txt"
 
+# A line's kernel series as a git branch to edit, and back (tools/kernel_series.py,
+# work repository under meta-ask/build/kernel-series): prepare builds base-<line> and
+# series-<line>; edit with fixup commits and autosquash; regen writes the series
+# back; check proves the files reproduce the branch on a fresh base.
+kernel-series-prepare kernel-series-regen kernel-series-check:
+	$(check-line)
+	python3 "$(CURDIR)/tools/kernel_series.py" $(@:kernel-series-%=%) --line $(LINE)
+
+# The upstream commits a stable bump of LINE to TO brings to files its series touches.
+kernel-stable-review:
+	$(check-line)
+	@test -n "$(TO)" || { echo "TO=<stable tag or commit> is required" >&2; exit 1; }
+	python3 "$(CURDIR)/tools/kernel_series.py" stable-review --line $(LINE) --to $(TO)
+
 # ============================================================================
 #  Help
 # ============================================================================
@@ -170,4 +185,6 @@ help:
 	@echo "make release-status - which release runs passed for this checkout, LINE and image"
 	@echo "                     (every test target runs against LINE's sources and build tree)"
 	@echo "make test-env      - install pinned runner dependencies without deploying agents"
+	@echo "make kernel-series-prepare|regen|check - LINE's patch series as a git branch and back"
+	@echo "make kernel-stable-review TO=<tag> - upstream commits a stable bump brings to files LINE patches"
 	@echo "make ask-test      - alias for make test; ASK_* settings remain supported"

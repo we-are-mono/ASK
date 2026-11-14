@@ -117,13 +117,16 @@ they conflict with modern kernel APIs or clean design, prefer the modern approac
   lines share (SDK overlay, config fragments, provenance, DTS) lives in
   `linux-ask.inc`; a line's recipe holds only its pins, its overlay additions and its
   series. A fix that applies to both lines lands in both series, as two patches.
-- **Changing a patch:** in a scratch clone, check out the line's base — its recipe's
-  `KERNEL_SRCREV` with the NXP SDK overlay at `pins/<line>/nxp-sdk-srcrev.inc`
-  applied as `do_overlay_sdk` does. `git am` the line's series in `SRC_URI` order,
-  change the patch's commit (fixup + `git rebase --autosquash`), regenerate with
-  `git format-patch --no-numbered` (subjects stay `[PATCH] subsystem: …`; the filename
-  prefix carries order), confirm the whole series applies to a fresh base, then build
-  with kas (`make ask-image LINE=<line>`).
+- **Changing a patch:** `make kernel-series-prepare LINE=<line>` builds the line's
+  base (its recipe's `KERNEL_SRCREV` with the NXP SDK overlay at
+  `pins/<line>/nxp-sdk-srcrev.inc`, as `do_overlay_sdk` lays it) and `series-<line>`,
+  the series `git am`'d strictly in `SRC_URI` order, under
+  `meta-ask/build/kernel-series`. Change the patch's commit there (fixup + `git
+  rebase --autosquash`; subjects stay `[PATCH] subsystem: …`, the filename prefix
+  carries order), `make kernel-series-regen` writes the series back (only patches
+  whose content changed), `make kernel-series-check` proves the files reproduce the
+  branch on a fresh base, then build with kas (`make ask-image LINE=<line>`). A
+  stable bump is read against `make kernel-stable-review TO=<tag>`.
 - Patches are organized **per-concern, not per-fix-site**: when a new bug fits an
   existing patch's concern (another iomem mem-op crash → extend 095, another lockdep
   nesting site → extend 092), add a hunk to that patch. New numbers are for *distinct*
