@@ -158,10 +158,15 @@ result independently of those temporary files.
   unanswered, and so did a QUERYFQ_NP on CPU 3's portal for 287 s and more, with ERR_ISR 0 and ~524k free PFDRs.
   No WireGuard ORP enqueue waited 5 ms (no "rx order ... lost"), so frames had likely stopped arriving by then.
   Why it matters: offload and the datapath stop until a reboot; the HC description no longer waits on QMan for
-  good, but that portal's next ordinary management command still would. Next: reproduce on an image with the
-  bounded HC description, which now says whether QMan answers and what each CPU's enqueue ring holds; then read
-  the WireGuard steer queue's ORP state (debugfs `query_fq_np_fields`) and `sfdr_in_use` from another CPU.
-  Whether 6.12 can do it too is unknown (same code).
+  good, but that portal's next ordinary management command still would. Lead (from review, unproven): QMan
+  stuck walking the steer queue's order restoration point (`orprws=5`, a 1024-frame window, auto-advance;
+  `cdx_wg_rxq_create()`); the ~200 us all-rings-full stall measured before fits one walk of that list, and the
+  queue's FQID 0x809a had been freed ~2 s before it was reused, so stale ORP state is a candidate trigger, as is
+  a hole sent under the steer queue's own FQID. Next: on a recurrence, the HC timeout line says whether QMan
+  answers and what each CPU's enqueue ring holds (all non-zero and no answer: a global stop); print the ORP
+  fields (bounded query) right after the steer queue's `qman_init_fq()`; A/B a smaller window. Debugfs
+  `query_fq_np` still waits without bound, so it cannot be used on a silent QMan. Whether 6.12 can do it too is
+  unknown (same code).
 
 - [x] **A441 — `test_restart_budget_waits_in_software`'s second window armed a fault nothing tripped.**
   `Rig.clear_ct()` returned before the flowtable's GC retired the connection's entries, so the next admission saw
