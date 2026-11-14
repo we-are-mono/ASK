@@ -796,6 +796,14 @@ async def _drop_latch_table(r):
                          check=False)
 
 
+async def kernel_release(r) -> tuple:
+    """The DUT kernel's (major, minor)."""
+    release = (await read(r.target, r.session, "/proc/sys/kernel/osrelease")).strip()
+    version = re.match(r"(\d+)\.(\d+)", release)
+    assert version, release
+    return int(version.group(1)), int(version.group(2))
+
+
 async def flowtable_closing(r) -> bool:
     """Whether the DUT's flowtable keeps a TCP flow on FIN or RST (Linux 6.14,
     upstream fdbaf51633313, NF_FLOW_CLOSING). It then forwards those packets
@@ -803,10 +811,17 @@ async def flowtable_closing(r) -> bool:
     withdrawn at once, and leaves conntrack ESTABLISHED until the flow times
     out and sets it CLOSE, with that state's short timeout. Before it, FIN or
     RST tore the flow down and took the classic path, conntrack following."""
-    release = (await read(r.target, r.session, "/proc/sys/kernel/osrelease")).strip()
-    version = re.match(r"(\d+)\.(\d+)", release)
-    assert version, release
-    return (int(version.group(1)), int(version.group(2))) >= (6, 14)
+    return await kernel_release(r) >= (6, 14)
+
+
+async def flowtable_follows_names(r) -> bool:
+    """Whether a flowtable's devices are names the DUT re-matches on a rename
+    (Linux 6.16, upstream 7b4856493d780): a listed device renamed to a name
+    the flowtable does not list leaves it -- its hook and offload block go,
+    and the entries it receives with them -- and an unlisted one renamed to a
+    listed name joins. Before it, a hook stayed with the device it was made
+    for, whatever it was later called."""
+    return await kernel_release(r) >= (6, 16)
 
 
 def tcp_closed_states(closing: bool) -> tuple:

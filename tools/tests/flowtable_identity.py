@@ -13,7 +13,8 @@ from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from _flowtable_connections import (FLOWS, healthy, peer)
 from _flowtable_mtu import (table_identity, udp_size, udp_warm)
-from _flowtable_rig import (artifact_dir, DPORT, TABLE, WAN_IP, command, console_command, read)
+from _flowtable_rig import (artifact_dir, DPORT, TABLE, WAN_IP, command, console_command,
+                            flowtable_follows_names, read)
 from _flowtable_selective_neighbour import (hardware, warm)
 
 
@@ -126,31 +127,49 @@ async def test_flowtable_rename_identity(connections):
                 assert 0 <= tx[TARGET_LAN_IF] <= 64 and 0 <= tx[TARGET_WAN_IF] <= 512, tx
                 r.record(label, {"before": before, "after": after, "transfers": transfers, "software_tx": tx})
 
-            for dev in names:
-                before = await r.state()
-                identity = await table_identity(r)
-                try:
-                    await console_command(con, "ip", "link", "set", "dev", dev, "name", temporary)
-                    names[dev] = temporary
-                    after = await r.state()
-                    assert after["installs"] == before["installs"] and after["deletes"] == before["deletes"]
-                    assert (await table_identity(r))["handle"] == identity["handle"]
-                    await window(f"rename-{dev}-retained")
-                    # A fresh binding must find the same hardware port by
-                    # object identity while its OS name differs from startup.
-                    await r.delete_table()
-                    await r.nft(f'''table inet {TABLE} {{
+            async def rebind(label):
+                """A fresh table naming the ports as they are called now: its
+                binding must find each hardware port by object identity,
+                whatever OS name the port has since startup."""
+                await r.delete_table()
+                await r.nft(f'''table inet {TABLE} {{
  flowtable fast {{ hook ingress priority 0; devices = {{ {', '.join(names.values())} }}; flags offload; }}
  chain forward {{ type filter hook forward priority 0; policy accept;
  ip saddr {r.lan_ip} ip daddr {WAN_IP} meta l4proto {{ tcp, udp }} th sport {flows[0]['sport']} th dport {DPORT} flow add @fast
  }}
 }}''')
-                    for _ in range(8):
-                        await p.batch([0, 1], 128, 0.01)
-                        if (await r.state())["entries"] == 4:
-                            break
+                for _ in range(8):
+                    await p.batch([0, 1], 128, 0.01)
+                    if (await r.state())["entries"] == 4:
+                        break
+                else:
+                    pytest.fail(f"{label}: the ports did not admit fresh flows")
+
+            follows = await flowtable_follows_names(r)
+            for n, dev in enumerate(names):
+                # A port renamed back has left a table that named it by its
+                # temporary name, where the flowtable follows names.
+                if follows and n:
+                    await rebind(f"rename-{dev}-start")
+                before = await r.state()
+                identity = await table_identity(r)
+                try:
+                    await console_command(con, "ip", "link", "set", "dev", dev, "name", temporary)
+                    names[dev] = temporary
+                    if follows:
+                        # Its old name stays listed, so the port leaves the
+                        # flowtable: the entries it receives retire with its
+                        # binding, those it transmits stay.
+                        after = await r.wait(lambda s: s["deletes"] == before["deletes"] + 2
+                                             and s["entries"] == 2)
+                        assert after["installs"] == before["installs"], (before, after)
+                        assert (await table_identity(r))["handle"] == identity["handle"]
                     else:
-                        pytest.fail("renamed port did not admit fresh flows")
+                        after = await r.state()
+                        assert after["installs"] == before["installs"] and after["deletes"] == before["deletes"]
+                        assert (await table_identity(r))["handle"] == identity["handle"]
+                        await window(f"rename-{dev}-retained")
+                    await rebind(f"rename-{dev}")
                     await window(f"rename-{dev}-rebound")
                 finally:
                     if names[dev] != dev:
