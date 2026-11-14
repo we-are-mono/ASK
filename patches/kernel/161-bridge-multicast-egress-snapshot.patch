@@ -27,7 +27,8 @@ the ingress is never selected, an isolated ingress reaches no isolated
 port, a hairpin or locked ingress is refused, and the caller learns whether
 the bridge also hands the data up -- the host joined the group, the bridge
 is a multicast router for this family in the live context, nothing snoops
-and the data floods, or the bridge device is promiscuous -- and whether the
+and the data floods, or the bridge device is promiscuous or, snooping, takes
+all multicast (a496d2f0fd61; ipmr makes each VIF device so) -- and whether the
 answer is snooping's at all, so an empty set the bridge drops data for can
 be told from one it returned because it could not say (bridge down, VID
 missing, ingress not forwarding). Without one the
@@ -52,15 +53,15 @@ router re-reads the snapshot on its own schedule.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- include/linux/if_bridge.h |  30 +++++
- net/bridge/br_multicast.c | 272 ++++++++++++++++++++++++++++++++++++++
- 2 files changed, 302 insertions(+)
+ include/linux/if_bridge.h |  32 +++++
+ net/bridge/br_multicast.c | 275 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 307 insertions(+)
 
 diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
-index c5fe3b2a53e82..f8b2b2939627d 100644
+index c5fe3b2a53e82..669d7dbd43a15 100644
 --- a/include/linux/if_bridge.h
 +++ b/include/linux/if_bridge.h
-@@ -69,6 +69,17 @@ void brioctl_set(int (*hook)(struct net *net, unsigned int cmd,
+@@ -69,6 +69,19 @@ void brioctl_set(int (*hook)(struct net *net, unsigned int cmd,
  			     void __user *uarg));
  int br_ioctl_call(struct net *net, unsigned int cmd, void __user *uarg);
  
@@ -74,11 +75,13 @@ index c5fe3b2a53e82..f8b2b2939627d 100644
 + * VID, the bridge is up and snooping with a querier -- so a port set left
 + * empty means the bridge drops the data, not that it could not say. */
 +#define BR_MCAST_SNOOPED	(1U << 4)
++/* The bridge device takes all multicast: ipmr makes each VIF device one. */
++#define BR_MCAST_TO_HOST_ALLMULTI (1U << 5)
 +
  #if IS_ENABLED(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_BRIDGE_IGMP_SNOOPING)
  int br_multicast_list_adjacent(struct net_device *dev,
  			       struct list_head *br_ip_list);
-@@ -77,6 +88,11 @@ bool br_multicast_has_querier_adjacent(struct net_device *dev, int proto);
+@@ -77,6 +90,11 @@ bool br_multicast_has_querier_adjacent(struct net_device *dev, int proto);
  bool br_multicast_has_router_adjacent(struct net_device *dev, int proto);
  bool br_multicast_enabled(const struct net_device *dev);
  bool br_multicast_router(const struct net_device *dev);
@@ -90,7 +93,7 @@ index c5fe3b2a53e82..f8b2b2939627d 100644
  #else
  static inline int br_multicast_list_adjacent(struct net_device *dev,
  					     struct list_head *br_ip_list)
-@@ -104,6 +120,20 @@ static inline bool br_multicast_enabled(const struct net_device *dev)
+@@ -104,6 +122,20 @@ static inline bool br_multicast_enabled(const struct net_device *dev)
  {
  	return false;
  }
@@ -112,10 +115,10 @@ index c5fe3b2a53e82..f8b2b2939627d 100644
  {
  	return false;
 diff --git a/net/bridge/br_multicast.c b/net/bridge/br_multicast.c
-index c437cb684aebb..bbd90ed1a6e5d 100644
+index c437cb684aebb..bb296dabfe334 100644
 --- a/net/bridge/br_multicast.c
 +++ b/net/bridge/br_multicast.c
-@@ -5092,6 +5092,278 @@ bool br_multicast_has_router_adjacent(struct net_device *dev, int proto)
+@@ -5092,6 +5092,281 @@ bool br_multicast_has_router_adjacent(struct net_device *dev, int proto)
  }
  EXPORT_SYMBOL_GPL(br_multicast_has_router_adjacent);
  
@@ -239,8 +242,9 @@ index c437cb684aebb..bbd90ed1a6e5d 100644
 +	}
 +	/* What br_handle_frame_finish() hands up besides forwarding: with no
 +	 * snooping or no querier the frame floods and goes up too; otherwise
-+	 * it goes up when the host joined it or the bridge is a multicast
-+	 * router for this family, as br_multicast_is_router() asks per frame. */
++	 * it goes up when the host joined it, the bridge is a multicast router
++	 * for this family, as br_multicast_is_router() asks per frame, or the
++	 * bridge device takes all multicast. */
 +	switch (brmctx->multicast_router) {
 +	case MDB_RTR_TYPE_PERM:
 +		router_ctx = true;
@@ -263,6 +267,8 @@ index c437cb684aebb..bbd90ed1a6e5d 100644
 +			*local |= BR_MCAST_TO_HOST_JOINED;
 +		if (snoop && router_ctx)
 +			*local |= BR_MCAST_TO_HOST_ROUTER;
++		if (snoop && (br->dev->flags & IFF_ALLMULTI))
++			*local |= BR_MCAST_TO_HOST_ALLMULTI;
 +		/* A promiscuous bridge -- an upper device with an address of
 +		 * its own makes it one, as it has no unicast filter -- hands
 +		 * everything up. */

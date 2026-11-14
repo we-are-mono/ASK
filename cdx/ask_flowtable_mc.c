@@ -604,9 +604,7 @@ bool ft_mc_route_publish(struct ft_mc_route *r,
 
 	/* Read before the lock like everything else the route describes; the
 	 * bridge is the caller's for the call. */
-	learns = want->bridge &&
-		 (br_multicast_router(want->bridge) ||
-		  (READ_ONCE(want->bridge->flags) & IFF_PROMISC));
+	learns = want->bridge && ft_mc_bridge_hands_up(want->bridge);
 	mutex_lock(&ft_mc_lock);
 	/* The same route through a bridge that now hands the host its streams,
 	 * or no longer does: a frame of the stream recorded while nothing named
@@ -830,15 +828,14 @@ static bool ft_mc_tapped(const struct ft_mc_flow *f)
  * or installed; a flow whose answer changed is marked for the install pass.
  *
  * A route counts only while the bridge hands this flow's frames to the host
- * for a VIF to see: as a multicast router, or because the bridge device is
- * promiscuous -- the derivation's BR_MCAST_TO_HOST_ROUTER and _PROMISC. A
- * bridge that is neither hands the host only what the host itself joined, and
- * a host membership keeps a flow in software regardless -- so a route through
- * such a bridge forwards nothing in Linux either, and carrying it would
- * forward what Linux does not. */
+ * for a VIF to see -- the derivation's FT_MC_TO_HOST_UP reasons. A bridge
+ * without one hands the host only what the host itself joined, and a host
+ * membership keeps a flow in software regardless -- so a route through such a
+ * bridge forwards nothing in Linux either, and carrying it would forward what
+ * Linux does not. */
 static void ft_mc_match_flow(struct ft_mc_flow *f)
 {
-	bool up = f->local & (BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC);
+	bool up = f->local & FT_MC_TO_HOST_UP;
 	struct ft_mc_route *r, *found = NULL;
 	bool routed_host, routes = false;
 
@@ -884,14 +881,14 @@ static void ft_mc_match_routes(void)
 }
 
 /* Whether the bridge needs a local copy: the host joined, flooding sends it
- * one, or router/promiscuous delivery has no routing consumer. A known VIF
- * or route is checked separately: only an offloaded route can replace that
- * copy. Host delivery must reach Linux even if Linux ultimately drops it. */
+ * one, or router, promiscuous or all-multicast delivery has no routing
+ * consumer. A known VIF or route is checked separately: only an offloaded
+ * route can replace that copy. Host delivery must reach Linux even if Linux
+ * ultimately drops it. */
 bool ft_mc_host_wants(const struct ft_mc_flow *f)
 {
 	return (f->local & (BR_MCAST_TO_HOST_JOINED | BR_MCAST_TO_HOST_FLOOD)) ||
-	       ((f->local & (BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC)) &&
-		!f->routed_host);
+	       ((f->local & FT_MC_TO_HOST_UP) && !f->routed_host);
 }
 
 /* Whether a flow can go into hardware as it stands, short of the key check
@@ -1743,7 +1740,7 @@ static void ft_mc_flow_derive(struct ft_mc_flow *f, const struct ft_mc_soft *sof
 	 * flow whatever runs there. A port is asked with what it is stacked on,
 	 * which is the whole of a copy's way down to the wire. */
 	ft_mc_soft_on(soft, f->in, true, &tc_soft, &nf_hooked);
-	if (local & (BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC))
+	if (local & FT_MC_TO_HOST_UP)
 		ft_mc_soft_on(soft, f->bridge, true, &tc_soft, &nf_hooked);
 	for (i = 0; i < n; i++)
 		ft_mc_soft_on(soft, chosen[i], false, &tc_soft, &nf_hooked);

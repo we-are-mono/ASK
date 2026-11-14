@@ -586,7 +586,15 @@ def test_tc_and_netdev_chains_keep_bridged_multicast_in_software():
     # The bridge device only for a copy it hands up that a carried flow
     # takes away: a host that joined, or flooding, refuses the flow anyway.
     hands_up = derive[:derive.index("ft_mc_soft_on(soft, f->bridge")]
-    assert "if (local & (BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC))" in hands_up
+    assert "if (local & FT_MC_TO_HOST_UP)" in hands_up
+    # Every reason the bridge hands up a snooped frame for: a router, a
+    # promiscuous device, or an all-multicast one (a VIF on the bridge).
+    up = source[source.index("#define FT_MC_TO_HOST_UP"):]
+    up = up[:up.index("\n\n")]
+    for reason in ("ROUTER", "PROMISC", "ALLMULTI"):
+        assert f"BR_MCAST_TO_HOST_{reason}" in up, reason
+    hands = function(source, "ft_mc_bridge_hands_up")
+    assert "br_multicast_router(bridge)" in hands and "IFF_PROMISC | IFF_ALLMULTI" in hands
     # A changed answer is one the install pass has to hear of.
     unchanged = derive[derive.index("if (same && error == f->error"):]
     unchanged = unchanged[:unchanged.index("return;")]

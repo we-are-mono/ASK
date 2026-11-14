@@ -362,6 +362,21 @@ struct ft_mc_group {
 	bool in_refused;
 };
 
+/* Why a snooping bridge hands a group's frames to the host for a VIF or a
+ * capture to see, besides a membership of the host's own: it is a multicast
+ * router, or its device is promiscuous or takes all multicast -- ipmr makes
+ * each VIF device all-multicast, and the bridge then hands up everything it
+ * snoops (br_handle_frame_finish()). */
+#define FT_MC_TO_HOST_UP (BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC | \
+			  BR_MCAST_TO_HOST_ALLMULTI)
+
+/* The same of a bridge device, as a route through it asks without a flow. */
+static inline bool ft_mc_bridge_hands_up(const struct net_device *bridge)
+{
+	return br_multicast_router(bridge) ||
+	       (READ_ONCE(bridge->flags) & (IFF_PROMISC | IFF_ALLMULTI));
+}
+
 /* A flow: one source's frames of a group as they arrive on one bridge port,
  * which is exactly what one classifier entry matches, and so what the
  * hardware carries. Learned from traffic -- see the traffic half below -- and

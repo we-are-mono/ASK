@@ -551,13 +551,8 @@ result independently of those temporary files.
 - [x] **A292 — a discarding multicast entry had no bound.** Fixed: a replicating add that finds no group id evicts the
   discard of its family that counted the fewest frames and retries at once; discards never displace each other (_:/^cdx: give a bridged discard's group id to a stream somebody wants_).
 
-- [ ] **A293 — patch 161 needs a to-host reason on the next kernel rebase.** Upstream
-  `a496d2f0fd61` (after 6.12; in 6.18) hands every multicast frame up to the host when the
-  bridge has `IFF_ALLMULTI`, which ipmr sets on each VIF device. `br_multicast_list_ports()`
-  models 6.12.103, which does not; rebased as is it would report `BR_MCAST_SNOOPED` alone for
-  such a bridge and the bridged learner would discard frames ipmr routes. Fix at rebase: a
-  `BR_MCAST_TO_HOST_*` reason for `IFF_ALLMULTI` in patch 161. Regression: a VIF on the bridge,
-  last bridged listener gone, require the routed copy still delivered.
+- [x] **A293 — on 6.18 an all-multicast bridge (a VIF on it) hands snooped multicast up; patch 161 did not say so.** Fixed:
+  `BR_MCAST_TO_HOST_ALLMULTI`, counted by the learner as router/promiscuous delivery (_:/^bridge, cdx: count an all-multicast bridge as handing multicast up_).
 
 - [x] **A294 — a port-selective iptables-legacy rule or tc filter was bypassed by a routed multicast group.** Fixed:
   `nf_xt_port_dependent()` (patch 148) walks x_tables (`refused-xtables`); software tc on the parent's or an oif's stack is `refused-tc` (_:/^cdx: keep a routed multicast group legacy iptables or tc tells apart in software_).

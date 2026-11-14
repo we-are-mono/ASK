@@ -573,16 +573,15 @@ static struct ft_mc_flow *ft_mc_flow_find(const struct br_ip *key,
 }
 
 /* Whether a published route names this source through its own bridge: only
- * while the bridge hands its streams to the host, as a multicast router or a
- * promiscuous bridge does, since otherwise the host never sees them for the
- * route to forward. Called with ft_mc_lock held. */
+ * while the bridge hands its streams to the host (ft_mc_bridge_hands_up()),
+ * since otherwise the host never sees them for the route to forward. Called
+ * with ft_mc_lock held. */
 static bool ft_mc_route_learns(const struct ft_mc_route *r,
 			       const struct br_ip *key)
 {
 	return r->bridge && ft_mc_route_reaches(r, r->bridge, key) &&
 	       !memcmp(&r->src, &key->src, sizeof(key->src)) &&
-	       (br_multicast_router(r->bridge) ||
-		(READ_ONCE(r->bridge->flags) & IFF_PROMISC));
+	       ft_mc_bridge_hands_up(r->bridge);
 }
 
 /* The bridge whose membership or route names a flow with this key, or NULL

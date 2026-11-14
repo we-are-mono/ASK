@@ -71,7 +71,9 @@ union nf_inet_addr {
 #define BR_MCAST_TO_HOST_FLOOD  (1U << 2)
 #define BR_MCAST_TO_HOST_PROMISC (1U << 3)
 #define BR_MCAST_SNOOPED (1U << 4)
+#define BR_MCAST_TO_HOST_ALLMULTI (1U << 5)
 #define IFF_PROMISC 0x100
+#define IFF_ALLMULTI 0x200
 #define IPV6_ADDR_SCOPE_LINKLOCAL 0x02
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -1917,7 +1919,8 @@ static void the_bridge_decides(void)
      * with no VIF or route. Check admission and retirement of an installed
      * flow when that delivery starts; forwarding resumes when it stops. */
     const unsigned host_copies[] = { BR_MCAST_TO_HOST_JOINED, BR_MCAST_TO_HOST_FLOOD,
-                                    BR_MCAST_TO_HOST_ROUTER, BR_MCAST_TO_HOST_PROMISC };
+                                    BR_MCAST_TO_HOST_ROUTER, BR_MCAST_TO_HOST_PROMISC,
+                                    BR_MCAST_TO_HOST_ALLMULTI };
     for (unsigned i = 0; i < ARRAY_SIZE(host_copies); i++) {
         reset();
         assert(ft_mc_membership(&BR, &P2, &any, true, false));
@@ -2320,6 +2323,12 @@ static void one_stream_both_learners(void)
     f->dirty = true;
     pass();
     assert(f->routed_host && !f->hw && !strcmp(ft_mc_state(f), "refused-routed"));
+    /* So does an all-multicast one -- ipmr makes each VIF device one -- with
+     * the last bridged listener gone: the routed copy still needs the host. */
+    answer(&P1, S, 289, BR_MCAST_TO_HOST_ALLMULTI, 0);
+    f->dirty = true;
+    pass();
+    assert(f->routed_host && !f->hw && !strcmp(ft_mc_state(f), "refused-routed"));
     answer(&P1, S, 289, 0, 1, &P2);
     f->dirty = true;
     pass();
@@ -2418,6 +2427,14 @@ static void one_stream_both_learners(void)
         assert(ft_mc_ring_head == recorded);
     }
     BR.flags &= ~IFF_PROMISC;
+    ft_mc_route_publish(&r1, &want);
+    assert(!r1.learns);
+    /* An all-multicast bridge -- a VIF on it makes it one -- hands its
+     * streams up as a promiscuous one does. */
+    BR.flags |= IFF_ALLMULTI;
+    ft_mc_route_publish(&r1, &want);
+    assert(r1.learns);
+    BR.flags &= ~IFF_ALLMULTI;
     ft_mc_route_publish(&r1, &want);
     assert(!r1.learns);
     withdraw(&r1);
