@@ -41,7 +41,11 @@ device as the reply's ingress, which no driver can redirect to, and
 nothing would walk the flow again. dev_fill_forward_path() passes a
 device hook's own error up, so a hook can report the same. A port's
 default path is the walked one, so a port still falls back, as does
-every other failed walk.
+every other failed walk. Such a table's software path, and any table's
+whose walk named no device, sends a direction through the device it was
+routed to -- the bridge, VLAN, ppp or tunnel device,
+which puts on its address, tag or session -- never out of the port the
+walk found below it, where 6.18's NEIGH output would otherwise go.
 
 A walk that ends on a port the table does not list falls back as well:
 deferring would walk every packet for good past a port that never joins,
@@ -105,14 +109,14 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/netfilter/nf_flow_table_inet.c        |   3 +
  net/netfilter/nf_flow_table_ip.c          |  25 +-
  net/netfilter/nf_flow_table_offload.c     | 205 ++++++++++++++-
- net/netfilter/nf_flow_table_path.c        | 172 ++++++++++---
+ net/netfilter/nf_flow_table_path.c        | 198 ++++++++++++---
  net/netfilter/nf_tables_api.c             |  47 +++-
  net/netfilter/nft_flow_offload.c          |  57 +++++
  net/xfrm/xfrm_device.c                    |  30 ++-
  net/xfrm/xfrm_policy.c                    | 124 ++++++++-
  net/xfrm/xfrm_state.c                     |  26 +-
  net/xfrm/xfrm_user.c                      |   3 +
- 25 files changed, 1314 insertions(+), 115 deletions(-)
+ 25 files changed, 1335 insertions(+), 120 deletions(-)
 
 diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
 index 2e9e1b4d74da9..ab395eca5620c 100644
@@ -1901,7 +1905,7 @@ index 2af7d64696044..98b266f2f83e3 100644
  }
  
 diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_path.c
-index 7a3b795f86277..09519d5e3607e 100644
+index 7a3b795f86277..44084aea0f2b0 100644
 --- a/net/netfilter/nf_flow_table_path.c
 +++ b/net/netfilter/nf_flow_table_path.c
 @@ -45,11 +45,13 @@ static int nft_dev_fill_forward_path(const struct nf_flow_route *route,
@@ -1910,7 +1914,7 @@ index 7a3b795f86277..09519d5e3607e 100644
  				     enum ip_conntrack_dir dir, u8 *ha,
 -				     struct net_device_path_stack *stack)
 +				     struct net_device_path_stack *stack,
-+				     struct nf_flowtable *flowtable)
++				     bool use_neigh)
  {
  	const void *daddr = &ct->tuplehash[!dir].tuple.src.u3;
  	struct net_device *dev = dst_cache->dev;
@@ -1919,7 +1923,7 @@ index 7a3b795f86277..09519d5e3607e 100644
  	u8 nud_state;
  
  	if (!nft_is_valid_ether_device(dev)) {
-@@ -57,18 +59,36 @@ static int nft_dev_fill_forward_path(const struct nf_flow_route *route,
+@@ -57,18 +59,35 @@ static int nft_dev_fill_forward_path(const struct nf_flow_route *route,
  		goto out;
  	}
  
@@ -1934,8 +1938,7 @@ index 7a3b795f86277..09519d5e3607e 100644
 +	 * flow_offload_eth_dst() holds its rules back until the neighbour
 +	 * resolves.
 +	 */
-+	defer = READ_ONCE(flowtable->use_neigh) &&
-+		dev->netdev_ops->ndo_fill_forward_path;
++	defer = use_neigh && dev->netdev_ops->ndo_fill_forward_path;
 +
  	n = dst_neigh_lookup(dst_cache, daddr);
  	if (!n)
@@ -1960,7 +1963,7 @@ index 7a3b795f86277..09519d5e3607e 100644
  
  out:
  	return dev_fill_forward_path(dev, ha, stack);
-@@ -86,6 +106,10 @@ struct nft_forward_info {
+@@ -86,12 +105,17 @@ struct nft_forward_info {
  	u8 ingress_vlans;
  	u8 h_source[ETH_ALEN];
  	u8 h_dest[ETH_ALEN];
@@ -1971,6 +1974,14 @@ index 7a3b795f86277..09519d5e3607e 100644
  	enum flow_offload_xmit_type xmit_type;
  };
  
+ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 			      struct nft_forward_info *info,
+-			      unsigned char *ha, struct nf_flowtable *flowtable)
++			      unsigned char *ha, struct nf_flowtable *flowtable,
++			      bool use_neigh)
+ {
+ 	const struct net_device_path *path;
+ 	int i;
 @@ -117,17 +141,35 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
  			}
  
@@ -2048,7 +2059,7 @@ index 7a3b795f86277..09519d5e3607e 100644
 +			 * redirect names other_tuple->iifidx, which is the port
 +			 * this walk resolved through the bridge FDB.
 +			 */
-+			if (!READ_ONCE(flowtable->use_neigh))
++			if (!use_neigh)
 +				info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
  			break;
  		default:
@@ -2058,11 +2069,12 @@ index 7a3b795f86277..09519d5e3607e 100644
  		}
  	}
  	if (!info->outdev)
-@@ -169,8 +216,20 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+@@ -168,9 +215,20 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 
  	info->hw_outdev = info->indev;
  
- 	if (nf_flowtable_hw_offload(flowtable) &&
-+	    !READ_ONCE(flowtable->use_neigh) &&
+-	if (nf_flowtable_hw_offload(flowtable) &&
++	if (nf_flowtable_hw_offload(flowtable) && !use_neigh &&
  	    nft_is_valid_ether_device(info->indev))
  		info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
 +	return;
@@ -2079,7 +2091,7 @@ index 7a3b795f86277..09519d5e3607e 100644
  }
  
  static bool nft_flowtable_find_dev(const struct net_device *dev,
-@@ -190,25 +249,53 @@ static bool nft_flowtable_find_dev(const struct net_device *dev,
+@@ -190,25 +248,70 @@ static bool nft_flowtable_find_dev(const struct net_device *dev,
  	return found;
  }
  
@@ -2093,16 +2105,22 @@ index 7a3b795f86277..09519d5e3607e 100644
 +				struct nft_flowtable *ft)
  {
  	const struct dst_entry *dst = route->tuple[dir].dst;
++	/* Read once: the walk's choices and the output device below must all
++	 * be the same table's. */
++	const bool use_neigh = READ_ONCE(ft->data.use_neigh);
  	struct net_device_path_stack stack;
  	struct nft_forward_info info = {};
  	unsigned char ha[ETH_ALEN];
 -	int i;
 -
 -	if (nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) >= 0)
+-		nft_dev_path_info(&stack, &info, ha, &ft->data);
+-
+-	if (info.outdev)
 +	int i, err;
 +
 +	err = nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack,
-+					&ft->data);
++					use_neigh);
 +	/* A path that cannot be known yet, as reported above or by a device's
 +	 * own hook, is not one to fall back from: a flow cached on the logical
 +	 * device now would stay there once the path is known. Every other
@@ -2111,9 +2129,23 @@ index 7a3b795f86277..09519d5e3607e 100644
 +	if (err == -EAGAIN)
 +		return err;
 +	if (err >= 0)
- 		nft_dev_path_info(&stack, &info, ha, &ft->data);
- 
- 	if (info.outdev)
++		nft_dev_path_info(&stack, &info, ha, &ft->data, use_neigh);
++
++	/* NEIGH output is transmitted by out.ifindex (nf_flow_offload_ip_hook()).
++	 * A table with neighbour output keeps it on the device this direction
++	 * was routed to, as routing transmits: the bridge, VLAN or ppp device
++	 * puts on its own address, tag or session, and the bridge applies its
++	 * FDB and port state, none of which the port the walk found below it
++	 * would. The walk's port reaches a rule as the other direction's
++	 * ingress. Such a table is never given DIRECT output. Any table whose
++	 * walk failed or was refused before naming a device -- a tunnel hop
++	 * another table cannot take, say -- transmits through the routed
++	 * device as well, rather than by no device at all. Set before any
++	 * return below, so that an unlisted port does too.
++	 */
++	if (use_neigh || !info.outdev)
++		route->tuple[dir].out.ifindex = dst->dev->ifindex;
++	else
  		route->tuple[dir].out.ifindex = info.outdev->ifindex;
  
 -	if (!info.indev || !nft_flowtable_find_dev(info.indev, ft))
@@ -2142,7 +2174,7 @@ index 7a3b795f86277..09519d5e3607e 100644
  
  	route->tuple[!dir].in.ifindex = info.indev->ifindex;
  	for (i = 0; i < info.num_encaps; i++) {
-@@ -224,6 +311,8 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
+@@ -224,6 +327,8 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
  		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
  		route->tuple[dir].xmit_type = info.xmit_type;
  	}
@@ -2151,7 +2183,7 @@ index 7a3b795f86277..09519d5e3607e 100644
  }
  
  int nft_flow_route(const struct nft_pktinfo *pkt, const struct nf_conn *ct,
-@@ -233,6 +322,7 @@ int nft_flow_route(const struct nft_pktinfo *pkt, const struct nf_conn *ct,
+@@ -233,6 +338,7 @@ int nft_flow_route(const struct nft_pktinfo *pkt, const struct nf_conn *ct,
  	struct dst_entry *this_dst = skb_dst(pkt->skb);
  	struct dst_entry *other_dst = NULL;
  	struct flowi fl;
@@ -2159,7 +2191,7 @@ index 7a3b795f86277..09519d5e3607e 100644
  
  	memset(&fl, 0, sizeof(fl));
  	switch (nft_pf(pkt)) {
-@@ -244,6 +334,11 @@ int nft_flow_route(const struct nft_pktinfo *pkt, const struct nf_conn *ct,
+@@ -244,6 +350,11 @@ int nft_flow_route(const struct nft_pktinfo *pkt, const struct nf_conn *ct,
  		fl.u.ip4.flowi4_dscp = ip4h_dscp(ip_hdr(pkt->skb));
  		fl.u.ip4.flowi4_mark = pkt->skb->mark;
  		fl.u.ip4.flowi4_flags = FLOWI_FLAG_ANYSRC;
@@ -2171,7 +2203,7 @@ index 7a3b795f86277..09519d5e3607e 100644
  		break;
  	case NFPROTO_IPV6:
  		fl.u.ip6.daddr = ct->tuplehash[dir].tuple.src.u3.in6;
-@@ -268,10 +363,21 @@ int nft_flow_route(const struct nft_pktinfo *pkt, const struct nf_conn *ct,
+@@ -268,10 +379,21 @@ int nft_flow_route(const struct nft_pktinfo *pkt, const struct nf_conn *ct,
  	nft_default_forward_path(route, this_dst, dir);
  	nft_default_forward_path(route, other_dst, !dir);
  

@@ -461,10 +461,10 @@ index 98b266f2f83e3..0281f828b0789 100644
  		.nf_xfrm_genid = flow->xfrm_genid,
  		.nf_dst_cookie = nf_flow_offload_dst_cookie(&flow->tuplehash[dir].tuple),
 diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_path.c
-index 09519d5e3607e..02f7b88982a79 100644
+index 44084aea0f2b0..00b4c021a856e 100644
 --- a/net/netfilter/nf_flow_table_path.c
 +++ b/net/netfilter/nf_flow_table_path.c
-@@ -110,6 +110,8 @@ struct nft_forward_info {
+@@ -109,6 +109,8 @@ struct nft_forward_info {
  	 * implicit in h_dest and the encap slot: a hardware adapter cannot
  	 * re-derive any of it, and h_dest is not carried to a NEIGH tuple. */
  	struct nf_flow_session session;
@@ -474,7 +474,7 @@ index 09519d5e3607e..02f7b88982a79 100644
  };
  
 @@ -206,6 +208,41 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
- 			if (!READ_ONCE(flowtable->use_neigh))
+ 			if (!use_neigh)
  				info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
  			break;
 +		case DEV_PATH_TUNNEL:
@@ -494,7 +494,7 @@ index 09519d5e3607e..02f7b88982a79 100644
 +			 * either -- those are the L2 headers a rule can pop and
 +			 * push. One per path, and the device the outer packet
 +			 * leaves by is the next entry's. */
-+			if (!READ_ONCE(flowtable->use_neigh) ||
++			if (!use_neigh ||
 +			    info->tunnel.lower_ifindex || i + 1 >= stack->num_paths)
 +				goto refuse;
 +			info->tunnel.lower_ifindex = stack->path[i + 1].dev->ifindex;
@@ -515,7 +515,7 @@ index 09519d5e3607e..02f7b88982a79 100644
  		default:
  			goto refuse;
  		}
-@@ -296,6 +333,7 @@ static int nft_dev_forward_path(struct nf_flow_route *route,
+@@ -312,6 +349,7 @@ static int nft_dev_forward_path(struct nf_flow_route *route,
  	/* Belongs to this direction's egress path, as out.h_dest does, and
  	 * unlike out.h_dest it survives NEIGH output. */
  	route->tuple[dir].session = info.session;

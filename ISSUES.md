@@ -152,6 +152,14 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A440 — 6.18's software flowtable sends a NEIGH direction to whatever address its neighbour holds.** Where:
+  `nf_flow_offload_ip_hook()` / `nf_flow_offload_ipv6_hook()` (upstream b5964aac51e0, in 6.18.y) take `neigh->ha`
+  from `ip_neigh_gw4()`/`ip_neigh_gw6()` without checking `nud_state` or starting resolution, then
+  `dev_queue_xmit()`; 6.12's `neigh_xmit()` queued the frame and resolved. Why it matters: a neighbour flushed or
+  recreated under a live flow can draw frames with an all-zero destination until the flow is retired. From review,
+  not seen on the rig. Fix direction: fall back to `neigh_xmit()`, or give the packet back to the stack, unless the
+  entry is `NUD_VALID`.
+
 - [ ] **A438 — a port's queues to the CPU are bounded by its probe order, not its own share.** Where:
   `dpaa_eth_priv_ingress_cgrs_init()` (patch 111) scales `priv->dpa_bp->config_count`, the shared pool's running
   total, which every port after the first raises by `CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT` once its groups are set up:

@@ -792,6 +792,12 @@ static void lan_walked(struct net_device *lan, u8 state, enum ip_conntrack_dir d
 	assert(s.route.tuple[to_lan].in.num_encaps == 0);
 	assert(s.route.tuple[0].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH);
 	assert(s.route.tuple[1].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH);
+	/* NEIGH output transmits by out.ifindex in software: a table with
+	 * neighbour output sends through the device each direction was routed
+	 * to, as routing does -- the bridge or VLAN device puts on its address
+	 * and tag -- never straight out of the port the walk found below it. */
+	assert(s.route.tuple[to_lan].out.ifindex == (u32)lan->ifindex);
+	assert(s.route.tuple[!to_lan].out.ifindex == (u32)eth4.ifindex);
 	none_unlisted(&s);
 	drop(&s);
 }
@@ -856,6 +862,10 @@ static void tunnel_cases(enum ip_conntrack_dir dir, bool lan_bound, int nf)
 				assert(s.route.tuple[to_lan].in.ifindex == (u32)tun->ifindex);
 				assert(!s.route.tuple[!to_lan].tunnel.lower_ifindex);
 			}
+			/* Either way the software path transmits into the
+			 * tunnel device, which encapsulates: a refused hop
+			 * leaves no walked device to name, never no device. */
+			assert(s.route.tuple[!to_lan].out.ifindex == (u32)tun->ifindex);
 			none_unlisted(&s);
 			drop(&s);
 

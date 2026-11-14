@@ -36,8 +36,8 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/bridge/br_stp.c                | 18 ++++++++++++++++++
  net/bridge/br_vlan.c               | 21 +++++++++++++++++++++
  net/bridge/br_vlan_options.c       | 25 +++++++++++++++++++++++++
- net/netfilter/nf_flow_table_path.c | 15 +++++++++++++--
- 8 files changed, 126 insertions(+), 3 deletions(-)
+ net/netfilter/nf_flow_table_path.c | 14 ++++++++++++--
+ 8 files changed, 125 insertions(+), 3 deletions(-)
 
 diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
 index 669d7dbd43a15..ad0c02e7c661c 100644
@@ -289,19 +289,18 @@ index 4a736e005bad7..2d9c2d96921b1 100644
  	return 0;
  }
 diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_path.c
-index 02f7b88982a79..2ae857f99b4ce 100644
+index 00b4c021a856e..70e95f69b03d2 100644
 --- a/net/netfilter/nf_flow_table_path.c
 +++ b/net/netfilter/nf_flow_table_path.c
-@@ -299,10 +299,21 @@ static int nft_dev_forward_path(struct nf_flow_route *route,
+@@ -301,10 +301,20 @@ static int nft_dev_forward_path(struct nf_flow_route *route,
  
  	err = nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack,
- 					&ft->data);
+ 					use_neigh);
 +	/* A bridge that has not learned the station's port (-ENXIO) is a path
 +	 * not known yet to a table with neighbour output, exactly as an
-+	 * unresolved neighbour is. Any other table keeps the fallback, which
-+	 * its software path forwards through the bridge as routing does.
++	 * unresolved neighbour is. Any other table keeps the fallback.
 +	 */
-+	if (err == -ENXIO && READ_ONCE(ft->data.use_neigh))
++	if (err == -ENXIO && use_neigh)
 +		err = -EAGAIN;
  	/* A path that cannot be known yet, as reported above or by a device's
  	 * own hook, is not one to fall back from: a flow cached on the logical
