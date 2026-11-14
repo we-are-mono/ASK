@@ -10,7 +10,8 @@ from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from _flowtable_connections import (consistent, healthy, peer)
 from _flowtable_dnat import (PUBLIC_PORT, hardware, warm, dnat as _dnat)
-from _flowtable_rig import (artifact_dir, DPORT, HEALTH_BASELINE, SPORT, command, console_command, read)
+from _flowtable_rig import (artifact_dir, DPORT, HEALTH_BASELINE, SPORT, command, console_command,
+                            flowtable_closing, read, tcp_closed_states)
 from _flowtable_policy import (CONFIG, apply, candidate, stop)
 from _flowtable_tcp import (software_tx)
 
@@ -183,7 +184,8 @@ async def test_flowtable_hairpin(hairpin, zero_checksum):
                                       and all(f["proto"] == "17" for f in s["flows"]), timeout=8)
                 healthy(closed)
                 ct_closed = await conntracks()
-                assert any(state in ct_closed["tcp"] for state in ("TIME_WAIT", "LAST_ACK")), ct_closed
+                closed_states = tcp_closed_states(await flowtable_closing(r))
+                assert any(state in ct_closed["tcp"] for state in closed_states), ct_closed
                 r.record("fin", {"state": closed, "conntracks": ct_closed})
         finally:
             try:

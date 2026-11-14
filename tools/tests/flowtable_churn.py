@@ -299,9 +299,13 @@ async def sustained_churn(r, path):
  chain forward {{ type filter hook forward priority 0; policy accept;
  {ip} saddr {lan} {ip} daddr {wan} meta l4proto {{ tcp, udp }} th sport {survivor_ports} th dport {DPORT} counter name survivor_forward
  {ip} saddr {wan} {ip} daddr {lan} meta l4proto {{ tcp, udp }} th sport {DPORT} th dport {survivor_ports} counter name survivor_forward
+ {ip} saddr {lan} {ip} daddr {wan} meta l4proto {{ tcp, udp }} th sport {BASE}-{BASE + len(specs) // 2 - 1} th dport {DPORT} flow add @fast
+ }}
+ # A close is counted as it reaches Linux, on ingress: a flowtable that keeps
+ # its flow on FIN or RST forwards them past the forward chain.
+ chain control {{ type filter hook ingress device {TARGET_LAN_IF} priority -10; policy accept;
  {ip} saddr {lan} {ip} daddr {wan} tcp sport {churned_ports} tcp dport {DPORT} tcp flags & fin == fin counter name fin
  {ip} saddr {lan} {ip} daddr {wan} tcp sport {churned_ports} tcp dport {DPORT} tcp flags & rst == rst counter name rst
- {ip} saddr {lan} {ip} daddr {wan} meta l4proto {{ tcp, udp }} th sport {BASE}-{BASE + len(specs) // 2 - 1} th dport {DPORT} flow add @fast
  }}
 }}''')
         async with peer(r, specs, initial_ids=[], lease=max(duration + 600, 3600), tcp_size=1024, reconnect=True,

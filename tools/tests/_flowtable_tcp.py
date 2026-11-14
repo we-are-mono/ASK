@@ -13,7 +13,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
-from _flowtable_rig import DPORT, SPORT, TABLE, WAN_IP, artifact_dir, command, drive, read
+from _flowtable_rig import (DPORT, SPORT, TABLE, WAN_IP, artifact_dir, command, drive,
+                            flowtable_closing, read, tcp_closed_states)
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from ask_orch.client import Agent
 from ask_orch.counters import kernel_tx_packets
@@ -21,6 +22,8 @@ from ask_orch.commands import console_python
 from ask_orch.uart import Console
 
 BLOCK = bytes(range(256)) * 256
+# The flowtable's TCP idle timeout while tcp_timeouts() holds.
+FLOWTABLE_TCP_TIMEOUT = 4
 
 MIB = 1 << 20
 
@@ -116,15 +119,20 @@ async def connection(r):
 
 async def tcp_table(r):
     await r.table()
-    # These counters are on the ordinary forward hook, independent of the
-    # flowtable counter feature (which this backend deliberately declines).
+    # The control flags are counted as they reach Linux: on each port's
+    # ingress, which a frame the hardware forwards never reaches, and which a
+    # flowtable keeping its flow on FIN or RST does not skip as it does the
+    # forward chain (flowtable_closing()). Independent of the flowtable
+    # counter feature, which this backend deliberately declines. Matched on
+    # the sending endpoint, the half of the tuple NAT has not rewritten yet.
+    for chain, dev in (("tcp_lan", TARGET_LAN_IF), ("tcp_wan", TARGET_WAN_IF)):
+        await r.nft(f"add chain inet {TABLE} {chain} {{ type filter hook ingress device "
+                    f"\"{dev}\" priority -10; policy accept; }}")
     for flag in ("syn", "fin", "rst"):
         await r.nft(f"add counter inet {TABLE} tcp_{flag}")
-        for src, dst, sport, dport in [(r.lan_ip, WAN_IP, SPORT, DPORT),
-                                      (WAN_IP, r.lan_ip, DPORT, SPORT)]:
-            await r.nft(f"insert rule inet {TABLE} forward ip saddr {src} ip daddr {dst} "
-                        f"tcp sport {sport} tcp dport {dport} tcp flags & {flag} == {flag} "
-                        f"counter name tcp_{flag}")
+        for chain, src, sport in (("tcp_lan", r.lan_ip, SPORT), ("tcp_wan", WAN_IP, DPORT)):
+            await r.nft(f"add rule inet {TABLE} {chain} ip saddr {src} tcp sport {sport} "
+                        f"tcp flags & {flag} == {flag} counter name tcp_{flag}")
 
 
 async def control_counters(r):
@@ -176,7 +184,7 @@ async def conntrack(r):
 async def tcp_timeouts(r):
     saved = []
     try:
-        for name, value in [("nf_flowtable_tcp_timeout", 4),
+        for name, value in [("nf_flowtable_tcp_timeout", FLOWTABLE_TCP_TIMEOUT),
                             ("nf_conntrack_tcp_timeout_last_ack", 10),
                             ("nf_conntrack_tcp_timeout_time_wait", 10)]:
             old = (await read(r.target, r.session, f"/proc/sys/net/netfilter/{name}")).strip()
@@ -281,15 +289,21 @@ async def tcp_transfer_expiry_fin(rig):
             counters = await control_counters(r)
             assert counters["tcp_fin"] >= 2 and counters["tcp_rst"] == 0, counters
             ct = await conntrack(r)
-            # FIN punts mark NF_FLOW_TEARDOWN immediately, but NF queues
-            # hardware removal from its periodic GC. The final pure ACK can
-            # cross hardware in that interval, leaving CT in LAST_ACK. Both
-            # endpoints must still close, both FINs must reach Linux, hardware
-            # must disappear promptly, and CT must expire without OFFLOAD.
-            assert any(state in ct["stdout"] for state in ("TIME_WAIT", "LAST_ACK")), ct
-            assert "OFFLOAD" not in ct["stdout"], ct
+            closing = await flowtable_closing(r)
+            # A FIN punt marks NF_FLOW_TEARDOWN at once, but NF queues
+            # hardware removal from its periodic GC: the final pure ACK can
+            # cross hardware in that interval, leaving CT in LAST_ACK. Where
+            # the flowtable forwards the FINs itself, the flow stays, closing,
+            # until it times out, and conntrack learns the close only then.
+            # Either way both endpoints close, both FINs reach Linux, hardware
+            # disappears promptly, and CT expires without OFFLOAD.
+            assert any(state in ct["stdout"] for state in tcp_closed_states(closing)), ct["stdout"]
+            if not closing:
+                assert "OFFLOAD" not in ct["stdout"], ct
             r.record("tcp-fin", {"state": removed, "counters": counters, "conntrack": ct})
-            deadline = time.monotonic() + 12
+            close_timeout = int((await read(r.target, r.session,
+                                           "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close")).strip())
+            deadline = time.monotonic() + (FLOWTABLE_TCP_TIMEOUT + close_timeout + 2 if closing else 12)
             while time.monotonic() < deadline:
                 final_ct = await conntrack(r)
                 if not final_ct["stdout"].strip():
@@ -348,14 +362,24 @@ async def tcp_retransmit_withdraw_rst(rig):
         # nf_conntrack_proto_tcp intentionally retains ESTABLISHED when the
         # RST sequence differs from its last observed ACK, allowing a possible
         # RFC5961 challenge ACK. Offloaded data makes that observation stale.
-        # Its RST path still applies the short CLOSE timeout. Require reset at
-        # the endpoint, Linux visibility, prompt removal and bounded CT expiry.
-        assert any(state in ct["stdout"] for state in ("CLOSE ", "ESTABLISHED")), ct
+        # Its RST path still applies the short CLOSE timeout. Where the
+        # flowtable forwards the RST itself, the flow stays, closing, until it
+        # times out, and conntrack is set CLOSE then (flowtable_closing()).
+        # Require reset at the endpoint, Linux visibility, prompt removal and
+        # bounded CT expiry.
+        closing = await flowtable_closing(r)
+        states = tcp_closed_states(closing) if closing else ("CLOSE ", "ESTABLISHED")
+        assert any(state in ct["stdout"] for state in states), ct["stdout"]
         close_timeout = int((await read(r.target, r.session,
                                        "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close")).strip())
-        assert "OFFLOAD" not in ct["stdout"] and int(ct["stdout"].split()[2]) <= close_timeout, ct
+        bound = close_timeout
+        if closing:
+            bound += int((await read(r.target, r.session,
+                                     "/proc/sys/net/netfilter/nf_flowtable_tcp_timeout")).strip())
+        else:
+            assert "OFFLOAD" not in ct["stdout"] and int(ct["stdout"].split()[2]) <= close_timeout, ct
         r.record("tcp-rst", {"state": removed, "counters": counters, "conntrack": ct})
-        deadline = time.monotonic() + close_timeout + 2
+        deadline = time.monotonic() + bound + 2
         while time.monotonic() < deadline:
             final_ct = await conntrack(r)
             if not final_ct["stdout"].strip():

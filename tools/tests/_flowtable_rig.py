@@ -796,6 +796,28 @@ async def _drop_latch_table(r):
                          check=False)
 
 
+async def flowtable_closing(r) -> bool:
+    """Whether the DUT's flowtable keeps a TCP flow on FIN or RST (Linux 6.14,
+    upstream fdbaf51633313, NF_FLOW_CLOSING). It then forwards those packets
+    itself -- the forward chain never sees them -- has the hardware entry
+    withdrawn at once, and leaves conntrack ESTABLISHED until the flow times
+    out and sets it CLOSE, with that state's short timeout. Before it, FIN or
+    RST tore the flow down and took the classic path, conntrack following."""
+    release = (await read(r.target, r.session, "/proc/sys/kernel/osrelease")).strip()
+    version = re.match(r"(\d+)\.(\d+)", release)
+    assert version, release
+    return (int(version.group(1)), int(version.group(2))) >= (6, 14)
+
+
+def tcp_closed_states(closing: bool) -> tuple:
+    """What conntrack shows for a TCP connection once its ends closed or reset
+    it through a flowtable (flowtable_closing()): TIME_WAIT, or LAST_ACK when
+    the final ACK crossed hardware before its deletion; where the flowtable
+    forwards the close itself, the flow still offloaded -- listed [OFFLOAD],
+    without a TCP state -- until it times out, and CLOSE after."""
+    return ("[OFFLOAD]", "CLOSE ") if closing else ("TIME_WAIT", "LAST_ACK")
+
+
 async def hardware_proof(r, count=256):
     """The flow's both directions in hardware: exact per-entry hits, conntrack
     reporting it as hardware-offloaded, and next to nothing sent by the CPU."""

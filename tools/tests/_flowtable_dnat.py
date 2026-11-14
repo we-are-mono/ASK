@@ -15,7 +15,9 @@ from _flowtable_rig import (
     artifact_dir,
     command,
     console_command,
+    flowtable_closing,
     read,
+    tcp_closed_states,
 )
 from _flowtable_tcp import cpu, cpu_delta, software_tx
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
@@ -214,8 +216,11 @@ async def dnat(rig, zero_checksum, double_nat=False):
                 healthy(closed)
                 ct_closed = await conntracks()
                 # The final ACK may precede asynchronous hardware deletion,
-                # leaving native conntrack in LAST_ACK (the routed TCP contract).
-                assert any(state in ct_closed["tcp"] for state in ("TIME_WAIT", "LAST_ACK")), ct_closed
+                # leaving native conntrack in LAST_ACK (the routed TCP
+                # contract); a flowtable that forwards the close itself leaves
+                # it ESTABLISHED until the flow times out (tcp_closed_states()).
+                closed_states = tcp_closed_states(await flowtable_closing(r))
+                assert any(state in ct_closed["tcp"] for state in closed_states), ct_closed
                 r.record("dnat-fin", {"state": closed, "conntracks": ct_closed})
         finally:
             try:
