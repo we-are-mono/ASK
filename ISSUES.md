@@ -199,14 +199,8 @@ result independently of those temporary files.
   interrupts masked; they now wait within a bound, a portal's next command takes an abandoned one's late answer
   first, and QMan's silence is reported (A442) (_:/^sdk_fman, qbman: bound the host-command timeout's QMan queries_).
 
-- [ ] **A438 — a port's queues to the CPU are bounded by its probe order, not its own share.** Where:
-  `dpaa_eth_priv_ingress_cgrs_init()` (patch 111) scales `priv->dpa_bp->config_count`, the shared pool's running
-  total, which every port after the first raises by `CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT` once its groups are set up:
-  the first two ports get half a share, the third a whole one, the fifth two. Why it matters: a flood on a late port
-  holds up to twice its share of the common pool, against _0b2a8c84_'s intent, and that commit's rig measurement of
-  "half" likely ran with the inflated bound wherever the traffic entered a late port. Predates the 6.18 port (from
-  review). Fix direction: scale `CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT`, then re-measure the 16,384-connection admission
-  on the LAN and WAN ports before settling `ingress_quarters`.
+- [x] **A438 — a port's queues to the CPU were bounded by its probe order, not its own share.** Every port's bound is
+  now half its own seed (1,280 frames each on the DK), as cdx's forwarding budget is (_:/^sdk_dpaa, cdx: bound_).
 
 - [x] **A437 — with several WireGuard transmit lanes, the peer's sent bytes lost updates.** Every send and the seal
   now add to one atomic `tx_bytes` (_:/^wireguard: count a peer's sent bytes atomically_).

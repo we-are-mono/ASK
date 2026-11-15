@@ -248,7 +248,7 @@ static_assert(CDX_CEETM_MAX_CHANNELS <= 32,
  * one frame past, that command's. It does not compound: the next command's
  * admission reads the refilled counts, and refuses until they have gone.
  */
-#define CDX_HTB_ETH_FRAMES	((u64)CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT * num_possible_cpus() / 2)
+#define CDX_HTB_ETH_FRAMES	ETH_PORT_HALF_FRAMES
 #define CDX_HTB_SEC_FRAMES	IPSEC_QDISC_FRAMES
 
 /* The class queues one tree can use: a leaf's each, and the top channel's two

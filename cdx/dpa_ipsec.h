@@ -160,6 +160,14 @@ struct sec_descriptor {
  * one port's forwarding queues may hold (fwd_pool_frames()). That is some
  * 2.5 ms of SEC's work in full-size frames. */
 #define IPSEC_TO_SEC_FRAMES	(4 * IPSEC_SHARE_FRAMES)
+/* Half a port's share of the Ethernet pool, in frames: half of what the port
+ * itself seeds the pool with, for each CPU (dpa_priv_bp_seed()). Its own seed,
+ * not the pool's count, the running total every port probed after the first
+ * raises by its seed, so that a port's bound does not grow with its place in
+ * the probe order. A port's forwarding queues hold at most this many
+ * (fwd_pool_frames()), and so do its queues to the CPU (the driver's ingress
+ * groups); the hardware qdisc trees share it (cdx_htb.c). */
+#define ETH_PORT_HALF_FRAMES	((u64)CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT * num_possible_cpus() / 2)
 
 struct ipsec_info; 
 void *  dpa_get_ipsec_instance(void);

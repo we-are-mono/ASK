@@ -61,7 +61,8 @@ def test_htb_offload(tmp_path):
     ceetm_h = (ROOT / "cdx/cdx_ceetm_app.h").read_text()
     (tmp_path / "htb_pools.inc").write_text(
         "".join(re.search(rf"^#define\s+{name}\s.*$", ipsec, re.M).group() + "\n"
-                for name in ("IPSEC_BUFCOUNT", "IPSEC_SHARE_FRAMES", "IPSEC_QDISC_FRAMES"))
+                for name in ("IPSEC_BUFCOUNT", "IPSEC_SHARE_FRAMES", "IPSEC_QDISC_FRAMES",
+                             "ETH_PORT_HALF_FRAMES"))
         + re.search(r"^#define\s+CEETM_PARKED_CQ_DEPTH\s.*$", ceetm_h, re.M).group() + "\n"
         + "".join(line + "\n" for line in ceetm.splitlines()
                   if line.startswith("#define CEETM_WRED_"))

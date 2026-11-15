@@ -1,4 +1,4 @@
-From b775c92816da84e4dc7feb56f408acaffbed8e34 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Fri, 9 Oct 2026 16:39:25 +0200
 Subject: [PATCH] sdk_dpaa: bound a port's queues to the CPU by its share of
@@ -27,9 +27,16 @@ fill is now one per-CPU count shared by every private port, each adding
 its share (CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT) to what the pool is kept
 at, so it holds as many buffers as before.
 ---
+ .../net/ethernet/freescale/sdk_dpaa/Kconfig   |  8 ---
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    | 71 ++++++++++++++-----
+ .../freescale/sdk_dpaa/dpaa_eth_common.c      | 10 +--
+ 3 files changed, 55 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/Kconfig b/drivers/net/ethernet/freescale/sdk_dpaa/Kconfig
+index a14b325f2b4b6..147b421c7d68d 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/Kconfig
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/Kconfig
-@@ -146,14 +146,6 @@
+@@ -146,14 +146,6 @@ config FSL_DPAA_CS_THRESHOLD_10G
  	help
  	  The size in bytes of the egress Congestion State notification threshold on 10G ports.
  
@@ -44,9 +51,11 @@ at, so it holds as many buffers as before.
  config FSL_DPAA_ETH_DEBUGFS
  	bool "DPAA Ethernet debugfs interface"
  	depends on DEBUG_FS && FSL_SDK_DPAA_ETH
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
+index c5a23f36b7d79..e06aa6d9cbb8e 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
-@@ -100,6 +100,13 @@
+@@ -100,6 +100,13 @@ static uint8_t debug = -1;
  module_param(debug, byte, S_IRUGO);
  MODULE_PARM_DESC(debug, "Module/Driver verbosity level");
  
@@ -60,7 +69,7 @@ at, so it holds as many buffers as before.
  /* This has to work in tandem with the DPA_CS_THRESHOLD_xxx values. */
  static uint16_t tx_timeout = 1000;
  module_param(tx_timeout, ushort, S_IRUGO);
-@@ -110,6 +117,10 @@
+@@ -110,6 +117,10 @@ MODULE_PARM_DESC(tx_timeout, "The Tx timeout in ms");
  #define DPAA_ETH_MAX_PAD (L1_CACHE_BYTES * 8)
  
  static uint8_t dpa_priv_common_bpid;
@@ -71,7 +80,7 @@ at, so it holds as many buffers as before.
  
  #ifdef CONFIG_FSL_DPAA_DBG_LOOP
  struct net_device *dpa_loop_netdevs[20];
-@@ -898,10 +909,23 @@
+@@ -898,10 +909,23 @@ dpa_priv_bp_probe(struct device *dev)
  	return dpa_bp;
  }
  
@@ -99,7 +108,7 @@ at, so it holds as many buffers as before.
   */
  static int dpaa_eth_priv_ingress_cgr_init(struct dpa_priv_s *priv)
  {
-@@ -915,11 +939,12 @@
+@@ -915,11 +939,15 @@ static int dpaa_eth_priv_ingress_cgr_init(struct dpa_priv_s *priv)
  		goto out_error;
  	}
  
@@ -111,12 +120,15 @@ at, so it holds as many buffers as before.
 +	initcgr.we_mask = QM_CGR_WE_MODE | QM_CGR_WE_CS_THRES | QM_CGR_WE_CSCN_EN;
 +	initcgr.cgr.mode = QMAN_CGR_MODE_FRAME;
 +	initcgr.cgr.cscn_en = 0;
-+	cs_th = max_t(u32, priv->dpa_bp->config_count * num_possible_cpus() *
++	/* What this port seeds the pool with, not the pool's running total
++	 * (config_count), which every port probed after the first raises by
++	 * its own seed: bounded by that, the bound grew with probe order. */
++	cs_th = max_t(u32, CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT * num_possible_cpus() *
 +			   clamp_t(uint, ingress_quarters, 1, 4) / 4, 1);
  	qm_cgr_cs_thres_set64(&initcgr.cgr.cs_thres, cs_th, 1);
  
  	initcgr.we_mask |= QM_CGR_WE_CSTD_EN;
-@@ -1180,17 +1205,24 @@
+@@ -1180,17 +1208,24 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
  		memset(percpu_priv, 0, sizeof(*percpu_priv));
  	}
  
@@ -151,9 +163,11 @@ at, so it holds as many buffers as before.
  
  	/* Initialize NAPI */
  	err = dpa_private_napi_add(net_dev);
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
+index ba7f50dcc98d7..6341181b110d1 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
-@@ -1317,14 +1317,8 @@
+@@ -1317,14 +1317,8 @@ int dpa_fq_init(struct dpa_fq *dpa_fq, bool td_enable)
  			initfq.we_mask |= QM_INITFQ_WE_CGID;
  			initfq.fqd.fq_ctrl |= QM_FQCTRL_CGE;
  			initfq.fqd.cgid = (uint8_t)priv->ingress_cgr.cgrid;
@@ -172,3 +186,4 @@ at, so it holds as many buffers as before.
  		/* Initialization common to all ingress queues */
 -- 
 2.47.3
+

@@ -223,8 +223,7 @@ static u64 fwd_cgr_frames(uint32_t speed, unsigned int mtu, u64 cap)
  * standard MTU, 1.6 ms of the largest frames rather than fwd_queue_us's 2. */
 static u64 fwd_pool_frames(const struct eth_iface_info *eth_info)
 {
-	return max_t(u64, (u64)eth_info->pool_info[0].count *
-			  num_possible_cpus() / 2, 1);
+	return max_t(u64, ETH_PORT_HALF_FRAMES, 1);
 }
 
 /* Size the port's groups for speed Mbit/s and the port's MTU as it is now;

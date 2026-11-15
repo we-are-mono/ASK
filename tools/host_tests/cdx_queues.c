@@ -98,6 +98,8 @@ struct eth_iface_info {
 };
 static unsigned cpus = 4;
 static unsigned num_possible_cpus(void) { return cpus; }
+/* What each port seeds the pool with, for each CPU. */
+#define CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT 640
 struct dpa_iface_info {
     struct dpa_iface_info *next; u32 if_flags;
     struct eth_iface_info eth_info; void *tx_proc_entry; const char *name;
@@ -312,7 +314,10 @@ int main(void)
         memset(&iface, 0, sizeof(iface)); calls = pauses = 0; fail = n;
         netdev = (struct net_device){ .carrier = n % 2, .speed = 1000, .mtu = 1500 };
         iface.eth_info.net_dev = &netdev; iface.eth_info.speed = 10000; iface.name = "eth4";
-        iface.eth_info.pool_info[0].count = 640;
+        /* The pool's count is its running total, which every port probed
+         * after the first raised by its own seed: the gateway's fifth port
+         * sees five ports' worth. Its share is still its own seed's half. */
+        iface.eth_info.pool_info[0].count = 5 * 640;
         unsigned released = cgr_releases;
         assert(create_fwd_tx_fqs(&iface)); assert(!live && !any_group());
         /* A group that was allocated went back exactly once: SEC's from
