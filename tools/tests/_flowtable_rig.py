@@ -599,6 +599,16 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
         assert len(set(mtus.values())) == 1 and mtus[TARGET_LAN_IF] >= 1500, \
             ("the rig needs both ports at one MTU of at least 1500", mtus)
         r.port_mtu = mtus[TARGET_LAN_IF]
+        # A smaller path an earlier case built for its own duration taught the
+        # endpoints its MTU (Fragmentation Needed), and they keep it for
+        # net.ipv4.route.mtu_expires, ten minutes: this case's full-size
+        # datagrams would leave the LAN client in fragments, which a shaper
+        # dropping some of them turns into lost datagrams. Both endpoints
+        # forget what they learned, so every path MTU is its egress port's.
+        for flush in ("ip route flush cache", "ip -6 route flush cache"):
+            flushed = lan.run(flush, timeout=10)
+            assert flushed.rc == 0, (flush, flushed.stdout)
+            await command(wan, r.session, *flush.split())
         for ip, mac, dev in [(r.lan_ip, lan_mac, TARGET_LAN_IF), (WAN_IP, wan_mac, TARGET_WAN_IF)]:
             old = json.loads((await command(r.target, r.session, "ip", "-j", "neigh", "show", "to", ip, "dev", dev))["stdout"])
             restore = ["ip", "neigh", "del", ip, "dev", dev]
@@ -689,6 +699,16 @@ for module, name in {knobs!r}:
                     result = await command(agent, r.session, *argv, check=False)
                 if result["rc"]:
                     failures.append(result)
+            except Exception as error:
+                failures.append(str(error))
+        # What this case taught the endpoints of a smaller path goes with it,
+        # for whatever runs next without this fixture's own flush.
+        for flush in ("ip route flush cache", "ip -6 route flush cache"):
+            try:
+                flushed = lan.run(flush, timeout=10)
+                if flushed.rc:
+                    failures.append((flush, flushed.stdout))
+                await command(wan, r.session, *flush.split())
             except Exception as error:
                 failures.append(str(error))
         if r.recovery_console:
