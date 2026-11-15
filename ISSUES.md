@@ -152,17 +152,8 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A445 — 6.12 carries upstream's flowtable GC race with pending offload work, without its fix.** Where:
-  `net/netfilter/nf_flow_table_{core,offload}.c` on the 6.12 line. v6.12.112 has `b4f0f05dfbe83` ("netfilter:
-  flowtable: publish HW_DEAD after worker is done", upstream d644b23afe1e) but not upstream 7c549fb7eecd
-  ("netfilter: flowtable: generalize pending status bit", Fixes: 2c8897953f3b), which 6.18.63 carries as stable
-  4033e1a9262c5: the GC skips a flow while offload work is pending and HW_DEAD goes back before the worker's end.
-  Why it matters: upstream found `nf_flow_offload_stats()` queuing stats work while the GC removes the flow, a race
-  between the GC and the offload handler; ASK's hardware flows take stats every GC pass on the line production
-  ships. Unverified: whether ASK's own GC changes on 6.12 (patches 140/141) close it. Found making the host
-  harnesses model both lines (`flowtable_handle` asserts each line's own GC). Next: if a 6.12.y after .112 carries
-  7c549fb7eecd, bump the pin (`make kernel-stable-review`); otherwise backport it into the 6.12 series over 140/141,
-  with a host case for stats work queued during teardown.
+- [x] **A445 — 6.12 lacked upstream's flowtable GC fix for pending offload work.** 6.12.113's fix, its two
+  prerequisites and their two follow-ups are carried as patches 001-005 (_:/^netfilter: carry 6.12.113's flowtable_).
 - [ ] **A444 — a DHCP renewal's unicast ACK was lost once on its way to the DUT.** Seen once on 6.18.63 (KASAN),
   `flowtable_dhcp::test_renewal_and_address_change` in the full suite after `flowtable_masquerade`: udhcpc sent its
   T1 renew to the server, dnsmasq logged the DHCPREQUEST and its DHCPACK, and the DUT's client never saw the ACK,

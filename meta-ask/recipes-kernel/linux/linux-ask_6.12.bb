@@ -13,6 +13,11 @@ require linux-ask.inc
 # The series, in order: one entry per patch in patches/kernel/6.12 (a glob
 # once dropped every patch numbered 100 or above).
 SRC_URI += "\
+           file://001-netfilter-conntrack-nf_ct_refresh-without-skb.patch \
+           file://002-netfilter-conntrack-offload-timeout-from-flowtable-gc.patch \
+           file://003-netfilter-flowtable-pending-status-bit.patch \
+           file://004-netfilter-conntrack-offload-bit-removal.patch \
+           file://005-netfilter-flowtable-offload-ct-timeout-extension.patch \
            file://010-ask-fman-dpaa-ehash.patch \
            file://030-ipv6-addrconf-modified-prefix-route-expiry.patch \
            file://040-ask-xfrm-ipsec-offload.patch \

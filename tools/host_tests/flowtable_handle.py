@@ -16,19 +16,23 @@ def test_lifecycle(tmp_path):
     header = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
     conntrack = (kernel / "include/net/netfilter/nf_conntrack.h").read_text()
     flags = re.search(r"^enum nf_flow_flags \{.*?^\};\n", header, re.M | re.S).group()
-    # The flag queued work holds (NF_FLOW_HW_PENDING until 6.18 renamed it),
-    # whether the collector leaves such a flow to that work, whether flows
-    # close on a FIN or RST (NF_FLOW_CLOSING, 6.18), and whether
-    # nf_ct_refresh() still takes the skb (dropped by 6.18).
+    # The flag queued work holds (NF_FLOW_HW_PENDING until upstream
+    # 7c549fb7eecd renamed it), whether flows close on a FIN or RST
+    # (NF_FLOW_CLOSING, 6.14), and whether nf_ct_refresh() still takes the
+    # skb (dropped by 31768596b15a, a prerequisite of 7c549fb7eecd).
     pending = re.search(r"if \(test_and_set_bit\((NF_FLOW_\w+), &flow->flags\)\)",
                         offload[offload.index("\nnf_flow_offload_work_alloc("):])
     assert pending, "the flag work_alloc claims"
     gc_step = function(source, "nf_flow_offload_gc_step")
+    # The collector leaves a flow with offload work queued to that work, on
+    # every line (upstream 7c549fb7eecd, backported into the 6.12 series,
+    # A445): judging it meanwhile let stats work race its removal.
+    assert f"test_bit({pending[1]}, &flow->flags)" in gc_step, \
+        "the collector judges a flow whose offload work is still queued"
     refresh = re.search(r"static inline void nf_ct_refresh\(([^)]*)\)", conntrack)
     assert refresh, "nf_ct_refresh"
     (tmp_path / "handle_types.inc").write_text(
-        flags + f"#define FLOW_PENDING {pending[1]}\n"
-        + ("#define GC_LEAVES_PENDING\n" if f"test_bit({pending[1]}, &flow->flags)" in gc_step else "")
+        flags + f"#define FLOW_PENDING {pending[1]}\n#define GC_LEAVES_PENDING\n"
         + ("#define HAVE_FLOW_CLOSING\n" if re.search(r"\bNF_FLOW_CLOSING,", flags) else "")
         + ("#define NF_CT_REFRESH_TAKES_SKB\n" if "const struct sk_buff *skb" in refresh[1] else ""))
     (tmp_path / "handle_production.inc").write_text(

@@ -47,7 +47,7 @@ static unsigned long flow_offload_get_timeout(struct flow_offload *flow)
     return 30 * HZ;
 }
 
-/* One work item per flow at a time, as NF_FLOW_HW_PENDING allows. */
+/* One work item per flow at a time, as NF_FLOW_PENDING allows. */
 static bool pending, refuse;
 static unsigned queued;
 static struct flow_offload_work work;

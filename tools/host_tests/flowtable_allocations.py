@@ -19,7 +19,8 @@ def test_native_admission_allocation_recovery(tmp_path):
     work_alloc = function(source[source.index("static struct flow_offload_work *nf_flow_offload_work_alloc"):],
                           "nf_flow_offload_work_alloc")
     # The flow's flags as the kernel numbers them, and the one queued work
-    # holds (NF_FLOW_HW_PENDING before 6.18 renamed it NF_FLOW_PENDING).
+    # holds (NF_FLOW_PENDING since upstream 7c549fb7eecd renamed
+    # NF_FLOW_HW_PENDING, which the 6.12 series carries).
     header = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
     pending = re.search(r"if \(test_and_set_bit\((NF_FLOW_\w+), &flow->flags\)\)", work_alloc)
     assert pending, "the flag work_alloc claims"

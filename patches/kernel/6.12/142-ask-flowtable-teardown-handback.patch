@@ -1,4 +1,4 @@
-From b61e0724bb009978cc68960f3ed93cc888ea042f Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 19 Oct 2026 11:13:16 +0200
 Subject: [PATCH] netfilter: hand the conntrack back once per flow, with the
@@ -54,10 +54,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  1 file changed, 36 insertions(+), 11 deletions(-)
 
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index 2cf93b982f2f..c08cde1ef5bd 100644
+index 4411ac94dab20..434bcaf5dba25 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -311,10 +311,17 @@ static void flow_offload_fixup_tcp(struct ip_ct_tcp *tcp)
+@@ -341,10 +341,17 @@ static void flow_offload_fixup_tcp(struct ip_ct_tcp *tcp)
  	tcp->seen[1].td_maxwin = 0;
  }
  
@@ -76,7 +76,7 @@ index 2cf93b982f2f..c08cde1ef5bd 100644
  	s32 timeout;
  
  	if (l4num == IPPROTO_TCP) {
-@@ -323,7 +330,7 @@ static void flow_offload_fixup_ct(struct nf_conn *ct)
+@@ -353,7 +360,7 @@ static void flow_offload_fixup_ct(struct nf_conn *ct)
  		flow_offload_fixup_tcp(&ct->proto.tcp);
  
  		timeout = tn->timeouts[ct->proto.tcp.state];
@@ -85,7 +85,7 @@ index 2cf93b982f2f..c08cde1ef5bd 100644
  	} else if (l4num == IPPROTO_UDP) {
  		struct nf_udp_net *tn = nf_udp_pernet(net);
  		enum udp_conntrack state =
-@@ -331,11 +338,25 @@ static void flow_offload_fixup_ct(struct nf_conn *ct)
+@@ -361,11 +368,25 @@ static void flow_offload_fixup_ct(struct nf_conn *ct)
  			UDP_CT_REPLIED : UDP_CT_UNREPLIED;
  
  		timeout = tn->timeouts[state];
@@ -112,7 +112,7 @@ index 2cf93b982f2f..c08cde1ef5bd 100644
  	if (timeout < 0)
  		timeout = 0;
  
-@@ -486,11 +507,6 @@ void flow_offload_refresh(struct nf_flowtable *flow_table,
+@@ -516,11 +537,6 @@ void flow_offload_refresh(struct nf_flowtable *flow_table,
  }
  EXPORT_SYMBOL_GPL(flow_offload_refresh);
  
@@ -124,13 +124,13 @@ index 2cf93b982f2f..c08cde1ef5bd 100644
  static void flow_offload_del(struct nf_flowtable *flow_table,
  			     struct flow_offload *flow)
  {
-@@ -505,9 +521,18 @@ static void flow_offload_del(struct nf_flowtable *flow_table,
+@@ -535,9 +551,18 @@ static void flow_offload_del(struct nf_flowtable *flow_table,
  
  void flow_offload_teardown(struct flow_offload *flow)
  {
 -	clear_bit(IPS_OFFLOAD_BIT, &flow->ct->status);
--	set_bit(NF_FLOW_TEARDOWN, &flow->flags);
--	flow_offload_fixup_ct(flow->ct);
+-	if (!test_and_set_bit(NF_FLOW_TEARDOWN, &flow->flags))
+-		flow_offload_fixup_ct(flow->ct);
 +	/* Hand the conntrack back only on the first teardown of this flow. A
 +	 * cleanup sweep over its device calls this again while the flow waits
 +	 * for its hardware retirement, and a tuple reopened in the meantime has
