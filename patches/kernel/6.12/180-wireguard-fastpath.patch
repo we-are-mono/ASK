@@ -1,4 +1,4 @@
-From 07dc4cc57fab0cf5f508fe0d414077dc43f81127 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 9 Nov 2026 12:00:00 +0100
 Subject: [PATCH] wireguard, netfilter: fast path for offloaded tunnels
@@ -47,23 +47,24 @@ Offload entry points (include/net/wg_fastpath.h):
  drivers/net/wireguard/main.c          |   1 +
  drivers/net/wireguard/netlink.c       |   6 +-
  drivers/net/wireguard/peer.c          |  18 +-
- drivers/net/wireguard/peer.h          |  31 +-
+ drivers/net/wireguard/peer.h          |  34 +-
  drivers/net/wireguard/peerlookup.c    |  20 +
  drivers/net/wireguard/peerlookup.h    |   4 +
  drivers/net/wireguard/queueing.h      |  40 +-
  drivers/net/wireguard/receive.c       |  52 ++-
  drivers/net/wireguard/send.c          |  52 ++-
+ drivers/net/wireguard/socket.c        |   4 +-
  include/crypto/poly1305.h             |   3 +
  include/net/netfilter/nf_flow_table.h |  17 +
  include/net/wg_fastpath.h             |  58 +++
  net/netfilter/nf_flow_table_inet.c    |  18 +
  net/netfilter/nf_flow_table_ip.c      |  92 ++++
- 21 files changed, 1041 insertions(+), 24 deletions(-)
+ 22 files changed, 1046 insertions(+), 26 deletions(-)
  create mode 100644 drivers/net/wireguard/fastpath.c
  create mode 100644 include/net/wg_fastpath.h
 
 diff --git a/arch/arm64/crypto/chacha-neon-glue.c b/arch/arm64/crypto/chacha-neon-glue.c
-index af2bbca38e70..ef8b511cfd44 100644
+index af2bbca38e70f..ef8b511cfd440 100644
 --- a/arch/arm64/crypto/chacha-neon-glue.c
 +++ b/arch/arm64/crypto/chacha-neon-glue.c
 @@ -37,6 +37,9 @@ asmlinkage void chacha_4block_xor_neon(u32 *state, u8 *dst, const u8 *src,
@@ -77,7 +78,7 @@ index af2bbca38e70..ef8b511cfd44 100644
  
  static void chacha_doneon(u32 *state, u8 *dst, const u8 *src,
 diff --git a/arch/arm64/crypto/poly1305-glue.c b/arch/arm64/crypto/poly1305-glue.c
-index 18883ea438f3..183e9d52af18 100644
+index 18883ea438f3c..183e9d52af186 100644
 --- a/arch/arm64/crypto/poly1305-glue.c
 +++ b/arch/arm64/crypto/poly1305-glue.c
 @@ -36,6 +36,20 @@ void poly1305_init_arch(struct poly1305_desc_ctx *dctx, const u8 key[POLY1305_KE
@@ -102,7 +103,7 @@ index 18883ea438f3..183e9d52af18 100644
  {
  	struct poly1305_desc_ctx *dctx = shash_desc_ctx(desc);
 diff --git a/drivers/net/wireguard/Makefile b/drivers/net/wireguard/Makefile
-index dbe1f8514efc..83042ce3033d 100644
+index dbe1f8514efc3..83042ce3033d2 100644
 --- a/drivers/net/wireguard/Makefile
 +++ b/drivers/net/wireguard/Makefile
 @@ -14,4 +14,5 @@ wireguard-y += allowedips.o
@@ -112,7 +113,7 @@ index dbe1f8514efc..83042ce3033d 100644
 +wireguard-y += fastpath.o
  obj-$(CONFIG_WIREGUARD) := wireguard.o
 diff --git a/drivers/net/wireguard/allowedips.c b/drivers/net/wireguard/allowedips.c
-index 4b8528206cc8..b19f4c1caa28 100644
+index 4b8528206cc8a..b19f4c1caa286 100644
 --- a/drivers/net/wireguard/allowedips.c
 +++ b/drivers/net/wireguard/allowedips.c
 @@ -146,6 +146,23 @@ static struct wg_peer *lookup(struct allowedips_node __rcu *root, u8 bits,
@@ -165,7 +166,7 @@ index 4b8528206cc8..b19f4c1caa28 100644
  struct wg_peer *wg_allowedips_lookup_src(struct allowedips *table,
  					 struct sk_buff *skb)
 diff --git a/drivers/net/wireguard/allowedips.h b/drivers/net/wireguard/allowedips.h
-index 2346c797eb4d..768bc03e33e0 100644
+index 2346c797eb4d8..768bc03e33e07 100644
 --- a/drivers/net/wireguard/allowedips.h
 +++ b/drivers/net/wireguard/allowedips.h
 @@ -48,6 +48,11 @@ struct wg_peer *wg_allowedips_lookup_dst(struct allowedips *table,
@@ -181,7 +182,7 @@ index 2346c797eb4d..768bc03e33e0 100644
  #ifdef DEBUG
  bool wg_allowedips_selftest(void);
 diff --git a/drivers/net/wireguard/device.c b/drivers/net/wireguard/device.c
-index 45e9b908dbfb..377b59dfd4b7 100644
+index 45e9b908dbfb0..377b59dfd4b7c 100644
 --- a/drivers/net/wireguard/device.c
 +++ b/drivers/net/wireguard/device.c
 @@ -233,6 +233,14 @@ static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -201,7 +202,7 @@ index 45e9b908dbfb..377b59dfd4b7 100644
  	.ndo_stop		= wg_stop,
 diff --git a/drivers/net/wireguard/fastpath.c b/drivers/net/wireguard/fastpath.c
 new file mode 100644
-index 000000000000..870a5f29d2c3
+index 0000000000000..a287e1c56706c
 --- /dev/null
 +++ b/drivers/net/wireguard/fastpath.c
 @@ -0,0 +1,587 @@
@@ -660,7 +661,7 @@ index 000000000000..870a5f29d2c3
 +	 * (iptunnel_xmit(), whose inner headers wg_reset_packet() put at the
 +	 * message). A frame the caller then fails to transmit is counted here
 +	 * all the same. */
-+	atomic64_add(message_data_len(plain), &peer->fp_tx_bytes);
++	atomic64_add(message_data_len(plain), &peer->tx_bytes);
 +	dev_sw_netstats_tx_add(wg_dev, 1, message_data_len(plain));
 +	ret = 0;
 +out:
@@ -793,7 +794,7 @@ index 000000000000..870a5f29d2c3
 +}
 +EXPORT_SYMBOL_GPL(wg_fastpath_open);
 diff --git a/drivers/net/wireguard/main.c b/drivers/net/wireguard/main.c
-index a00671b58701..01e1a850711c 100644
+index a00671b58701f..01e1a850711c5 100644
 --- a/drivers/net/wireguard/main.c
 +++ b/drivers/net/wireguard/main.c
 @@ -32,6 +32,7 @@ static int __init wg_mod_init(void)
@@ -805,7 +806,7 @@ index a00671b58701..01e1a850711c 100644
  	ret = wg_peer_init();
  	if (ret < 0)
 diff --git a/drivers/net/wireguard/netlink.c b/drivers/net/wireguard/netlink.c
-index f7055180ba4a..6bc27985046a 100644
+index f7055180ba4aa..87f177c4dfc26 100644
 --- a/drivers/net/wireguard/netlink.c
 +++ b/drivers/net/wireguard/netlink.c
 @@ -138,9 +138,11 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
@@ -813,8 +814,8 @@ index f7055180ba4a..6bc27985046a 100644
  		    nla_put_u16(skb, WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL,
  				peer->persistent_keepalive_interval) ||
 -		    nla_put_u64_64bit(skb, WGPEER_A_TX_BYTES, peer->tx_bytes,
-+		    nla_put_u64_64bit(skb, WGPEER_A_TX_BYTES, peer->tx_bytes +
-+				      atomic64_read(&peer->fp_tx_bytes),
++		    nla_put_u64_64bit(skb, WGPEER_A_TX_BYTES,
++				      atomic64_read(&peer->tx_bytes),
  				      WGPEER_A_UNSPEC) ||
 -		    nla_put_u64_64bit(skb, WGPEER_A_RX_BYTES, peer->rx_bytes,
 +		    nla_put_u64_64bit(skb, WGPEER_A_RX_BYTES, peer->rx_bytes +
@@ -823,7 +824,7 @@ index f7055180ba4a..6bc27985046a 100644
  		    nla_put_u32(skb, WGPEER_A_PROTOCOL_VERSION, 1))
  			goto err;
 diff --git a/drivers/net/wireguard/peer.c b/drivers/net/wireguard/peer.c
-index 1cb502a932e0..af5dbecd0794 100644
+index 1cb502a932e07..af5dbecd07948 100644
 --- a/drivers/net/wireguard/peer.c
 +++ b/drivers/net/wireguard/peer.c
 @@ -24,6 +24,7 @@ struct wg_peer *wg_peer_create(struct wg_device *wg,
@@ -869,7 +870,7 @@ index 1cb502a932e0..af5dbecd0794 100644
  	/* The final zeroing takes care of clearing any remaining handshake key
  	 * material and other potentially sensitive information.
 diff --git a/drivers/net/wireguard/peer.h b/drivers/net/wireguard/peer.h
-index 76e4d3128ad4..09e68ee080f7 100644
+index 76e4d3128ad4e..9bb7db29a93aa 100644
 --- a/drivers/net/wireguard/peer.h
 +++ b/drivers/net/wireguard/peer.h
 @@ -34,9 +34,23 @@ struct endpoint {
@@ -897,7 +898,7 @@ index 76e4d3128ad4..09e68ee080f7 100644
  	struct sk_buff_head staged_packet_queue;
  	int serial_work_cpu;
  	bool is_dead;
-@@ -46,7 +60,7 @@ struct wg_peer {
+@@ -46,10 +60,10 @@ struct wg_peer {
  	rwlock_t endpoint_lock;
  	struct noise_handshake handshake;
  	atomic64_t last_sent_handshake;
@@ -905,8 +906,12 @@ index 76e4d3128ad4..09e68ee080f7 100644
 +	struct work_struct transmit_handshake_work, clear_peer_work;
  	struct cookie latest_cookie;
  	struct hlist_node pubkey_hash;
- 	u64 rx_bytes, tx_bytes;
-@@ -64,6 +78,18 @@ struct wg_peer {
+-	u64 rx_bytes, tx_bytes;
++	u64 rx_bytes;
+ 	struct timer_list timer_retransmit_handshake, timer_send_keepalive;
+ 	struct timer_list timer_new_handshake, timer_zero_key_material;
+ 	struct timer_list timer_persistent_keepalive;
+@@ -64,6 +78,19 @@ struct wg_peer {
  	struct list_head allowedips_list;
  	struct napi_struct napi;
  	u64 internal_id;
@@ -917,15 +922,16 @@ index 76e4d3128ad4..09e68ee080f7 100644
 +	int fp_rx_cpu;
 +	/* wg_fastpath_open()'s receive-timer pacing. */
 +	unsigned long fp_rx_timers;
-+	/* The bytes the fast path seals and opens, on whichever CPUs at once:
-+	 * added to rx_bytes and tx_bytes where they are reported. Each on its
-+	 * own line, apart from the fields every sealed or opened packet reads. */
++	/* The bytes the fast path opens, on whichever CPUs at once: added to
++	 * rx_bytes where it is reported. The bytes sent, by every transmit lane
++	 * and by the fast path's seal at once, all in tx_bytes. Each on its own
++	 * line, apart from the fields every sealed or opened packet reads. */
 +	atomic64_t fp_rx_bytes ____cacheline_aligned_in_smp;
-+	atomic64_t fp_tx_bytes ____cacheline_aligned_in_smp;
++	atomic64_t tx_bytes ____cacheline_aligned_in_smp;
  };
  
  struct wg_peer *wg_peer_create(struct wg_device *wg,
-@@ -78,6 +104,7 @@ static inline struct wg_peer *wg_peer_get(struct wg_peer *peer)
+@@ -78,6 +105,7 @@ static inline struct wg_peer *wg_peer_get(struct wg_peer *peer)
  }
  void wg_peer_put(struct wg_peer *peer);
  void wg_peer_remove(struct wg_peer *peer);
@@ -934,7 +940,7 @@ index 76e4d3128ad4..09e68ee080f7 100644
  
  int wg_peer_init(void);
 diff --git a/drivers/net/wireguard/peerlookup.c b/drivers/net/wireguard/peerlookup.c
-index f2783aa7a88f..194e213081eb 100644
+index f2783aa7a88f1..194e213081ebf 100644
 --- a/drivers/net/wireguard/peerlookup.c
 +++ b/drivers/net/wireguard/peerlookup.c
 @@ -224,3 +224,23 @@ wg_index_hashtable_lookup(struct index_hashtable *table,
@@ -962,7 +968,7 @@ index f2783aa7a88f..194e213081eb 100644
 +	return NULL;
 +}
 diff --git a/drivers/net/wireguard/peerlookup.h b/drivers/net/wireguard/peerlookup.h
-index ced811797680..17b5fc2feeaf 100644
+index ced8117976800..17b5fc2feeaf4 100644
 --- a/drivers/net/wireguard/peerlookup.h
 +++ b/drivers/net/wireguard/peerlookup.h
 @@ -60,5 +60,9 @@ struct index_hashtable_entry *
@@ -976,7 +982,7 @@ index ced811797680..17b5fc2feeaf 100644
  
  #endif /* _WG_PEERLOOKUP_H */
 diff --git a/drivers/net/wireguard/queueing.h b/drivers/net/wireguard/queueing.h
-index 7eb76724b3ed..fce8893725be 100644
+index 7eb76724b3edb..fce8893725be8 100644
 --- a/drivers/net/wireguard/queueing.h
 +++ b/drivers/net/wireguard/queueing.h
 @@ -32,6 +32,10 @@ void wg_packet_receive(struct wg_device *wg, struct sk_buff *skb);
@@ -1069,7 +1075,7 @@ index 7eb76724b3ed..fce8893725be 100644
  }
  
 diff --git a/drivers/net/wireguard/receive.c b/drivers/net/wireguard/receive.c
-index eb8851113654..403e7a209874 100644
+index eb8851113654f..403e7a2098749 100644
 --- a/drivers/net/wireguard/receive.c
 +++ b/drivers/net/wireguard/receive.c
 @@ -15,6 +15,7 @@
@@ -1152,7 +1158,7 @@ index eb8851113654..403e7a209874 100644
 +	keep_key_fresh(peer);
 +}
 diff --git a/drivers/net/wireguard/send.c b/drivers/net/wireguard/send.c
-index 67d01478eb76..3f2f98942824 100644
+index 67d01478eb76d..3f2f989428242 100644
 --- a/drivers/net/wireguard/send.c
 +++ b/drivers/net/wireguard/send.c
 @@ -261,15 +261,16 @@ static void wg_packet_create_data_done(struct wg_peer *peer, struct sk_buff *fir
@@ -1234,8 +1240,24 @@ index 67d01478eb76..3f2f98942824 100644
  	return;
  
  out_invalid:
+diff --git a/drivers/net/wireguard/socket.c b/drivers/net/wireguard/socket.c
+index 0414d7a6ce741..ef049a6f1ca14 100644
+--- a/drivers/net/wireguard/socket.c
++++ b/drivers/net/wireguard/socket.c
+@@ -179,8 +179,10 @@ int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
+ 			    &peer->endpoint_cache);
+ 	else
+ 		dev_kfree_skb(skb);
++	/* Several transmit lanes send for one peer at once, under the shared
++	 * side of endpoint_lock: the count must be atomic. */
+ 	if (likely(!ret))
+-		peer->tx_bytes += skb_len;
++		atomic64_add(skb_len, &peer->tx_bytes);
+ 	read_unlock_bh(&peer->endpoint_lock);
+ 
+ 	return ret;
 diff --git a/include/crypto/poly1305.h b/include/crypto/poly1305.h
-index 090692ec3bc7..628b1e04d014 100644
+index 090692ec3bc73..628b1e04d0143 100644
 --- a/include/crypto/poly1305.h
 +++ b/include/crypto/poly1305.h
 @@ -86,6 +86,9 @@ static inline void poly1305_update(struct poly1305_desc_ctx *desc,
@@ -1249,7 +1271,7 @@ index 090692ec3bc7..628b1e04d014 100644
  
  static inline void poly1305_final(struct poly1305_desc_ctx *desc, u8 *digest)
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index 2f90ebb0a6cd..10ba097dbcf0 100644
+index fcd87d204ab9b..4a1ef779c2e3c 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
 @@ -467,6 +467,23 @@ unsigned int nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
@@ -1278,7 +1300,7 @@ index 2f90ebb0a6cd..10ba097dbcf0 100644
  extern int nf_flow_register_bpf(void);
 diff --git a/include/net/wg_fastpath.h b/include/net/wg_fastpath.h
 new file mode 100644
-index 000000000000..66574110a61b
+index 0000000000000..66574110a61b9
 --- /dev/null
 +++ b/include/net/wg_fastpath.h
 @@ -0,0 +1,58 @@
@@ -1341,7 +1363,7 @@ index 000000000000..66574110a61b
 +
 +#endif /* _NET_WG_FASTPATH_H */
 diff --git a/net/netfilter/nf_flow_table_inet.c b/net/netfilter/nf_flow_table_inet.c
-index 4bdcc4f33339..e13311369e27 100644
+index 4bdcc4f333391..e13311369e276 100644
 --- a/net/netfilter/nf_flow_table_inet.c
 +++ b/net/netfilter/nf_flow_table_inet.c
 @@ -98,6 +98,24 @@ static struct nf_flowtable_type flowtable_ipv6 = {
@@ -1370,7 +1392,7 @@ index 4bdcc4f33339..e13311369e27 100644
  {
  	nft_register_flowtable_type(&flowtable_ipv4);
 diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
-index 47b521670e6c..7efb7bb7f919 100644
+index 47b521670e6c1..7efb7bb7f9190 100644
 --- a/net/netfilter/nf_flow_table_ip.c
 +++ b/net/netfilter/nf_flow_table_ip.c
 @@ -14,6 +14,7 @@

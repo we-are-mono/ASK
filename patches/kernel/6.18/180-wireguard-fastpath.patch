@@ -45,12 +45,13 @@ Offload entry points (include/net/wg_fastpath.h):
  drivers/net/wireguard/main.c          |   1 +
  drivers/net/wireguard/netlink.c       |   6 +-
  drivers/net/wireguard/peer.c          |  18 +-
- drivers/net/wireguard/peer.h          |  31 +-
+ drivers/net/wireguard/peer.h          |  34 +-
  drivers/net/wireguard/peerlookup.c    |  20 +
  drivers/net/wireguard/peerlookup.h    |   4 +
  drivers/net/wireguard/queueing.h      |  40 +-
  drivers/net/wireguard/receive.c       |  52 ++-
  drivers/net/wireguard/send.c          |  52 ++-
+ drivers/net/wireguard/socket.c        |   4 +-
  include/crypto/poly1305.h             |   7 +
  include/net/netfilter/nf_flow_table.h |  17 +
  include/net/wg_fastpath.h             |  58 +++
@@ -58,7 +59,7 @@ Offload entry points (include/net/wg_fastpath.h):
  lib/crypto/arm64/poly1305.h           |  15 +
  net/netfilter/nf_flow_table_inet.c    |  18 +
  net/netfilter/nf_flow_table_ip.c      |  92 ++++
- 21 files changed, 1073 insertions(+), 21 deletions(-)
+ 22 files changed, 1078 insertions(+), 23 deletions(-)
  create mode 100644 drivers/net/wireguard/fastpath.c
  create mode 100644 include/net/wg_fastpath.h
 
@@ -162,7 +163,7 @@ index 67b07ee2d6600..b84ca47783ebe 100644
  	.ndo_stop		= wg_stop,
 diff --git a/drivers/net/wireguard/fastpath.c b/drivers/net/wireguard/fastpath.c
 new file mode 100644
-index 0000000000000..cb79cc9308413
+index 0000000000000..64e3ba237c140
 --- /dev/null
 +++ b/drivers/net/wireguard/fastpath.c
 @@ -0,0 +1,611 @@
@@ -645,7 +646,7 @@ index 0000000000000..cb79cc9308413
 +	 * (iptunnel_xmit(), whose inner headers wg_reset_packet() put at the
 +	 * message). A frame the caller then fails to transmit is counted here
 +	 * all the same. */
-+	atomic64_add(message_data_len(plain), &peer->fp_tx_bytes);
++	atomic64_add(message_data_len(plain), &peer->tx_bytes);
 +	dev_sw_netstats_tx_add(wg_dev, 1, message_data_len(plain));
 +	ret = 0;
 +out:
@@ -790,7 +791,7 @@ index a00671b58701f..01e1a850711c5 100644
  	ret = wg_peer_init();
  	if (ret < 0)
 diff --git a/drivers/net/wireguard/netlink.c b/drivers/net/wireguard/netlink.c
-index 67f962eb8b46d..d87da9813761e 100644
+index 67f962eb8b46d..e9b6b2c59598c 100644
 --- a/drivers/net/wireguard/netlink.c
 +++ b/drivers/net/wireguard/netlink.c
 @@ -139,9 +139,11 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
@@ -798,8 +799,8 @@ index 67f962eb8b46d..d87da9813761e 100644
  		    nla_put_u16(skb, WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL,
  				peer->persistent_keepalive_interval) ||
 -		    nla_put_u64_64bit(skb, WGPEER_A_TX_BYTES, peer->tx_bytes,
-+		    nla_put_u64_64bit(skb, WGPEER_A_TX_BYTES, peer->tx_bytes +
-+				      atomic64_read(&peer->fp_tx_bytes),
++		    nla_put_u64_64bit(skb, WGPEER_A_TX_BYTES,
++				      atomic64_read(&peer->tx_bytes),
  				      WGPEER_A_UNSPEC) ||
 -		    nla_put_u64_64bit(skb, WGPEER_A_RX_BYTES, peer->rx_bytes,
 +		    nla_put_u64_64bit(skb, WGPEER_A_RX_BYTES, peer->rx_bytes +
@@ -854,7 +855,7 @@ index 1cb502a932e07..af5dbecd07948 100644
  	/* The final zeroing takes care of clearing any remaining handshake key
  	 * material and other potentially sensitive information.
 diff --git a/drivers/net/wireguard/peer.h b/drivers/net/wireguard/peer.h
-index 718fb42bdac7e..2e3c1c50d5265 100644
+index 718fb42bdac7e..9180664ad8c11 100644
 --- a/drivers/net/wireguard/peer.h
 +++ b/drivers/net/wireguard/peer.h
 @@ -34,9 +34,23 @@ struct endpoint {
@@ -882,7 +883,7 @@ index 718fb42bdac7e..2e3c1c50d5265 100644
  	struct sk_buff_head staged_packet_queue;
  	int serial_work_cpu;
  	bool is_dead;
-@@ -46,7 +60,7 @@ struct wg_peer {
+@@ -46,10 +60,10 @@ struct wg_peer {
  	rwlock_t endpoint_lock;
  	struct noise_handshake handshake;
  	atomic64_t last_sent_handshake;
@@ -890,8 +891,12 @@ index 718fb42bdac7e..2e3c1c50d5265 100644
 +	struct work_struct transmit_handshake_work, clear_peer_work;
  	struct cookie latest_cookie;
  	struct hlist_node pubkey_hash;
- 	u64 rx_bytes, tx_bytes;
-@@ -64,6 +78,18 @@ struct wg_peer {
+-	u64 rx_bytes, tx_bytes;
++	u64 rx_bytes;
+ 	struct timer_list timer_retransmit_handshake, timer_send_keepalive;
+ 	struct timer_list timer_new_handshake, timer_zero_key_material;
+ 	struct timer_list timer_persistent_keepalive;
+@@ -64,6 +78,19 @@ struct wg_peer {
  	struct list_head allowedips_list;
  	struct napi_struct napi;
  	u64 internal_id;
@@ -902,15 +907,16 @@ index 718fb42bdac7e..2e3c1c50d5265 100644
 +	int fp_rx_cpu;
 +	/* wg_fastpath_open()'s receive-timer pacing. */
 +	unsigned long fp_rx_timers;
-+	/* The bytes the fast path seals and opens, on whichever CPUs at once:
-+	 * added to rx_bytes and tx_bytes where they are reported. Each on its
-+	 * own line, apart from the fields every sealed or opened packet reads. */
++	/* The bytes the fast path opens, on whichever CPUs at once: added to
++	 * rx_bytes where it is reported. The bytes sent, by every transmit lane
++	 * and by the fast path's seal at once, all in tx_bytes. Each on its own
++	 * line, apart from the fields every sealed or opened packet reads. */
 +	atomic64_t fp_rx_bytes ____cacheline_aligned_in_smp;
-+	atomic64_t fp_tx_bytes ____cacheline_aligned_in_smp;
++	atomic64_t tx_bytes ____cacheline_aligned_in_smp;
  };
  
  struct wg_peer *wg_peer_create(struct wg_device *wg,
-@@ -78,6 +104,7 @@ static inline struct wg_peer *wg_peer_get(struct wg_peer *peer)
+@@ -78,6 +105,7 @@ static inline struct wg_peer *wg_peer_get(struct wg_peer *peer)
  }
  void wg_peer_put(struct wg_peer *peer);
  void wg_peer_remove(struct wg_peer *peer);
@@ -1218,6 +1224,22 @@ index 67d01478eb76d..3f2f989428242 100644
  	return;
  
  out_invalid:
+diff --git a/drivers/net/wireguard/socket.c b/drivers/net/wireguard/socket.c
+index 253488f8c00f8..b136014dc0125 100644
+--- a/drivers/net/wireguard/socket.c
++++ b/drivers/net/wireguard/socket.c
+@@ -179,8 +179,10 @@ int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
+ 			    &peer->endpoint_cache);
+ 	else
+ 		dev_kfree_skb(skb);
++	/* Several transmit lanes send for one peer at once, under the shared
++	 * side of endpoint_lock: the count must be atomic. */
+ 	if (likely(!ret))
+-		peer->tx_bytes += skb_len;
++		atomic64_add(skb_len, &peer->tx_bytes);
+ 	read_unlock_bh(&peer->endpoint_lock);
+ 
+ 	return ret;
 diff --git a/include/crypto/poly1305.h b/include/crypto/poly1305.h
 index d4daeec8da19d..823b6adef07bf 100644
 --- a/include/crypto/poly1305.h

@@ -208,11 +208,8 @@ result independently of those temporary files.
   review). Fix direction: scale `CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT`, then re-measure the 16,384-connection admission
   on the LAN and WAN ports before settling `ingress_quarters`.
 
-- [ ] **A437 — with more than one WireGuard transmit lane, the peer's sent bytes lose updates.** Where:
-  `wg_socket_send_skb_to_peer()` adds to `peer->tx_bytes` under a shared read lock, and patch 180's
-  `wireguard.tx_lanes` runs several lane workers for one peer at once. Why it matters: `wg show` under-reports sent
-  bytes with `tx_lanes` above its default of 1 (the fast path's own counts are atomic, A436). From review, not
-  measured. Fix direction: count the ordinary send into the same atomic the seal uses.
+- [x] **A437 — with several WireGuard transmit lanes, the peer's sent bytes lost updates.** Every send and the seal
+  now add to one atomic `tx_bytes` (_:/^wireguard: count a peer's sent bytes atomically_).
 
 - [x] **A436 — offloaded WireGuard frames were miscounted.** The seal added the outer headers to the peer's sent
   bytes and never counted the device's TX, and the seal and open summed peer bytes from several CPUs without
