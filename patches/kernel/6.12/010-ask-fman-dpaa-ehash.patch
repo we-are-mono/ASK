@@ -206,7 +206,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  drivers/staging/fsl_qbman/qman_debugfs.c      |    9 +-
  drivers/staging/fsl_qbman/qman_high.c         |  195 +-
  drivers/staging/fsl_qbman/qman_low.h          |  119 +-
- include/linux/fsl_oh_port.h                   |   26 +
+ include/linux/fsl_oh_port.h                   |   28 +
  include/linux/fsl_qman.h                      |   35 +
  include/linux/netdevice.h                     |   12 +
  include/linux/skbuff.h                        |    7 +
@@ -217,7 +217,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    3 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   30 +-
- 85 files changed, 8817 insertions(+), 12497 deletions(-)
+ 85 files changed, 8819 insertions(+), 12497 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -25104,10 +25104,10 @@ index 0e6fdf8d30c1d..32ae9f9b55458 100644
  			       fqid, ERR_PTR(err));
 diff --git a/include/linux/fsl_oh_port.h b/include/linux/fsl_oh_port.h
 new file mode 100644
-index 0000000000000..03eb762aa0a4e
+index 0000000000000..1126851f08f32
 --- /dev/null
 +++ b/include/linux/fsl_oh_port.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,28 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -25121,6 +25121,8 @@ index 0000000000000..03eb762aa0a4e
 +
 +#ifndef _FSL_OH_PORT_H_
 +#define _FSL_OH_PORT_H_
++
++#include <linux/types.h>
 +
 +#define MAX_FMANS               1
 +#define MAX_OFFLINE_PORTS       4
