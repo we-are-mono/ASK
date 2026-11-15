@@ -116,7 +116,7 @@ print(json.dumps({{'unbound': completion, 'rebound': device['name']}}))
         finally:
             r.record("unregister-transition", await traffic)
     assert unloaded
-    await r.clear_ct()
+    await r.clear_ct(adapter=False)
     await r.exchange(256, promiscuous=False)
     r.record("unregister-software", {"echoes": 256, "provider_absent": True,
                                      "boot_id": await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")})

@@ -997,7 +997,7 @@ async def test_cdx_unload(rig):
     assert absent["rc"] == 1, absent
     assert (await console_command(con, "test", "-e", "/proc/ask_flowtable", check=False))["rc"] == 1
     await console_command(con, "nft", "delete", "table", "inet", TABLE, check=False)
-    await r.clear_ct()
+    await r.clear_ct(adapter=False)
     await r.exchange(64)
     r.record("unload-complete", {"module_absent": True, "post_unload_echoes": 64,
                                  "boot_id": await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")})

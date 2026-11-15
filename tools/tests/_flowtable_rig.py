@@ -250,13 +250,15 @@ class Rig:
                 if {endpoint(f.get("src")), endpoint(f.get("dst"))} == ends
                 or {endpoint(f.get("new_src")), endpoint(f.get("new_dst"))} == ends}
 
-    async def clear_ct(self):
+    async def clear_ct(self, adapter=True):
         """Delete the rig's connection, and wait until the adapter has retired
         the entries it held for it. The flowtable takes a flow out on its next
         garbage-collection pass, not with the connection, and until then the
         hardware forwards the same tuple through the old entries: traffic sent
-        at once would pass for a new flow's while Linux makes none."""
-        held = self.held_entries(await self.state())
+        at once would pass for a new flow's while Linux makes none. A case that
+        has unloaded the adapter says so (adapter=False): nothing holds entries
+        then, and there is no state to read."""
+        held = self.held_entries(await self.state()) if adapter else set()
         await command(self.target, self.session, "conntrack", "-D", "-p", self.proto,
                       "--orig-src", self.lan_ip, "--orig-dst", WAN_IP,
                       "--sport", str(SPORT), "--dport", str(DPORT), check=False)
