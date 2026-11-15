@@ -58,8 +58,8 @@ Offload entry points (include/net/wg_fastpath.h):
  lib/crypto/arm64/chacha.h             |   3 +
  lib/crypto/arm64/poly1305.h           |  15 +
  net/netfilter/nf_flow_table_inet.c    |  18 +
- net/netfilter/nf_flow_table_ip.c      |  92 ++++
- 22 files changed, 1078 insertions(+), 23 deletions(-)
+ net/netfilter/nf_flow_table_ip.c      |  99 +++++
+ 22 files changed, 1085 insertions(+), 23 deletions(-)
  create mode 100644 drivers/net/wireguard/fastpath.c
  create mode 100644 include/net/wg_fastpath.h
 
@@ -1420,7 +1420,7 @@ index 4bdcc4f333391..e13311369e276 100644
  {
  	nft_register_flowtable_type(&flowtable_ipv4);
 diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
-index e515522baebee..b2d0477333e31 100644
+index e515522baebee..8e4ed19febb39 100644
 --- a/net/netfilter/nf_flow_table_ip.c
 +++ b/net/netfilter/nf_flow_table_ip.c
 @@ -14,6 +14,7 @@
@@ -1431,7 +1431,7 @@ index e515522baebee..b2d0477333e31 100644
  #include <net/xfrm.h>
  #include <net/netfilter/nf_flow_table.h>
  #include <net/netfilter/nf_conntrack.h>
-@@ -580,6 +581,97 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
+@@ -580,6 +581,104 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
  }
  EXPORT_SYMBOL_GPL(nf_flow_offload_ip_hook);
  
@@ -1512,6 +1512,13 @@ index e515522baebee..b2d0477333e31 100644
 +	neigh = __ipv4_neigh_lookup_noref(rt->dst.dev, (__force u32)nexthop);
 +	if (!neigh || !(READ_ONCE(neigh->nud_state) & NUD_VALID))
 +		return -EHOSTUNREACH;
++	/* A stale entry is still sent to, as the stack's own output sends to
++	 * it, but only the neighbour layer moves it on to be confirmed again
++	 * (DELAY, then PROBE): a next hop only this path sends to would stay
++	 * stale for good, and a peer that changed its address unannounced
++	 * would be sent to at its old one until the flow retires. */
++	if (!(READ_ONCE(neigh->nud_state) & NUD_CONNECTED))
++		neigh_event_send(neigh, NULL);
 +	neigh_ha_snapshot(xmit->h_dest, neigh, rt->dst.dev);
 +	ether_addr_copy(xmit->h_source, rt->dst.dev->dev_addr);
 +	xmit->dev = rt->dst.dev;
