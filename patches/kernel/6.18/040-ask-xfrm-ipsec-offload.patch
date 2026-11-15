@@ -82,18 +82,18 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  drivers/crypto/caam/pdb.h                     |  12 +-
  .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 286 ++++++++++++++++--
  include/net/netns/xfrm.h                      |   3 +
- include/net/xfrm.h                            |  11 +
+ include/net/xfrm.h                            |  21 ++
  net/ipv4/Kconfig                              |   6 +
  net/ipv4/ip_output.c                          |  24 +-
  net/ipv6/Kconfig                              |   6 +
  net/ipv6/ip6_output.c                         |  21 +-
  net/ipv6/output_core.c                        |   8 +
- net/xfrm/xfrm_device.c                        |  24 ++
- net/xfrm/xfrm_input.c                         |  48 +++
+ net/xfrm/xfrm_device.c                        |  45 ++-
+ net/xfrm/xfrm_input.c                         |  41 +++
  net/xfrm/xfrm_output.c                        | 248 +++++++++++++++
  net/xfrm/xfrm_state.c                         | 202 +++++++++++++
  net/xfrm/xfrm_user.c                          |  27 ++
- 14 files changed, 887 insertions(+), 39 deletions(-)
+ 14 files changed, 907 insertions(+), 43 deletions(-)
 
 diff --git a/drivers/crypto/caam/pdb.h b/drivers/crypto/caam/pdb.h
 index 4b1bcf53f7ac8..1669e0d267e35 100644
@@ -572,7 +572,7 @@ index b73983a17e088..77d04c715e019 100644
  	struct hlist_head	 __percpu *state_cache_input;
  	unsigned int		state_hmask;
 diff --git a/include/net/xfrm.h b/include/net/xfrm.h
-index af0869c14a253..1e0e89bb68b0d 100644
+index af0869c14a253..004aeb2d48fa2 100644
 --- a/include/net/xfrm.h
 +++ b/include/net/xfrm.h
 @@ -196,6 +196,11 @@ struct xfrm_state {
@@ -587,7 +587,7 @@ index af0869c14a253..1e0e89bb68b0d 100644
  	struct hlist_node	byseq;
  	struct hlist_node	state_cache;
  	struct hlist_node	state_cache_input;
-@@ -337,6 +342,12 @@ enum {
+@@ -337,6 +342,22 @@ enum {
  	XFRM_STATE_EXPIRED,
  	XFRM_STATE_DEAD
  };
@@ -596,6 +596,16 @@ index af0869c14a253..1e0e89bb68b0d 100644
 + * out-of-tree cdx module, which gets the handle back from SEC with each
 + * decrypted frame. */
 +struct xfrm_state *xfrm_state_lookup_byhandle(struct net *net, u16 handle);
++
++/* Whether SEC handles @x and nothing else: a packet-offloaded state the DPAA
++ * offload module took, the one driver that gives a state a handle (from
++ * xdo_dev_state_add(), before the state is inserted). A state another driver
++ * offloads has no handle: it is received as upstream receives it, and the
++ * core's offload checks apply to it. */
++static inline bool xfrm_state_sec_only(const struct xfrm_state *x)
++{
++	return x->xso.type == XFRM_DEV_OFFLOAD_PACKET && x->handle;
++}
 +#endif
  
  /* callback structure passed from either netlink or pfkey */
@@ -742,7 +752,7 @@ index cba1684a3f30f..caffaee470981 100644
  		       net, sk, skb, NULL, skb_dst_dev(skb),
  		       dst_output);
 diff --git a/net/xfrm/xfrm_device.c b/net/xfrm/xfrm_device.c
-index 4719aba331cd6..4d96c8eebde01 100644
+index 4719aba331cd6..e7e7d6267f82e 100644
 --- a/net/xfrm/xfrm_device.c
 +++ b/net/xfrm/xfrm_device.c
 @@ -124,6 +124,30 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
@@ -776,11 +786,57 @@ index 4719aba331cd6..4d96c8eebde01 100644
  	if (!xo || (xo->flags & XFRM_XMIT))
  		return skb;
  
+@@ -423,13 +447,26 @@ bool xfrm_dev_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
+ 	struct xfrm_dst *xdst = (struct xfrm_dst *)dst;
+ 	struct net_device *dev = x->xso.dev;
+ 	bool check_tunnel_size;
++	bool sec = false;
++
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/* Two decisions upstream moved here from the drivers stay SEC's for a
++	 * state SEC handles. A bundle routed off the SA's port or nested in
++	 * another transform is refused by xfrm_output()'s bundle check, right
++	 * after this, and counted as such (ca70c104e151 refused it here first).
++	 * And IPv4 options and IPv6 extension headers are no reason to refuse
++	 * a frame (cc18f482e8b6): SEC is told each frame's own header
++	 * (dpa_ipsec_dpovrd()), and the driver drops what it cannot describe
++	 * rather than send it in the clear. */
++	sec = xfrm_state_sec_only(x);
++#endif
+ 
+ 	if (!x->type_offload ||
+ 	    (x->xso.type == XFRM_DEV_OFFLOAD_UNSPECIFIED && x->encap))
+ 		return false;
+ 
+-	if ((!dev || dev == xfrm_dst_path(dst)->dev) &&
+-	    !xdst->child->xfrm) {
++	if (sec || ((!dev || dev == xfrm_dst_path(dst)->dev) &&
++		    !xdst->child->xfrm)) {
+ 		mtu = xfrm_state_mtu(x, xdst->child_mtu_cached);
+ 		if (skb->len <= mtu)
+ 			goto ok;
+@@ -449,14 +486,14 @@ bool xfrm_dev_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
+ 	switch (skb_dst(skb)->ops->family) {
+ 	case AF_INET:
+ 		/* Check for IPv4 options */
+-		if (ip_hdr(skb)->ihl != 5)
++		if (!sec && ip_hdr(skb)->ihl != 5)
+ 			return false;
+ 		if (check_tunnel_size && xfrm4_tunnel_check_size(skb))
+ 			return false;
+ 		break;
+ 	case AF_INET6:
+ 		/* Check for IPv6 extensions */
+-		if (ipv6_ext_hdr(ipv6_hdr(skb)->nexthdr))
++		if (!sec && ipv6_ext_hdr(ipv6_hdr(skb)->nexthdr))
+ 			return false;
+ 		if (check_tunnel_size && xfrm6_tunnel_check_size(skb))
+ 			return false;
 diff --git a/net/xfrm/xfrm_input.c b/net/xfrm/xfrm_input.c
-index 58c153af6fcc6..ec51d48899dd4 100644
+index 58c153af6fcc6..0584b9a837cf6 100644
 --- a/net/xfrm/xfrm_input.c
 +++ b/net/xfrm/xfrm_input.c
-@@ -44,6 +44,27 @@ struct xfrm_trans_cb {
+@@ -44,6 +44,20 @@ struct xfrm_trans_cb {
  
  #define XFRM_TRANS_SKB_CB(__skb) ((struct xfrm_trans_cb *)&((__skb)->cb[0]))
  
@@ -789,26 +845,19 @@ index 58c153af6fcc6..ec51d48899dd4 100644
 +				      const struct xfrm_state *x);
 +
 +/*
-+ * Whether @x is received through SEC and nothing else: a packet-offloaded
-+ * state the DPAA offload module took, the one driver that gives a state a
-+ * handle (from xdo_dev_state_add(), before the state is inserted). SEC keeps
-+ * such a state's anti-replay window. xfrm's own is a copy the driver
-+ * refreshes now and then, and nothing tells SEC what software accepted, so
-+ * decrypting a frame here would check it against a second window, each
-+ * accepting what the other had already seen. What SEC is not given is
-+ * dropped instead. A state another driver offloads has no handle and is
-+ * received as upstream receives it.
++ * A state SEC handles (xfrm_state_sec_only()) is received through SEC and
++ * nothing else. SEC keeps such a state's anti-replay window. xfrm's own is a
++ * copy the driver refreshes now and then, and nothing tells SEC what software
++ * accepted, so decrypting a frame here would check it against a second
++ * window, each accepting what the other had already seen. What SEC is not
++ * given is dropped instead.
 + */
-+static bool xfrm_state_sec_only(const struct xfrm_state *x)
-+{
-+	return x->xso.type == XFRM_DEV_OFFLOAD_PACKET && x->handle;
-+}
 +#endif /* IPSEC */
 +
  static DEFINE_SPINLOCK(xfrm_input_afinfo_lock);
  static struct xfrm_input_afinfo const __rcu *xfrm_input_afinfo[2][AF_INET6 + 1];
  
-@@ -619,6 +640,19 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+@@ -619,6 +633,19 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
  			goto drop;
  		}
  
@@ -828,7 +877,7 @@ index 58c153af6fcc6..ec51d48899dd4 100644
  lock:
  		spin_lock(&x->lock);
  
-@@ -631,6 +665,20 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+@@ -631,6 +658,20 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
  			goto drop_unlock;
  		}
  

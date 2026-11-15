@@ -152,6 +152,15 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A447 — a frame in flight when its SA is deleted can still be handed to SEC by handle.** Where: patch 040's
+  output path in `xfrm_output()` (both lines): transport mode reaches it through `xfrm_output_one()`'s early `goto
+  resume`, tunnel mode through `xfrm_dev_sec_output()`, with no `km.state == XFRM_STATE_VALID` check, unlike the input
+  path (`xfrm_input.c`, `xfrm_state_sec_only()` callers). Why it matters: a frame on a stale bundle is encrypted
+  under a state being torn down. Mitigated by cdx's `SA_DELETE` gate (`control_ipsec.c`), rotating handle
+  allocation and `xfrm_bundle_ok()` revalidating `km.state`, so only frames already in flight. From review, not seen.
+  Fix direction: drop them as `XFRMOUTSTATEINVALID` in the bundle-check block, as the software path does.
+- [x] **A446 — 6.18 refused SEC-owned SAs' frames with IPv4 options and pre-empted ASK's bundle check.** Upstream's
+  core checks now leave both to SEC for a state it owns, as 6.12 did (_:/^xfrm: leave SEC's own SAs' headers_).
 - [x] **A445 — 6.12 lacked upstream's flowtable GC fix for pending offload work.** 6.12.113's fix, its two
   prerequisites and their two follow-ups are carried as patches 001-005 (_:/^netfilter: carry 6.12.113's flowtable_).
 - [ ] **A444 — a DHCP renewal's unicast ACK was lost once on its way to the DUT.** Seen once on 6.18.63 (KASAN),

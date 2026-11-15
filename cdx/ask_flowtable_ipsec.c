@@ -2991,10 +2991,14 @@ static void ft_xdo_state_free(CDX_XDO_DEV(dev) struct xfrm_state *x)
 
 static bool ft_xdo_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
 {
-	/* Reached only after the core's own size check. There is nothing
-	 * per-frame left to refuse: an SA the hardware accepted stays
-	 * installed until the state is deleted, and a port that has gone down
-	 * takes its flows with it rather than its SAs. */
+	/* Reached only after the core's own size check. IPv4 options and
+	 * IPv6 extension headers are no reason to refuse a frame: SEC is told
+	 * each frame's own header (dpa_ipsec_dpovrd()), and on 6.18, whose
+	 * core refuses them for other drivers, the kernel leaves them to SEC
+	 * for an SA SEC handles. There is nothing per-frame left to refuse:
+	 * an SA the hardware accepted stays installed until the state is
+	 * deleted, and a port that has gone down takes its flows with it
+	 * rather than its SAs. */
 	return true;
 }
 

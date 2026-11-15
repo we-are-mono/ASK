@@ -23,12 +23,16 @@ from _kernel_source import (kernel_source)
 def test_xfrm_input_sec_only(tmp_path):
     kernel = kernel_source()
     text = (kernel / "net/xfrm/xfrm_input.c").read_text()
+    # The predicate is xfrm_input.c's own where only receiving asks it; where
+    # xfrm_dev_offload_ok() asks it too (6.18), it lives in include/net/xfrm.h.
+    predicate = (text if re.search(r"^static (?:inline )?bool xfrm_state_sec_only\(", text, re.M)
+                 else (kernel / "include/net/xfrm.h").read_text())
     snmp = (kernel / "include/uapi/linux/snmp.h").read_text()
     (tmp_path / "xfrm_input_mib.inc").write_text(
         re.search(r"^enum\s*\{\s*LINUX_MIB_XFRMNUM = 0,.*?^\};", snmp, re.S | re.M).group()
         + "\n")
     (tmp_path / "xfrm_input_sec_only.inc").write_text(
-        function(text, "xfrm_state_sec_only") + function(text, "xfrm_input"))
+        function(predicate, "xfrm_state_sec_only") + function(text, "xfrm_input"))
     binary = tmp_path / "xfrm_input_sec_only"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
