@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sat, 14 Nov 2026 23:55:05 +0100
+Subject: [PATCH] netfilter: flowtable: resolve a neighbour before writing its
+ address
+
+The software fast path's NEIGH transmit (b5964aac51e0) takes the next
+hop's address straight from the entry ip_neigh_gw4()/ip_neigh_gw6()
+return, whatever its state, and writes it into the frame. That entry is
+created empty when missing -- after a flush, a link flap's carrier-down
+purge, or the neighbour GC -- and is otherwise never confirmed again by
+this path, so the flow's frames go out with an all-zero or stale
+destination until the flow retires: lost, or flooded by a bridge. Before
+it, neigh_xmit() queued the frame and resolved.
+
+Send a frame whose neighbour is not NUD_CONNECTED through the neighbour's
+own output on the route's device, as neigh_xmit() did: queued until it
+resolves, a failed entry restarted, a stale one probed again. Copy a
+confirmed address whole with neigh_ha_snapshot(), against a concurrent
+update.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ net/netfilter/nf_flow_table_ip.c | 37 ++++++++++++++++++++++++++++++--
+ 1 file changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
+index b2d0477333e31..b7d3df22168ad 100644
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -418,6 +418,31 @@ static unsigned int nf_flow_queue_xmit(struct net *net, struct sk_buff *skb,
+ 	return NF_STOLEN;
+ }
+ 
++/* A NEIGH flow's frame whose next hop the neighbour layer has not confirmed
++ * goes out through that layer, as neigh_xmit() sent it before: queued until
++ * an entry never resolved -- created empty by ip_neigh_gw4()/ip_neigh_gw6(),
++ * as after a flush or a link flap -- resolves, a failed one restarted, a stale
++ * one sent and probed again. Its address is all zeroes or unconfirmed, so
++ * writing it into the frame here would send the frame to nobody, or flood a
++ * bridge with it, until the flow retires.
++ */
++static unsigned int nf_flow_neigh_output(struct sk_buff *skb, struct neighbour *neigh,
++					 struct net_device *dev)
++{
++	unsigned int hh_len = LL_RESERVED_SPACE(dev);
++
++	if (unlikely(skb_headroom(skb) < hh_len && dev->header_ops)) {
++		skb = skb_expand_head(skb, hh_len);
++		if (!skb)
++			return NF_STOLEN;
++	}
++
++	skb->dev = dev;
++	READ_ONCE(neigh->output)(neigh, skb);
++
++	return NF_STOLEN;
++}
++
+ static struct flow_offload_tuple_rhash *
+ nf_flow_offload_lookup(struct nf_flowtable_ctx *ctx,
+ 		       struct nf_flowtable *flow_table, struct sk_buff *skb)
+@@ -519,6 +544,7 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
+ 	struct nf_flow_xmit xmit = {};
+ 	struct flow_offload *flow;
+ 	struct neighbour *neigh;
++	u8 ha[MAX_ADDR_LEN];
+ 	struct rtable *rt;
+ 	int ret;
+ 
+@@ -559,9 +585,12 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
+ 			flow_offload_teardown(flow);
+ 			return NF_DROP;
+ 		}
+-		xmit.dest = neigh->ha;
+ 		skb_dst_drop(skb);
+ 		skb_dst_set_noref(skb, &rt->dst);
++		if (!(READ_ONCE(neigh->nud_state) & NUD_CONNECTED))
++			return nf_flow_neigh_output(skb, neigh, rt->dst.dev);
++		neigh_ha_snapshot(ha, neigh, neigh->dev);
++		xmit.dest = ha;
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_DIRECT:
+ 		xmit.outdev = dev_get_by_index_rcu(state->net, tuplehash->tuple.out.ifidx);
+@@ -928,6 +957,7 @@ nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
+ 	struct nf_flow_xmit xmit = {};
+ 	struct flow_offload *flow;
+ 	struct neighbour *neigh;
++	u8 ha[MAX_ADDR_LEN];
+ 	struct rt6_info *rt;
+ 	int ret;
+ 
+@@ -968,9 +998,12 @@ nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
+ 			flow_offload_teardown(flow);
+ 			return NF_DROP;
+ 		}
+-		xmit.dest = neigh->ha;
+ 		skb_dst_drop(skb);
+ 		skb_dst_set_noref(skb, &rt->dst);
++		if (!(READ_ONCE(neigh->nud_state) & NUD_CONNECTED))
++			return nf_flow_neigh_output(skb, neigh, rt->dst.dev);
++		neigh_ha_snapshot(ha, neigh, neigh->dev);
++		xmit.dest = ha;
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_DIRECT:
+ 		xmit.outdev = dev_get_by_index_rcu(state->net, tuplehash->tuple.out.ifidx);
+-- 
+2.47.3
+

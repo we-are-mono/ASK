@@ -187,13 +187,8 @@ result independently of those temporary files.
   the dying ones; it now waits for them, and a budget wait on an earlier case's window that ends sooner is let run
   out first (status `restart_budget_ms`) (_:/^tests, cdx: wait out a deleted connection's entries_).
 
-- [ ] **A440 — 6.18's software flowtable sends a NEIGH direction to whatever address its neighbour holds.** Where:
-  `nf_flow_offload_ip_hook()` / `nf_flow_offload_ipv6_hook()` (upstream b5964aac51e0, in 6.18.y) take `neigh->ha`
-  from `ip_neigh_gw4()`/`ip_neigh_gw6()` without checking `nud_state` or starting resolution, then
-  `dev_queue_xmit()`; 6.12's `neigh_xmit()` queued the frame and resolved. Why it matters: a neighbour flushed or
-  recreated under a live flow can draw frames with an all-zero destination until the flow is retired. From review,
-  not seen on the rig. Fix direction: fall back to `neigh_xmit()`, or give the packet back to the stack, unless the
-  entry is `NUD_VALID`.
+- [x] **A440 — 6.18's software flowtable wrote an unresolved neighbour's address into NEIGH frames.** An entry not
+  `NUD_CONNECTED` now goes through the neighbour's output, as `neigh_xmit()` did (_:/^netfilter: flowtable: resolve_).
 
 - [x] **A439 — a host-command timeout wedged a CPU in its own diagnostic.** Its QMan queries waited unbounded with
   interrupts masked; they now wait within a bound, a portal's next command takes an abandoned one's late answer

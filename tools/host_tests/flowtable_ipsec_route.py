@@ -75,10 +75,11 @@ def test_flowtable_forward_path_unresolved_hops(tmp_path):
     _run(tmp_path, "flowtable_forward_path.c", {
         # How the line's software path sends a NEIGH direction: 6.12 hands
         # it to neigh_xmit() on the routed destination's device, 6.18 to
-        # dev_queue_xmit() on the device the route names in out.ifindex.
+        # dev_queue_xmit() on the device the route names in out.ifindex. Read
+        # from the code alone: 6.18's comments name neigh_xmit() too.
         "forward_path_xmit.inc":
-            "#define NEIGH_XMIT_BY_DST\n" if "neigh_xmit(" in _source("net/netfilter/nf_flow_table_ip.c")
-            else "",
+            "#define NEIGH_XMIT_BY_DST\n"
+            if "neigh_xmit(" in _code(_source("net/netfilter/nf_flow_table_ip.c")) else "",
         "forward_path_devices.inc":
             function(dev, "dev_fwd_path") + function(dev, "dev_fill_forward_path")
             + function(_source("net/8021q/vlan_dev.c"), "vlan_dev_fill_forward_path")
