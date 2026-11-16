@@ -8,7 +8,7 @@ otherwise execs the real nft with the inherited transaction lease intact.
 """
 from __future__ import annotations
 
-from _flowtable_service import (ADMISSION_GUARDS, CONF, DAEMON, FAULT_DIR, FIRST, FLOWS, INIT, blocked_probe, chain_rules, devices_follow, dpaa_ports, managed_service, operstate, service_status, set_link, supervision_status, wait_replacement, wait_service)
+from _flowtable_service import (ADMISSION_GUARDS, CONF, DAEMON, FAULT_DIR, FIRST, FLOWS, INIT, LINK_SECONDS, blocked_probe, chain_rules, devices_follow, dpaa_ports, managed_service, operstate, service_status, set_link, supervision_status, wait_replacement, wait_service)
 
 import asyncio
 import json
@@ -485,8 +485,7 @@ async def test_devices_follow_ports(rig):
             for name in ([] if port else [name for name in spare if not ports[name]["up"]]):
                 await set_link(r, name, "up")
                 restore[name] = "down"
-                # A 1G copper port negotiates for a few seconds.
-                linked = await operstate(r, name, "up", timeout=8)
+                linked = await operstate(r, name, "up", timeout=LINK_SECONDS)
                 await set_link(r, name, "down")
                 if linked:
                     port = name
@@ -504,7 +503,7 @@ async def test_devices_follow_ports(rig):
                 for state, expected in (("up", sorted([*base, port])), ("down", base)):
                     await set_link(r, port, state)
                     if state == "up":
-                        assert await operstate(r, port, "up", timeout=8), port
+                        assert await operstate(r, port, "up", timeout=LINK_SECONDS), port
                     # Bounded well inside the LAN peer's 35 s wait for its
                     # next command, so a slow change fails here, not there.
                     status = await devices_follow(r, expected, timeout=15)

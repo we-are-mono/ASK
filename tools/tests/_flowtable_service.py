@@ -274,6 +274,13 @@ async def devices_follow(r, expected, timeout=20):
     pytest.fail(f"flowtable devices did not follow {expected}: {samples[-3:]}")
 
 
+# How long a 1G copper port may take to link once set up. The GPY115C PHYs are
+# polled, and autonegotiation with the switch sometimes takes a second or third
+# round: 4.6 to 14.1 s on 6.12, 5.6 to 7.2 s on 6.18, against the 8 s once
+# allowed here.
+LINK_SECONDS = 20
+
+
 async def operstate(r, port, wanted, timeout):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
