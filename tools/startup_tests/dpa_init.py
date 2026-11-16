@@ -57,6 +57,11 @@ def test_rollback(tmp_path, request):
             return result.stdout.strip()
 
         run("stty cols 240 -echo")
+        # Nothing set a console log level on this boot, so every kernel message
+        # reaches the UART, inside whatever command output it lands in: a
+        # kmemleak scan's report split the ports' JSON. The test reads the
+        # kernel's log through dmesg; the console keeps only emergencies.
+        run("echo 1 > /proc/sys/kernel/printk")
         # The only precondition that matters is an FMAN nothing has configured
         # yet. Boot the staged image with rdinit=/bin/sh, so nothing runs
         # /etc/modules-load.d/ask.conf; the sweep loads and unloads cdx itself.
