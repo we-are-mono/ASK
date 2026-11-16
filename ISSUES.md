@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A448 — the flowtable GC held its CPU while a route change retired thousands of flows.** Softirqs ran inside
+  its unpreemptible walk at every TCP teardown (6.18) and interrupt exit, for up to 23 s; walks now batch them and the
+  GC sleeps between batches, on both lines (_:/^netfilter: let flowtable walks give softirqs_).
 - [ ] **A447 — a frame in flight when its SA is deleted can still be handed to SEC by handle.** Where: patch 040's
   output path in `xfrm_output()` (both lines): transport mode reaches it through `xfrm_output_one()`'s early `goto
   resume`, tunnel mode through `xfrm_dev_sec_output()`, with no `km.state == XFRM_STATE_VALID` check, unlike the input

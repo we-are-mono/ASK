@@ -70,4 +70,5 @@ SRC_URI += "\
            file://175-netfilter-flowtable-conntrack-sees-carried-replies.patch \
            file://180-wireguard-fastpath.patch \
            file://184-sdk_dpaa-rx-checksum-feature.patch \
+           file://186-netfilter-flowtable-walk-latency.patch \
           "

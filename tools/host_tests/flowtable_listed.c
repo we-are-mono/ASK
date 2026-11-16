@@ -147,6 +147,14 @@ static void rhashtable_walk_exit(struct rhashtable_iter *iter)
 {
 	iter->ht = NULL;
 }
+/* The sweeps here never sleep, and no table here reaches a batch's end, where
+ * a walk would: flowtable_walk models that. */
+static int bh_depth;
+static void local_bh_disable(void) { bh_depth++; }
+static void local_bh_enable(void) { assert(bh_depth > 0); bh_depth--; }
+static bool need_resched(void) { assert(false); return false; }
+static void cond_resched(void) { assert(false); }
+static void *rhashtable_walk_peek(struct rhashtable_iter *iter) { assert(false); return NULL; }
 
 /* What happened, in order: a hook published on a flowtable's list, a full
  * barrier, the flowtable told of a device, a hook list read under RCU. */
@@ -789,7 +797,7 @@ static void cleanup_cases(void)
 
 	nf_flow_table_iterate(&ft.data, nf_flow_table_do_cleanup, NULL);
 	assert(torn(&flows[OTHER_NET]) && teardowns == 7);
-	assert(!rcu_depth);
+	assert(!rcu_depth && !bh_depth);
 	printf("flowtable listed cleanup checks passed\n");
 }
 

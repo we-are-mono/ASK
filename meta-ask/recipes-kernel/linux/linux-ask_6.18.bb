@@ -66,4 +66,5 @@ SRC_URI += "\
            file://180-wireguard-fastpath.patch \
            file://184-sdk_dpaa-rx-checksum-feature.patch \
            file://185-netfilter-flowtable-neigh-resolution.patch \
+           file://186-netfilter-flowtable-walk-latency.patch \
           "

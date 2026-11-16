@@ -13,6 +13,16 @@ not a dead one, and the probe passes while it changes hands. This puts
 CONNECTIONS connections and BULK_STREAMS iperf3 streams behind WAN_IP/32,
 replaces the route every FLAP_SECONDS for FLAPS changes with traffic on every
 connection, and runs the probe every PROBE_INTERVAL.
+
+Each change also retires thousands of flows in one flowtable GC pass, while the
+streams' software forwarding keeps receive softirqs pending. A pass that holds
+its CPU for every flow it retires (6.18 ran a softirq round at each TCP flow,
+inside the walk's RCU section) left the CPU and RCU grace periods stuck for
+seconds, once 23 s. The flaps run with the soft-lockup watchdog at
+WATCHDOG_THRESH (a lockup is reported after twice that), so a pass that does not
+give the CPU up is reported and fails the test. The pass runs on one CPU, which
+needs receive load of its own for the stall to show: with eight streams, one run
+of two on such a kernel passed; BULK_STREAMS spreads the load wider.
 """
 from __future__ import annotations
 
@@ -36,7 +46,8 @@ FLAP_SECONDS = 5
 PROBE_INTERVAL = 1
 SEND_INTERVAL = float(os.environ.get("ASK_FLAP_SEND_INTERVAL", "2"))
 BULK_PORT = 5310
-BULK_STREAMS = int(os.environ.get("ASK_FLAP_BULK_STREAMS", "8"))
+BULK_STREAMS = int(os.environ.get("ASK_FLAP_BULK_STREAMS", "32"))
+WATCHDOG_THRESH = 1
 
 
 async def test_route_flap_keeps_the_probe_healthy(rig):
@@ -91,10 +102,14 @@ async def test_route_flap_keeps_the_probe_healthy(rig):
                                                  streams=BULK_STREAMS))
                 # In hardware before the first change, as a running transfer is.
                 await asyncio.sleep(3)
+            thresh = (await command(r.target, r.session, "sysctl", "-n",
+                                    "kernel.watchdog_thresh"))["stdout"].strip()
             started = time.monotonic()
             probing = asyncio.create_task(prober())
             changes = []
             try:
+                await command(r.target, r.session, "sysctl", "-w",
+                              f"kernel.watchdog_thresh={WATCHDOG_THRESH}")
                 for n in range(FLAPS):
                     began = time.monotonic()
                     await command(r.target, r.session, "ip", "route", "replace", f"{WAN_IP}/32",
@@ -102,6 +117,9 @@ async def test_route_flap_keeps_the_probe_healthy(rig):
                     changes.append(round(time.monotonic() - began, 3))
                     await asyncio.sleep(max(0, began + FLAP_SECONDS - time.monotonic()))
             finally:
+                # The flaps alone run under it.
+                await command(r.target, r.session, "sysctl", "-w", f"kernel.watchdog_thresh={thresh}",
+                              check=False)
                 stop.set()
                 await asyncio.gather(probing, return_exceptions=True)
                 if bulk:

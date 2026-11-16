@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Mon, 16 Nov 2026 00:39:47 +0100
+Subject: [PATCH] netfilter: flowtable: let table walks give softirqs and the
+ CPU a turn
+
+A flowtable walk is one RCU read-side section, which a kernel without
+preemptible RCU cannot preempt: it keeps its CPU, and holds up every grace
+period, until it is through the table. Softirqs raised meanwhile run inside
+it at each interrupt's exit. Under a receive load the CPU cannot keep up
+with, a GC pass that retires a table of thousands of flows, their bulk
+traffic falling back to software, keeps the CPU for as long as those
+softirqs take; newer kernels, whose TCP teardown also runs them at every
+flow, held it for up to 23 s.
+
+Walk in nf_flow_table_walk(), which holds softirqs off across batches of
+64 flows and lets them run between batches. The GC and the table's
+release also sleep there when the CPU is wanted: each stops before an
+original direction only it removes, so it finds that entry again on
+waking. The sweeps beside the GC (device cleanup, listing) do not sleep.
+nf_flow_table_iterate() keeps its prototype, which trees that export it
+rely on.
+---
+ net/netfilter/nf_flow_table_core.c | 108 +++++++++++++++++++++--------
+ 1 file changed, 78 insertions(+), 30 deletions(-)
+
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+index 0ffa5c5ba2e28..f85a622726efe 100644
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -623,6 +623,80 @@ void flow_offload_teardown(struct flow_offload *flow)
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_teardown);
+ 
++/* Flows a walk handles with softirqs held off. */
++#define NF_FLOW_TABLE_WALK_BATCH	64
++
++/* A walk is one RCU read-side section, which a kernel without preemptible RCU
++ * cannot preempt: it keeps its CPU, and holds up every grace period, until it
++ * is through the table. Softirqs raised meanwhile ran inside it, at each
++ * interrupt's exit, so under a receive load the CPU could not keep up with, a
++ * change that retired thousands of flows held the CPU for seconds. Softirqs
++ * are held off across a batch of flows instead and run between batches; what
++ * the callbacks do, the packet path also does with softirqs disabled.
++ *
++ * @resched also lets the walk sleep between batches. It stops before an
++ * original direction it has not handled, finds it again by address on waking
++ * and resumes there; had it gone, the walk would resume at the entry after it,
++ * and skip one more for each entry ahead of it in its bucket that went too.
++ * Only the GC and the table's release remove original directions, never beside
++ * each other (nf_flow_table_free() cancels the GC before it walks), so both
++ * sleep; a sweep beside the GC -- a device's cleanup, a listing -- may not. A
++ * resize while the walk sleeps restarts it, which shows flows again, as a
++ * resize during any walk does.
++ */
++static int nf_flow_table_walk(struct nf_flowtable *flow_table,
++			      void (*iter)(struct nf_flowtable *flowtable,
++					   struct flow_offload *flow, void *data),
++			      void *data, bool resched)
++{
++	struct flow_offload_tuple_rhash *tuplehash;
++	struct rhashtable_iter hti;
++	struct flow_offload *flow;
++	unsigned int batch = 0;
++	int err = 0;
++
++	rhashtable_walk_enter(&flow_table->rhashtable, &hti);
++	rhashtable_walk_start(&hti);
++	local_bh_disable();
++
++	while ((tuplehash = rhashtable_walk_next(&hti))) {
++		if (IS_ERR(tuplehash)) {
++			if (PTR_ERR(tuplehash) != -EAGAIN) {
++				err = PTR_ERR(tuplehash);
++				break;
++			}
++			continue;
++		}
++		if (tuplehash->tuple.dir)
++			continue;
++
++		if (++batch == NF_FLOW_TABLE_WALK_BATCH) {
++			batch = 0;
++			local_bh_enable();
++			if (resched && need_resched()) {
++				rhashtable_walk_stop(&hti);
++				cond_resched();
++				rhashtable_walk_start(&hti);
++				tuplehash = rhashtable_walk_peek(&hti);
++			}
++			local_bh_disable();
++			if (!tuplehash)
++				break;
++			if (IS_ERR(tuplehash) || tuplehash->tuple.dir)
++				continue;
++		}
++
++		flow = container_of(tuplehash, struct flow_offload, tuplehash[0]);
++
++		iter(flow_table, flow, data);
++	}
++	local_bh_enable();
++	rhashtable_walk_stop(&hti);
++	rhashtable_walk_exit(&hti);
++
++	return err;
++}
++
+ struct flow_offload_tuple_rhash *
+ flow_offload_lookup(struct nf_flowtable *flow_table,
+ 		    struct flow_offload_tuple *tuple)
+@@ -654,33 +728,7 @@ nf_flow_table_iterate(struct nf_flowtable *flow_table,
+ 				   struct flow_offload *flow, void *data),
+ 		      void *data)
+ {
+-	struct flow_offload_tuple_rhash *tuplehash;
+-	struct rhashtable_iter hti;
+-	struct flow_offload *flow;
+-	int err = 0;
+-
+-	rhashtable_walk_enter(&flow_table->rhashtable, &hti);
+-	rhashtable_walk_start(&hti);
+-
+-	while ((tuplehash = rhashtable_walk_next(&hti))) {
+-		if (IS_ERR(tuplehash)) {
+-			if (PTR_ERR(tuplehash) != -EAGAIN) {
+-				err = PTR_ERR(tuplehash);
+-				break;
+-			}
+-			continue;
+-		}
+-		if (tuplehash->tuple.dir)
+-			continue;
+-
+-		flow = container_of(tuplehash, struct flow_offload, tuplehash[0]);
+-
+-		iter(flow_table, flow, data);
+-	}
+-	rhashtable_walk_stop(&hti);
+-	rhashtable_walk_exit(&hti);
+-
+-	return err;
++	return nf_flow_table_walk(flow_table, iter, data, false);
+ }
+ 
+ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
+@@ -873,7 +921,7 @@ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+ 
+ void nf_flow_table_gc_run(struct nf_flowtable *flow_table)
+ {
+-	nf_flow_table_iterate(flow_table, nf_flow_offload_gc_step, NULL);
++	nf_flow_table_walk(flow_table, nf_flow_offload_gc_step, NULL, true);
+ }
+ 
+ static void nf_flow_offload_work_gc(struct work_struct *work)
+@@ -1121,9 +1169,9 @@ void nf_flow_table_free(struct nf_flowtable *flow_table)
+ 	unbound = list_empty(&flow_table->flow_block.cb_list);
+ 	up_read(&flow_table->flow_block_lock);
+ 	if (unbound) {
+-		nf_flow_table_iterate(flow_table, nf_flow_table_free_flow, NULL);
++		nf_flow_table_walk(flow_table, nf_flow_table_free_flow, NULL, true);
+ 	} else {
+-		nf_flow_table_iterate(flow_table, nf_flow_table_do_cleanup, NULL);
++		nf_flow_table_walk(flow_table, nf_flow_table_do_cleanup, NULL, true);
+ 		nf_flow_table_gc_run(flow_table);
+ 		nf_flow_table_offload_flush_cleanup(flow_table);
+ 	}
+-- 
+2.47.3
+

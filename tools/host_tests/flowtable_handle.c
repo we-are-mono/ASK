@@ -206,6 +206,15 @@ static void nf_flow_table_iterate(struct nf_flowtable *table,
     struct flow_offload_tuple_rhash *tuple = table->rhashtable.slots[0];
     if (tuple) iter(table, container_of(tuple, struct flow_offload, tuplehash[0]), data);
 }
+/* The table's release walks it as any sweep does; that it may sleep between
+ * batches changes nothing a one-flow table shows (flowtable_walk models it). */
+static int nf_flow_table_walk(struct nf_flowtable *table,
+                              void (*iter)(struct nf_flowtable *, struct flow_offload *, void *),
+                              void *data, bool resched)
+{
+    nf_flow_table_iterate(table, iter, data);
+    return 0;
+}
 static void nf_flow_table_do_cleanup(struct nf_flowtable *table, struct flow_offload *flow, void *data)
 { assert(!data); flow_offload_teardown(flow); }
 void nf_flow_table_gc_run(struct nf_flowtable *table);

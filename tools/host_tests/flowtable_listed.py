@@ -59,6 +59,8 @@ def test_a_joining_port_retires_the_flows_that_walked_to_it(tmp_path):
         function(core, "nft_route_dst_fetch")
         + function(core, "flow_offload_fill_route")
         + function(core, "flow_offload_route_init")
+        + re.search(r"^#define NF_FLOW_TABLE_WALK_BATCH\b.*\n", core, re.M).group()
+        + function(core, "nf_flow_table_walk")
         + function(core, "nf_flow_table_iterate")
         + function(core, "nf_flow_table_do_cleanup")
         + function(core, "nf_flow_table_do_listed")
