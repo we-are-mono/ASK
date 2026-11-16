@@ -14,7 +14,8 @@ from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from _flowtable_connections import (FLOWS, consistent, healthy, peer)
-from _flowtable_rig import (artifact_dir, DPORT, TABLE, WAN_IP, command, console_command, proc_paths, status_text)
+from _flowtable_rig import (artifact_dir, DPORT, TABLE, WAN_IP, command, console_command, drive, proc_paths,
+                            status_text)
 from _flowtable_policy import (CONFIG, apply, candidate, stop)
 from _flowtable_snat import (udp_snat as _udp)
 from _flowtable_tcp import (cpu, cpu_delta, software_tx, tcp_retransmit_withdraw_rst as _tcp)
@@ -80,13 +81,15 @@ def mapping_rows(r, state, ids, external):
 
 
 async def warm_mapping(r, p, ids, external):
-    for _ in range(10):
-        await p.batch(ids, 64, 0.01)
-        state = await r.state()
-        if state["entries"] == len(ids) * 2 and consistent(state):
-            mapping_rows(r, state, ids, external)
-            return state
-    pytest.fail(f"MASQUERADE did not install: {state}")
+    """Send batches until every flow's translated directions are installed.
+    An offer the backend declines in passing -- a lost RTNL trylock, a
+    retirement still settling -- comes back only on a later packet, or two GC
+    ticks later, so the batches go on until a deadline (drive()) rather than
+    for a count of rounds."""
+    state = await drive(r, lambda: p.batch(ids, 64, 0.01),
+                        lambda s: s["entries"] == len(ids) * 2 and consistent(s))
+    mapping_rows(r, state, ids, external)
+    return state
 
 
 async def hardware_mapping(r, p, ids, external, label):

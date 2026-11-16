@@ -21,7 +21,7 @@ import pytest
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from _flowtable_rig import (DPORT, SPORT, TABLE, WAN_IP, artifact_dir, assert_undisturbed,
-                            command, ct_listing, read)
+                            command, ct_listing, drive, read)
 from _flowtable_connections import counted
 from _flowtable_udp_wire import udp_wire_payload
 from _gated_tcp import GatedTcp
@@ -260,28 +260,36 @@ async def test_device_mtu_retires(vlan_rig):
     async def settled(expected, since=None):
         """`expected` maps the egress port of each direction hardware should
         hold to the MTU it should describe; `since`, a state the directions
-        must have been installed after. Readmission needs traffic, so each
-        attempt sends before it looks; nothing re-offers a retired flow on its
-        own."""
-        for _ in range(10):
-            await r.exchange(count=4)
-            state = await r.state()
-            if (sorted(f["out"] for f in state["flows"]) == sorted(expected)
+        must have been installed after. Readmission needs traffic -- nothing
+        re-offers a retired flow on its own -- and an offer that loses the
+        backend's RTNL trylock comes back only two GC ticks later, so it keeps
+        sending until a deadline (drive()) rather than for a count of rounds:
+        ten rounds, about 2 s, missed one such offer in the 6.18 suite."""
+        def holds(state):
+            return (sorted(f["out"] for f in state["flows"]) == sorted(expected)
                     and all(int(f["mtu"]) == expected[f["out"]] for f in state["flows"])
-                    and (since is None or state["installs"] > since["installs"])):
-                return state
-        pytest.fail(f"flow did not settle at {expected}: {state}")
+                    and (since is None or state["installs"] > since["installs"]))
+        return await drive(r, lambda: r.exchange(count=4), holds)
 
     before = await settled({TARGET_LAN_IF: 1500, TARGET_WAN_IF: 1500})
     await command(r.target, r.session, "ip", "link", "set", r.dut_vlan_if, "mtu", "1400")
     try:
         invalidated = await r.wait(
             lambda s: s["mtu_invalidations"] >= before["mtu_invalidations"] + 1)
+        # Readmission declined once as busy, as a lost RTNL trylock declines
+        # it: the flow comes back a re-offer, or two GC ticks, later, and the
+        # wait for it has to outlast that.
+        armed = await r.target.fs_write(
+            r.session, "/sys/module/ask_flowtable/parameters/flowtable_fail_stage", "4")
+        assert armed["errno"] == 0, armed
         # The flow comes back rather than staying retired: the direction
         # leaving by the WAN port as it was, the one into the tagged device
         # through the offline-port detour (A385). Installed since, so a state
         # caught mid-retirement cannot pass for the readmitted one.
         reduced = await settled({TARGET_LAN_IF: 1400, TARGET_WAN_IF: 1500}, since=before)
+        assert (await read(r.target, r.session,
+                           "/sys/module/ask_flowtable/parameters/flowtable_fail_stage")).strip() == "0"
+        assert reduced["busy"] > before["busy"], reduced
         assert reduced["errors"] == before["errors"], reduced
         assert {f["out"]: f["detour"] for f in reduced["flows"]} == {
             TARGET_LAN_IF: "1", TARGET_WAN_IF: "0"}, reduced

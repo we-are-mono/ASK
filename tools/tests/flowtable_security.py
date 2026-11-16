@@ -9,15 +9,26 @@ from types import SimpleNamespace
 import pytest
 
 from _topology import TARGET_WAN_IF
-from _flowtable_rig import (DPORT, SPORT, WAN_IP, command)
+from _flowtable_rig import (DPORT, SPORT, WAN_IP, command, drive)
 from _flowtable_tunnel import (DUT_WAN_IPV4, _offload_table, _udp_exchange)
 
 
+async def _echoed(r):
+    """Eight datagrams, every one answered, then a second's pause. Sent until
+    a deadline (drive()) rather than for a count of rounds: a direction the
+    backend declined in passing -- a lost RTNL trylock -- is offered again
+    only by a later packet of it, at most once a second, so a wait that
+    stops sending strands it."""
+    assert await _udp_exchange(r, 8) == {"echoed": 8, "lost": 0}
+    await asyncio.sleep(1)
+
+
 async def warm_tunnel(r):
+    """The offload table, and the tunnel's decapsulating direction in
+    hardware."""
     await _offload_table(r)
-    for _ in range(4):
-        assert await _udp_exchange(r, 8) == {"echoed": 8, "lost": 0}
-        await asyncio.sleep(1)
+    return await drive(r, lambda: _echoed(r),
+                       lambda state: any(f["in_tnl"] != "-" for f in state["flows"]))
 
 
 @pytest.mark.parametrize(("tunnel_rig", "options"),
@@ -30,7 +41,6 @@ async def test_tunnel_outer_endpoints(tunnel_rig, options, wrong):
 
     r = tunnel_rig
     await warm_tunnel(r)
-    await r.wait(lambda state: any(f["in_tnl"] != "-" for f in state["flows"]))
     shape = r.shape
     outer, inner = (IP, IPv6) if shape.mode == "6o4" else (IPv6, IP)
     endpoints = {"src": shape.outer[1], "dst": shape.outer[0]}
@@ -88,7 +98,6 @@ async def test_tunnel_inbound_xfrm_policy(tunnel_rig, policy):
     await warm_tunnel(r)
     local, remote = r.shape.outer
     selector = ["src", remote + "/128", "dst", local + "/128", "proto", "4", "dir", "in"]
-    await r.wait(lambda state: any(f["in_tnl"] != "-" for f in state["flows"]))
     if policy == "device":
         selector[6:6] = ["dev", "lo"]
     elif policy == "unrelated":
@@ -110,7 +119,8 @@ async def test_tunnel_inbound_xfrm_policy(tunnel_rig, policy):
         allowed = policy in {"unrelated", "allow"}
         assert results == [{"echoed": 4, "lost": 0} if allowed else {"echoed": 0, "lost": 4}] * 2, results
         if allowed:
-            await r.wait(lambda state: any(f["in_tnl"] != "-" for f in state["flows"]))
+            await drive(r, lambda: _echoed(r),
+                        lambda state: any(f["in_tnl"] != "-" for f in state["flows"]))
         else:
             assert not any(f["in_tnl"] != "-" for f in state["flows"]), state
     finally:
@@ -118,10 +128,7 @@ async def test_tunnel_inbound_xfrm_policy(tunnel_rig, policy):
             await command(r.target, r.session, "ip", "xfrm", "policy", "setdefault", "in", "accept")
         else:
             await command(r.target, r.session, "ip", "-6", "xfrm", "policy", "delete", *selector)
-    for _ in range(4):
-        assert await _udp_exchange(r, 8) == {"echoed": 8, "lost": 0}
-        await asyncio.sleep(1)
-    await r.wait(lambda state: any(f["in_tnl"] != "-" for f in state["flows"]))
+    await drive(r, lambda: _echoed(r), lambda state: any(f["in_tnl"] != "-" for f in state["flows"]))
 
 
 @pytest.mark.parametrize("hook", ["output", "postrouting"])
@@ -133,10 +140,7 @@ async def test_unicast_bridge_egress_filter(bridge_software, hook, installed):
     r.shape = SimpleNamespace(family=4, sport=SPORT, dport=DPORT, inner_orch=WAN_IP)
     await r.table()
     if installed:
-        for _ in range(4):
-            assert await _udp_exchange(r, 8) == {"echoed": 8, "lost": 0}
-            await asyncio.sleep(1)
-        await r.wait(lambda s: s["entries"] == 2)
+        await drive(r, lambda: _echoed(r), lambda s: s["entries"] == 2)
     table = "ask_security_bridge"
     await command(r.target, r.session, "nft", f'''table bridge {table} {{
  chain blocked {{ type filter hook {hook} priority 0; policy accept;
@@ -158,7 +162,4 @@ async def test_unicast_bridge_egress_filter(bridge_software, hook, installed):
         assert not any(f["in"] == TARGET_WAN_IF for f in state["flows"]), state
     finally:
         await command(r.target, r.session, "nft", "delete", "table", "bridge", table)
-    for _ in range(4):
-        assert await _udp_exchange(r, 8) == {"echoed": 8, "lost": 0}
-        await asyncio.sleep(1)
-    await r.wait(lambda s: s["entries"] == 2)
+    await drive(r, lambda: _echoed(r), lambda s: s["entries"] == 2)

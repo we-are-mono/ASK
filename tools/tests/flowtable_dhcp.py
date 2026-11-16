@@ -15,7 +15,7 @@ from ask_orch.commands import console_command, console_python
 from ask_orch.uart import Console
 from _flowtable_connections import consistent, healthy, peer
 from _flowtable_policy import CONFIG, apply, candidate, stop
-from _flowtable_rig import DPORT
+from _flowtable_rig import DPORT, drive
 from _native_process import dut_process
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif
 
@@ -165,11 +165,10 @@ os.kill(pid, signal.SIGUSR1)
                       "connect_ip": ENDPOINT, "connect_port": PORT}]
 
             async def mapping(p, address):
-                for _ in range(12):
-                    await p.batch([0], 32, 0.02)
-                    state = await r.state()
-                    if len(state["flows"]) == 2 and consistent(state):
-                        break
+                # Until a deadline (drive()), not for a count of rounds: an
+                # offer declined in passing comes back only on a later packet.
+                state = await drive(r, lambda: p.batch([0], 32, 0.02),
+                                    lambda s: len(s["flows"]) == 2 and consistent(s), timeout=15)
                 healthy(state)
                 assert len(state["flows"]) == 2, state
                 forward, = [row for row in state["flows"] if row["in"] == TARGET_LAN_IF]

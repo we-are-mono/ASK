@@ -191,16 +191,18 @@ def check_arp_trace(r, original_mac, failure_start, failure_end):
 async def udp_hardware(r, count=512, interval=0.003, label="forwarding"):
     # Admission can legitimately lose RTNL trylock. Linux retries hardware
     # from software traffic when its flow timeout advances by more than HZ;
-    # keep verified traffic moving instead of idly polling after a short burst.
+    # keep verified traffic moving instead of idly polling after a short burst,
+    # and until a deadline rather than for a count of rounds.
     warmup = []
-    for _ in range(5):
+    deadline = time.monotonic() + 10
+    while True:
         await r.exchange(128, interval=0.01, promiscuous=False)
         before = await r.state()
         warmup.append(before)
         if before["entries"] == before["neighbour_refs"] == 2:
             break
-    else:
-        pytest.fail(f"UDP did not install during admission traffic: {warmup}")
+        if time.monotonic() >= deadline:
+            pytest.fail(f"UDP did not install during admission traffic: {warmup}")
     r.record(f"arp-udp-{label}-admission", warmup)
     tx_before = await software_tx(r)
     result = await observe(r, r.exchange(count, interval=interval, promiscuous=False), label)

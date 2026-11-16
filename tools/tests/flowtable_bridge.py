@@ -30,8 +30,8 @@ from ask_orch.client import Agent
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack,
                        OPENWRT_LAN_VID, dut_vlan_subif, lan_run, lan_vlan_subif,
                        openwrt_lan, openwrt_wan)
-from _flowtable_rig import (DPORT, Echo, SPORT, WAN_IP, Rig, assert_undisturbed, command, read,
-                            release_latch, stop_boot_daemon)
+from _flowtable_rig import (DPORT, Echo, SPORT, WAN_IP, Rig, assert_undisturbed, command, drive,
+                            read, release_latch, stop_boot_daemon)
 from _flowtable_connections import counted
 from _gated_tcp import GatedTcp
 
@@ -385,16 +385,16 @@ async def _established(r, count=64):
 async def _settled(r, expected, since=None):
     """`expected` maps the egress port of each direction hardware should hold
     to the MTU it should describe; `since`, a state the directions must have
-    been installed after. Readmission needs traffic, so each attempt sends
-    before it looks; nothing re-offers a retired flow on its own."""
-    for _ in range(10):
-        await r.exchange(count=4)
-        state = await r.state()
-        if (sorted(f["out"] for f in state["flows"]) == sorted(expected)
+    been installed after. Readmission needs traffic -- nothing re-offers a
+    retired flow on its own -- and an offer that loses the backend's RTNL
+    trylock comes back only on a later packet, or two GC ticks later, so it
+    keeps sending until a deadline (drive()) rather than for a count of
+    rounds."""
+    def holds(state):
+        return (sorted(f["out"] for f in state["flows"]) == sorted(expected)
                 and all(int(f["mtu"]) == expected[f["out"]] for f in state["flows"])
-                and (since is None or state["installs"] > since["installs"])):
-            return state
-    pytest.fail(f"flow did not settle at {expected}: {state}")
+                and (since is None or state["installs"] > since["installs"]))
+    return await drive(r, lambda: r.exchange(count=4), holds)
 
 
 def _assert_ports(r, forward, reverse):
@@ -759,16 +759,12 @@ async def test_fdb_ageing(bridge_rig):
     await command(r.target, r.session, "ip", "link", "set", BRIDGE, "type", "bridge",
                   "ageing_time", "30000")
     # Traffic relearns the station and readmits the flow against it. Each
-    # attempt sends before it looks: readmission needs both a bridge that has
+    # round sends before it looks: readmission needs both a bridge that has
     # seen the station again and a Linux flow that has finished retiring, and
-    # nothing re-offers a retired flow on its own.
-    for _ in range(10):
-        await r.exchange(count=4)
-        state = await r.state()
-        if state["entries"] == 2:
-            break
-    else:
-        pytest.fail(f"flow was not readmitted after the entry aged out: {state}")
+    # nothing re-offers a retired flow on its own. An offer declined in
+    # passing comes back only on a later packet, so it keeps sending until a
+    # deadline (drive()) rather than for a count of rounds.
+    await drive(r, lambda: r.exchange(count=4), lambda s: s["entries"] == 2)
     assert await _fdb(r, r.lan_mac) == [TARGET_LAN_IF]
 
 

@@ -1697,16 +1697,19 @@ async def test_mixed_traffic_survives_rekey(homelab, splat_window):
         await _routed_installed(ctx, lambda rows: any(
             row["group"] == GROUP and row["state"] == "installed" for row in rows))
         async with peer(proxy, flows, lease=240) as p:
-            for _ in range(12):
+            # Until a deadline rather than for a count of rounds: an offer
+            # declined in passing comes back only on a later packet, at most
+            # once a second, or after two GC ticks.
+            deadline = asyncio.get_running_loop().time() + 20
+            while True:
                 await p.batch(ids, 32, 0.02)
                 before = await ctx.state()
                 try:
                     original = pairs(before)
                     break
                 except AssertionError:
-                    continue
-            else:
-                pytest.fail(f"mixed profile did not admit every direction: {before}")
+                    if asyncio.get_running_loop().time() >= deadline:
+                        pytest.fail(f"mixed profile did not admit every direction: {before}")
             for index, (forward, reverse) in enumerate(original[:3]):
                 _assert_wan(ctx, forward, reverse, client=paths[index][0])
             assert original[3][1]["in_tnl"] == _tunnel_text(ctx.shape), original[3]

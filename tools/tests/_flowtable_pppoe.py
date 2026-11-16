@@ -25,6 +25,7 @@ from _flowtable_rig import (
     command,
     console_command,
     console_python,
+    drive,
     read,
     release_latch,
     stop_boot_daemon,
@@ -1164,14 +1165,12 @@ def _untagged_directions(r, flows):
 async def _untagged_window(r, echo):
     """Admit the untagged flow, then run UNTAGGED_COUNT round trips over it
     between two readings of everything the session keeps: its record, its
-    ppp device's counters, and its download's entry in the adapter state."""
-    for _ in range(10):
-        await _untagged_exchange(r, 4)
-        state = await r.state()
-        if _untagged_directions(r, state["flows"]):
-            break
-    else:
-        pytest.fail(f"the untagged flow was not admitted beside the session: {state}")
+    ppp device's counters, and its download's entry in the adapter state.
+    Admission exchanges until a deadline (drive()) rather than for a count of
+    rounds: an offer the backend declines in passing comes back only on a
+    later packet, at most once a second, or after two GC ticks."""
+    await drive(r, lambda: _untagged_exchange(r, 4),
+                lambda s: _untagged_directions(r, s["flows"]))
     before = await r.state()
     assert _untagged_directions(r, before["flows"]), before["flows"]
     record = _session_halves(before, r.session_identity)

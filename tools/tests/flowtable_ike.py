@@ -16,7 +16,7 @@ from ask_orch.commands import console_command, console_python
 from ask_orch.uart import Console
 from _flowtable_connections import consistent, healthy, peer
 from _flowtable_policy import CONFIG, apply, candidate, stop
-from _flowtable_rig import DPORT
+from _flowtable_rig import DPORT, drive
 from _topology import TARGET_WAN_IF, TopologyStack
 from _native_process import dut_process
 
@@ -123,11 +123,10 @@ print(json.dumps(rows))
             await asyncio.sleep(0.3)
 
     async def hardware(p, label):
-        for _ in range(12):
-            await p.batch([0], 32, 0.02)
-            before = await r.state()
-            if len(before["flows"]) == 2 and consistent(before):
-                break
+        # Until a deadline (drive()), not for a count of rounds: an offer
+        # declined in passing comes back only on a later packet.
+        before = await drive(r, lambda: p.batch([0], 32, 0.02),
+                             lambda s: len(s["flows"]) == 2 and consistent(s), timeout=15)
         healthy(before)
         assert len(before["flows"]) == 2, before
         await p.batch([0], 128, 0.02)

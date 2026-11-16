@@ -422,7 +422,8 @@ async def test_add_failures(rig):
     for stage in [1, 2, 3]:
         result = await r.target.fs_write(r.session, "/sys/module/ask_flowtable/parameters/flowtable_fail_stage", str(stage))
         assert result["errno"] == 0, result
-        for attempt in range(3):
+        deadline = time.monotonic() + 10
+        while True:
             before = await r.state()
             await r.table()
             await r.exchange()
@@ -432,11 +433,15 @@ async def test_add_failures(rig):
             # RTNL contention declines admission before fault injection. The
             # software path offers the flow again about a second later, but
             # only while traffic keeps it there, so a fresh connection is the
-            # dependable way to reach the requested stage.
+            # dependable way to reach the requested stage -- tried until a
+            # deadline rather than a count of attempts, since each one can
+            # lose RTNL in turn.
             state = await r.state()
             assert state["busy"] > before["busy"] and state["invalidated"] == 0, state
             await r.delete_table()
             await r.clear_ct()
+            if time.monotonic() >= deadline:
+                break
         assert remaining == "0", (stage, await r.state())
         # Native Netfilter may install the other direction: each accepted
         # direction is independent. The rejected request leaves no owned object.

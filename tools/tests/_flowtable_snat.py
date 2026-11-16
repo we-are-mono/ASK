@@ -7,10 +7,9 @@ import json
 import re
 import socket
 
-import pytest
 from _flowtable_connections import FLOWS, consistent, healthy, peer
 from _flowtable_policy import CONFIG, apply, candidate, stop
-from _flowtable_rig import DPORT, WAN_IP, artifact_dir, command, console_command, read
+from _flowtable_rig import DPORT, WAN_IP, artifact_dir, command, console_command, drive, read
 from _flowtable_tcp import cpu, cpu_delta, software_tx
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from ask_orch.uart import Console
@@ -75,19 +74,23 @@ async def path_counters(r, label):
 
 
 async def snat_warm(r, p, external, port, label):
+    """Send batches until both translated directions are installed. An offer
+    the backend declines in passing -- a lost RTNL trylock, a retirement
+    still settling -- comes back only on a later packet, or two GC ticks
+    later, so the batches go on until a deadline (drive()) rather than for a
+    count of rounds."""
     await path_counters(r, f"{label}-counters-before")
-    for _ in range(10):
+
+    async def send():
         try:
             await p.batch([0], 64, 0.01)
         except BaseException:
             await path_counters(r, f"{label}-counters-failed")
             raise
-        state = await r.state()
-        if state["entries"] == 2 and consistent(state):
-            snat_flows(r, state, external, port)
-            r.record(label, state)
-            return state
-    pytest.fail(f"SNAT did not install: {state}")
+    state = await drive(r, send, lambda s: s["entries"] == 2 and consistent(s))
+    snat_flows(r, state, external, port)
+    r.record(label, state)
+    return state
 
 
 async def snat_hardware(r, p, external, port, zero_checksum, label):

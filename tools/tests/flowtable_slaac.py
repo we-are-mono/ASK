@@ -137,10 +137,14 @@ run('ip','-n',{namespace!r},'link','set',{lan_if!r},'up')
                   "netns": namespace, "connect_ip": WAN_IPV6, "connect_port": PORT}
                  for ident in (0, 1)]
         async with peer(proxy, flows, initial_ids=[0], lease=240) as p:
-            for _ in range(8):
+            # Admission keeps sending until a deadline rather than for a count
+            # of rounds: an offer declined in passing comes back only on a
+            # later packet, at most once a second (drive()).
+            deadline = asyncio.get_running_loop().time() + 10
+            while True:
                 await p.batch([0], 32, 0.02)
                 initial = await r.state()
-                if initial["entries"] == 2:
+                if initial["entries"] == 2 or asyncio.get_running_loop().time() >= deadline:
                     break
             r.record("slaac-initial", initial)
             assert initial["entries"] == 2 and initial["errors"] == r.errors, initial
@@ -163,10 +167,11 @@ run('ip','-n',{namespace!r},'link','set',{lan_if!r},'up')
             assert echo.sources[0] == {old["local"]}, echo.sources
             await reachable("slaac-new-connectivity")
             await p.rpc("open", [1])
-            for _ in range(8):
+            deadline = asyncio.get_running_loop().time() + 10
+            while True:
                 await p.batch([0, 1], 32, 0.02)
                 before = await r.state()
-                if before["entries"] == 4:
+                if before["entries"] == 4 or asyncio.get_running_loop().time() >= deadline:
                     break
             assert echo.sources == {0: {old["local"]}, 1: {new["local"]}}, echo.sources
             assert len(before["flows"]) == 4 and before["errors"] == r.errors, before

@@ -60,7 +60,7 @@ from _flowtable_pppoe import CLONED_WAN_MAC, DPORT6, _concentrator_if, _session_
 from _gated_tcp import GatedTcp
 from _topology import LAN_IPV6, TARGET_LAN_IF, TARGET_WAN_IF, lan_run
 import _flowtable_rig as ft
-from _flowtable_rig import DPORT, Echo, SPORT, command, console_command, read
+from _flowtable_rig import DPORT, Echo, SPORT, command, console_command, drive, read
 from _flowtable_connections import counted
 
 
@@ -130,9 +130,13 @@ async def test_ipv6_routed(pppoe_rig):
     await _offload_table6(r)
     # Nothing re-offers a flow on its own, so each attempt sends before it
     # looks; admission needs traffic and the reverse direction needs a reply.
-    for _ in range(10):
+    # An offer that loses rtnl_trylock comes back only on a later packet, at
+    # most once a second (drive()), so it keeps sending until a deadline
+    # rather than for a count of rounds, then judges what is installed.
+    deadline = time.monotonic() + 10
+    while True:
         await _exchange6(r, 4)
-        if (await r.state())["entries"] == 1:
+        if (await r.state())["entries"] == 1 or time.monotonic() >= deadline:
             break
     state = await r.state()
     flows = state["flows"]
@@ -226,9 +230,13 @@ async def test_session_counters(pppoe_rig):
     """
     r = pppoe_rig
     await r.table()
-    for _ in range(10):
+    # An offer can be declined in passing, and comes back only on a later
+    # packet (drive()): keep sending until both directions are in or a
+    # deadline passes, then judge what is installed.
+    deadline = time.monotonic() + 10
+    while True:
         await r.exchange(count=4)
-        if len((await r.state())["flows"]) == 2:
+        if len((await r.state())["flows"]) == 2 or time.monotonic() >= deadline:
             break
     await _udp_directions(r)
     state = await r.state()
@@ -327,9 +335,13 @@ async def test_session_record_ignores_untagged_flows(pppoe_rig):
         await r.nft(f"add rule inet {ft.TABLE} forward ip saddr {r.lan_ip} "
                     f"ip daddr {WAN_ENDPOINT} udp sport {UNTAGGED_SPORT} "
                     f"udp dport {UNTAGGED_DPORT} flow add @fast")
-        for _ in range(10):
+        # An offer can be declined in passing, and comes back only on a later
+        # packet (drive()): keep sending until both directions are in or a
+        # deadline passes, then judge what is installed.
+        deadline = time.monotonic() + 10
+        while True:
             await r.exchange(count=4)
-            if len((await r.state())["flows"]) == 2:
+            if len((await r.state())["flows"]) == 2 or time.monotonic() >= deadline:
                 break
         await _udp_directions(r)
         held = await r.state()
@@ -403,15 +415,12 @@ async def test_session_record_ignores_untagged_flows(pppoe_rig):
         assert after["session_records"] == after["session_slots"] == 1, after
 
         # The control. The session's directions may have expired over the
-        # window, so they are offered until hardware holds both again, then
-        # measured as test_session_counters measures them.
-        for _ in range(10):
-            await r.exchange(count=4)
-            state = await r.state()
-            if sum(f["in_ppp"] != "-" or f["out_ppp"] != "-" for f in state["flows"]) == 2:
-                break
-        else:
-            pytest.fail(f"the session's directions were not readmitted: {state}")
+        # window, so they are offered until hardware holds both again -- until
+        # a deadline (drive()), an offer declined in passing coming back only
+        # on a later packet -- then measured as test_session_counters measures
+        # them.
+        state = await drive(r, lambda: r.exchange(count=4), lambda s: sum(
+            f["in_ppp"] != "-" or f["out_ppp"] != "-" for f in s["flows"]) == 2)
         download = _direction(state["flows"], INNER_LOCAL, r.lan_ip)
         halves = _session_halves(state, r.session_identity)
         payload = 256
@@ -728,10 +737,15 @@ async def test_download_into_smaller_lan_path(pppoe_rig):
     try:
         initial = await r.state()
         await r.table()
-        for _ in range(10):
+        # Until both directions are decided or a deadline passes, not for a
+        # count of rounds: an offer declined in passing comes back only on a
+        # later packet (drive()).
+        deadline = time.monotonic() + 10
+        while True:
             await r.exchange(count=4)
             state = await r.state()
-            if state["flows"] and state["rejects"] > initial["rejects"]:
+            if (state["flows"] and state["rejects"] > initial["rejects"]) \
+                    or time.monotonic() >= deadline:
                 break
         upload, = state["flows"]
         assert (upload["in"], int(upload["mtu"]), upload["detour"]) == (
@@ -878,9 +892,13 @@ async def test_full_mtu_datagram(pppoe_rig):
     """
     r = pppoe_rig
     await r.table()
-    for _ in range(10):
+    # An offer can be declined in passing, and comes back only on a later
+    # packet (drive()): keep sending until both directions are in or a
+    # deadline passes, then judge what is installed.
+    deadline = time.monotonic() + 10
+    while True:
         await r.exchange(count=4)
-        if len((await r.state())["flows"]) == 2:
+        if len((await r.state())["flows"]) == 2 or time.monotonic() >= deadline:
             break
     before = {f["cookie"]: int(f["packets"]) for f in await _udp_directions(r)}
     installed = await r.state()
@@ -1172,17 +1190,16 @@ async def test_mtu_retires(pppoe_rig):
     async def settled(expected, since=None):
         """`expected` maps the egress port of each direction hardware should
         hold to the MTU it should describe; `since`, a state the directions
-        must have been installed after. Readmission needs traffic, so each
-        attempt sends before it looks; nothing re-offers a retired flow on its
-        own."""
-        for _ in range(10):
-            await r.exchange(count=4)
-            state = await r.state()
-            if (sorted(f["out"] for f in state["flows"]) == sorted(expected)
+        must have been installed after. Readmission needs traffic -- nothing
+        re-offers a retired flow on its own -- and an offer that loses the
+        backend's RTNL trylock comes back only on a later packet, or two GC
+        ticks later, so it keeps sending until a deadline (drive()) rather
+        than for a count of rounds."""
+        def holds(state):
+            return (sorted(f["out"] for f in state["flows"]) == sorted(expected)
                     and all(int(f["mtu"]) == expected[f["out"]] for f in state["flows"])
-                    and (since is None or state["installs"] > since["installs"])):
-                return state
-        pytest.fail(f"flow did not settle at {expected}: {state}")
+                    and (since is None or state["installs"] > since["installs"]))
+        return await drive(r, lambda: r.exchange(count=4), holds)
 
     before = await settled({TARGET_LAN_IF: 1500, TARGET_WAN_IF: SESSION_MTU})
     await command(r.target, r.session, "ip", "link", "set", r.ppp_if, "mtu", "1400")
@@ -1290,16 +1307,11 @@ async def test_session_retires_and_redials(pppoe_rig):
     await _wait_reachable(r)
 
     # Nothing re-offers a retired flow on its own, so each attempt sends before
-    # it looks. What it does not need is the table: the retirement was
-    # selective, so the bindings that were there before are the ones admitting
-    # this flow again.
-    for _ in range(10):
-        await r.exchange(count=4)
-        state = await r.state()
-        if state["entries"] == 2:
-            break
-    else:
-        pytest.fail(f"the flow was not readmitted after the redial: {state}")
+    # it looks, until a deadline (drive()): an offer declined in passing comes
+    # back only on a later packet. What it does not need is the table: the
+    # retirement was selective, so the bindings that were there before are
+    # the ones admitting this flow again.
+    await drive(r, lambda: r.exchange(count=4), lambda s: s["entries"] == 2)
     readmitted = await _udp_directions(r)
     # Against the session that exists now. A flow that had survived the hangup,
     # or been readmitted from anything cached, would name the old one -- which
@@ -1406,13 +1418,9 @@ print(n - {lossy})
     second = await _session_identity(r)
     r.session_identity = second
     await _wait_reachable(r)
-    for _ in range(10):
-        await r.exchange(count=4)
-        state = await r.state()
-        if state["entries"] == 2:
-            break
-    else:
-        pytest.fail(f"the flow was not carried again after the redial: {state}")
+    # Until a deadline (drive()), not for a count of rounds: an offer declined
+    # in passing comes back only on a later packet.
+    await drive(r, lambda: r.exchange(count=4), lambda s: s["entries"] == 2)
     readmitted = await _udp_directions(r)
     _assert_session(r, _direction(readmitted, r.lan_ip, INNER_LOCAL),
                     _direction(readmitted, INNER_LOCAL, r.lan_ip), session=second)

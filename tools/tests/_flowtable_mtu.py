@@ -8,7 +8,6 @@ import struct
 import threading
 import time
 
-import pytest
 from _flowtable_connections import by_key, consistent, healthy
 from _flowtable_rig import (
     DPORT,
@@ -18,6 +17,7 @@ from _flowtable_rig import (
     artifact_dir,
     command,
     ct_listing,
+    drive,
     read,
 )
 from _flowtable_tcp import software_tx
@@ -75,16 +75,17 @@ def current_mtus(state, mtus):
 
 
 async def udp_warm(r, sport, mtus):
-    """Exchange until the UDP tuple holds exactly the directions `mtus` admits."""
+    """Exchange until the UDP tuple holds exactly the directions `mtus` admits.
+    A direction retired by an MTU change is offered again only by its own
+    later packets, and an offer that loses the backend's RTNL trylock comes
+    back a second, or two GC ticks, later: the exchanges go on until a
+    deadline (drive()) rather than for a count of rounds."""
     wanted = udp_ingresses(mtus)
-    for _ in range(8):
-        await r.exchange(64, sport=sport, promiscuous=False)
-        state = await r.state()
-        if (consistent(state) and sorted(f["in"] for f in state["flows"]) == sorted(wanted)
-                and all(f["proto"] == "17" for f in state["flows"])):
-            current_mtus(state, mtus)
-            return state
-    pytest.fail(f"UDP was not re-admitted on {sorted(wanted)}: {state}")
+    state = await drive(r, lambda: r.exchange(64, sport=sport, promiscuous=False),
+                        lambda s: (consistent(s) and sorted(f["in"] for f in s["flows"]) == sorted(wanted)
+                                   and all(f["proto"] == "17" for f in s["flows"])))
+    current_mtus(state, mtus)
+    return state
 
 
 async def udp_size(r, sport, size, label, mtus=None):

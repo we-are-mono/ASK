@@ -1,6 +1,7 @@
 """Both flowtable paths must match the negotiated PPPoE peer and session."""
 import json
 import socket
+import time
 
 import pytest
 import pytest_asyncio
@@ -33,13 +34,17 @@ async def test_pppoe_receive_identity(pppoe_rig, hardware):
  {"ip6" if ipv6 else "ip"} saddr {local} udp sport {sport} udp dport {dport} flow add @fast
  }}
 }}''')
-    for _ in range(10):
+    # Until a deadline rather than for a count of rounds: an offer the
+    # backend declines in passing -- a lost RTNL trylock -- comes back only on
+    # a later packet, at most once a second, or after two GC ticks.
+    deadline = time.monotonic() + 10
+    while True:
         await (_exchange6(r, 4) if ipv6 else r.exchange(count=4))
         state = await r.state()
         listing = await command(r.target, r.session, "conntrack", "-L", "-f", family,
                                 "-p", "udp", "--orig-src", local, "--sport", str(sport))
         if (state["entries"] == (1 if ipv6 else 2) if hardware
-                else "[OFFLOAD]" in listing["stdout"]):
+                else "[OFFLOAD]" in listing["stdout"]) or time.monotonic() >= deadline:
             break
     if hardware:
         # Both directions of IPv4, the upload into the session's 1492 through
