@@ -94,8 +94,13 @@ def test_raw_forward_tells_the_neighbour_layer_of_an_unconfirmed_next_hop(tmp_pa
         "".join(re.findall(r"^#define NUD_\w+\s+0x[0-9a-fA-F]+\n", uapi, re.M))
         + macro(neighbour, "NUD_VALID") + macro(neighbour, "NUD_CONNECTED")
         + structure(flowtable, "flow_ports") + structure(flowtable, "nf_flow_raw_xmit"))
+    raw = _raw(source)
+    # A line with a closing state (6.14) tears a closing flow down on a SYN
+    # rather than passing the SYN past conntrack.
+    closing = re.search(r"\bNF_FLOW_CLOSING,", flowtable)
     (tmp_path / "flowtable_raw_neigh_production.inc").write_text(
-        "".join(function(neighbour, name) for name in NEIGHBOUR) + _raw(source))
+        ("#define HAVE_FLOW_CLOSING\n" if closing else "")
+        + "".join(function(neighbour, name) for name in NEIGHBOUR) + raw)
     binary = tmp_path / "flowtable_raw_neigh"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",

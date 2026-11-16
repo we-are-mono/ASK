@@ -152,6 +152,8 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A449 — on 6.18 a TCP tuple reopened right after its close stayed in software.** Its closing flow, handle
+  invalid, let the SYN past to a stale conntrack; now handed back first (_:/^netfilter: hand a closing TCP flow back_).
 - [x] **A448 — the flowtable GC held its CPU while a route change retired thousands of flows.** Softirqs ran inside
   its unpreemptible walk at every TCP teardown (6.18) and interrupt exit, for up to 23 s; walks now batch them and the
   GC sleeps between batches, on both lines (_:/^netfilter: let flowtable walks give softirqs_).

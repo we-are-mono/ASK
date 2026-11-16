@@ -54,7 +54,7 @@ enum flow_offload_xmit_type {
 	FLOW_OFFLOAD_XMIT_UNSPEC, FLOW_OFFLOAD_XMIT_NEIGH, FLOW_OFFLOAD_XMIT_XFRM,
 	FLOW_OFFLOAD_XMIT_DIRECT, FLOW_OFFLOAD_XMIT_TC,
 };
-enum nf_flow_flags { NF_FLOW_SNAT, NF_FLOW_DNAT };
+enum nf_flow_flags { NF_FLOW_SNAT, NF_FLOW_DNAT, NF_FLOW_CLOSING = 3 };
 enum nf_flowtable_flags { NF_FLOWTABLE_HW_OFFLOAD = 0x1, NF_FLOWTABLE_COUNTER = 0x2 };
 
 struct net { int id; };
@@ -416,6 +416,91 @@ static void forward(unsigned int s)
 	       mac(xmit.h_dest), jiffies - neigh.used);
 }
 
+/* A SYN on a closing flow reopens its tuple. Conntrack has to see it after the
+ * flow's hand-back, so the raw path tears the flow down and gives the packet
+ * back to the stack untouched, as the hook does; a SYN on a live flow is
+ * forwarded like any other packet. */
+static void syn(bool closing)
+{
+	struct nf_flowtable table = { false, false, NF_FLOWTABLE_COUNTER };
+	struct nf_flow_raw_xmit xmit;
+	struct {
+		struct iphdr ip;
+		struct tcphdr tcp;
+		u8 payload[40];
+	} packet = { 0 };
+	unsigned int len = sizeof(packet);
+	int ret;
+
+	snprintf(context, sizeof(context), "SYN on a %s flow", closing ? "closing" : "live");
+	memset(&seen, 0, sizeof(seen));
+	memset(&xmit, 0, sizeof(xmit));
+	memset(&neigh, 0, sizeof(neigh));
+	neigh.dev = &wan;
+	neigh.key = rt4.rt_gw4;
+	neigh.nud_state = NUD_REACHABLE;
+	neigh.used = LAST_USED;
+	memcpy(neigh.ha, next_hop_mac, ETH_ALEN);
+	memset(&conntrack, 0, sizeof(conntrack));
+
+	packet.ip.version = 4;
+	packet.ip.ihl = 5;
+	packet.ip.ttl = 64;
+	packet.ip.protocol = IPPROTO_TCP;
+	packet.ip.tot_len = htons(len);
+	inet_pton(AF_INET, "10.0.0.2", &packet.ip.saddr);
+	inet_pton(AF_INET, "198.51.100.16", &packet.ip.daddr);
+	packet.tcp.source = htons(40000);
+	packet.tcp.dest = htons(5201);
+	packet.tcp.doff = 5;
+	packet.tcp.syn = 1;
+
+	memset(&flow, 0, sizeof(flow));
+	flow.ct = &conntrack;
+	flow.flags = closing ? 1UL << NF_FLOW_CLOSING : 0;
+	flow.tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple = (struct flow_offload_tuple){
+		.src_v4.s_addr = packet.ip.saddr,
+		.dst_v4.s_addr = packet.ip.daddr,
+		.src_port = packet.tcp.source,
+		.dst_port = packet.tcp.dest,
+		.iifidx = wg.ifindex,
+		.l3proto = AF_INET,
+		.l4proto = IPPROTO_TCP,
+		.dir = FLOW_OFFLOAD_DIR_ORIGINAL,
+		.xmit_type = FLOW_OFFLOAD_XMIT_NEIGH,
+		.mtu = 1500,
+		.dst_cache = &rt4.dst,
+		.dst_cookie = rt4.dst.cookie,
+	};
+	flow.tuplehash[FLOW_OFFLOAD_DIR_REPLY].tuple = (struct flow_offload_tuple){
+		.src_v4.s_addr = packet.ip.daddr,
+		.dst_v4.s_addr = packet.ip.saddr,
+		.src_port = packet.tcp.dest,
+		.dst_port = packet.tcp.source,
+		.iifidx = wan.ifindex,
+		.l3proto = AF_INET,
+		.l4proto = IPPROTO_TCP,
+		.dir = FLOW_OFFLOAD_DIR_REPLY,
+		.xmit_type = FLOW_OFFLOAD_XMIT_NEIGH,
+		.mtu = 1500,
+	};
+
+	ret = nf_flow_offload_ip_raw(&table, &wg, &packet.ip, len, egress_ok, &xmit);
+#ifdef HAVE_FLOW_CLOSING
+	if (closing) {
+		expect(ret == -ECONNRESET && flow.torn_down == 1,
+		       "the raw path answered %d and tore the flow down %u times, not -ECONNRESET "
+		       "once", ret, flow.torn_down);
+		expect(!xmit.dev && packet.ip.ttl == 64 && !seen.refreshes,
+		       "the SYN was refused, but not untouched");
+		return;
+	}
+#endif
+	expect(ret == 0 && !flow.torn_down, "the raw path answered %d, torn down %u times",
+	       ret, flow.torn_down);
+	expect(xmit.dev == &wan && packet.ip.ttl == 63, "the SYN was not forwarded");
+}
+
 int main(void)
 {
 	unsigned int cases = sizeof(states) / sizeof(states[0]);
@@ -423,8 +508,10 @@ int main(void)
 	inet_pton(AF_INET, "203.0.113.1", &rt4.rt_gw4);
 	for (unsigned int s = 0; s < cases; s++)
 		forward(s);
+	syn(false);
+	syn(true);
 	if (failures) {
-		fprintf(stderr, "%u of %u raw forwards went wrong\n", failures, cases);
+		fprintf(stderr, "%u of %u raw forwards went wrong\n", failures, cases + 2);
 		return 1;
 	}
 	printf("%u raw forwards, each unconfirmed next hop told to the neighbour layer\n", cases);

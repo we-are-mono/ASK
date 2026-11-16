@@ -364,7 +364,10 @@ int main(void)
     assert(flow_offload_lookup(&table, &key[0]));
     policy_generation++;
     assert(nf_flow_offload_handle_valid(old) && flow_offload_hw_invalid(flow));
+    unsigned refused = teardowns;
     for (unsigned i = 0; i < 2; i++) assert(!flow_offload_lookup(&table, &key[i]));
+    /* The lookup refuses a live flow and leaves its retirement to the GC. */
+    assert(teardowns == refused && !test_bit(NF_FLOW_TEARDOWN, &flow->flags));
     unsigned invalidations = gc_stats.count_gc_hw_invalid;
     nf_flow_offload_gc_step(&table, flow, NULL);
     assert(test_bit(NF_FLOW_TEARDOWN, &flow->flags));
@@ -441,6 +444,14 @@ int main(void)
     assert(extensions == extended_before + 1);
     nf_flow_offload_gc_step(&table, flow, NULL);
     assert(deletes == deleted_before + 1 && !test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+    /* Its handle gone invalid -- a deletion the driver deferred -- a closing
+     * flow is handed back by the lookup that refuses it, once, rather than at
+     * the GC's next pass: the packet the lookup gives the stack, a SYN
+     * reopening the tuple above all, reaches conntrack after the hand-back. */
+    retirements = teardowns;
+    assert(nf_flow_offload_handle_invalidate(flow->hw_handle));
+    for (unsigned i = 0; i < 2; i++) assert(!flow_offload_lookup(&table, &key[i]));
+    assert(teardowns == retirements + 1 && test_bit(NF_FLOW_TEARDOWN, &flow->flags));
 #endif
     (void)read_before; (void)deleted_before; (void)extended_before;
     flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);

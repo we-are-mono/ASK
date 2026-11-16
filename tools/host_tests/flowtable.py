@@ -372,8 +372,14 @@ def test_software_path_carries_the_conntrack(tmp_path):
     (tmp_path / "flowtable_ct_types.inc").write_text("".join(
         uapi[uapi.index(start):uapi.index("};", uapi.index(start)) + 3]
         for start in ("enum ip_conntrack_info {", "enum ip_conntrack_status {")))
+    # A line with a closing state (6.14) hands a closing flow back before a
+    # frame bypasses it.
+    header = (kernel / "include/net/netfilter/nf_flow_table.h").read_text()
+    bypass = bool(re.search(r"\bNF_FLOW_CLOSING,", header))
+    assert bypass == ("static void nf_flow_bypass(" in source), "closing state without its hand-back"
     (tmp_path / "flowtable_ct_production.inc").write_text(
         function(source, "nf_flow_ct_set")
+        + ("#define HAVE_FLOW_BYPASS\n" + function(source, "nf_flow_bypass") if bypass else "")
         + function(source, "nf_flow_pppoe_peer_valid")
         + function(source, "nf_flow_offload_forward")
         + function(source, "nf_flow_offload_ipv6_forward"))

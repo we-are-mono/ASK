@@ -67,4 +67,5 @@ SRC_URI += "\
            file://184-sdk_dpaa-rx-checksum-feature.patch \
            file://185-netfilter-flowtable-neigh-resolution.patch \
            file://186-netfilter-flowtable-walk-latency.patch \
+           file://187-netfilter-flowtable-closing-handback.patch \
           "

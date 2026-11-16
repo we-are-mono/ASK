@@ -50,9 +50,11 @@ struct flow_offload_tuple_rhash { struct flow_offload_tuple tuple; };
 struct flow_offload {
     struct flow_offload_tuple_rhash tuplehash[FLOW_OFFLOAD_DIR_MAX];
     struct nf_conn *ct;
+    unsigned long flags;
     bool torn_down;
     unsigned refreshed;
 };
+enum { NF_FLOW_CLOSING = 3 };
 #define NF_FLOWTABLE_COUNTER 0x8
 struct nf_flowtable { unsigned flags; };
 struct net_device { int ifindex; };
@@ -234,25 +236,38 @@ static void family(forward_fn fn)
     assert(ct.ct_general.use == 1 && other.ct_general.use == 1);
 
     /* PPPoE uses the opposite tuple's concentrator identity. Rejected frames
-     * must retain their original conntrack and take no new reference. */
+     * must retain their original conntrack and take no new reference. A
+     * rejected frame reaches conntrack past the flow, so a closing flow is
+     * handed back first, and a live one is left alone. */
     const u8 peer[ETH_ALEN] = { 2, 3, 4, 5, 6, 7 };
     for (unsigned dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
         struct nf_flow_session *session = &flow.tuplehash[!dir].tuple.session;
         skb.protocol = htons(ETH_P_PPP_SES);
         memcpy(skb.ethernet.h_source, peer, ETH_ALEN);
         memcpy(session->h_dest, peer, ETH_ALEN);
-        for (unsigned invalid = 0; invalid < 3; invalid++) {
-            session->lower_ifindex = invalid == 0 ? 0 : in.ifindex;
-            skb.mac_header_set = invalid != 1;
-            skb.ethernet.h_source[5] = peer[5] ^ (invalid == 2);
+        for (unsigned invalid = 0; invalid < 6; invalid++) {
+            bool flow_closing = invalid >= 3;
+
+            flow.torn_down = false;
+            flow.flags = flow_closing ? 1UL << NF_FLOW_CLOSING : 0;
+            session->lower_ifindex = invalid % 3 == 0 ? 0 : in.ifindex;
+            skb.mac_header_set = invalid % 3 != 1;
+            skb.ethernet.h_source[5] = peer[5] ^ (invalid % 3 == 2);
             before = accounted;
             nf_conntrack_get(&other.ct_general);
             nf_ct_set(&skb, &other, IP_CT_ESTABLISHED);
             assert(forward(fn, &table, &flow, dir, &skb) == 0);
             assert(skb_nfct(&skb) == &other.ct_general && other.ct_general.use == 2);
             assert(ct.ct_general.use == 1 && accounted == before);
+#ifdef HAVE_FLOW_BYPASS
+            assert(flow.torn_down == flow_closing);
+#else
+            assert(!flow.torn_down);
+#endif
             nf_reset_ct(&skb);
         }
+        flow.torn_down = false;
+        flow.flags = 0;
         skb.ethernet.h_source[5] = peer[5];
         assert(forward(fn, &table, &flow, dir, &skb) == 1);
         assert(skb_nfct(&skb) == &ct.ct_general && ct.ct_general.use == 2);

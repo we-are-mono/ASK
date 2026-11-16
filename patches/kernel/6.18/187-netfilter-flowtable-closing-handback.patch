@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Mon, 16 Nov 2026 23:20:25 +0100
+Subject: [PATCH] netfilter: flowtable: hand a closing flow back before the
+ stack sees its packets
+
+Since 6.14 a FIN or RST leaves a TCP flow in the table as CLOSING, and a
+SYN reopening its tuple tears it down in nf_flow_state_check(), so that
+flow_offload_fixup_ct() puts the conntrack in CLOSE before conntrack sees
+the SYN. A packet the flowtable gives back to the stack earlier skips that
+check: one whose flow's hardware handle went invalid (flow_offload_lookup()
+refuses it), one with a secpath or while XFRM keeps away from the table,
+one whose PPPoE peer does not match. Conntrack then took a reopening SYN
+against the old connection's stale ESTABLISHED state, followed the new
+handshake as the old connection, and the GC's later teardown put the live
+connection in CLOSE, which only a SYN leaves: it was never offloaded
+again. A driver that defers a deletion invalidates the handle, so clients
+reconnecting from the same port as soon as hardware let the old flow go
+lost their connections to software this way.
+
+Hand a closing flow's conntrack back wherever the stack gets its packet
+first, and let the raw path tear one down on a SYN, as the hook does.
+---
+ net/netfilter/nf_flow_table_core.c | 15 ++++++++++++-
+ net/netfilter/nf_flow_table_ip.c   | 36 +++++++++++++++++++++++++-----
+ 2 files changed, 45 insertions(+), 6 deletions(-)
+
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+index 26be024c37285..b07e023058fe4 100644
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -741,8 +741,21 @@ flow_offload_lookup(struct nf_flowtable *flow_table,
+ 
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+-	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags) || flow_offload_hw_invalid(flow))
++	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags))
+ 		return NULL;
++	/* A flow whose handle went invalid is the stack's until the GC retires
++	 * it. A closing one hands its conntrack back here instead, as
++	 * nf_flow_state_check() hands it back for a SYN: conntrack saw neither
++	 * the FIN or RST the flowtable forwarded nor the close, and would take a
++	 * SYN reopening the tuple against the old connection's state -- ignore
++	 * it, follow the new handshake as the old connection, and the GC's later
++	 * hand-back would put the live connection in CLOSE, which only a SYN
++	 * leaves and nothing offloads. */
++	if (flow_offload_hw_invalid(flow)) {
++		if (test_bit(NF_FLOW_CLOSING, &flow->flags))
++			flow_offload_teardown(flow);
++		return NULL;
++	}
+ 
+ 	if (unlikely(nf_ct_is_dying(flow->ct)))
+ 		return NULL;
+diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
+index 0d4c5020228ff..0d3af1135dc76 100644
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -44,6 +44,18 @@ static int nf_flow_state_check(struct flow_offload *flow, int proto,
+ 	return 0;
+ }
+ 
++/* A packet the flowtable gives back to the stack before nf_flow_state_check()
++ * reaches conntrack past its flow. A closing flow hands its conntrack back
++ * first, as that check does for a SYN, so conntrack judges the packet -- a SYN
++ * reopening the tuple above all -- against the closed connection, not the state
++ * it held before the FIN or RST the flowtable forwarded (flow_offload_lookup()
++ * does the same for a flow it refuses). */
++static void nf_flow_bypass(struct flow_offload *flow)
++{
++	if (test_bit(NF_FLOW_CLOSING, &flow->flags))
++		flow_offload_teardown(flow);
++}
++
+ static void nf_flow_nat_ip_tcp(struct sk_buff *skb, unsigned int thoff,
+ 			       __be32 addr, __be32 new_addr)
+ {
+@@ -489,8 +501,10 @@ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
+ 
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+-	if (!nf_flow_pppoe_peer_valid(flow, dir, skb))
++	if (!nf_flow_pppoe_peer_valid(flow, dir, skb)) {
++		nf_flow_bypass(flow);
+ 		return 0;
++	}
+ 
+ 	mtu = flow->tuplehash[dir].tuple.mtu + ctx->offset;
+ 	if (unlikely(nf_flow_exceeds_mtu(skb, mtu)))
+@@ -552,8 +566,11 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
+ 	if (!tuplehash)
+ 		return NF_ACCEPT;
+ 	if (READ_ONCE(flow_table->use_hw_handles) &&
+-	    (secpath_exists(skb) || !xfrm_flowtable_enabled(state->net)))
++	    (secpath_exists(skb) || !xfrm_flowtable_enabled(state->net))) {
++		nf_flow_bypass(container_of(tuplehash, struct flow_offload,
++					    tuplehash[tuplehash->tuple.dir]));
+ 		return NF_ACCEPT;
++	}
+ 
+ 	ret = nf_flow_offload_forward(&ctx, flow_table, tuplehash, skb);
+ 	if (ret < 0)
+@@ -670,8 +687,12 @@ int nf_flow_offload_ip_raw(struct nf_flowtable *flow_table,
+ 		return -EOPNOTSUPP;
+ 	if (len > tuplehash->tuple.mtu)
+ 		return -EMSGSIZE;
++	/* A SYN on a closing flow reopens its tuple: conntrack has to see it
++	 * after the hand-back, as nf_flow_state_check() sees to. */
+ 	if (iph->protocol == IPPROTO_TCP &&
+-	    unlikely(((struct tcphdr *)ports)->fin || ((struct tcphdr *)ports)->rst)) {
++	    unlikely(((struct tcphdr *)ports)->fin || ((struct tcphdr *)ports)->rst ||
++		     (((struct tcphdr *)ports)->syn &&
++		      test_bit(NF_FLOW_CLOSING, &flow->flags)))) {
+ 		flow_offload_teardown(flow);
+ 		return -ECONNRESET;
+ 	}
+@@ -897,8 +918,10 @@ static int nf_flow_offload_ipv6_forward(struct nf_flowtable_ctx *ctx,
+ 
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+-	if (!nf_flow_pppoe_peer_valid(flow, dir, skb))
++	if (!nf_flow_pppoe_peer_valid(flow, dir, skb)) {
++		nf_flow_bypass(flow);
+ 		return 0;
++	}
+ 
+ 	mtu = flow->tuplehash[dir].tuple.mtu + ctx->offset;
+ 	if (unlikely(nf_flow_exceeds_mtu(skb, mtu)))
+@@ -972,8 +995,11 @@ nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
+ 	if (tuplehash == NULL)
+ 		return NF_ACCEPT;
+ 	if (READ_ONCE(flow_table->use_hw_handles) &&
+-	    (secpath_exists(skb) || !xfrm_flowtable_enabled(state->net)))
++	    (secpath_exists(skb) || !xfrm_flowtable_enabled(state->net))) {
++		nf_flow_bypass(container_of(tuplehash, struct flow_offload,
++					    tuplehash[tuplehash->tuple.dir]));
+ 		return NF_ACCEPT;
++	}
+ 
+ 	ret = nf_flow_offload_ipv6_forward(&ctx, flow_table, tuplehash, skb);
+ 	if (ret < 0)
+-- 
+2.47.3
+

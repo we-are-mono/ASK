@@ -102,8 +102,16 @@ struct flow_offload_tuple {
 struct flow_offload_tuple_rhash { struct flow_offload_tuple tuple; };
 struct flow_offload {
 	struct flow_offload_tuple_rhash tuplehash[2];
+	unsigned long flags;
 	unsigned int torn_down;
 };
+/* What a frame the hooks give back to the stack asks of a closing flow
+ * (nf_flow_bypass(), where the line has it). */
+enum { NF_FLOW_CLOSING = 3 };
+static inline bool test_bit(unsigned int nr, const unsigned long *addr)
+{
+	return (*addr >> nr) & 1;
+}
 
 /* NUD_* and LL_RESERVED_SPACE() as the tree defines them, and the hooks' own
  * context and transmit structures. */
