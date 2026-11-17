@@ -152,6 +152,17 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A451 — CEETM teardown drains portal messages from an IPI, where a plain spinlock may be taken.** Where:
+  `cdx/cdx_ceetm_app.c` (`ceetm_sync_portal()` via `on_each_cpu_mask()`) runs `qman_drain_ern()` (patch 103) in
+  hard interrupt context; `__poll_portal_slow(p, QM_PIRQ_MRI)` reaches `fq_state_change()` and `FQLOCK`, a
+  `spinlock_t`, for FQs created `QMAN_FQ_FLAG_LOCKED` (the offline ports', `sdk_dpaa/offline_port.c`), and calls ERN
+  callbacks there (`cdx_wg_hole_ern`, `dpa_ipsec_ern_cb`, `pf_backlog_ern` not yet read for locks). Why it matters:
+  with `CONFIG_PROVE_RAW_LOCK_NESTING` (6.18's test image) an offline-port retirement message pending when the sync
+  lands reports an invalid wait context, which turns lockdep off for the boot; on PREEMPT_RT it would sleep in hard
+  IRQ. Harmless on a non-RT kernel. From review (A450), not seen. Fix direction: drain from process context on each
+  CPU (a work item per portal CPU) rather than an IPI, or keep the drain from running state-change callbacks there.
+- [x] **A450 — removing a port took the SDK QMan `cgr_lock`, a plain spinlock, in an IPI.** Lockdep's raw-nesting
+  check (6.18) reported it; `cgr_lock` is raw now on both lines, as mainline did (_:/^qbman: take the congestion_).
 - [x] **A449 — on 6.18 a TCP tuple reopened right after its close stayed in software.** Its closing flow, handle
   invalid, let the SYN past to a stale conntrack; now handed back first (_:/^netfilter: hand a closing TCP flow back_).
 - [x] **A448 — the flowtable GC held its CPU while a route change retired thousands of flows.** Softirqs ran inside

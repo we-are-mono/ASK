@@ -68,4 +68,5 @@ SRC_URI += "\
            file://185-netfilter-flowtable-neigh-resolution.patch \
            file://186-netfilter-flowtable-walk-latency.patch \
            file://187-netfilter-flowtable-closing-handback.patch \
+           file://188-qbman-cgr-lock-raw-spinlock.patch \
           "
