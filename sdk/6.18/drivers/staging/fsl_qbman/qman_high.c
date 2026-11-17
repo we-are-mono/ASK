@@ -127,8 +127,10 @@ struct qman_portal {
 	struct qman_cgrs *cgrs;
 	/* linked-list of CSCN handlers. */
 	struct list_head cgr_cbs;
-	/* list lock */
-	spinlock_t cgr_lock;
+	/* list lock. Raw: qman_delete_cgr_safe() takes it from another CPU's
+	 * smp_call_function_single() callback, which runs in hard interrupt
+	 * context even where spinlocks sleep (mainline fbec4e7fed89). */
+	raw_spinlock_t cgr_lock;
 	/* 2-element array. ccgrs[0] is mask, ccgrs[1] is snapshot. */
 	struct qman_ccgrs *ccgrs[QMAN_CEETM_MAX];
 	/* 256-element array, each is a linked-list of CCSCN handlers. */
@@ -668,7 +670,7 @@ struct qman_portal *qman_create_portal(
 		/* if the given mask is NULL, assume all CGRs can be seen */
 		qman_cgrs_fill(&portal->cgrs[0]);
 	INIT_LIST_HEAD(&portal->cgr_cbs);
-	spin_lock_init(&portal->cgr_lock);
+	raw_spin_lock_init(&portal->cgr_lock);
 	if (num_ceetms) {
 		for (ret = 0; ret < num_ceetms; ret++) {
 			portal->ccgrs[ret] = kmalloc(2 *
@@ -1018,7 +1020,7 @@ static u32 __poll_portal_slow(struct qman_portal *p, u32 is)
 		struct qman_cgr *cgr;
 		unsigned long irqflags __maybe_unused;
 
-		spin_lock_irqsave(&p->cgr_lock, irqflags);
+		raw_spin_lock_irqsave(&p->cgr_lock, irqflags);
 		/*
 		 * The CSCI bit must be cleared _before_ issuing the
 		 * Query Congestion State command, to ensure that a long
@@ -1044,7 +1046,7 @@ static u32 __poll_portal_slow(struct qman_portal *p, u32 is)
 		list_for_each_entry(cgr, &p->cgr_cbs, node)
 			if (cgr->cb && qman_cgrs_get(&c, cgr->cgrid))
 				cgr->cb(p, cgr, qman_cgrs_get(&rr, cgr->cgrid));
-		spin_unlock_irqrestore(&p->cgr_lock, irqflags);
+		raw_spin_unlock_irqrestore(&p->cgr_lock, irqflags);
 	}
 	if (is & QM_PIRQ_CCSCI) {
 		struct qman_ccgrs rr, c, congestion_result;
@@ -3136,7 +3138,7 @@ int qman_create_cgr(struct qman_cgr *cgr, u32 flags,
 
 	memset(&local_opts, 0, sizeof(struct qm_mcc_initcgr));
 	cgr->chan = p->config->public_cfg.channel;
-	spin_lock_irqsave(&p->cgr_lock, irqflags);
+	raw_spin_lock_irqsave(&p->cgr_lock, irqflags);
 
 	/* if no opts specified, just add it to the list */
 	if (!opts)
@@ -3179,7 +3181,7 @@ add_list:
 							cgr->cgrid))
 		cgr->cb(p, cgr, 1);
 release_lock:
-	spin_unlock_irqrestore(&p->cgr_lock, irqflags);
+	raw_spin_unlock_irqrestore(&p->cgr_lock, irqflags);
 	put_affine_portal();
 	return ret;
 }
@@ -3250,7 +3252,7 @@ int qman_delete_cgr(struct qman_cgr *cgr)
 		goto put_portal;
 	}
 	memset(&local_opts, 0, sizeof(struct qm_mcc_initcgr));
-	spin_lock_irqsave(&p->cgr_lock, irqflags);
+	raw_spin_lock_irqsave(&p->cgr_lock, irqflags);
 	list_del(&cgr->node);
 	/*
 	 * If there are no other CGR objects for this CGRID in the list, update
@@ -3277,7 +3279,7 @@ int qman_delete_cgr(struct qman_cgr *cgr)
 		/* add back to the list */
 		list_add(&cgr->node, &p->cgr_cbs);
 release_lock:
-	spin_unlock_irqrestore(&p->cgr_lock, irqflags);
+	raw_spin_unlock_irqrestore(&p->cgr_lock, irqflags);
 put_portal:
 	put_affine_portal();
 	return ret;

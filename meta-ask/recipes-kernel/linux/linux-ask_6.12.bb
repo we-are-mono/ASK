@@ -46,6 +46,5 @@ SRC_URI += "\
            file://175-netfilter-flowtable-conntrack-sees-carried-replies.patch \
            file://180-wireguard-fastpath.patch \
            file://186-netfilter-flowtable-walk-latency.patch \
-           file://188-qbman-cgr-lock-raw-spinlock.patch \
            file://189-sdk_dpaa-rx-pool-recovery.patch \
           "
