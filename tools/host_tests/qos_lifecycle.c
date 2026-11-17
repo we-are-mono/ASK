@@ -349,13 +349,64 @@ static int qman_ceetm_query_cq(unsigned id, unsigned fm, struct qm_mcr_ceetm_cq_
     if (pending_frames && !hold_frames) pending_frames--;
     return 0;
 }
+/* Four CPUs with an affine portal, one of them offline. A portal is synced on
+ * its own CPU with interrupts off, which stops that CPU's producers, and in
+ * task context: its message ring carries FQ state changes and ERNs whose
+ * callbacks take spinlock_t, which a non-threaded hard interrupt (an IPI)
+ * must not take. */
+typedef unsigned cpumask_t;
+static const cpumask_t affine_cpus = 0xf, online_cpus = 0xb;
+static int current_cpu = -1;
+static bool in_ipi, irqs_off, hotplug_held;
+static cpumask_t eqcr_waited, erns_drained;
+#define for_each_cpu(cpu, mask) \
+    for ((cpu) = 0; (cpu) < 32; (cpu)++) if (!(*(mask) & (1u << (cpu)))) {} else
+#define local_irq_save(flags) do { (flags) = irqs_off; irqs_off = true; } while (0)
+#define local_irq_restore(flags) do { irqs_off = (flags); } while (0)
+static int smp_processor_id(void) { assert(current_cpu >= 0); return current_cpu; }
+/* Online stays true only while hotplug is held off. */
+static bool cpu_online(int cpu) { assert(hotplug_held); return online_cpus & (1u << cpu); }
+static const cpumask_t *qman_affine_cpus(void) { return &affine_cpus; }
 static bool qman_eqcr_is_empty(void)
-{ if (pending_enqueues) { pending_enqueues--; return false; } return true; }
-static void qman_drain_ern(void) { pending_erns = 0; }
-static int qman_affine_cpus(void) { return 1; }
-static void on_each_cpu_mask(int mask, void (*func)(void *), void *arg, int wait) { func(arg); }
-static void cpus_read_lock(void) {}
-static void cpus_read_unlock(void) {}
+{
+    assert(irqs_off && current_cpu >= 0);
+    eqcr_waited |= 1u << current_cpu;
+    if (pending_enqueues) { pending_enqueues--; return false; }
+    return true;
+}
+static void qman_drain_ern(void)
+{
+    assert(!in_ipi);
+    assert(irqs_off && current_cpu >= 0);
+    erns_drained |= 1u << current_cpu;
+    pending_erns = 0;
+}
+static long work_on_cpu(int cpu, long (*fn)(void *), void *arg)
+{
+    long ret;
+
+    assert(cpu_online(cpu) && current_cpu < 0 && !in_ipi && !irqs_off);
+    current_cpu = cpu;
+    ret = fn(arg);
+    assert(!irqs_off);
+    current_cpu = -1;
+    return ret;
+}
+/* An IPI runs its function in hard interrupt context with interrupts off. */
+static void on_each_cpu_mask(const cpumask_t *mask, void (*func)(void *), void *arg, bool wait)
+{
+    int cpu;
+
+    for_each_cpu(cpu, mask) {
+        if (!cpu_online(cpu))
+            continue;
+        current_cpu = cpu; in_ipi = irqs_off = true;
+        func(arg);
+        current_cpu = -1; in_ipi = irqs_off = false;
+    }
+}
+static void cpus_read_lock(void) { assert(!hotplug_held); hotplug_held = true; }
+static void cpus_read_unlock(void) { assert(hotplug_held); hotplug_held = false; }
 static void udelay(unsigned delay) {}
 static void usleep_range(unsigned low, unsigned high) { jiffies++; }
 static void msleep(unsigned ms)
@@ -554,10 +605,20 @@ static void device_tree(void)
 
 int main(void)
 {
+    /* The first CPU times out; the others are still synced, and every one
+     * drained. */
     pending_enqueues = 1001;
+    eqcr_waited = erns_drained = 0;
     assert(ceetm_sync_portals() == -ETIMEDOUT);
+    assert(eqcr_waited == (affine_cpus & online_cpus) && erns_drained == eqcr_waited);
+    assert(!hotplug_held);
     pending_enqueues = 0;
+    eqcr_waited = erns_drained = 0;
     assert(ceetm_sync_portals() == 0);
+    /* Every online CPU with a portal, and none other, each on its own. */
+    assert(eqcr_waited == (affine_cpus & online_cpus) && erns_drained == eqcr_waited);
+    assert(current_cpu < 0 && !irqs_off);
+    puts("portals synced on each online CPU, in task context with interrupts off");
     device_tree();
     /* No channels: nothing is built and the load fails, as it did when the
      * first channel could not be allocated. */

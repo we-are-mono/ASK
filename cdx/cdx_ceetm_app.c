@@ -14,6 +14,7 @@
 #include <linux/delay.h>
 #include <linux/jiffies.h>
 #include <linux/of.h>
+#include <linux/workqueue.h>
 #include "cdx.h"
 #include "control_ipv4.h"
 #include "lnxwrp_fm.h"
@@ -1943,33 +1944,45 @@ int ceetm_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t dscp, uint8_t chan
 	return CEETM_SUCCESS;
 }
 
-static void ceetm_sync_portal(void *arg)
+/* Runs on the portal's own CPU. Interrupts off stop this CPU's producers (a
+ * transmit, a forwarding softirq) while QMan consumes their enqueue ring;
+ * then the ERNs pending for it are processed before the caller releases
+ * their FQs. A worker rather than an IPI: the message ring also carries FQ
+ * state changes and ERNs whose callbacks take spinlock_t (FQLOCK, the ERN
+ * handlers' own), which a non-threaded hard interrupt must not take. */
+static long ceetm_sync_portal(void *arg)
 {
-	atomic_t *ret = arg;
+	unsigned long flags;
+	long ret = 0;
 	int ii;
 
-	/* The IPI stops this CPU's producers while QMan consumes their
-	 * enqueue ring. Process pending ERNs before releasing their FQs. */
+	local_irq_save(flags);
 	for (ii = 0; ii < 1000; ii++) {
 		if (qman_eqcr_is_empty())
 			break;
 		udelay(1);
 	}
 	if (ii == 1000) {
-		ceetm_err("QMan enqueue ring did not drain\n");
-		atomic_set(ret, -ETIMEDOUT);
+		ceetm_err("QMan enqueue ring of CPU %d did not drain\n", smp_processor_id());
+		ret = -ETIMEDOUT;
 	}
 	qman_drain_ern();
+	local_irq_restore(flags);
+	return ret;
 }
 
 static int ceetm_sync_portals(void)
 {
-	atomic_t ret = ATOMIC_INIT(0);
+	int cpu, ret = 0;
 
+	/* Held across the walk, so no CPU goes offline between its check and
+	 * its sync. */
 	cpus_read_lock();
-	on_each_cpu_mask(qman_affine_cpus(), ceetm_sync_portal, &ret, 1);
+	for_each_cpu(cpu, qman_affine_cpus())
+		if (cpu_online(cpu) && work_on_cpu(cpu, ceetm_sync_portal, NULL))
+			ret = -ETIMEDOUT;
 	cpus_read_unlock();
-	return atomic_read(&ret);
+	return ret;
 }
 
 /* As many frames as a drain pops: all of them, until the queue reads empty. */

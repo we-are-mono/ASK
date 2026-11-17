@@ -11,7 +11,7 @@ def function(source, name):
     # keeps a forward declaration or a call site from being mistaken for the
     # definition. Widen it when a new one is needed.
     match = re.search(r"^(?:static )?(?:inline )?(?:int\s+|void |bool |U8 |U16 |u8 |u16 |u32 |u64 |__s32 |uint32_t |"
-                      r"unsigned int |unsigned long |size_t |const char \*|"
+                      r"unsigned int |unsigned long |long |size_t |const char \*|"
                       r"struct qman_fq \*|struct en_exthash_tbl_entry ?\* ?|"
                       r"struct net_device ?\* ?|struct net_device_path ?\* ?|"
                       r"struct sk_buff ?\* ?|struct ft_mc_group ?\* ?|"

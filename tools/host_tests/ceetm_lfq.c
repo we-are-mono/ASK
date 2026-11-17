@@ -66,6 +66,12 @@ static unsigned __poll_portal_slow(struct qman_portal *p, unsigned sources)
 }
 static void qm_isr_status_clear(int *p, unsigned sources)
 { assert(!irq_enabled && p == &portal.p); irq_status &= ~sources; }
+/* Lockdep's raw-nesting check (6.18's test image) reports a drain reached
+ * from a hard interrupt that is never threaded, such as an IPI: the FQ
+ * state-change and ERN callbacks it runs take spinlock_t. */
+static bool in_ipi;
+static unsigned unthreaded_drains;
+#define lockdep_assert_RT_in_threaded_ctx() (unthreaded_drains += in_ipi)
 #include "lfq_production.inc"
 int main(void)
 {
@@ -96,5 +102,11 @@ int main(void)
     qman_drain_ern();
     assert(!pins && irq_enabled && polls == 2);
     puts("pending ERNs drain even without an IRQ status bit; shared portal ownership preserved");
+    assert(!unthreaded_drains);
+    in_ipi = true;
+    qman_drain_ern();
+    in_ipi = false;
+    assert(unthreaded_drains == 1);
+    puts("a drain from an IPI is reported");
     return 0;
 }
