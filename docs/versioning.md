@@ -44,7 +44,8 @@ with the full rig suite and supported. The release commit declares them in
 ```text
 $ cat RELEASED_LINES
 6.12
-$ git tag -a mono-1.4.0 -m "ASK 1.4.0 (lines: 6.12)"
+6.18
+$ git tag -a mono-1.4.0 -m "ASK 1.4.0 (lines: 6.12, 6.18)"
 ```
 
 Consumers refuse a release whose `RELEASED_LINES` lacks their kernel's line:

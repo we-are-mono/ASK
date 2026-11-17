@@ -3,3 +3,4 @@
 # commit, and unlisted when it retires (docs/versioning.md). Consumers refuse
 # a release that does not list their kernel's line.
 6.12
+6.18
