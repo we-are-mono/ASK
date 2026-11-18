@@ -92,6 +92,7 @@ enum return_code {
 #define IS_IPV4_FLOW(pEntry) ((pEntry->fftype & FFTYPE_IPV4) != 0)
 #define IS_IPV6(pEntry) (pEntry->fftype == FFTYPE_IPV6)
 #define IS_IPV6_FLOW(pEntry) ((pEntry->fftype & FFTYPE_IPV6) != 0)
+#define IS_NATPT(pEntry) ((pEntry->fftype & FFTYPE_NATPT) != 0)
 
 static __inline void COPY_MACADDR(void *ptomacaddr, void *pfrommacaddr)
 {

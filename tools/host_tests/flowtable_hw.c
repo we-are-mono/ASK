@@ -37,6 +37,8 @@ typedef u32 U32;
 #define NETREG_REGISTERED 1
 #define FFTYPE_IPV4 1
 #define FFTYPE_IPV6 2
+#define FFTYPE_NATPT 8
+#define CDX_NATPT_SLACK 2
 #define IS_IPV6_FLOW(entry) ((entry)->fftype == FFTYPE_IPV6)
 #define CONNTRACK_ORIG 1
 #define CONNTRACK_DNAT 0x10
@@ -314,6 +316,7 @@ typedef struct CtEntry {
         unsigned chnl_id : 6;
     } qosmark;
     uint8_t detour;
+    uint8_t natpt_tos;
 } CtEntry, *PCtEntry;
 /* The detour's stages (cdx_detour.h); whether it is set up, as a case says;
  * and its records, by tuple, as cdx_detour.c keeps them: a second live one
@@ -408,6 +411,9 @@ static bool cdx_ipsec_sa_outbound(u16 handle)
     return handle == 7;
 }
 static u8 expected_expansion;
+/* A translated direction's: the family its new tuple is in, and the TOS its
+ * frames leave with. */
+static u8 expected_xlat, expected_tos;
 static struct cdx_l2_encap observed_encap;
 static void *kzalloc(size_t n, int flags) { if(fail_alloc) return NULL; allocations++; return calloc(1,n); }
 static void kfree(void *p) { assert(p && allocations); allocations--; free(p); }
@@ -432,7 +438,28 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
     assert(ct->Sport == htons(1234) && ct->Dport == htons(5678));
     /* Ports always come from the twin object, in both families. */
     assert(ct->twin->Sport == expected_dport && ct->twin->Dport == expected_sport && ct->twin->twin == ct);
-    if (expected_family == AF_INET6) {
+    assert(ct->natpt_tos == expected_tos);
+    if (expected_xlat) {
+        /* Keyed in its own family, the twin in the other, and none of the
+         * entry's own twin_* fields written: on an IPv6 entry they are its
+         * destination's second half. No NAT status: the opcode is NAT-PT. */
+        assert(ct->fftype == ((expected_family == AF_INET6 ? FFTYPE_IPV6 : FFTYPE_IPV4) | FFTYPE_NATPT));
+        assert(ct->twin->fftype == (expected_xlat == AF_INET6 ? FFTYPE_IPV6 : FFTYPE_IPV4));
+        assert(ct->status == CONNTRACK_ORIG);
+        if (expected_family == AF_INET6) {
+            union nf_inet_addr destination = v6(0x401);
+
+            assert(ct->hash == expected_proto * 17);
+            assert(!memcmp(ct->Daddr_v6, destination.ip6, 16));
+            assert(ct->twin->Saddr_v4 == expected_dst.ip && ct->twin->Daddr_v4 == expected_src.ip);
+        } else {
+            assert(ct->hash == expected_proto * 13);
+            assert(ct->Saddr_v4 == htonl(0xc0000201) && ct->Daddr_v4 == htonl(0xc6336401));
+            assert(!ct->twin_Saddr && !ct->twin_Daddr && !ct->twin_Sport && !ct->twin_Dport);
+            assert(!memcmp(ct->twin->Saddr_v6, expected_dst.ip6, 16));
+            assert(!memcmp(ct->twin->Daddr_v6, expected_src.ip6, 16));
+        }
+    } else if (expected_family == AF_INET6) {
         union nf_inet_addr source = v6(0x201), destination = v6(0x401);
 
         assert(ct->fftype == FFTYPE_IPV6 && ct->hash == expected_proto * 17);
@@ -2296,6 +2323,52 @@ int main(void)
         rule.new_dport = expected_dport = variant == 3 || variant == 5 || variant >= 6 ? htons(40000) : rule.dport;
         assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
         assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+    }
+    /* Translated between the families (NAT64, SIIT): IPv6 matched and IPv4
+     * out, then the reverse. The insert callback checks the pair; the entry's
+     * MTU carries the slack the NAT-PT opcode leaves in the frame. */
+    {
+        struct cdx_ft_rule saved = rule;
+        union nf_inet_addr src = expected_src, dst = expected_dst;
+        __be16 sport = expected_sport, dport = expected_dport;
+
+        for (unsigned dir = 0; dir < 2; dir++) {
+            u8 xfamily = dir ? AF_INET6 : AF_INET;
+
+            expected_family = rule.family = dir ? AF_INET : AF_INET6;
+            rule.src = dir ? v4(htonl(0xc0000201)) : v6(0x201);
+            rule.dst = dir ? v4(htonl(0xc6336401)) : v6(0x401);
+            rule.new_src = expected_src = dir ? v6(0x104) : v4(htonl(0x0a00003e));
+            rule.new_dst = expected_dst = dir ? v6(0x105) : v4(htonl(0x0a0000e8));
+            rule.new_sport = expected_sport = htons(40000);
+            rule.new_dport = expected_dport = rule.dport;
+            rule.xlat_family = expected_xlat = xfamily;
+            rule.xlat_tos = expected_tos = 0x28 + dir;
+            expected_mtu = rule.mtu + CDX_NATPT_SLACK;
+            for (unsigned p = 0; p < 2; p++) {
+                rule.proto = expected_proto = p ? IPPROTO_TCP : IPPROTO_UDP;
+                assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+                assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+            }
+            /* Nothing that names the family it already is, and nothing
+             * outside the IP header the opcode replaces. */
+            rule.xlat_family = rule.family;
+            assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw);
+            rule.xlat_family = xfamily;
+            rule.out_tunnel.present = 1;
+            assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw);
+            rule.out_tunnel.present = 0;
+            rule.in_sa_handle = 7;
+            assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw);
+            rule.in_sa_handle = 0;
+        }
+        rule = saved;
+        expected_src = src; expected_dst = dst;
+        expected_sport = sport; expected_dport = dport;
+        expected_xlat = expected_tos = 0;
+        expected_family = AF_INET6;
+        expected_proto = rule.proto;
+        expected_mtu = rule.mtu;
     }
     /* An unrecognised family is refused rather than silently encoded as IPv4. */
     rule.family = AF_UNSPEC; assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw);

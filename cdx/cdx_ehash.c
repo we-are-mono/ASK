@@ -18,6 +18,8 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/string.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
 #include "linux/netdevice.h"
 #include "portdefs.h"
 #include "dpaa_eth.h"
@@ -62,6 +64,7 @@
 #define VLAN_STRIP_HM_VALID     (1 << 5)
 #define VLAN_ADD_HM_VALID       (1 << 6)
 #define PPPoE_STRIP_HM_VALID    (1 << 8)
+#define NAT_HM_NATPT            (1 << 9)
 #define NAT_V6	                (1 << 10)
 #define EHASH_IPV6_FLOW		(1 << 11)
 
@@ -1041,6 +1044,17 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info, bool routed
 	if (info->l2_info.pppoe_present)
 		info->flags |= PPPoE_STRIP_HM_VALID;
 
+	/* A translated direction takes its ports from the twin as NAT does,
+	 * and its header from the twin too, all of it: NAT-PT replaces the
+	 * header and takes the TTL step with it. The address comparisons below
+	 * would read an IPv6 entry's address as IPv4 NAT's twin fields, which
+	 * share its storage, so they are not reached. */
+	if (IS_NATPT(entry)) {
+		info->flags &= ~TTL_HM_VALID;
+		info->flags |= NAT_HM_NATPT | NAT_HM_REPLACE_SPORT | NAT_HM_REPLACE_DPORT;
+		info->nat_sport = twin_entry->Dport;
+		info->nat_dport = twin_entry->Sport;
+	} else
 	//perform NAT where required
 	{
 		if (IS_IPV4_NAT(entry) || IS_IPV6_NAT(entry)) {
@@ -1098,8 +1112,10 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info, bool routed
 		}
 	}
 	//fill all opcodes and parameters
-	if(L2_L3_HDR_OPS(info))	{
+	if (L2_L3_HDR_OPS(info) || IS_NATPT(entry)) {
 		/*If L2 /L3 Headers need to be stripped off or  enabled, we strip and rebuild the headers */
+		/* A translated frame leaves with the other family's EtherType,
+		 * which create_natpt_hm() puts in eth_type over this one. */
 		rebuild_l2_hdr = 1;
 		info->eth_type  = ethertype;
 	}
@@ -2585,6 +2601,85 @@ static int insert_opcodeonly_hm(struct ins_entry_info *info, uint8_t opcode)
 	return SUCCESS;
 }
 
+/* Translation between the families in one opcode (NAT64, SIIT): the microcode
+ * replaces the first IP header with the template after the opcode's word.
+ * NXP's fm_ehash.h defined these for its NAT-PT; this tree's copy lost them.
+ * What 210.10.1 does with them, measured on the DK (docs/flowtable/nat64.md):
+ * - it computes the length, the IPv4 header checksum and the L4 checksum, and
+ *   writes the IPv4 protocol from the IPv6 next header itself, counting it
+ *   in the checksum: a template that names the protocol has it counted twice;
+ * - TTL/hop limit comes from the replaced header, decremented (bit 24), and a
+ *   frame with TTL 1 or 0 goes to the CPU untouched;
+ * - TOS/traffic class comes from the template only: bit 25 (NXP's "copy")
+ *   does nothing, nor does any bit up to 31;
+ * - the IPv4 identification counts per flow from the word's low half unless
+ *   bit 26 takes the template's;
+ * - it writes no EtherType, so the Ethernet header is rebuilt;
+ * - it leaves the frame CDX_NATPT_SLACK bytes longer than the packet. */
+#ifndef NATPT_4to6
+#define NATPT_4to6	0x51
+#define NATPT_6to4	0x52
+#endif
+#define NATPT_HLU	(1 << 24)	/* 4to6: hop limit from the IPv4 TTL */
+#define NATPT_TLU	(1 << 24)	/* 6to4: TTL from the IPv6 hop limit */
+/* The word carries the flags above, the template's length in bits 16-23 (it
+ * must be the header's exact size) and, for 6to4, the identification a flow
+ * starts counting from. */
+struct cdx_natpt_param {
+	uint32_t word;
+	uint8_t l3hdr[];
+} __attribute__((packed));
+
+/* The header a translated frame leaves with: addresses from the twin and the
+ * TOS/traffic class the direction was admitted with in the template; length,
+ * checksums and the IPv4 protocol the microcode's; TTL/hop limit carried over
+ * from the header replaced, and an IPv4 identification counted per flow. */
+static int create_natpt_hm(struct ins_entry_info *info)
+{
+	PCtEntry entry = (PCtEntry)info->entry;
+	PCtEntry twin = CT_TWIN(entry);
+	struct cdx_natpt_param *param = (struct cdx_natpt_param *)info->paramptr;
+	uint32_t hdrlen, size;
+
+	if (info->opc_count == MAX_OPCODES)
+		return FAILURE;
+	hdrlen = IS_IPV4_FLOW(twin) ? sizeof(struct iphdr) : sizeof(struct ipv6hdr);
+	size = ALIGN(sizeof(*param) + hdrlen, sizeof(uint32_t));
+	if (size > info->param_size)
+		return FAILURE;
+	memset(param, 0, size);
+	if (IS_IPV4_FLOW(twin)) {
+		struct iphdr *ip = (struct iphdr *)param->l3hdr;
+
+		param->word = cpu_to_be32(NATPT_TLU | (hdrlen << 16) | IPID_STARTVAL);
+		ip->version = 4;
+		ip->ihl = 5;
+		ip->tos = entry->natpt_tos;
+		/* No protocol: the microcode writes and checksums it. */
+		ip->saddr = twin->Daddr_v4;
+		ip->daddr = twin->Saddr_v4;
+		*(info->opcptr) = NATPT_6to4;
+		info->eth_type = ETHERTYPE_IPV4;
+	} else {
+		struct ipv6hdr *ip6 = (struct ipv6hdr *)param->l3hdr;
+
+		param->word = cpu_to_be32(NATPT_HLU | (hdrlen << 16));
+		ip6->version = 6;
+		ip6->priority = entry->natpt_tos >> 4;
+		ip6->flow_lbl[0] = (entry->natpt_tos & 0xf) << 4;
+		ip6->nexthdr = twin->proto;
+		memcpy(&ip6->saddr, twin->Daddr_v6, sizeof(ip6->saddr));
+		memcpy(&ip6->daddr, twin->Saddr_v6, sizeof(ip6->daddr));
+		*(info->opcptr) = NATPT_4to6;
+		info->eth_type = ETHERTYPE_IPV6;
+	}
+	info->opcptr++;
+	info->opc_count++;
+	info->paramptr += size;
+	info->param_size -= size;
+	return SUCCESS;
+}
+
 static int create_nat_hm(struct ins_entry_info *info)
 {
 	uint8_t opcode;
@@ -2617,6 +2712,11 @@ static int create_nat_hm(struct ins_entry_info *info)
 		info->paramptr += sizeof(struct en_ehash_update_port);
 		info->param_size -= sizeof(struct en_ehash_update_port);
 	}
+
+	/* The ports were rewritten while the frame was still in the family its
+	 * checksum covers; the header goes next. */
+	if (info->flags & NAT_HM_NATPT)
+		return create_natpt_hm(info);
 
 	if (info->opc_count == MAX_OPCODES)
 		return FAILURE;
@@ -3000,6 +3100,15 @@ static int create_enque_hm(struct ins_entry_info *info)
 	}
 
 	param->hdr_xpnd_sz = info->tnl_hdr_size;
+	/* The DF check runs on the frame as it arrived and adds this before
+	 * comparing; the fragmentation after translation does not. An IPv4
+	 * direction into IPv6 grows by the difference and the slack, and its
+	 * MTU carries the slack (ft_hw_add_one()), so a DF packet goes to the
+	 * CPU exactly when its translation would not fit, and one without DF
+	 * is translated into IPv6 fragments, as RFC 7915 has it. */
+	if (info->entry && IS_NATPT(entry) && IS_IPV4_FLOW(entry))
+		param->hdr_xpnd_sz = sizeof(struct ipv6hdr) - sizeof(struct iphdr) +
+				     CDX_NATPT_SLACK;
 	seal_preemptive_checks_hm(info);
 	*(info->opcptr) = ENQUEUE_PKT;
 	info->opcptr++;

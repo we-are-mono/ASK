@@ -38,6 +38,8 @@ typedef struct ct *PCtEntry;
 #define IS_IPV6_FLOW(e) ((e)->family == AF_INET6)
 #define IS_IPV6(e) IS_IPV6_FLOW(e)
 #define IS_IPV4(e) (!IS_IPV6(e))
+/* A group's entry never translates between the families. */
+#define IS_NATPT(e) ((void)(e), 0)
 struct dpa_iface_info { int unused; };
 struct ins_entry_info {
     uint16_t sec_tag;

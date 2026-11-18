@@ -176,6 +176,13 @@ struct cdx_ft_rule {
 	u8 out_vlans;
 	u8 family;
 	u8 proto;
+	/* Zero, or the family new_src and new_dst are in when it is not
+	 * family's: a direction translated between IPv4 and IPv6 (NAT64,
+	 * SIIT), whose L3 header the hardware replaces with one built from the
+	 * new tuple, with xlat_tos as its TOS/traffic class: the hardware
+	 * cannot carry the arriving packet's over. */
+	u8 xlat_family;
+	u8 xlat_tos;
 	/* Adapter state: the family of the next hop dst_mac was resolved for.
 	 * The flow's own, except for a direction encrypted by an SA of the
 	 * other family, whose frames are addressed to the SA's endpoint. */

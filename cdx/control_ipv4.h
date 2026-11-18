@@ -86,6 +86,9 @@ typedef struct _tCtEntry {
 	/* CDX_DETOUR_*: the entry of an offline-port detour this one is, for
 	 * a direction whose path is smaller than its ingress delivers. */
 	U8 detour;
+	/* FFTYPE_NATPT: the TOS/traffic class translated frames leave with; the
+	 * microcode takes it from the template only. */
+	U8 natpt_tos;
 
 	struct _tCtEntry *twin;
 	struct hw_ct *ct;       /** pointer to the hardware conntrack */
@@ -111,6 +114,13 @@ typedef struct _tCtEntry {
 
 #define	FFTYPE_IPV4	0x01
 #define FFTYPE_IPV6	0x02
+/* The pair translates between the families (NAT64, SIIT): the entry is keyed
+ * in its own family and its twin is in the other; the hardware replaces the
+ * L3 header (NATPT_4to6 / NATPT_6to4). */
+#define FFTYPE_NATPT	0x08
+/* The bytes past the IP packet a NAT-PT opcode leaves in the frame (measured on
+ * 210.10.1): its frame shrinks or grows by the header difference plus this. */
+#define CDX_NATPT_SLACK	2
 
 #define CT_TWIN(pentry)		(((PCtEntry)(pentry))->twin)
 

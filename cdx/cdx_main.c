@@ -49,6 +49,7 @@
 #include "dpa_ipsec.h"
 #include "cdx_detour.h"
 #include "cdx_wg.h"
+#include "cdx_xlat_test.h"
 
 #ifdef CDX_DEBUG_KEY_ZEROING
 /* H2 regression tripwire — see cdx_dpa_ipsec.c for design rationale.
@@ -273,6 +274,10 @@ static void cdx_module_deinit(void)
 	 * after the QoS objects a qdisc command would configure have gone.
 	 * Safe on the initialization-failure path too, where nothing registered. */
 	cdx_htb_exit();
+	/* The feasibility hook's hand-installed directions, while the encoder
+	 * and its tables are still whole. */
+	if (cdx_info)
+		cdx_xlat_test_flush();
 	/* Stop the remaining internal writer before terminal retries release
 	 * both locks. Timer storage survives until its normal exit callback. */
 	cdx_ctrl_timer_stop();

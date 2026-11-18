@@ -50,6 +50,13 @@ static void cdx_htb_exit(void)
     assert(timer_running);
     ndo_released = true;
 }
+/* The hand-installed translated directions go while the encoder and its tables
+ * are whole: after tc is given up, before the timer and the ports stop. */
+static void cdx_xlat_test_flush(void)
+{
+    assert(ndo_released && timer_running && !ports_safe && !freed);
+    assert(!rtnl && !cdx_info->ctrl.mutex);
+}
 static int dpa_cfg_quiesce(void)
 {
     assert(ndo_released);

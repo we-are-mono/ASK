@@ -35,6 +35,7 @@ original bench records; they are not a promise of permanent artifact storage.
 | [MASQUERADE](masquerade.md) | Source translation and retirement across WAN address replacement and interface down/up. |
 | [Static TCP SNAT](tcp-snat.md) | Bulk transfers, idle expiry, retransmission, live policy withdrawal and FIN/RST. |
 | [Static UDP SNAT](udp-snat.md) | Forced translation, endpoint checksums, route recovery and live software fallback. |
+| [NAT64 feasibility](nat64-feasibility.md) | The NAT-PT opcodes on the wire: checksums, TTL, TOS, MTU/DF, the 2-byte slack, and a sender-bound load run. |
 
 The separate [UDP loss investigation](../udp-loss-investigation.md)
 remains intact. Unexplained failures are retained; later passing measurements do
@@ -77,6 +78,7 @@ with the UDP proof.
 | DNAT — 2026-09-15 | [Evidence](dnat.md) |
 | MASQUERADE — 2026-09-15 | [Evidence](masquerade.md) |
 | Connection capacity — 2026-09-15 | [Evidence](capacity.md) |
+| NAT64 feasibility — 2026-11-19 | [Evidence](nat64-feasibility.md) |
 
 ## Maintaining the records
 

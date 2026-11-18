@@ -223,6 +223,16 @@ static int ft_hw_add_one(const struct cdx_ft_rule *rule,
 	     !cdx_ft_portless(rule->family, rule->proto)) ||
 	    (rule->family != AF_INET && rule->family != AF_INET6))
 		return ask_refuse(-EOPNOTSUPP);
+	/* A translating direction carries the other family's tuple, ports and
+	 * all, and nothing outside its IP header: the NAT-PT opcode replaces
+	 * the first one, which a tunnel's, an SA's or a detour's would be. */
+	if (rule->xlat_family &&
+	    (rule->xlat_family == rule->family ||
+	     (rule->xlat_family != AF_INET && rule->xlat_family != AF_INET6) ||
+	     (rule->proto != IPPROTO_TCP && rule->proto != IPPROTO_UDP) ||
+	     rule->sa_handle || rule->in_sa_handle || rule->in_tunnel.present ||
+	     rule->out_tunnel.present || detour))
+		return ask_refuse(-EOPNOTSUPP);
 	/* A direction handed to SEC carries the bound its SA puts on it and
 	 * what SEC adds, both from admission, and names an SA that has to be
 	 * there to encrypt it. */
@@ -315,6 +325,12 @@ static int ft_hw_add_one(const struct cdx_ft_rule *rule,
 	 * devman.c does. */
 	if (rule->out_tunnel.present)
 		hw->route.mtu += rule->out_tunnel.header_size;
+	/* A translated frame leaves CDX_NATPT_SLACK bytes longer than its
+	 * packet, and the size the microcode checks is the frame's: without
+	 * them back on, every packet of exactly the MTU would fail it. The DF
+	 * check's share is create_enque_hm()'s. */
+	if (rule->xlat_family)
+		hw->route.mtu += CDX_NATPT_SLACK;
 	ether_addr_copy(hw->route.dstmac, rule->dst_mac);
 	ether_addr_copy(hw->route.srcmac, rule->src_mac);
 	ct = &hw->entry;
@@ -335,7 +351,34 @@ static int ft_hw_add_one(const struct cdx_ft_rule *rule,
 	hw->twin.Sport = rule->new_dport;
 	hw->twin.Dport = rule->new_sport;
 	hw->twin.proto = rule->proto;
-	if (rule->family == AF_INET6) {
+	if (rule->xlat_family) {
+		/* Keyed in its own family; the twin, which the encoder builds
+		 * the replacement header from, in the other. The entry's own
+		 * twin_* fields are IPv4 NAT's and overlay an IPv6 destination,
+		 * so they stay clear. */
+		ct->fftype = (rule->family == AF_INET6 ? FFTYPE_IPV6 : FFTYPE_IPV4) |
+			     FFTYPE_NATPT;
+		ct->natpt_tos = rule->xlat_tos;
+		hw->twin.fftype = rule->xlat_family == AF_INET6 ? FFTYPE_IPV6 : FFTYPE_IPV4;
+		if (rule->family == AF_INET6) {
+			memcpy(ct->Saddr_v6, rule->src.ip6, sizeof(ct->Saddr_v6));
+			memcpy(ct->Daddr_v6, rule->dst.ip6, sizeof(ct->Daddr_v6));
+			ct->hash = HASH_CT6(ct->Saddr_v6, ct->Daddr_v6, rule->sport,
+					    rule->dport, rule->proto);
+		} else {
+			ct->Saddr_v4 = rule->src.ip;
+			ct->Daddr_v4 = rule->dst.ip;
+			ct->hash = HASH_CT(rule->src.ip, rule->dst.ip, rule->sport,
+					   rule->dport, rule->proto);
+		}
+		if (rule->xlat_family == AF_INET6) {
+			memcpy(hw->twin.Saddr_v6, rule->new_dst.ip6, sizeof(hw->twin.Saddr_v6));
+			memcpy(hw->twin.Daddr_v6, rule->new_src.ip6, sizeof(hw->twin.Daddr_v6));
+		} else {
+			hw->twin.Saddr_v4 = rule->new_dst.ip;
+			hw->twin.Daddr_v4 = rule->new_src.ip;
+		}
+	} else if (rule->family == AF_INET6) {
 		ct->fftype = FFTYPE_IPV6;
 		memcpy(ct->Saddr_v6, rule->src.ip6, sizeof(ct->Saddr_v6));
 		memcpy(ct->Daddr_v6, rule->dst.ip6, sizeof(ct->Daddr_v6));

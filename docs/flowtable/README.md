@@ -33,6 +33,7 @@ Current checkpoint: IPv6, 802.1Q VLAN, bridging, PPPoE, IPv4 TCP/UDP NAT and
 | Why a bridged group has to learn its own key from traffic, what the MDB cannot supply, and its proof | [Multicast design](multicast.md) |
 | Why a routed group needs no learning at all, what `ipmr` states outright, and how the two learners share one hardware key | [Routed multicast design](multicast-routed.md) |
 | Admission budget, pressure and resource reuse | [Capacity guide](capacity.md) |
+| What the hardware does with an IPv4/IPv6 translation, and the design for admitting Jool's (prototype) | [NAT64 and SIIT](nat64.md) |
 | Original proposal, implementation snapshots and dated measurements | [History by topic and chronology](history/README.md) |
 | Remaining intermittent UDP/link observations | [UDP loss investigation](udp-loss-investigation.md) |
 | Why live UDP flows are spuriously retired, and what it is not | [Retirement investigation](retirement-investigation.md) |
