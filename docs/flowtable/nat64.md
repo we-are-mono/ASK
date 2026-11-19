@@ -183,9 +183,14 @@ configuration change or local IPv4 address change.
 
 ## Order of work
 
-1. Encoder and its host proof: done in the prototype (`flowtable_hw.c`
-   checks the pair, the overlay, the TOS and the slack in the MTU; the rig
-   checks the wire).
+1. Encoder and its host proof: done in the prototype.
+   - `flowtable_hw.c` checks the pair, the overlay, the TOS and the slack in
+     the MTU.
+   - `natpt_hm.c` runs the production selector and the NAT, NAT-PT and
+     Ethernet emitters. It checks the opcode order, the flags and every
+     parameter byte the microcode reads, for both directions, TCP and UDP,
+     and both TOS modes.
+   - The rig checks the wire.
 2. The Jool patch and the adapter for stateful NAT64, TCP and UDP. Jool goes
    into the test image so the rig can run a real NAT64 (`set nat64` under
    VyOS, Jool's netfilter mode in meta-ask), with line-rate and lifecycle
