@@ -152,6 +152,29 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A452 — A202's zero-payload fragments do not reproduce; the bound on non-TCP into a smaller path may be stale.**
+
+  **Where:** `ft_mtu_carried()` and `ft_detours()` (`cdx/ask_flowtable_core.c`), and the offline-port detour
+  (A385).
+
+  **Why it matters:** the bound keeps IPv4 non-TCP directions into a smaller path in software, or on the detour,
+  because A202 measured all-zero payloads in microcode fragments of port-received frames. If the microcode
+  fragments correctly, IPv4 UDP into a PPPoE or tunnel uplink, or from a jumbo LAN, could fragment directly in
+  hardware, without the detour's second pass or its exclusions (sessions, tunnels, jumbo ports). IPv6 stays in
+  software regardless: a router may not fragment it.
+
+  **Measured 2026-11-19** (stock 210.10.1, 6.18 test image, `docs/flowtable/history/nat64-feasibility.md`):
+  - Every payload came back byte-identical in 8 shapes:
+    - hairpin eth4: plain NAT, NAT-PT 4to6, 6o4, PPPoE;
+    - eth3→eth4: SNAT, into a PPPoE session and into a 4o6 tunnel (A202's own two shapes);
+    - a 9000-byte frame into 1500 (A316's shape).
+  - Restoring the pre-`b957f822` fragment pool (2048 × 1500 B) changed nothing.
+
+  **Cause of A202's zeros:** unknown. Lead: patch 106 (port ICIDs) landed the day before A202's commit, so its
+  image may have run the fragmenter's DMA with zeroed ICIDs.
+
+  **Next:** either bisect against a September image, or accept today's measurements. In both cases a full suite
+  must pass before the bound is relaxed, for IPv4 only.
 - [x] **A451 — CEETM teardown drained portal messages, whose callbacks take spinlocks, from an IPI.** Each portal
   CPU's worker syncs it now; 6.18's lockdep flags a drain from an IPI at once (_:/^cdx: sync CEETM portals from_).
 - [x] **A450 — removing a port took the SDK QMan `cgr_lock`, a plain spinlock, in an IPI.** Lockdep's raw-nesting
