@@ -164,6 +164,58 @@ An unfragmented control alongside each case was intact too.
 **Conclusion.** A202's zero payload does not reproduce on this build in any
 recorded shape. What changed since is not known.
 
+## The admission source on the rig (2026-11-19)
+
+**Setup.** Branch `nat64-offload` at `0321cf9c`, 6.18 test image, stock
+210.10.1, driven through `ask_xlat_test.ko`.
+
+**Hairpin on eth4, TCP:**
+- **Refusal:** an offer before either end had a neighbour entry was refused,
+  with one `expired` each time; two offers gave two `expired`.
+- **Install:** with neighbours present it installed. `flows` showed both
+  directions with the translated tuple in its own family, `xlat=` and
+  `tos=copy`.
+- **Wire:** probes in both directions came out translated with TOS 0xb8, 0xbb
+  (CE) and 0x00 copied, correct checksums, DF on the IPv4 side, and data
+  intact. The counters matched the probes.
+- **Keepalive:** `used` rose only in passes that saw packets (6 after six
+  probes, unchanged over 4 s idle, 7 after one more).
+- **Withdrawal:** removed both entries with no `expired`, and the next probe
+  went to the CPU.
+- **Retirement:** changing the IPv4 neighbour's MAC retired the session with
+  one `expired`, and so did deleting the IPv6 route.
+- **Unload:** unloading the client with a session installed drained it
+  (entries 2 to 0, `fatal` 0), and the client loaded again cleanly.
+
+**eth3 → eth4 (loki, `fc00:dead::2` ↔ 10.0.0.232), TCP:**
+- **Probes:** 5 of 5 each way, translated, TOS 0xbb copied, checksums
+  correct, data intact.
+- **Load:**
+  - loki sent 4,466,688 frames of 1,374 bytes in 5 s, at 893 kpps and
+    9.82 Gbit/s.
+  - The 6to4 entry counted exactly those, plus the 10 earlier probes.
+  - eth4 transmitted 4,466,737 frames.
+  - The CPU's eth3 receive count rose by 3.
+  - eth4's receive drops rose by about 1.5 million, as many as the WAN host
+    received. Those are most likely its resets for the unsolicited ACKs,
+    which the classifier sends to the CPU. Not confirmed.
+
+**After the run:** the kernel log had no `WARNING:`, `BUG:`, `Oops` or KASAN
+report.
+
+**`FRAG_DISABLE` on a translated entry** (a temporary knob, not committed):
+- an oversized IPv4 packet without DF (1500 bytes) left whole, as 1520 bytes
+  of IPv6, over the 1500-byte MTU, and nothing reached the CPU;
+- with the fragmenter on, it left as two IPv6 fragments.
+
+The bit stops fragmentation and nothing else, so it cannot keep UDP safe.
+
+**Found:**
+- the admission path logs no refusal reason (the flowtable path does, under
+  `ask_debug`);
+- a translated `flows` row's `cookie=` is the adapter's own, not the client's
+  session cookie.
+
 ## Not measured
 
 * Line rate with a real LAN client (loki's NIC was detached).

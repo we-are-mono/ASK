@@ -115,6 +115,14 @@ none); its translations only shrink.
   without `compute-udp-csum-zero`). Hardware would emit it as 0. Admission
   refuses a UDP flow whose packets reached Jool with checksum 0; whether a
   sender checksums is a per-socket choice, so a flow does not mix the two.
+* **A UDP session whose IPv4 side could outgrow the IPv6 path.** A 1500-byte
+  IPv4 packet is 1520 bytes as IPv6. Without DF, the only thing that keeps it
+  within the MTU in hardware is the microcode's fragmenter, which A452 has not
+  cleared. Disabling the fragmenter is no way around it: measured, the
+  enqueue's `FRAG_DISABLE` bit sends the oversized packet out whole, over the
+  MTU, rather than to the CPU (history). So until A452 is settled, such a
+  session stays with the translator, which is every UDP session at equal
+  MTUs.
 
 ## Where hardware differs from Jool
 
