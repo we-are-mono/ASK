@@ -169,8 +169,9 @@ static void ft_owner_invalidate(struct ft_owner *owner, atomic64_t *counter)
 }
 
 /* The bridged learner, as the worker reaches it: both take its lock and let
- * it go, and walk no tc. */
-static bool ft_bound, paired;
+ * it go, and walk no tc. And whether a translation client is registered,
+ * whose sessions are admitted against the sample with nothing bound. */
+static bool ft_bound, paired, ft_xlat_active;
 static const struct net_device *changed_dev[4];
 static unsigned devs_changed, refusal_resets, mc_kicks, mr_kicks;
 bool ft_l2_paired(void);
@@ -326,7 +327,13 @@ int main(void)
     paired = true;
     pass();
     assert(ft_tc_known() && ft_tc_work.queued);
+    /* A translation client alone keeps it too: its sessions are judged by
+     * the sample with no flowtable bound. */
     paired = false;
+    ft_xlat_active = true;
+    pass();
+    assert(ft_tc_known() && ft_tc_work.queued);
+    ft_xlat_active = false;
     pass();
     assert(!ft_tc_known() && !ft_tc_work.queued);
 

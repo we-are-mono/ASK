@@ -34,9 +34,9 @@ def refusal_classes(source):
 def files():
     source = flowtable_source()
     status = (function(source, "ft_status_show") + function(source, "ft_l2_status")
-              + function(source, "ft_qos_status"))
+              + function(source, "ft_xlat_status") + function(source, "ft_qos_status"))
     stats = (function(source, "ft_stats_show") + function(source, "ft_l2_stats")
-             + function(source, "ft_sec_refusal_stats"))
+             + function(source, "ft_xlat_stats") + function(source, "ft_sec_refusal_stats"))
     return source, status, stats
 
 
@@ -55,6 +55,8 @@ def test_every_key_is_short_unique_and_documented():
     assert "ft_sec_refusal_stats(seq);" in function(source, "ft_stats_show")
     assert "ft_l2_status(seq);" in function(source, "ft_status_show")
     assert "ft_l2_stats(seq);" in function(source, "ft_stats_show")
+    assert "ft_xlat_status(seq);" in function(source, "ft_status_show")
+    assert "ft_xlat_stats(seq);" in function(source, "ft_stats_show")
 
 
 def test_levels_under_the_transaction_counts_without_it():
@@ -62,6 +64,9 @@ def test_levels_under_the_transaction_counts_without_it():
     show = function(flowtable_source(), "ft_status_show")
     assert show.index("cdx_ft_begin();") < show.index("ft_kv(") and \
         show.rindex("ft_kv(") < show.index("cdx_ft_end();")
+    # The translated sessions' levels are read in the same hold.
+    assert show.index("cdx_ft_begin();") < show.index("ft_xlat_status(seq);") < \
+        show.index("cdx_ft_end();")
     # The hardware QoS budget comes last, read after the transaction is let
     # go: cdx's QoS mutex is no part of what the health probe times.
     assert show.index("cdx_ft_end();") < show.index("ft_qos_status(seq);")

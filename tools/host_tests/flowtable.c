@@ -90,6 +90,7 @@ static bool ipv6_prefix_equal(const struct in6_addr *a, const struct in6_addr *b
 struct ipv6hdr { u8 prefix[8]; struct in6_addr saddr, daddr; };
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
 #define U8_MAX 0xffU
+#define U16_MAX 0xffffU
 #define __ffs(x) ((unsigned long)__builtin_ctzl(x))
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
@@ -170,6 +171,7 @@ struct list_head { struct list_head *next, *prev; };
 #define LIST_HEAD_INIT(n) { &(n), &(n) }
 #define list_entry(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
 #define list_first_entry(h, t, m) list_entry((h)->next, t, m)
+#define list_first_entry_or_null(h, t, m) ((h)->next != (h) ? list_first_entry(h, t, m) : NULL)
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
 /* Only ever handed a const pointer here, which the kernel's keeps const. */
 #define container_of_const(p, t, m) ((const t *)((const char *)(p) - offsetof(t, m)))
@@ -215,6 +217,11 @@ static bool hlist_unhashed(const struct hlist_node *n) { return !n->pprev; }
 #define hash_for_each_possible(t, p, m, k) \
     for (struct hlist_node *node_ = (t)[hash_slot(t, k)].first; \
          node_ && ((p) = list_entry(node_, typeof(*(p)), m), 1); node_ = node_->next)
+/* Every entry of every bucket. */
+#define hash_for_each(t, b, p, m) \
+    for ((b) = 0; (b) < ARRAY_SIZE(t); (b)++) \
+        for (struct hlist_node *node_ = (t)[b].first; \
+             node_ && ((p) = list_entry(node_, typeof(*(p)), m), 1); node_ = node_->next)
 /* Every entry of every bucket, with the next node read before the body runs,
  * so the body may free the entry. */
 #define hash_for_each_safe(t, b, n, p, m) \
@@ -300,6 +307,9 @@ struct net_device_path {
     struct { u16 id; __be16 proto; u8 h_dest[6]; } encap;
 };
 struct net_device_path_ctx { const struct net_device *dev; u8 daddr[6]; };
+/* The whole walk, as a translated direction's admission asks it for the
+ * physical port (dev_fill_forward_path(), defined with the devices). */
+struct net_device_path_stack { int num_paths; struct net_device_path path[5]; };
 struct net_device_ops {
     int (*ndo_fill_forward_path)(struct net_device_path_ctx *ctx, struct net_device_path *path);
 };
@@ -547,7 +557,18 @@ static void ft_l2_refusals_reset(void) { l2_refusal_resets++; }
 static struct { const struct net_device *dev; int ifindex; u8 soft; } tc_sample[6];
 static unsigned tc_samples, tc_kicks, tc_exits;
 static bool tc_unknown;
-static bool ft_tc_known(void) { return !tc_unknown; }
+/* What a case has happen elsewhere the next time admission asks whether a
+ * sample is known, or kicks for one: once each. */
+static void (*tc_known_hook)(void), (*tc_kick_hook)(void);
+static void run_once(void (**hook)(void))
+{
+    void (*run)(void) = *hook;
+
+    *hook = NULL;
+    if (run)
+        run();
+}
+static bool ft_tc_known(void) { run_once(&tc_known_hook); return !tc_unknown; }
 static bool ft_tc_any(void) { return !tc_unknown && tc_samples; }
 static u8 ft_tc_dev_bits(const struct net_device *dev)
 {
@@ -563,7 +584,7 @@ static u8 ft_tc_index_bits(int ifindex)
             return tc_sample[i].soft;
     return 0;
 }
-static void ft_tc_kick(void) { tc_kicks++; }
+static void ft_tc_kick(void) { tc_kicks++; run_once(&tc_kick_hook); }
 static void ft_tc_exit(void) { tc_exits++; }
 static bool ft_l2_retire_batch(void) { l2_retire_alls++; return false; }
 /* Three buckets of bridged pairs' rows after the flows': two rows, none and
@@ -627,6 +648,11 @@ struct dst_entry {
     bool valid;
     /* RTAX_MTU's lock bit, the one metric lock the adapter reads. */
     bool mtu_locked;
+    /* What dst_mtu() answers, the device's own when zero; and the
+     * references a translated admission's route lookups hand out, which it
+     * gives back before it returns. */
+    unsigned mtu;
+    int refs;
 };
 #define RTAX_MTU 2
 static bool dst_metric_locked(const struct dst_entry *d, int metric)
@@ -659,6 +685,79 @@ static const struct in6_addr *rt6_nexthop(const struct rt6_info *r,
     if (r->rt6i_flags & RTF_GATEWAY) return &r->rt6i_gateway;
     if (r->rt6i_flags & RTF_CACHE) return &r->rt6i_dst.addr;
     return address;
+}
+/* A translated direction's routes, which its admission looks up itself as the
+ * translator routes its own packets: an output route from the translated
+ * source, any source allowed. A case says what each family's lookup finds,
+ * NULL being unreachable; the last flow asked is kept, and every reference
+ * handed out is counted on its route. */
+#define FLOWI_FLAG_ANYSRC 0x01
+struct flowi4 { __be32 saddr, daddr; u8 flowi4_proto; unsigned flowi4_flags; __be16 fl4_sport, fl4_dport; };
+struct flowi6 { struct in6_addr saddr, daddr; u8 flowi6_proto; __be16 fl6_sport, fl6_dport; };
+static struct rtable *xlat_route4;
+static struct rt6_info *xlat_route6;
+static struct rt6_info xlat_unreachable6 = { .dst = { .error = -ENETUNREACH } };
+static struct flowi4 xlat_last_fl4;
+static struct flowi6 xlat_last_fl6;
+static struct rtable *__ip_route_output_key(struct net *net, struct flowi4 *fl4)
+{
+    assert(net == &init_net && (fl4->flowi4_flags & FLOWI_FLAG_ANYSRC));
+    xlat_last_fl4 = *fl4;
+    if (!xlat_route4) return ERR_PTR(-ENETUNREACH);
+    xlat_route4->dst.refs++;
+    return xlat_route4;
+}
+static struct dst_entry *ip6_route_output(struct net *net, const void *sk, struct flowi6 *fl6)
+{
+    struct rt6_info *rt = xlat_route6 ? xlat_route6 : &xlat_unreachable6;
+
+    assert(net == &init_net && !sk);
+    xlat_last_fl6 = *fl6;
+    rt->dst.refs++;
+    return &rt->dst;
+}
+static void dst_release(struct dst_entry *d) { assert(d->refs > 0); d->refs--; }
+static u32 rt6_get_cookie(const struct rt6_info *r) { return r->dst.cookie; }
+static unsigned dst_mtu(const struct dst_entry *d) { return d->mtu ? d->mtu : (unsigned)d->dev->mtu; }
+/* The kernel's forwarding-path walk over the fixtures' devices: a device's own
+ * hook where it has one (a ppp unit's), down a VLAN device to its lower, and
+ * through a bridge by the one FDB entry a case teaches it; a device that is
+ * none of those ends the walk as its Ethernet device. */
+static const u8 *xlat_fdb_mac;
+static struct net_device *xlat_fdb_port;
+static int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
+                                 struct net_device_path_stack *stack)
+{
+    struct net_device_path_ctx ctx = { .dev = dev };
+
+    memcpy(ctx.daddr, daddr, sizeof(ctx.daddr));
+    stack->num_paths = 0;
+    while (ctx.dev) {
+        struct net_device_path *path;
+
+        assert(stack->num_paths < (int)ARRAY_SIZE(stack->path));
+        path = &stack->path[stack->num_paths++];
+        memset(path, 0, sizeof(*path));
+        path->dev = ctx.dev;
+        if (ctx.dev->netdev_ops && ctx.dev->netdev_ops->ndo_fill_forward_path) {
+            int rc = ctx.dev->netdev_ops->ndo_fill_forward_path(&ctx, path);
+
+            if (rc)
+                return rc;
+        } else if (is_vlan_dev(ctx.dev)) {
+            path->type = DEV_PATH_VLAN;
+            ctx.dev = ctx.dev->real_dev;
+        } else if (netif_is_bridge_master(ctx.dev)) {
+            path->type = DEV_PATH_BRIDGE;
+            if (!xlat_fdb_port || memcmp(ctx.daddr, xlat_fdb_mac, ETH_ALEN))
+                return -1;
+            ctx.dev = xlat_fdb_port;
+        } else {
+            path->type = DEV_PATH_ETHERNET;
+            return 0;
+        }
+    }
+    return 0;
 }
 struct neigh_table { unsigned key_len; int family; };
 static struct neigh_table arp_tbl = { .key_len = 4, .family = AF_INET },
@@ -878,6 +977,7 @@ static u64 ft_stats_passes, ft_stats_requests;
 static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_stp_invalidations, ft_qos_invalidations, ft_admission_invalidations, ft_destroy_deferrals;
 static u64 ft_tc_refused, ft_tc_invalidations;
 static void atomic64_inc(u64 *v) { (*v)++; }
+static void atomic64_add(u64 n, u64 *v) { *v += n; }
 static u64 atomic64_inc_return(u64 *v) { return ++*v; }
 static u64 atomic64_read_acquire(u64 *v) { return *v; }
 static u64 ft_ipsec_genid, xfrm_genid, ft_ipsec_invalidations, ft_ipsec_policy_invalidations;
@@ -888,6 +988,8 @@ static unsigned long jiffies = 1000;
 static unsigned allocated, live_hw, flushed, scheduled;
 static bool allocation_fail, hardware_fail, invalidate_on_add, physical_ok = true, neigh_ok = true;
 static int hardware_alloc_error;
+static unsigned hardware_fail_nth;
+static void (*add_hook)(void);
 static bool change_neigh_on_add, change_neigh_on_lookup;
 static bool change_policy_on_add, change_sa_on_add;
 static unsigned neigh_lookups, neigh_uses;
@@ -1129,6 +1231,20 @@ static bool queue_delayed_work(int *wq, int *work, unsigned long delay)
 }
 #define msecs_to_jiffies(m) ((unsigned long)(m) * HZ / 1000)
 static void ft_stats_kick(void);
+/* The translated sessions' worker, which an offer queues and which requeues
+ * itself after an offer that has to wait; the cases run it by hand. Declared
+ * here for the stubs; the adapter's own declaration repeats it. */
+#define DECLARE_DELAYED_WORK(n, fn) int n
+static int ft_xlat_work;
+static unsigned xlat_work_kicks;
+static unsigned long xlat_work_delay;
+static bool mod_delayed_work(int *wq, int *work, unsigned long delay)
+{
+    assert(wq == system_unbound_wq && work == &ft_xlat_work);
+    xlat_work_kicks++;
+    xlat_work_delay = delay;
+    return true;
+}
 /* A batched job's turn to the others, with the transaction let go: what a
  * case has them do meanwhile, once. */
 static unsigned let_waiters;
@@ -1380,7 +1496,8 @@ static bool ft_ipsec_handle(const struct flow_cls_offload *cls, struct cdx_ft_ru
 static struct net_device *__dev_get_by_index(struct net *net, int ifindex);
 typedef int atomic_t;
 #define ATOMIC_INIT(n) (n)
-static int atomic_read(int *v) { return *v; }
+#define ATOMIC64_INIT(n) (n)
+static int atomic_read(const int *v) { return *v; }
 static int atomic_xchg(int *v, int n) { int old = *v; *v = n; return old; }
 /* The lock-free list deletions that found the transaction held leave their
  * records on: a stack, newest first, as the kernel's. */
@@ -1707,6 +1824,11 @@ static int cdx_ft_add(const struct cdx_ft_rule *r,
         observed_in_vlan[i] = stats->in_vlan[i] ? stats->in_vlan[i]->rx_index : 0;
         observed_out_vlan[i] = stats->out_vlan[i] ? stats->out_vlan[i]->tx_index : 0;
     }
+    /* What a case has happen elsewhere while an entry is being added. */
+    run_once(&add_hook);
+    /* The add a case counts down to, alone, fails: the second direction of a
+     * pair, say, after the first went in. */
+    if (hardware_fail_nth && !--hardware_fail_nth) return -EIO;
     if (hardware_fail) return -EIO;
     if (hardware_alloc_error) {
         assert(ft_handle_refs && ft_neighbour_refs);
@@ -1900,11 +2022,16 @@ static void cancel_work_sync(int *work)
     if (work == &ft_dev_stats_work) work_queued_dev_stats = false;
     canceled++;
 }
+static unsigned xlat_work_cancels;
 static void cancel_delayed_work_sync(int *work)
 {
-    assert(work == &ft_work || work == &ft_ipsec_stats || work == &ft_rearm_work);
+    assert(work == &ft_work || work == &ft_ipsec_stats || work == &ft_rearm_work ||
+           work == &ft_xlat_work);
+    /* Never while holding the transaction, which the work takes. */
+    assert(!cdx_info->ctrl.mutex);
     if (work == &ft_work) work_queued_invalidate = false;
     else if (work == &ft_rearm_work) work_queued_rearm = false;
+    else if (work == &ft_xlat_work) xlat_work_cancels++;
     canceled++;
 }
 /* The counter pass is disabled, not cancelled, on the way out. */
@@ -1925,16 +2052,18 @@ static void unregister_indirect(void (*release)(void *))
 {
     assert(indirect_registered && !cdx_info->ctrl.mutex);
     /* Both unwinds stop new binds first. Unload gives this route back last,
-     * with all seven works cancelled -- retirement, the settle Linux's own
+     * with all eight works cancelled -- retirement, the settle Linux's own
      * deletions left, the delayed installer, the parked rearm's retry, the SA
-     * next-hop follower, the SA accounting pass and the counter pass -- and
-     * every notifier already gone. A load unwinding its own failure gives it
-     * back first and cancels the works after, once nothing bound is left to
-     * queue them, with its notifiers still registered: that is what tells the
-     * two apart. */
+     * next-hop follower, the SA accounting pass, the counter pass and the
+     * translated sessions' worker -- and every notifier already gone. A load
+     * unwinding its own failure gives it back first and cancels the works
+     * after, once nothing bound is left to queue them, with its notifiers
+     * still registered: that is what tells the two apart; no translation
+     * client can have registered before the load returned, so its worker was
+     * never queued. */
     assert(ft_stopping);
     if (!netdev_registered) {
-        assert(canceled == 7);
+        assert(canceled == 8 && xlat_work_cancels);
         assert(!neigh_registered && !fib_registered && !nexthop_registered);
         assert(!fdb_registered && !swdev_obj_registered);
     } else {
@@ -1968,7 +2097,7 @@ static unsigned unload_sleeps, unload_failures;
 static void msleep(unsigned ms)
 {
     assert(ms == 1000 && backend_claimed && !cdx_info->ctrl.mutex && !rtnl);
-    assert(!indirect_registered && !ft_count && !ft_bound && canceled == 7);
+    assert(!indirect_registered && !ft_count && !ft_bound && canceled == 8);
     assert(unload_failures);
     unload_sleeps++;
     if (!--unload_failures) { retry_error=0; quiesce_fail=false; }
@@ -1990,6 +2119,8 @@ static unsigned bridge_hooks;
 /* A bridge hook a routed frame leaving by the bridge crosses: br_netfilter's
  * pass it untouched, so these are anything else. */
 static bool ft_bridge_hooked_routed(unsigned hooks) { return bridge_hooks & hooks; }
+/* Compiled after the translated sessions' unregistration, which waits on it. */
+void ft_hw_settle(void);
 #include "flowtable_production.inc"
 
 /* Most cases drive admission and removal directly, standing in for the rule
@@ -10121,6 +10252,1113 @@ static void test_registration(void)
     }
 }
 
+/* ---- translated sessions (ask_flowtable_xlat.c) -------------------------
+ *
+ * NAT64 between the LAN client fd00::2 behind `in' and the server
+ * 198.51.100.10 behind `out', mapped into 64:ff9b::/96 and translated through
+ * the pool address 203.0.113.1. Direction 0 is the client's upload, IPv6 in on
+ * `in' and IPv4 out on `out'; direction 1 the download, the other way. The
+ * client registered below counts what it is told, inside the transaction. */
+#define XLAT_POOL	0xcb007101
+#define XLAT_SERVER	0xc633640a
+#define XLAT_COOKIE	0x5e55ULL
+static struct ask_xlat_flow xlat_flow;
+static struct rtable xlat_rt4;
+static struct rt6_info xlat_rt6;
+static unsigned xlat_expired_calls, xlat_used_calls;
+static u64 xlat_expired_cookie, xlat_used_cookie;
+static unsigned long xlat_used_lastused;
+/* What the client does from inside an expired, once: withdraw the session or
+ * offer it again, standing in for another CPU doing so while the call is under
+ * way, with what the adapter answered. */
+static bool xlat_withdraw_in_expired, xlat_offer_in_expired;
+static int xlat_in_expired_answer = -1;
+/* Each session's expired calls, by its cookie's distance from XLAT_COOKIE;
+ * and the translated directions still in the hardware at the last call. */
+static unsigned xlat_expired_by[80], xlat_expired_entries;
+static void xlat_expired_cb(u64 cookie)
+{
+    assert(cdx_info->ctrl.mutex && !ft_xlat_lock);
+    xlat_expired_calls++;
+    xlat_expired_cookie = cookie;
+    xlat_expired_entries = ft_xlat_count;
+    if (cookie - XLAT_COOKIE < ARRAY_SIZE(xlat_expired_by))
+        xlat_expired_by[cookie - XLAT_COOKIE]++;
+    if (xlat_withdraw_in_expired) {
+        xlat_withdraw_in_expired = false;
+        xlat_in_expired_answer = ask_xlat_withdraw(cookie);
+    } else if (xlat_offer_in_expired) {
+        xlat_offer_in_expired = false;
+        xlat_in_expired_answer = ask_xlat_offer(&xlat_flow);
+    }
+}
+static void xlat_used_cb(u64 cookie, unsigned long lastused)
+{
+    assert(cdx_info->ctrl.mutex);
+    xlat_used_calls++;
+    xlat_used_cookie = cookie;
+    xlat_used_lastused = lastused;
+}
+static const struct ask_xlat_ops xlat_ops = { .expired = xlat_expired_cb, .used = xlat_used_cb };
+
+static union nf_inet_addr xlat_client(void) { return (union nf_inet_addr){ .in6 = addr6(0xfd000000, 2) }; }
+static union nf_inet_addr xlat_mapped(void) { return (union nf_inet_addr){ .in6 = addr6(0x0064ff9b, XLAT_SERVER) }; }
+
+static void xlat_flow_fill(u8 proto)
+{
+    union nf_inet_addr client = xlat_client(), mapped = xlat_mapped();
+    union nf_inet_addr pool = v4(htonl(XLAT_POOL)), server = v4(htonl(XLAT_SERVER));
+
+    xlat_flow = (struct ask_xlat_flow){ .net = &init_net, .cookie = XLAT_COOKIE, .proto = proto,
+                                        .tos = ASK_XLAT_TOS_COPY };
+    xlat_flow.dir[0] = (struct ask_xlat_dir){
+        .match = { .src = client, .dst = mapped, .sport = htons(40001), .dport = htons(5000),
+                   .family = AF_INET6 },
+        .xlat = { .src = pool, .dst = server, .sport = htons(61001), .dport = htons(5000),
+                  .family = AF_INET },
+        .ifindex = in.ifindex };
+    xlat_flow.dir[1] = (struct ask_xlat_dir){
+        .match = { .src = server, .dst = pool, .sport = htons(5000), .dport = htons(61001),
+                   .family = AF_INET },
+        .xlat = { .src = mapped, .dst = client, .sport = htons(5000), .dport = htons(40001),
+                  .family = AF_INET6 },
+        .ifindex = out.ifindex };
+}
+
+/* After fixture(): the server's neighbour on `out' and the client's on `in',
+ * the routes each family's lookup finds, the latches clear and nothing told
+ * yet. The fixture's own neighbour stays for a Netfilter offer beside. */
+static void xlat_setup(u8 proto)
+{
+    alternate_gateway = (struct neighbour){ .tbl = &arp_tbl, .nud_state = NUD_REACHABLE,
+        .ha = {2, 0x44, 0x44, 0x44, 0x44, 0x01}, .dev = &out,
+        .primary_key = v4(htonl(XLAT_SERVER)) };
+    gateway = (struct neighbour){ .tbl = &nd_tbl, .nud_state = NUD_REACHABLE,
+        .ha = {2, 0x66, 0x66, 0x66, 0x66, 0x02}, .dev = &in, .primary_key = xlat_client() };
+    xlat_rt4 = (struct rtable){ .dst = { .ops = &ipv4_ops, .dev = &out, .valid = true },
+                                .rt_type = RTN_UNICAST };
+    xlat_rt6 = (struct rt6_info){ .dst = { .ops = &ipv6_ops6, .dev = &in, .valid = true,
+                                           .cookie = 0x7a7 } };
+    xlat_route4 = &xlat_rt4;
+    xlat_route6 = &xlat_rt6;
+    xlat_fdb_port = NULL;
+    xlat_fdb_mac = NULL;
+    /* The adapter loaded and running, whatever an unload case before left:
+     * a load starts with the queue open, as a module's statics are. */
+    ft_ready = true;
+    ft_xlat_closing = false;
+    ft_invalid = 0;
+    ft_fatal = ft_stopping = false;
+    tc_unknown = rtnl_busy = false;
+    tc_samples = 0;
+    retry_error = deletion_error = 0;
+    xlat_expired_calls = xlat_used_calls = 0;
+    memset(xlat_expired_by, 0, sizeof(xlat_expired_by));
+    xlat_withdraw_in_expired = xlat_offer_in_expired = false;
+    xlat_in_expired_answer = -1;
+    tc_known_hook = tc_kick_hook = add_hook = NULL;
+    xlat_flow_fill(proto);
+}
+
+static struct cdx_ft_entry *xlat_entry(unsigned d)
+{
+    struct cdx_ft_entry *e;
+
+    list_for_each_entry(e, &ft_xlat_list, binding_node)
+        if (e->dir == d)
+            return e;
+    return NULL;
+}
+
+/* A session offered and decided: true when both directions went in. */
+static bool xlat_admitted(void)
+{
+    assert(ask_xlat_offer(&xlat_flow));
+    ft_xlat_workfn(NULL);
+    /* Whatever the run unlinked -- a pair taken back, a retired holder --
+     * proven before it let the transaction go. */
+    assert(!xlat_rt4.dst.refs && !xlat_rt6.dst.refs && !rtnl && !owed);
+    assert(ft_xlat_count == (unsigned)(xlat_entry(0) != NULL) + (xlat_entry(1) != NULL));
+    return xlat_entry(0) && xlat_entry(1);
+}
+
+/* Withdrawn, and out of the hardware by the worker's direct retirement, with
+ * no walk of the table: no callback for it. */
+static void xlat_withdrawn(void)
+{
+    unsigned expired = xlat_expired_calls;
+
+    atomic_set(&ft_retire_scan, 0);
+    assert(ask_xlat_withdraw(XLAT_COOKIE));
+    assert(!atomic_read(&ft_retire_scan));
+    ft_xlat_workfn(NULL);
+    assert(!ft_xlat_count && xlat_expired_calls == expired && list_empty(&ft_xlat_retiring));
+}
+
+/* An offer refused after it was queued: said expired once, nothing left. */
+static void xlat_refused(void)
+{
+    unsigned expired = xlat_expired_calls, before = allocated, count = ft_count;
+
+    assert(!xlat_admitted());
+    assert(xlat_expired_calls == expired + 1 && xlat_expired_cookie == XLAT_COOKIE);
+    assert(ft_count == count && !ft_xlat_count && !ft_xlat_sessions && allocated == before);
+}
+
+/* An offer turned away at the door, before anything was queued: nothing owed
+ * and nothing said. */
+static void xlat_turned_away(void)
+{
+    unsigned expired = xlat_expired_calls, head = ft_xlat_head;
+
+    assert(!ask_xlat_offer(&xlat_flow));
+    ft_xlat_workfn(NULL);
+    assert(ft_xlat_head == head && xlat_expired_calls == expired && !ft_xlat_count);
+}
+
+static void test_xlat_admission(void)
+{
+    union nf_inet_addr client = xlat_client();
+    struct cdx_ft_entry *e0, *e1;
+    unsigned before, kicks = xlat_work_kicks, tc = tc_kicks;
+    u64 installs = ft_xlat_installs;
+    int in_refs, out_refs;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    before = allocated;
+    in_refs = in.refs;
+    out_refs = out.refs;
+    /* With no client nothing is queued, and nothing is owed. */
+    assert(!ask_xlat_offer(&xlat_flow) && xlat_work_kicks == kicks);
+    assert(ask_xlat_register(&xlat_ops) == 0 && ft_xlat_active && tc_kicks == tc + 1);
+    assert(ask_xlat_register(&xlat_ops) == -EBUSY);
+    assert(ask_xlat_offer(&xlat_flow) && xlat_work_kicks == kicks + 1 && !xlat_work_delay);
+    ft_xlat_workfn(NULL);
+    assert(ft_count == 2 && ft_xlat_count == 2 && ft_xlat_sessions == 1 && live_hw == 2);
+    assert(ft_handle_refs == 2 && ft_neighbour_refs == 2 && !xlat_expired_calls && !rtnl);
+    e0 = xlat_entry(0);
+    e1 = xlat_entry(1);
+    assert(e0 && e1 && !e0->binding && !e1->binding && e0->owner == e1->owner);
+    assert(e0->cookie == XLAT_COOKIE && e1->cookie == XLAT_COOKIE);
+    /* The upload: keyed on the client's IPv6 tuple at `in', translated to the
+     * pool's IPv4 tuple out of `out', to the server's neighbour, from the
+     * port Linux sends from, at the IPv4 route's MTU. */
+    assert(e0->rule.family == AF_INET6 && e0->rule.xlat_family == AF_INET);
+    assert(e0->rule.xlat_tos == ASK_XLAT_TOS_COPY && e0->rule.proto == IPPROTO_TCP);
+    assert(nf_inet_addr_cmp(&e0->rule.src, &client));
+    assert(nf_inet_addr_cmp(&e0->rule.dst, &xlat_flow.dir[0].match.dst));
+    assert(is4(&e0->rule.new_src, htonl(XLAT_POOL)) && is4(&e0->rule.new_dst, htonl(XLAT_SERVER)));
+    assert(e0->rule.sport == htons(40001) && e0->rule.dport == htons(5000));
+    assert(e0->rule.new_sport == htons(61001) && e0->rule.new_dport == htons(5000));
+    assert(e0->rule.in == &in && e0->rule.in_logical == &in);
+    assert(e0->rule.out == &out && e0->rule.out_logical == &out);
+    assert(e0->rule.mtu == 1500 && !e0->rule.mtu_follows_dev && !e0->rule.detour);
+    assert(e0->rule.next_hop_family == AF_INET && is4(&e0->next_hop, htonl(XLAT_SERVER)));
+    assert(ether_addr_equal(e0->rule.dst_mac, alternate_gateway.ha));
+    assert(ether_addr_equal(e0->rule.src_mac, out.dev_addr));
+    assert(!e0->rule.qos && !e0->rule.sa_handle && !e0->rule.in_sa_handle);
+    assert(!e0->rule.out_tunnel.present && !e0->rule.in_tunnel.present);
+    /* The download the other way round, its IPv6 MTU its device's. */
+    assert(e1->rule.family == AF_INET && e1->rule.xlat_family == AF_INET6);
+    assert(is4(&e1->rule.src, htonl(XLAT_SERVER)) && is4(&e1->rule.dst, htonl(XLAT_POOL)));
+    assert(nf_inet_addr_cmp(&e1->rule.new_dst, &client));
+    assert(e1->rule.in == &out && e1->rule.out == &in && e1->rule.mtu == 1500);
+    assert(e1->rule.mtu_follows_dev && e1->rule.next_hop_family == AF_INET6);
+    assert(nf_inet_addr_cmp(&e1->next_hop, &client));
+    assert(ether_addr_equal(e1->rule.dst_mac, gateway.ha));
+    assert(ether_addr_equal(e1->rule.src_mac, in.dev_addr));
+    /* Each holds its ingress port as well as its egress, with no binding to
+     * pin either, and gave back every route it looked up. */
+    assert(in.refs == in_refs + 2 && out.refs == out_refs + 2);
+    /* Looked up as the translator routes its own packets. */
+    assert(xlat_last_fl4.saddr == htonl(XLAT_POOL) && xlat_last_fl4.daddr == htonl(XLAT_SERVER));
+    assert(xlat_last_fl4.flowi4_proto == IPPROTO_TCP && xlat_last_fl4.fl4_sport == htons(61001));
+    assert(!memcmp(&xlat_last_fl6.daddr, &client.in6, sizeof(client.in6)));
+    /* An offer of the session it holds is folded into it. */
+    assert(xlat_admitted() && ft_count == 2 && !xlat_expired_calls);
+    assert(ft_xlat_head == ft_xlat_tail && ft_xlat_installs == installs + 1);
+    /* The download's neighbour moving retires both directions, said once. */
+    gateway.ha[5]++;
+    ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &gateway);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !ft_xlat_count && !ft_xlat_sessions && !live_hw);
+    assert(!ft_handle_refs && !ft_neighbour_refs);
+    assert(xlat_expired_calls == 1 && xlat_expired_cookie == XLAT_COOKIE);
+    assert(in.refs == in_refs && out.refs == out_refs && allocated == before);
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!ft_xlat_active && !ask_xlat_offer(&xlat_flow) && xlat_expired_calls == 1);
+}
+
+static void test_xlat_refusals(void)
+{
+    static struct xfrm_state transform;
+    u64 busy;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    /* Refused at the door, with nothing owed: another namespace, a protocol
+     * other than TCP or UDP, two directions in one family, a malformed one. */
+#define XLAT_DOOR(...) do { xlat_flow_fill(IPPROTO_TCP); __VA_ARGS__; \
+    assert(!ask_xlat_offer(&xlat_flow)); } while (0)
+    XLAT_DOOR(xlat_flow.net = NULL);
+    XLAT_DOOR(xlat_flow.proto = IPPROTO_ICMP);
+    XLAT_DOOR(xlat_flow.proto = IPPROTO_ICMPV6);
+    XLAT_DOOR(xlat_flow.dir[0].xlat.family = AF_INET6;
+              xlat_flow.dir[0].xlat.src = xlat_client(); xlat_flow.dir[0].xlat.dst = xlat_mapped());
+    XLAT_DOOR(xlat_flow.dir[1].match.family = AF_INET6);
+    XLAT_DOOR(xlat_flow.dir[0].ifindex = 0);
+    XLAT_DOOR(xlat_flow.dir[0].match.sport = 0);
+    XLAT_DOOR(xlat_flow.dir[1].xlat.dport = 0);
+    XLAT_DOOR(xlat_flow.dir[0].xlat.dst = v4(htonl(0xe0000001)));
+    XLAT_DOOR(xlat_flow.dir[1].xlat.dst.in6 = addr6(0xfe800000, 2));
+    assert(!xlat_expired_calls && ft_xlat_head == ft_xlat_tail);
+    /* Refused once queued, each said expired: no route, a tunnel or an
+     * encapsulation on the way out, a route that does not forward or whose
+     * MTU is set above its device's, no neighbour, a port the classifier
+     * cannot program, and a translator that received a direction where its
+     * sibling does not leave. */
+#define XLAT_REFUSED(...) do { fixture(); xlat_setup(IPPROTO_TCP); __VA_ARGS__; \
+    xlat_refused(); } while (0)
+    XLAT_REFUSED(xlat_route4 = NULL);
+    XLAT_REFUSED(xlat_route6 = NULL);
+    XLAT_REFUSED(xlat_rt4.dst.dev = &sit);
+    XLAT_REFUSED(xlat_rt6.dst.lwtstate = &transform);
+    XLAT_REFUSED(xlat_rt6.dst.mtu = 1501; xlat_rt6.dst.mtu_locked = true);
+    XLAT_REFUSED(xlat_rt4.rt_type = RTN_UNICAST + 1);
+    XLAT_REFUSED(xlat_rt6.rt6i_flags = RTF_LOCAL);
+    XLAT_REFUSED(alternate_gateway.nud_state = NUD_FAILED);
+    XLAT_REFUSED(gateway.dead = true);
+    XLAT_REFUSED(physical_ok = false);
+    XLAT_REFUSED(xlat_flow.dir[0].ifindex = upper.ifindex);
+    XLAT_REFUSED(xlat_flow.dir[1].ifindex = in.ifindex);
+    /* tc in software where a direction leaves, as the sample says. */
+    XLAT_REFUSED(tc_samples = 1;
+                 tc_sample[0] = (typeof(tc_sample[0])){ .dev = &out, .soft = FT_TC_TX });
+    /* And on the way in: a translated direction never meets the fast path,
+     * so its whole receive stack counts, the logical device included. */
+    XLAT_REFUSED(xlat_rt6.dst.dev = &br; xlat_fdb_port = &in; xlat_fdb_mac = gateway.ha;
+                 gateway.dev = &br; in.master = &br; xlat_flow.dir[0].ifindex = br.ifindex;
+                 tc_samples = 1;
+                 tc_sample[0] = (typeof(tc_sample[0])){ .dev = &br, .soft = FT_TC_RX_L4 });
+    tc_samples = 0;
+    in.master = NULL;
+    /* The budget the flowtable shares, and the translated half of it. */
+    XLAT_REFUSED(ft_count = CDX_FT_MAX_ENTRIES - 1);
+    ft_count = 0;
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    ft_xlat_count = FT_XLAT_MAX_ENTRIES - 1;
+    assert(ask_xlat_offer(&xlat_flow));
+    ft_xlat_workfn(NULL);
+    assert(!ft_count && !live_hw && xlat_expired_calls == 1);
+    assert(ft_xlat_count == FT_XLAT_MAX_ENTRIES - 1);
+    ft_xlat_count = 0;
+    /* A latch refuses without asking for RTNL. */
+    {
+        unsigned tries = rtnl_trylocks;
+
+        XLAT_REFUSED(ft_invalid = 1);
+        assert(rtnl_trylocks == tries);
+        XLAT_REFUSED(ft_fatal = true);
+        XLAT_REFUSED(ft_observe = true);
+        ft_observe = false;
+    }
+    /* What can clear by itself waits in the queue, owing nothing yet: RTNL
+     * taken, or no tc sample. Both are tried again later, and admitted. */
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    busy = ft_xlat_busy;
+    rtnl_busy = true;
+    assert(ask_xlat_offer(&xlat_flow));
+    ft_xlat_workfn(NULL);
+    assert(!ft_count && !xlat_expired_calls && ft_xlat_busy == busy + 1);
+    assert(ft_xlat_head - ft_xlat_tail == 1 && xlat_work_delay == FT_XLAT_RETRY);
+    rtnl_busy = false;
+    tc_unknown = true;
+    {
+        unsigned tc = tc_kicks;
+
+        ft_xlat_workfn(NULL);
+        assert(!ft_count && !xlat_expired_calls && tc_kicks == tc + 1);
+        assert(ft_xlat_head - ft_xlat_tail == 1);
+    }
+    tc_unknown = false;
+    ft_xlat_workfn(NULL);
+    assert(ft_count == 2 && !xlat_expired_calls && ft_xlat_head == ft_xlat_tail);
+    xlat_withdrawn();
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!allocated && !ft_count && !in.refs && !out.refs);
+}
+
+/* An IPv4 packet the ingress port takes whole is twenty bytes longer as IPv6,
+ * an IPv6 one twenty shorter as IPv4. UDP is carried only where the
+ * translation of the largest frame fits (A452), and so is TCP into IPv4,
+ * which no MSS clamp reaches; TCP into IPv6 is carried into a path it does
+ * not fit. What the route's MTU alone is certain to refuse is turned away at
+ * the door, with nothing queued. */
+static void test_xlat_mtu(void)
+{
+    struct cdx_ft_entry *e;
+    unsigned tries;
+    u64 door;
+
+    fixture();
+    xlat_setup(IPPROTO_UDP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    /* 1500 everywhere: the download grows to 1520 into a 1500-byte LAN, which
+     * the IPv6 route's MTU already says -- without RTNL or the transaction,
+     * however often the translator offers it. */
+    door = ft_xlat_mtu_refusals;
+    tries = rtnl_trylocks;
+    xlat_turned_away();
+    xlat_turned_away();
+    assert(ft_xlat_mtu_refusals == door + 2 && rtnl_trylocks == tries);
+    /* Nothing of it is kept to go stale: with the LAN port taking 1520 the
+     * next offer is admitted, the download fitting and the upload of a
+     * 1520-byte IPv6 packet leaving as 1500 bytes of IPv4. */
+    in.mtu = 1520;
+    assert(xlat_admitted());
+    assert(xlat_entry(0)->rule.mtu == 1500 && xlat_entry(1)->rule.mtu == 1520);
+    xlat_withdrawn();
+    /* And a route locked below that turns it away again, until it goes. */
+    xlat_rt6.dst.mtu = 1500;
+    xlat_rt6.dst.mtu_locked = true;
+    xlat_turned_away();
+    xlat_rt6.dst.mtu = 0;
+    xlat_rt6.dst.mtu_locked = false;
+    assert(xlat_admitted());
+    xlat_withdrawn();
+    /* One byte less on the IPv4 route and the upload no longer fits: a
+     * refusal only the port's own MTU decides, so it is the worker's. */
+    fixture();
+    xlat_setup(IPPROTO_UDP);
+    in.mtu = 1520;
+    xlat_rt4.dst.mtu = 1499;
+    xlat_refused();
+    /* TCP into IPv4 likewise: 1480 bytes of IPv4 from a 1500-byte LAN fit
+     * 1480 and not 1479, the worker's to say; far below, the route says it. */
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    xlat_rt4.dst.mtu = 1480;
+    assert(xlat_admitted() && xlat_entry(0)->rule.mtu == 1480);
+    xlat_withdrawn();
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    xlat_rt4.dst.mtu = 1479;
+    xlat_refused();
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    xlat_rt4.dst.mtu = 1400;
+    xlat_turned_away();
+    /* TCP into IPv6 is carried into a smaller path, at the route's MTU. */
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    xlat_rt6.dst.mtu = 1400;
+    assert(xlat_admitted() && xlat_entry(1)->rule.mtu == 1400);
+    xlat_withdrawn();
+    /* And never below the egress family's floor. */
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    xlat_rt6.dst.mtu = IPV6_MIN_MTU - 1;
+    xlat_refused();
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    xlat_rt6.dst.mtu = IPV6_MIN_MTU;
+    assert(xlat_admitted());
+    e = xlat_entry(1);
+    assert(e->rule.mtu == IPV6_MIN_MTU && e->rule.mtu_follows_dev);
+    /* The IPv6 egress follows its device's IPv6 MTU, as an IPv6 flow's does:
+     * lowered under it, the counter pass retires the session. */
+    in.ip6_mtu = IPV6_MIN_MTU - 8;
+    ft_stats_workfn(NULL);
+    ft_retire_workfn(NULL);
+    assert(!ft_xlat_count && xlat_expired_calls == 1);
+    in.ip6_mtu = 0;
+    in.mtu = 1500;
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!allocated && !in.refs && !out.refs);
+}
+
+/* Both directions or neither: a failure installing the second takes the
+ * first out, and so does anything the recheck after publication finds. */
+static void test_xlat_pairs(void)
+{
+    u64 routes = ft_route_invalidations;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    hardware_fail_nth = 2;
+    xlat_refused();
+    assert(!live_hw && !hardware_fail_nth && !in.refs && !out.refs && !ft_handle_refs);
+    /* The first, alone, failing installs nothing either. */
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    hardware_fail_nth = 1;
+    xlat_refused();
+    /* A route that moved between its lookup and the publication. */
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    xlat_rt6.dst.valid = false;
+    xlat_refused();
+    assert(ft_route_invalidations == routes + 1 && !live_hw);
+    /* An invalidation latched while the entries were being added. */
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    invalidate_on_add = true;
+    xlat_refused();
+    invalidate_on_add = false;
+    ft_invalid = 0;
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!allocated && !live_hw);
+}
+
+/* One hardware key, one entry: a Netfilter flow and a translated direction
+ * on the same port and tuple refuse each other in either order, and a key an
+ * entry whose owner is retired still holds goes to the newcomer. */
+static void test_xlat_collision(void)
+{
+    struct cdx_ft_entry *nf;
+
+    fixture6();
+    tcp_flow();
+    assert(ft_replace(&binding, &cls) == 0);
+    nf = ft_find(&binding, cls.cookie);
+    assert(nf && ft_count == 1);
+    xlat_setup(IPPROTO_TCP);
+    /* The upload arrives as that flow does, on `in' with its tuple, and
+     * the download goes back to its source. */
+    xlat_flow.dir[0].match.src.in6 = i6k.src;
+    xlat_flow.dir[0].match.dst.in6 = i6k.dst;
+    xlat_flow.dir[0].match.sport = pk.src;
+    xlat_flow.dir[0].match.dport = pk.dst;
+    xlat_flow.dir[1].xlat.src.in6 = i6k.dst;
+    xlat_flow.dir[1].xlat.dst.in6 = i6k.src;
+    xlat_flow.dir[1].xlat.sport = pk.dst;
+    xlat_flow.dir[1].xlat.dport = pk.src;
+    gateway.primary_key.in6 = i6k.src;
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    xlat_refused();
+    assert(ft_find(&binding, cls.cookie) == nf && ft_owner_valid(nf->owner));
+    /* The translated session in first, the Netfilter offer refused. */
+    assert(ft_remove(nf) == 0);
+    assert(xlat_admitted());
+    assert(ft_replace(&binding, &cls) == -EEXIST && ft_count == 2);
+    /* A retired Netfilter entry's key goes to a translated offer. */
+    xlat_withdrawn();
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    handle.invalid = true;
+    assert(xlat_admitted() && ft_count == 2 && !ft_find(&binding, cls.cookie));
+    /* Only the collision refused first was ever said expired. */
+    assert(handle.refs == 1 && xlat_expired_calls == 1);
+    xlat_withdrawn();
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!allocated && !ft_count);
+}
+
+/* One owner for both directions, a reference each: the session is said
+ * expired once, when its last direction leaves, and not before. */
+static void test_xlat_owner(void)
+{
+    struct cdx_ft_entry *e0, *e1;
+    struct ft_xlat_owner *o;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    assert(xlat_admitted());
+    e0 = xlat_entry(0);
+    e1 = xlat_entry(1);
+    o = container_of(e0->owner, struct ft_xlat_owner, owner);
+    assert(e1->owner == &o->owner && o->refs == 2 && o->answers && o->cookie == XLAT_COOKIE);
+    assert(ft_owner_valid(e0->owner) && ft_handle_refs == 2);
+    assert(ft_remove(e1) == 0);
+    assert(o->refs == 1 && ft_xlat_count == 1 && ft_handle_refs == 1 && !xlat_expired_calls);
+    assert(ft_remove(e0) == 0);
+    assert(!ft_xlat_count && !ft_xlat_sessions && !ft_handle_refs && xlat_expired_calls == 1);
+    /* Offered again after it left, a fresh owner. */
+    assert(xlat_admitted());
+    assert(container_of(xlat_entry(0)->owner, struct ft_xlat_owner, owner)->refs == 2);
+    /* Retired through either direction, the other answers the same, and the
+     * retirement is counted by the call that made it alone. */
+    {
+        u64 links = ft_link_invalidations;
+
+        ft_owner_invalidate(xlat_entry(1)->owner, &ft_link_invalidations);
+        assert(!ft_owner_valid(xlat_entry(0)->owner) && ft_link_invalidations == links + 1);
+        ft_owner_invalidate(xlat_entry(0)->owner, &ft_link_invalidations);
+        assert(ft_link_invalidations == links + 1);
+    }
+    ft_retire_workfn(NULL);
+    assert(!ft_xlat_count && xlat_expired_calls == 2);
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!allocated);
+}
+
+/* The keepalive: said from the counter pass, only when packets moved, once a
+ * pass per session whichever directions moved. */
+static void test_xlat_keepalive(void)
+{
+    unsigned queued;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    assert(xlat_admitted());
+    ft_stats_workfn(NULL);
+    assert(!xlat_used_calls);
+    xlat_entry(0)->hw->stats.packets = 10;
+    xlat_entry(0)->hw->stats.bytes = 10 * 80;
+    xlat_entry(0)->hw->stats.lastused = (u32)(jiffies - 5);
+    ft_stats_workfn(NULL);
+    assert(xlat_used_calls == 1 && xlat_used_cookie == XLAT_COOKIE);
+    assert(xlat_used_lastused == jiffies - 5);
+    ft_stats_workfn(NULL);
+    assert(xlat_used_calls == 1);
+    /* Both moving in one pass are said once in it; the later movement waits
+     * for the next pass, which says it though nothing moved meanwhile. The
+     * pass visits the upload first, as it was installed. */
+    xlat_entry(0)->hw->stats.packets = 20;
+    xlat_entry(1)->hw->stats.packets = 7;
+    xlat_entry(1)->hw->stats.lastused = (u32)(jiffies - 2);
+    ft_stats_workfn(NULL);
+    assert(xlat_used_calls == 2 && xlat_used_lastused == jiffies - 5);
+    ft_stats_workfn(NULL);
+    assert(xlat_used_calls == 3 && xlat_used_lastused == jiffies - 2);
+    ft_stats_workfn(NULL);
+    assert(xlat_used_calls == 3);
+    /* Netfilter asks for none of their counters, so with stats_ms zero the
+     * passes still run while a translated direction is installed. */
+    ft_stats_ms = 0;
+    queued = stats_queued;
+    ft_stats_kick();
+    assert(stats_queued == queued + 1 && stats_delay == msecs_to_jiffies(FT_STATS_XLAT_MS));
+    xlat_withdrawn();
+    ft_stats_kick();
+    assert(stats_queued == queued + 1);
+    ft_stats_ms = 1000;
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!allocated);
+}
+
+/* A withdrawal says nothing: before the worker decides the offer, while the
+ * session is installed, and for every owner of it, each retired directly by
+ * the translation worker with no walk of the table. One landing while the
+ * session's expired is being said cannot stop that call, and is told so; an
+ * offer landing then is turned away, the call answering what came before. */
+static void test_xlat_withdraw(void)
+{
+    u64 withdrawals = ft_xlat_withdrawals;
+    unsigned kicks;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    /* Queued and not yet decided: nothing to retire, nothing counted. */
+    assert(ask_xlat_offer(&xlat_flow));
+    assert(ask_xlat_withdraw(XLAT_COOKIE));
+    ft_xlat_workfn(NULL);
+    assert(!ft_count && !xlat_expired_calls && ft_xlat_withdrawals == withdrawals);
+    /* Installed: marked at once, out of the hardware by the worker it
+     * queued. */
+    assert(xlat_admitted());
+    atomic_set(&ft_retire_scan, 0);
+    kicks = xlat_work_kicks;
+    assert(ask_xlat_withdraw(XLAT_COOKIE));
+    assert(ft_xlat_withdrawals == withdrawals + 1 && !ft_owner_valid(xlat_entry(0)->owner));
+    assert(!atomic_read(&ft_retire_scan) && xlat_work_kicks == kicks + 1);
+    assert(ft_count == 2 && !list_empty(&ft_xlat_retiring));
+    ft_xlat_workfn(NULL);
+    assert(!ft_count && !xlat_expired_calls && list_empty(&ft_xlat_retiring));
+    /* A retired owner still leaving, and an offer queued since: both go, the
+     * owner directly, and neither says anything. */
+    assert(xlat_admitted());
+    ft_owner_invalidate(xlat_entry(0)->owner, &ft_link_invalidations);
+    assert(ask_xlat_offer(&xlat_flow));
+    assert(ask_xlat_withdraw(XLAT_COOKIE));
+    ft_xlat_workfn(NULL);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !xlat_expired_calls && ft_xlat_head == ft_xlat_tail);
+    /* Another session's withdrawal touches nothing of this one. */
+    assert(xlat_admitted());
+    assert(ask_xlat_withdraw(XLAT_COOKIE + 1));
+    assert(ft_owner_valid(xlat_entry(0)->owner));
+    /* Withdrawn while the installed session's expired is being said: late,
+     * and an offer then is turned away. Afterwards nothing stands for it. */
+    xlat_withdraw_in_expired = true;
+    ft_owner_invalidate(xlat_entry(0)->owner, &ft_link_invalidations);
+    ft_retire_workfn(NULL);
+    assert(xlat_expired_calls == 1 && xlat_in_expired_answer == 0 && !ft_xlat_sessions);
+    assert(ask_xlat_withdraw(XLAT_COOKIE));
+    assert(xlat_admitted());
+    xlat_offer_in_expired = true;
+    ft_owner_invalidate(xlat_entry(0)->owner, &ft_link_invalidations);
+    ft_retire_workfn(NULL);
+    assert(xlat_expired_calls == 2 && xlat_in_expired_answer == 0);
+    assert(ft_xlat_head == ft_xlat_tail);
+    /* The same while a refusal's is: the offer in the worker's hands
+     * answering. */
+    xlat_route4 = NULL;
+    xlat_withdraw_in_expired = true;
+    xlat_refused();
+    assert(xlat_in_expired_answer == 0 && ask_xlat_withdraw(XLAT_COOKIE));
+    xlat_offer_in_expired = true;
+    xlat_refused();
+    assert(xlat_in_expired_answer == 0 && ft_xlat_head == ft_xlat_tail);
+    xlat_route4 = &xlat_rt4;
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!allocated && xlat_expired_calls == 4);
+}
+
+/* Offered again while its retired owner is on its way out of the hardware:
+ * the offer stands for the session from the moment it is queued, whichever of
+ * the old entries' retirement and its own decision comes first, so the
+ * session is said expired once -- and never while entries of it still forward,
+ * nor before a session the offer installs. */
+static void test_xlat_supersede(void)
+{
+    u64 refused = ft_xlat_refused;
+    struct ft_owner *old;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    /* Admission first: the retired directions' keys go to the offer. */
+    assert(xlat_admitted());
+    old = xlat_entry(0)->owner;
+    assert(ft_owner_mark(old));
+    assert(xlat_admitted() && xlat_entry(0)->owner != old && ft_count == 2);
+    assert(!xlat_expired_calls && ft_xlat_sessions == 1);
+    ft_retire_workfn(NULL);
+    assert(ft_count == 2 && !xlat_expired_calls);
+    /* Retirement first: the old owner leaves without a word, the queued
+     * offer having taken the answer, and installs the session that owes it. */
+    ft_owner_invalidate(xlat_entry(1)->owner, &ft_link_invalidations);
+    assert(ask_xlat_offer(&xlat_flow));
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !xlat_expired_calls && ft_xlat_head - ft_xlat_tail == 1);
+    ft_xlat_workfn(NULL);
+    assert(ft_count == 2 && !xlat_expired_calls && ft_xlat_sessions == 1);
+    /* RTNL lost in between: the offer waits in the queue, still owing it. */
+    ft_owner_invalidate(xlat_entry(1)->owner, &ft_link_invalidations);
+    assert(ask_xlat_offer(&xlat_flow));
+    rtnl_busy = true;
+    ft_xlat_workfn(NULL);
+    assert(ft_count == 2 && ft_xlat_head - ft_xlat_tail == 1);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !xlat_expired_calls);
+    rtnl_busy = false;
+    ft_xlat_workfn(NULL);
+    assert(ft_count == 2 && !xlat_expired_calls);
+    /* Refused while the old entries still forward: the answer goes back to
+     * the old owner, and is said once they have left. */
+    ft_owner_invalidate(xlat_entry(1)->owner, &ft_link_invalidations);
+    xlat_route4 = NULL;
+    assert(ask_xlat_offer(&xlat_flow));
+    ft_xlat_workfn(NULL);
+    assert(ft_count == 2 && !xlat_expired_calls && ft_xlat_refused == refused + 1);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !ft_xlat_sessions && xlat_expired_calls == 1);
+    assert(!xlat_expired_entries);
+    /* Unregistering with an offer queued behind a retired owner: refused,
+     * the answer goes to the owner, which says it as it leaves -- once. */
+    xlat_route4 = &xlat_rt4;
+    assert(xlat_admitted());
+    ft_owner_invalidate(xlat_entry(0)->owner, &ft_link_invalidations);
+    assert(ask_xlat_offer(&xlat_flow));
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!ft_count && xlat_expired_calls == 2 && !xlat_expired_entries);
+    assert(xlat_expired_by[0] == 2 && !allocated);
+}
+
+static void xlat_offer_again(void) { assert(ask_xlat_offer(&xlat_flow)); }
+static void xlat_offer_unrouted(void) { assert(ask_xlat_offer(&xlat_flow)); xlat_route4 = NULL; }
+static void xlat_withdraw_now(void) { assert(ask_xlat_withdraw(XLAT_COOKIE)); }
+
+/* While the worker decides an offer: another offer of the session is folded
+ * into it, or into the owner it has published, and answered with it; and a
+ * withdrawal between the owner's publication and the end of the install
+ * takes back what went in and says nothing. */
+static void test_xlat_inflight(void)
+{
+    u64 installs = ft_xlat_installs, refused = ft_xlat_refused, withdrawals;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    tc_known_hook = xlat_offer_again;
+    assert(xlat_admitted() && !tc_known_hook);
+    assert(ft_xlat_head == ft_xlat_tail && ft_xlat_installs == installs + 1);
+    xlat_withdrawn();
+    add_hook = xlat_offer_again;
+    assert(xlat_admitted() && !add_hook);
+    assert(ft_xlat_head == ft_xlat_tail && ft_xlat_installs == installs + 2);
+    xlat_withdrawn();
+    /* Refused, one expired answers both. */
+    tc_known_hook = xlat_offer_unrouted;
+    xlat_refused();
+    assert(ft_xlat_head == ft_xlat_tail && ft_xlat_refused == refused + 1);
+    xlat_route4 = &xlat_rt4;
+    /* Withdrawn as the first direction goes in. */
+    withdrawals = ft_xlat_withdrawals;
+    add_hook = xlat_withdraw_now;
+    assert(ask_xlat_offer(&xlat_flow));
+    ft_xlat_workfn(NULL);
+    assert(!add_hook && !ft_count && !ft_xlat_count && !ft_xlat_sessions && !live_hw);
+    assert(xlat_expired_calls == 1 && ft_xlat_refused == refused + 1);
+    assert(ft_xlat_withdrawals == withdrawals + 1 && list_empty(&ft_xlat_retiring));
+    ft_xlat_workfn(NULL);
+    assert(!ft_count && xlat_expired_calls == 1);
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!allocated && !in.refs && !out.refs && xlat_expired_calls == 1);
+}
+
+/* What fills the ring again behind the batch the worker holds. */
+static void xlat_fill(void)
+{
+    unsigned i;
+
+    for (i = 0; i < FT_XLAT_BATCH; i++) {
+        xlat_flow.cookie = XLAT_COOKIE + FT_XLAT_RING + i;
+        assert(ask_xlat_offer(&xlat_flow));
+    }
+    xlat_flow.cookie = XLAT_COOKIE + FT_XLAT_RING + FT_XLAT_BATCH;
+    assert(!ask_xlat_offer(&xlat_flow));
+}
+
+/* The ring: an offer of a session queued replaces it, a new one finds no room
+ * once it is full and is turned away owing nothing, and one that has to wait
+ * and finds the ring filled behind it is refused -- each session said once. */
+static void test_xlat_ring(void)
+{
+    u64 dropped = ft_xlat_dropped;
+    unsigned i;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    for (i = 0; i < FT_XLAT_RING; i++) {
+        xlat_flow.cookie = XLAT_COOKIE + i;
+        assert(ask_xlat_offer(&xlat_flow));
+    }
+    xlat_flow.cookie = XLAT_COOKIE;
+    assert(ask_xlat_offer(&xlat_flow) && ft_xlat_head - ft_xlat_tail == FT_XLAT_RING);
+    xlat_flow.cookie = XLAT_COOKIE + FT_XLAT_RING + FT_XLAT_BATCH;
+    assert(!ask_xlat_offer(&xlat_flow) && ft_xlat_dropped == dropped + 1);
+    /* No tc sample yet: each offer the worker took waits, and finds the
+     * ring full again. */
+    tc_unknown = true;
+    tc_known_hook = xlat_fill;
+    ft_xlat_workfn(NULL);
+    assert(!ft_count && xlat_expired_calls == FT_XLAT_BATCH && ft_xlat_dropped == dropped + 2);
+    assert(ft_xlat_head - ft_xlat_tail == FT_XLAT_RING);
+    for (i = 0; i < FT_XLAT_BATCH; i++)
+        assert(xlat_expired_by[i] == 1);
+    tc_unknown = false;
+    /* Unregistering answers every one still queued, once each. */
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(xlat_expired_calls == FT_XLAT_RING + FT_XLAT_BATCH);
+    for (i = 0; i < FT_XLAT_RING + FT_XLAT_BATCH; i++)
+        assert(xlat_expired_by[i] == 1);
+    assert(!xlat_expired_by[FT_XLAT_RING + FT_XLAT_BATCH] && ft_xlat_head == ft_xlat_tail);
+    assert(!allocated && !ft_count);
+}
+
+/* One client, for as long as the adapter runs; only its own ops unregister
+ * it, and not twice at once. */
+static void test_xlat_register(void)
+{
+    static const struct ask_xlat_ops other = { .expired = xlat_expired_cb, .used = xlat_used_cb };
+    static const struct ask_xlat_ops half = { .expired = xlat_expired_cb };
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(NULL) == -EINVAL && ask_xlat_register(&half) == -EINVAL);
+    ft_ready = false;
+    assert(ask_xlat_register(&xlat_ops) == -ENODEV && !ft_xlat_active && !ft_xlat_client);
+    ft_ready = true;
+    ft_stopping = true;
+    assert(ask_xlat_register(&xlat_ops) == -ENODEV && !ft_xlat_active && !ft_xlat_client);
+    ft_stopping = false;
+    assert(ask_xlat_unregister(&xlat_ops) == -EINVAL);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    assert(ask_xlat_unregister(&other) == -EINVAL && ask_xlat_unregister(NULL) == -EINVAL);
+    assert(ft_xlat_active && xlat_admitted());
+    /* An unregistration under way: a second is refused, and so is any
+     * offer. */
+    ft_xlat_closing = true;
+    assert(ask_xlat_unregister(&xlat_ops) == -EBUSY && !ask_xlat_offer(&xlat_flow));
+    assert(ask_xlat_register(&other) == -EBUSY);
+    ft_xlat_closing = false;
+    xlat_withdrawn();
+    assert(ask_xlat_unregister(&xlat_ops) == 0 && !ft_xlat_active && !ft_xlat_client);
+    assert(!allocated && !xlat_expired_calls);
+}
+
+/* The ports a translated pair holds with nothing bound: a port stopping takes
+ * the session out before the notifier returns, and one unregistering latches
+ * the invalidation that retires it, which gives back the references that
+ * would otherwise hold the unregistration open. */
+static void test_xlat_ports(void)
+{
+    struct netdev_notifier_changeupper_info info = { .info.dev = &in };
+    int in_refs, out_refs;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    in_refs = in.refs;
+    out_refs = out.refs;
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    assert(xlat_admitted() && !ft_bound);
+    assert(ft_netdev_event(NULL, NETDEV_GOING_DOWN, &info) == NOTIFY_DONE);
+    assert(!ft_count && !live_hw && xlat_expired_calls == 1 && !owed);
+    assert(in.refs == in_refs && out.refs == out_refs);
+    assert(xlat_admitted());
+    ft_invalid = 0;
+    assert(ft_netdev_event(NULL, NETDEV_UNREGISTER, &info) == NOTIFY_DONE);
+    assert(ft_invalid);
+    ft_invalid_done = false;
+    ft_invalidate_work(NULL);
+    assert(!ft_count && !live_hw && xlat_expired_calls == 2);
+    assert(in.refs == in_refs && out.refs == out_refs);
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!allocated);
+}
+
+/* A route event retires what was found through the route it names, each
+ * address in its own family: a translated direction's new_dst is in the other
+ * family from its src, and an address of one family read as the other names
+ * nothing. */
+static void test_xlat_routes(void)
+{
+    struct netevent_ipv4_route event4 = { .net = &init_net, .prefixlen = 32 };
+    struct netevent_ipv6_route event6 = { .net = &init_net, .prefixlen = 32 };
+    u64 routes = ft_route_invalidations;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    assert(xlat_admitted());
+    /* The IPv6 client's first word, read as an IPv4 prefix: the download's
+     * new_dst, which is IPv6. */
+    event4.dst = htonl(0xfd000000);
+    ft_neigh_event(NULL, NETEVENT_IPV4_ROUTE_UPDATE, &event4);
+    /* The IPv4 server's address, read as the first word of an IPv6 prefix:
+     * the upload's new_dst, which is IPv4. */
+    event6.dst = addr6(XLAT_SERVER, 0);
+    ft_neigh_event(NULL, NETEVENT_IPV6_ROUTE_UPDATE, &event6);
+    assert(ft_owner_valid(xlat_entry(0)->owner) && ft_route_invalidations == routes);
+    /* The server's IPv4 route: the upload's egress. */
+    event4.dst = htonl(XLAT_SERVER);
+    ft_neigh_event(NULL, NETEVENT_IPV4_ROUTE_UPDATE, &event4);
+    assert(!ft_owner_valid(xlat_entry(0)->owner) && ft_route_invalidations == routes + 1);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && xlat_expired_calls == 1);
+    /* The client's IPv6 route: the download's egress, and the upload's
+     * ingress. */
+    assert(xlat_admitted());
+    event6.dst = addr6(0xfd000000, 0);
+    event6.prefixlen = 64;
+    ft_neigh_event(NULL, NETEVENT_IPV6_ROUTE_UPDATE, &event6);
+    assert(!ft_owner_valid(xlat_entry(0)->owner) && ft_route_invalidations == routes + 2);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && xlat_expired_calls == 2);
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!allocated);
+}
+
+/* A policy is asked about a translated direction's tuples in their own
+ * families: what arrives and its reverse in one, what leaves and its reverse
+ * in the other, and nothing between the two. */
+static void test_xlat_policy(void)
+{
+    struct cdx_ft_rule r;
+    union nf_inet_addr client = xlat_client(), mapped = xlat_mapped();
+    struct xfrm_policy pol;
+
+    memset(&r, 0, sizeof(r));
+    r.family = AF_INET6;
+    r.xlat_family = AF_INET;
+    r.proto = IPPROTO_UDP;
+    r.src = client; r.dst = mapped; r.sport = htons(40001); r.dport = htons(5000);
+    r.new_src = v4(htonl(XLAT_POOL)); r.new_dst = v4(htonl(XLAT_SERVER));
+    r.new_sport = htons(61001); r.new_dport = htons(5000);
+#define XLAT_POLICY(fam, s, d) (pol = (struct xfrm_policy){ .family = (fam), .selector = { \
+    .saddr = (s), .daddr = (d), .prefixlen_s = (fam) == AF_INET ? 32 : 128, \
+    .prefixlen_d = (fam) == AF_INET ? 32 : 128 } }, ft_policy_covers(&pol, &r))
+    assert(XLAT_POLICY(AF_INET6, client, mapped));
+    assert(XLAT_POLICY(AF_INET6, mapped, client));
+    assert(XLAT_POLICY(AF_INET, r.new_src, r.new_dst));
+    assert(XLAT_POLICY(AF_INET, r.new_dst, r.new_src));
+    /* Between the translations means nothing: the arriving source with the
+     * translated destination, in either family. */
+    assert(!XLAT_POLICY(AF_INET, r.src, r.new_dst));
+    assert(!XLAT_POLICY(AF_INET6, r.src, r.new_dst));
+    /* And a family's policy is not asked about the other family's tuple. */
+    assert(!XLAT_POLICY(AF_INET, client, mapped));
+    assert(!XLAT_POLICY(AF_INET6, r.new_src, r.new_dst));
+    /* What covers every direction covers a translated one too. */
+    assert(ft_policy_covers(NULL, &r));
+}
+
+/* The paths the walk derives for a translated direction as for any: a bridge
+ * the download leaves through and the upload arrives by, and a PPPoE session
+ * the upload leaves into and the download arrives from. */
+static void test_xlat_paths(void)
+{
+    static const u8 concentrator[ETH_ALEN] = {2, 0xcc, 0, 0, 0, 1};
+    struct cdx_ft_entry *e0, *e1;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    xlat_rt6.dst.dev = &br;
+    gateway.dev = &br;
+    in.master = &br;
+    xlat_fdb_port = &in;
+    xlat_fdb_mac = gateway.ha;
+    xlat_flow.dir[0].ifindex = br.ifindex;
+    assert(xlat_admitted());
+    e0 = xlat_entry(0);
+    e1 = xlat_entry(1);
+    assert(e0->rule.in == &in && e0->rule.in_logical == &br && e0->rule.in_bridge == &br);
+    assert(e1->rule.out == &in && e1->rule.out_logical == &br && e1->rule.out_bridge == &br);
+    assert(ether_addr_equal(e1->rule.src_mac, br.dev_addr));
+    assert(ether_addr_equal(e1->rule.dst_mac, gateway.ha));
+    /* The FDB pins the download's port: a station moving retires the
+     * session. */
+    {
+        struct switchdev_notifier_fdb_info info = { .info.dev = &decoy, .addr = gateway.ha };
+
+        ft_fdb_event(NULL, SWITCHDEV_FDB_ADD_TO_DEVICE, &info);
+        assert(!ft_owner_valid(e0->owner));
+    }
+    ft_retire_workfn(NULL);
+    assert(!ft_count && xlat_expired_calls == 1);
+    in.master = NULL;
+    /* Into a PPPoE session over `out': the concentrator is the upload's
+     * destination, and the download strips the session it arrives in. */
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    egress_session = (struct nf_flow_session){ .lower_ifindex = out.ifindex, .id = 0x1234 };
+    memcpy(egress_session.h_dest, concentrator, ETH_ALEN);
+    xlat_rt4.dst.dev = &ppp;
+    xlat_flow.dir[1].ifindex = ppp.ifindex;
+    assert(xlat_admitted());
+    e0 = xlat_entry(0);
+    e1 = xlat_entry(1);
+    assert(e0->rule.out == &out && e0->rule.out_logical == &ppp && e0->rule.out_session.present);
+    assert(e0->rule.out_session.id == 0x1234 && ether_addr_equal(e0->rule.dst_mac, concentrator));
+    assert(ether_addr_equal(e0->rule.src_mac, out.dev_addr) && e0->rule.mtu == 1492);
+    assert(e1->rule.in == &out && e1->rule.in_logical == &ppp && e1->rule.in_session.present);
+    assert(e1->rule.in_session.id == 0x1234 && e0->neigh == NULL);
+    /* The session strip counts on the way in: a download of what the port
+     * takes is 1492 bytes of IPv4 and 1512 as IPv6, which only TCP carries
+     * into the 1500-byte LAN -- as the LAN route's MTU already says. */
+    xlat_withdrawn();
+    xlat_flow.proto = IPPROTO_UDP;
+    xlat_turned_away();
+    /* With the LAN at 1512 it is carried, on the size less the session --
+     * 1520 without it would not fit -- and one byte less is the door's: no
+     * ingress delivers less than that. */
+    in.mtu = 1512;
+    assert(xlat_admitted() && xlat_entry(1)->rule.in_session.present);
+    xlat_withdrawn();
+    in.mtu = 1511;
+    xlat_turned_away();
+    in.mtu = 1500;
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    drop_dev_records();
+    assert(!allocated && !in.refs && !out.refs && !ppp.refs);
+}
+
+/* Unregistering says expired for every offer still queued and every session
+ * installed, and returns once they are out of the hardware; unload retires
+ * what a client left with no binding to do it, and CDX's restart hands every
+ * session back to its translator. */
+static void test_xlat_lifetime(void)
+{
+    u64 restarts = ft_xlat_restart_invalidations;
+    unsigned proofs_before;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    assert(xlat_admitted());
+    /* A second session queued and not yet decided. */
+    xlat_flow.cookie = XLAT_COOKIE + 1;
+    assert(ask_xlat_offer(&xlat_flow));
+    proofs_before = recoveries;
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!ft_count && !ft_xlat_count && !ft_xlat_sessions && !ft_xlat_active && !live_hw);
+    assert(xlat_expired_calls == 2 && ft_xlat_head == ft_xlat_tail);
+    assert(recoveries > proofs_before && !owed);
+    assert(!allocated && !in.refs && !out.refs);
+    /* Unload: nothing but the list the translated directions are on reaches
+     * them, the client gone without unregistering or not. */
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    assert(xlat_admitted());
+    ft_xlat_client = NULL;
+    ft_stopping = true;
+    xlat_entry(0)->owner->ops->invalidate(xlat_entry(0)->owner);
+    ft_xlat_exit();
+    assert(!ft_count && !ft_xlat_count && !live_hw && !xlat_expired_calls);
+    assert(!allocated && !in.refs && !out.refs);
+    ft_stopping = ft_xlat_closing = false;
+    ft_xlat_active = false;
+    /* CDX restarted the datapath: every session retired and said expired. */
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    assert(xlat_admitted());
+    atomic_set(&ft_retire_scan, 0);
+    ft_egress_restarted();
+    /* Retired directly, as a withdrawal is: no walk of the table. */
+    assert(ft_xlat_restart_invalidations == restarts + 1 && !atomic_read(&ft_retire_scan));
+    ft_xlat_workfn(NULL);
+    assert(!ft_count && xlat_expired_calls == 1);
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    assert(!allocated);
+}
+
+/* A global invalidation with no flowtable bound retires translated
+ * directions like any, and the drain that ends it rearms admission for the
+ * client: with no binding there is none to park, and without a client the
+ * latch stays lazy as it always was. */
+static void test_xlat_rearm(void)
+{
+    u64 rearms = ft_rearms;
+
+    fixture();
+    xlat_setup(IPPROTO_TCP);
+    assert(!ft_bound && !ft_parked);
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    assert(xlat_admitted());
+    ft_invalid = 1;
+    ft_invalid_done = false;
+    ft_invalidate_work(NULL);
+    assert(!ft_count && xlat_expired_calls == 1);
+    assert(!ft_invalid && ft_rearms == rearms + 1);
+    assert(xlat_admitted());
+    xlat_withdrawn();
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    /* No client: the latch waits for the next bind. */
+    ft_invalid = 1;
+    ft_invalid_done = false;
+    ft_invalidate_work(NULL);
+    assert(ft_invalid && ft_invalid_done && ft_rearms == rearms + 1);
+    /* A client registering then finds it drained, and clears it. */
+    assert(ask_xlat_register(&xlat_ops) == 0);
+    assert(!ft_invalid && ft_rearms == rearms + 2);
+    assert(ask_xlat_unregister(&xlat_ops) == 0);
+    ft_invalid_done = false;
+    assert(!allocated);
+}
+
 int main(void)
 {
     struct cdx_ft_rule decoded;
@@ -10336,6 +11574,24 @@ int main(void)
     test_direct_bind_unload();
     test_teardown_delta_unbind();
     test_passive_indirect_unload();
+    test_xlat_admission();
+    test_xlat_refusals();
+    test_xlat_mtu();
+    test_xlat_pairs();
+    test_xlat_collision();
+    test_xlat_owner();
+    test_xlat_keepalive();
+    test_xlat_withdraw();
+    test_xlat_supersede();
+    test_xlat_inflight();
+    test_xlat_ring();
+    test_xlat_register();
+    test_xlat_ports();
+    test_xlat_routes();
+    test_xlat_policy();
+    test_xlat_paths();
+    test_xlat_lifetime();
+    test_xlat_rearm();
     test_registration();
     puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm, class decode, VLAN records and fatal retry passed");
 }

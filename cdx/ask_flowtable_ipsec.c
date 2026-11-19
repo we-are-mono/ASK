@@ -420,34 +420,30 @@ static bool ft_ipsec_forward_flowi(const struct cdx_ft_rule *rule,
  * reverse direction's outbound tuple, and the two receiving ones. What the
  * selector alone cannot bound covers every direction: no policy named (a
  * default changed), a mark or interface in the policy's key, and a tunnelled
- * direction, whose outer header policy judges with a tuple of its own. */
-bool ft_policy_covers(const struct xfrm_policy *pol,
-		      const struct cdx_ft_rule *rule)
+ * direction, whose outer header policy judges with a tuple of its own.
+ *
+ * A translated direction's two tuples are in two families, so the mixed
+ * tuples between the translations mean nothing for it: its packets arrive as
+ * the match, in its family, and leave as the translation, in the other, and
+ * each is asked in its own family, both ways round. */
+struct ft_policy_tuple {
+	const union nf_inet_addr *src, *dst;
+	__be16 sport, dport;
+};
+
+static bool ft_policy_selects(const struct xfrm_policy *pol, u8 family, u8 proto,
+			      const struct ft_policy_tuple *tuples, unsigned int n)
 {
-	const struct {
-		const union nf_inet_addr *src, *dst;
-		__be16 sport, dport;
-	} tuples[] = {
-		{ &rule->new_src, &rule->new_dst, rule->new_sport, rule->new_dport },
-		{ &rule->src, &rule->new_dst, rule->sport, rule->new_dport },
-		{ &rule->dst, &rule->src, rule->dport, rule->sport },
-		{ &rule->new_dst, &rule->new_src, rule->new_dport, rule->new_sport },
-		{ &rule->src, &rule->dst, rule->sport, rule->dport },
-	};
 	struct flowi fl;
 	unsigned int i;
 
-	if (!pol || pol->mark.v || pol->mark.m || pol->if_id ||
-	    pol->selector.ifindex || rule->in_tunnel.present ||
-	    rule->out_tunnel.present)
-		return true;
-	if (pol->family != rule->family)
+	if (pol->family != family)
 		return false;
 	/* Every field a tuple sets is set for each one; the rest stay zero. */
 	memset(&fl, 0, sizeof(fl));
-	fl.flowi_proto = rule->proto;
-	for (i = 0; i < ARRAY_SIZE(tuples); i++) {
-		if (rule->family == AF_INET) {
+	fl.flowi_proto = proto;
+	for (i = 0; i < n; i++) {
+		if (family == AF_INET) {
 			fl.u.ip4.saddr = tuples[i].src->ip;
 			fl.u.ip4.daddr = tuples[i].dst->ip;
 			fl.u.ip4.fl4_sport = tuples[i].sport;
@@ -458,10 +454,34 @@ bool ft_policy_covers(const struct xfrm_policy *pol,
 			fl.u.ip6.fl6_sport = tuples[i].sport;
 			fl.u.ip6.fl6_dport = tuples[i].dport;
 		}
-		if (xfrm_selector_match(&pol->selector, &fl, rule->family))
+		if (xfrm_selector_match(&pol->selector, &fl, family))
 			return true;
 	}
 	return false;
+}
+
+bool ft_policy_covers(const struct xfrm_policy *pol,
+		      const struct cdx_ft_rule *rule)
+{
+	const struct ft_policy_tuple tuples[] = {
+		{ &rule->new_src, &rule->new_dst, rule->new_sport, rule->new_dport },
+		{ &rule->src, &rule->new_dst, rule->sport, rule->new_dport },
+		{ &rule->dst, &rule->src, rule->dport, rule->sport },
+		{ &rule->new_dst, &rule->new_src, rule->new_dport, rule->new_sport },
+		{ &rule->src, &rule->dst, rule->sport, rule->dport },
+	};
+
+	if (!pol || pol->mark.v || pol->mark.m || pol->if_id ||
+	    pol->selector.ifindex || rule->in_tunnel.present ||
+	    rule->out_tunnel.present)
+		return true;
+	if (rule->xlat_family)
+		/* The arriving tuple and its reverse; the translated ones. */
+		return ft_policy_selects(pol, rule->family, rule->proto, &tuples[4], 1) ||
+		       ft_policy_selects(pol, rule->family, rule->proto, &tuples[2], 1) ||
+		       ft_policy_selects(pol, rule->xlat_family, rule->proto, &tuples[0], 1) ||
+		       ft_policy_selects(pol, rule->xlat_family, rule->proto, &tuples[3], 1);
+	return ft_policy_selects(pol, rule->family, rule->proto, tuples, ARRAY_SIZE(tuples));
 }
 
 /* The receiving end of a direction, or with `reverse` of the other one: the

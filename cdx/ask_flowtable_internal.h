@@ -172,12 +172,13 @@ struct ft_delta {
 	unsigned long lastused;
 };
 
-/* What a direction is in the hardware on behalf of: today a Netfilter flow
- * generation, through the handle its offer carried (patch 140). The owner is
- * what every retirement marks -- and the direction's sibling goes with it,
- * since both directions of one flow answer to one owner's state -- where the
- * direction's counters go, its last delta included as it leaves the hardware,
- * and what the entry holds until it is unlinked.
+/* What a direction is in the hardware on behalf of: a Netfilter flow
+ * generation, through the handle its offer carried (patch 140), or a session
+ * a translator offered (ask_flowtable_xlat.c). The owner is what every
+ * retirement marks -- and the direction's sibling goes with it, since both
+ * directions of one flow answer to one owner's state -- where the direction's
+ * counters go, its last delta included as it leaves the hardware, and what
+ * the entry holds until it is unlinked.
  *
  * valid and invalidate are asked under ft_watch_lock, from softirq, as well
  * as in the backend transaction, so neither may sleep; account, used and
@@ -246,7 +247,10 @@ static inline void ft_owner_used(struct ft_owner *owner, unsigned long lastused)
 
 struct cdx_ft_entry {
 	struct list_head list;
-	/* On its binding's entries. */
+	/* On its binding's entries, or, for a direction admitted without a
+	 * binding, on its source's own list (ft_xlat_list): every published
+	 * entry is on one, which is what lets ft_unlink() take it off
+	 * unconditionally, and what a source without a binding drains by. */
 	struct list_head binding_node;
 	struct hlist_node cookie_node;
 	struct hlist_node key_node;
@@ -263,6 +267,8 @@ struct cdx_ft_entry {
 	/* Where owner points for a direction Netfilter offered. */
 	struct ft_nf_owner nf_owner;
 	union nf_inet_addr next_hop;
+	/* The binding whose offer admitted it, which pins its ingress port; NULL
+	 * for a translated direction, which pins that port itself. */
 	struct cdx_ft_binding *binding;
 	/* The ppp device record each half of this direction's session counts
 	 * into, or NULL. Held on the entry rather than in the rule: a rule is
@@ -286,9 +292,14 @@ struct cdx_ft_entry {
 	 * entry for the reason the records above are. */
 	struct net_device *crossed[CDX_FT_CROSSED_MAX];
 	unsigned int ncrossed;
+	/* Netfilter's cookie for the direction, or a translated session's own,
+	 * which both of its directions carry. The two spaces never meet: a
+	 * lookup by cookie compares the binding too (ft_find()), and a
+	 * translated direction has none. */
 	unsigned long cookie;
-	/* Which of the flow's directions this is, as Netfilter names it: where
-	 * its deltas go through the owner. */
+	/* Which of the flow's directions this is, as Netfilter names it -- or
+	 * the index of a translated session's direction: where its deltas go
+	 * through the owner. */
 	u8 dir;
 	struct cdx_ft_rule rule;
 	struct cdx_ft_hw *hw;
@@ -296,6 +307,19 @@ struct cdx_ft_entry {
 	/* The counter pass that last reported it (ft_stats_workfn()). */
 	u32 pass;
 };
+
+/* How much an IPv6 header is longer than an IPv4 one, without options: what a
+ * translated packet grows by into IPv6 and shrinks by into IPv4. The opcode
+ * replaces the header whole (docs/flowtable/nat64.md). */
+#define FT_XLAT_GROWTH	(sizeof(struct ipv6hdr) - sizeof(struct iphdr))
+
+/* The family a direction's translated tuple (new_src, new_dst) is in: the
+ * direction's own, or the other one for a direction translated between the
+ * two -- which is also the family of the route its egress was found by. */
+static inline u8 ft_new_family(const struct cdx_ft_rule *rule)
+{
+	return rule->xlat_family ?: rule->family;
+}
 
 /* Admission budget, not a firmware maximum. Directions consume slots
  * independently without eviction. The deployed TCP/UDP classifiers each have
@@ -908,8 +932,9 @@ extern unsigned int ft_bound, ft_count;
 extern unsigned int ft_parked;
 extern unsigned int ft_passive;
 extern unsigned int ft_neighbour_refs;
-/* The owner references the entries hold, one each; /proc reports it as
- * handle_refs, which is what every owner is today. */
+/* The owner references the entries hold, one each, whichever source admitted
+ * them (ft_owner_attach()); /proc reports it as handle_refs, the name it had
+ * while every owner was a Netfilter handle. */
 extern unsigned int ft_handle_refs;
 extern atomic64_t ft_neigh_invalidations;
 extern atomic64_t ft_route_invalidations;
@@ -928,6 +953,9 @@ extern u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy
 extern u64 ft_rearms;
 extern u64 ft_finals;
 extern u64 ft_stats_passes, ft_stats_requests;
+/* The counter pass under way, or the last one: what a translated owner says
+ * its keepalive once a pass by (ask_flowtable_xlat.c). */
+extern u32 ft_stats_pass;
 extern struct delayed_work ft_stats_work;
 void ft_stats_kick(void);
 /* One line of /proc/ask_flowtable/status or stats, in /proc/meminfo's layout. */
@@ -947,6 +975,7 @@ void ft_invalidate(void);
 void ft_handle_invalidate(struct nf_flow_offload_handle *handle,
 			  atomic64_t *counter);
 void ft_owner_invalidate(struct ft_owner *owner, atomic64_t *counter);
+void ft_owner_attach(struct cdx_ft_entry *entry, struct ft_owner *owner);
 void ft_neigh_invalidate(struct cdx_ft_entry *entry);
 bool ft_rule_names(const struct cdx_ft_rule *rule, const struct net_device *dev);
 void ft_dev_stats_gone(const struct net_device *dev);
@@ -957,6 +986,32 @@ int ft_settle(void);
 int ft_remove(struct cdx_ft_entry *entry);
 bool ft_retire_batch(bool (*match)(const struct cdx_ft_entry *entry, const void *arg),
 		     const void *arg);
+bool ft_retire_list(struct list_head *entries);
+void ft_hw_settle(void);
+/* The install every admission source shares (ft_install()), and what feeds
+ * it: an entry allocated for a decoded rule, and the entry already holding
+ * the rule's hardware key. */
+struct cdx_ft_entry *ft_entry_alloc(const struct cdx_ft_rule *rule,
+				    const union nf_inet_addr *next_hop,
+				    unsigned long cookie, u8 dir);
+int ft_install(struct cdx_ft_entry *entry, struct list_head *owned);
+bool ft_install_current(const struct cdx_ft_entry *entry);
+struct cdx_ft_entry *ft_key_holder(const struct cdx_ft_rule *rule);
+/* What the decoder asks of a route and a path, for a source that resolves
+ * its own (ask_flowtable_xlat.c). */
+bool ft_route_next_hop(const struct dst_entry *dst, u8 family,
+		       const union nf_inet_addr *daddr, union nf_inet_addr *next_hop);
+bool ft_dst_current(struct dst_entry *dst, u32 cookie);
+bool ft_endpoint(u8 family, const union nf_inet_addr *address);
+int ft_path_stack(struct net_device *logical, struct net_device *physical,
+		  const struct nf_flow_session *session,
+		  const struct nf_flow_tunnel *tunnel,
+		  struct cdx_ft_vlan *stack, struct net_device **bridge,
+		  u16 *bridge_vid, struct cdx_ft_session *out_session,
+		  struct cdx_ft_tunnel *out_tunnel, struct net_device **source);
+bool ft_mtu_carried(const struct cdx_ft_rule *rule, u32 mtu);
+bool ft_egress_mtu_current(const struct cdx_ft_rule *rule);
+bool ft_bridge_egress_filtered(const struct cdx_ft_rule *rule);
 struct net_device *ft_vlan_lower(struct net_device *dev);
 int ft_bridge_vlan(struct net_device *bridge, struct net_device *port,
 		   struct cdx_ft_vlan *stack, unsigned int *count);
@@ -979,6 +1034,8 @@ bool ft_neigh_check(u8 family, struct net_device *dev,
 		    const union nf_inet_addr *dst, const u8 *mac);
 bool ft_neigh_moved(u8 family, struct net_device *dev,
 		    const union nf_inet_addr *dst, const u8 *mac);
+bool ft_neigh_resolve(u8 family, struct net_device *dev,
+		      const union nf_inet_addr *dst, u8 *mac);
 bool ft_nexthop_usable(u8 family, const union nf_inet_addr *next_hop);
 int ft_neigh_attach(struct cdx_ft_entry *entry);
 void ft_neigh_detach(struct cdx_ft_entry *entry);
@@ -1205,6 +1262,21 @@ extern atomic64_t ft_wg_refusals;
 void ft_wg_reconsider(struct net_device *dev);
 void ft_wg_device_gone(struct net_device *dev);
 void ft_wg_exit(void);
+
+/* ask_flowtable_xlat.c: the sessions a translator offers (ask_xlat.h).
+ * ft_xlat_active says a client is registered, or its sessions are still
+ * draining; it is what lets a global invalidation, the parked-binding rearm and
+ * the tc sample serve translated directions with no flowtable bound. Written
+ * under the backend transaction, read anywhere. ft_xlat_count counts the
+ * translated directions holding an owner reference, and ft_xlat_list holds
+ * the published ones by their binding_node, both under the transaction. */
+extern bool ft_xlat_active;
+extern unsigned int ft_xlat_count;
+extern struct list_head ft_xlat_list;
+void ft_xlat_restarted(void);
+void ft_xlat_exit(void);
+void ft_xlat_status(struct seq_file *seq);
+void ft_xlat_stats(struct seq_file *seq);
 
 /* ask_flowtable_main.c */
 extern unsigned int ft_qos_mark_mask;

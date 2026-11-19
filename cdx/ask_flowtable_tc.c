@@ -16,10 +16,11 @@
  * once a second for as long as it carries traffic, which under SQM is every
  * upload, for its whole life.
  *
- * So this worker asks for them, about once a second while a binding or a
- * bridged pair could use the answer, under RTNL taken as the multicast workers
- * take it -- waiting for it, and holding nothing of this module's while it
- * walks -- and publishes the devices with something to say through RCU.
+ * So this worker asks for them, about once a second while a binding, a
+ * bridged pair or a translation client could use the answer, under RTNL taken
+ * as the multicast workers take it -- waiting for it, and holding nothing of
+ * this module's while it walks -- and publishes the devices with something to
+ * say through RCU.
  * Admission reads it before RTNL for the devices an offer names, and after the
  * path walk for every device the walk crossed; the counter pass and an
  * installed direction's offers read it again for those. A device whose answer
@@ -197,9 +198,11 @@ static void ft_tc_retire(void)
 	spin_unlock_bh(&ft_watch_lock);
 }
 
+/* A binding, a bridged pair, or a translation client, whose sessions are
+ * admitted against the sample with no binding at all. */
 static bool ft_tc_wanted(void)
 {
-	return READ_ONCE(ft_bound) || ft_l2_paired();
+	return READ_ONCE(ft_bound) || ft_l2_paired() || READ_ONCE(ft_xlat_active);
 }
 
 static void ft_tc_workfn(struct work_struct *work)

@@ -120,6 +120,9 @@ struct cdx_ft_tunnel {
 	bool present;
 };
 
+/* cdx_ft_rule.xlat_tos: carry each arriving packet's TOS or traffic class. */
+#define CDX_FT_XLAT_TOS_COPY	0xff
+
 /* Private in-repository interface. No CDX, firmware or borrowed Netfilter
  * objects cross it; the address union is a plain UAPI value type shared with
  * conntrack so no tuple has to be transcribed. Addresses and ports are in
@@ -180,9 +183,10 @@ struct cdx_ft_rule {
 	 * family's: a direction translated between IPv4 and IPv6 (NAT64,
 	 * SIIT), whose L3 header the hardware replaces with one built from the
 	 * new tuple, with xlat_tos as its TOS/traffic class:
-	 * CDX_NATPT_TOS_COPY (0xff) carries each arriving packet's over, ECN
-	 * included, as RFC 7915 does; any other value is a fixed one, as
-	 * Jool's reset-tos/new-tos or reset-traffic-class configure. */
+	 * CDX_FT_XLAT_TOS_COPY (CDX_NATPT_TOS_COPY, 0xff) carries each arriving
+	 * packet's over, ECN included, as RFC 7915 does; any other value is a
+	 * fixed one, as Jool's reset-tos/new-tos or reset-traffic-class
+	 * configure. */
 	u8 xlat_family;
 	u8 xlat_tos;
 	/* Adapter state: the family of the next hop dst_mac was resolved for.

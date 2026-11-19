@@ -18,6 +18,9 @@
 #include "cdx_police.h"
 #include "cdx_detour.h"
 
+/* The rule names the opcode's copy sentinel without CDX's headers. */
+static_assert(CDX_FT_XLAT_TOS_COPY == CDX_NATPT_TOS_COPY);
+
 struct cdx_ft_hw {
 	struct cdx_ft_hw *options;
 	/* The receive port's entry of a direction detoured through the offline

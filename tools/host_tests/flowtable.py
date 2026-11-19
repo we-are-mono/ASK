@@ -23,12 +23,15 @@ def test_decoder_and_lifecycle(tmp_path):
         + function(hashes, "jhash2")
         + function(hashes, "__jhash_nwords") + function(hashes, "jhash_3words"))
     hardware = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
+    xlat_api = (ROOT / "cdx/ask_xlat.h").read_text()
     (tmp_path / "flowtable_types.inc").write_text(
         # From the encapsulation bound, not the rule: the rule embeds the tag
         # type and its depth, so slicing past them leaves an incomplete struct.
         hardware[hardware.index("#define CDX_FT_VLAN_MAX"):hardware.index("/* Process-context transactions")]
         + source[source.index("struct cdx_ft_binding {"):
                  source.index("\n", source.index("#define CDX_FT_HASH_BITS")) + 1]
+        # The translation client's interface, as a translator compiles it.
+        + xlat_api[xlat_api.index("#define ASK_XLAT_TOS_COPY"):xlat_api.index("/* The one client:")]
         # The framing a VLAN device's record is published with, as the
         # adapter defines it: the cases below assert the published values.
         + "\n".join(re.findall(r"^#define FT_(?:VLAN|PPP)_[RT]X_OVERHEAD\s.*$", source, re.M)) + "\n"
@@ -42,15 +45,18 @@ def test_decoder_and_lifecycle(tmp_path):
         # The counter pass's batch and the state it keeps, as defined.
         + re.search(r"^#define FT_STATS_BATCH\s.*$", source, re.M).group() + "\n"
         + re.search(r"^static unsigned int ft_stats_ms\b.*$", source, re.M).group() + "\n"
-        + re.search(r"^static u32 ft_stats_pass;$", source, re.M).group() + "\n"
+        + re.search(r"^#define FT_STATS_XLAT_MS\s.*$", source, re.M).group() + "\n"
+        + re.search(r"^u32 ft_stats_pass;$", source, re.M).group() + "\n"
         # What the bridge-port walk keeps between its callbacks.
         + re.search(r"^struct ft_bridge_port_walk \{.*?^\};\n", source, re.M | re.S).group()
+        # One tuple a policy's selector is asked about.
+        + re.search(r"^struct ft_policy_tuple \{.*?^\};\n", source, re.M | re.S).group()
     )
     names = ["ft_fault", "ft_devices_hold", "ft_devices_put", "ft_rule_names", "ft_crossed_hold", "ft_crossed_hold_all", "ft_crossed_put_all",
              "ft_find", "ft_retire_kick", "ft_retire_marked", "ft_handle_invalidate", "ft_owner_invalidate",
-             "ft_nf_owner_hold", "ft_owner_release", "ft_owner_is_handle", "ft_neigh_invalidate", "ft_neigh_matches",
-             "ft_neigh_table", "ft_neigh_check", "ft_neigh_moved", "ft_nexthop_usable",
-             "ft_next_hop", "ft_routes_valid", "ft_offer_routes_current", "ft_offer_current", "ft_policy_covers", "ft_fdb_key", "ft_watch_publish", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used",
+             "ft_owner_attach", "ft_nf_owner_hold", "ft_owner_release", "ft_owner_is_handle", "ft_neigh_invalidate", "ft_neigh_matches",
+             "ft_neigh_table", "ft_neigh_check", "ft_neigh_moved", "ft_neigh_resolve", "ft_nexthop_usable",
+             "ft_route_next_hop", "ft_next_hop", "ft_dst_current", "ft_routes_valid", "ft_offer_routes_current", "ft_offer_current", "ft_policy_selects", "ft_policy_covers", "ft_fdb_key", "ft_watch_publish", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used",
              "ft_route_event", "ft_route6_event", "ft_neigh_event", "ft_retire_all", "ft_fib_event", "ft_nexthop_event",
              "ft_ppp_rx_overhead", "ft_tunnel_under",
              "ft_dev_stats_release",
@@ -61,16 +67,31 @@ def test_decoder_and_lifecycle(tmp_path):
              "ft_unlink", "ft_settle", "ft_remove",
              "ft_destroy_defer", "ft_retire_deferred", "ft_deferred_destroys_drop", "ft_retire_batch",
              "ft_owner_retired", "ft_retire_workfn", "ft_settle_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_qos_remarks", "ft_qos_params_check", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
-             "ft_vlan_lower", "ft_bridge_vlan", "ft_bridge_port_one", "ft_bridge_port", "ft_tunnel_dev", "ft_tunnel_hop", "ft_session_current", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_port_arriving", "ft_mtu_less", "ft_port_mtu", "ft_rule_stripped", "ft_arriving", "ft_mtu_carried", "ft_detours", "ft_ipv6_dev_mtu", "ft_egress_mtu_current", "ft_mtu_refused", "ft_fast_path", "ft_software_reoffers", "ft_tc_rx_bit", "ft_tc_side", "ft_rule_tc_soft", "ft_tc_offer_refused", "ft_bridge_egress_filtered", "ft_tunnel_inbound_allowed", "ft_parse", "ft_same_key", "ft_key_hash",
+             "ft_vlan_lower", "ft_bridge_vlan", "ft_bridge_port_one", "ft_bridge_port", "ft_tunnel_dev", "ft_tunnel_hop", "ft_session_current", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_port_arriving", "ft_mtu_less", "ft_port_mtu", "ft_rule_stripped", "ft_arriving", "ft_handed_on", "ft_mtu_carried", "ft_detours", "ft_ipv6_dev_mtu", "ft_egress_mtu_current", "ft_mtu_refused", "ft_fast_path", "ft_software_reoffers", "ft_tc_rx_bit", "ft_tc_side", "ft_rule_tc_soft", "ft_tc_offer_refused", "ft_bridge_egress_filtered", "ft_tunnel_inbound_allowed", "ft_parse", "ft_same_key", "ft_key_hash",
+             "ft_key_holder", "ft_entry_alloc", "ft_install", "ft_install_current",
              "ft_replace", "ft_entry_bounded", "ft_stats", "ft_request_owned", "ft_offer_installed", "ft_admission_fault", "ft_rule_callback",
              "ft_invalid_complete", "ft_drained", "ft_can_rearm", "ft_rearm", "ft_rearm_workfn",
-             "ft_retire_bound", "ft_release",
-             "ft_bind_admissible", "ft_passive_callback", "ft_bind_passive",
+             "ft_retire_list", "ft_retire_bound", "ft_release"]
+    # The translated sessions' admission source, behind the install it
+    # shares with Netfilter's and ahead of the module's exit and the
+    # restart hook, which reach it: its owner and the table naming its ops,
+    # then its queue, path resolution, worker and registration.
+    xlat_owner = ["ft_xlat_of", "ft_xlat_owner_valid", "ft_xlat_owner_invalidate", "ft_xlat_expire",
+                  "ft_xlat_owner_account", "ft_xlat_owner_used", "ft_xlat_heir", "ft_xlat_put",
+                  "ft_xlat_owner_release"]
+    xlat = ["ft_xlat_retire", "ft_xlat_tuple_valid", "ft_xlat_flow_valid", "ft_xlat_tuple_clean",
+            "ft_xlat_route", "ft_xlat_mtu_refused", "ft_xlat_fold",
+            "ask_xlat_offer", "ask_xlat_withdraw", "ft_xlat_port", "ft_xlat_path",
+            "ft_xlat_rule", "ft_xlat_admissible", "ft_xlat_keys_free", "ft_xlat_admit",
+            "ft_xlat_requeue", "ft_xlat_refuse", "ft_xlat_entry_of", "ft_xlat_retire_queued",
+            "ft_xlat_workfn", "ask_xlat_register", "ft_xlat_unqueue",
+            "ask_xlat_unregister", "ft_xlat_restarted", "ft_xlat_exit"]
+    tail = ["ft_bind_admissible", "ft_passive_callback", "ft_bind_passive",
              "ft_block_setup", "ft_bind", "cdx_ft_setup_tc",
              "ft_any_entry", "ft_invalidate_work", "ft_entry_crosses", "ft_entry_uses", "ft_device_used", "ft_device_role", "ft_device_retire", "ft_through", "ft_port_stopping",
              "ft_port_stopped", "ft_stopped_clean", "ft_stopped_workfn", "ft_netdev_event",
              "ft_out_port", "ft_fdb_event", "ft_stp_stopped", "ft_swdev_event", "ft_egress_changed", "ft_egress_drain", "ft_egress_restarted", "ft_block_drain", "ft_hw_settle", "ft_init_fault", "ft_proc_init", "ask_flowtable_init", "ask_flowtable_exit", "ft_flow_at", "ft_flows_start", "ft_flows_next", "ft_l2_at", "ft_l2_start", "ft_l2_next", "ft_rows_stop",
-             "ft_stats_kick", "ft_stats_report", "ft_stats_workfn"]
+             "ft_stats_period_ms", "ft_stats_kick", "ft_stats_report", "ft_stats_workfn"]
     # The owner every Netfilter direction's entry takes: its ops over the
     # handle stub, and the table naming them, ahead of everything that sets
     # or compares an entry's owner.
@@ -86,10 +107,19 @@ def test_decoder_and_lifecycle(tmp_path):
         # And what the work has taken off that list and not yet looked at.
         + source[source.index("struct ft_deferred_destroy {"):
                  source.index("\n", source.index("static LLIST_HEAD(ft_deferred_destroys);")) + 1]
+        # The translated sessions' bounds, types and state, as declared: the
+        # core reads whether a client is active and how many directions it has.
+        + source[source.index("#define FT_XLAT_RING"):
+                 source.index("/* ---------------------------------------------------------------- owner */")]
         + "\n".join(function(source, name) for name in owner)
         + re.search(r"^static const struct ft_owner_ops ft_nf_owner_ops = \{.*?^\};\n",
                     source, re.M | re.S).group()
-        + "\n".join(function(source, name) for name in names))
+        + "\n".join(function(source, name) for name in names)
+        + "\n".join(function(source, name) for name in xlat_owner)
+        + re.search(r"^static const struct ft_owner_ops ft_xlat_owner_ops = \{.*?^\};\n",
+                    source, re.M | re.S).group()
+        + "\n".join(function(source, name) for name in xlat)
+        + "\n".join(function(source, name) for name in tail))
     binary = tmp_path / "flowtable"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
@@ -101,6 +131,32 @@ def test_decoder_and_lifecycle(tmp_path):
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
+
+
+def test_translated_sessions_reach_the_global_paths():
+    """The two paths test_decoder_and_lifecycle stubs, read off the source: a
+    global invalidation latches with a translation client registered and
+    nothing bound, which no binding's release would otherwise cover; and both
+    the unload and a load unwinding its own failure retire the translated
+    directions themselves, with their worker stopped, after every chain that
+    could reach them is gone and before the barrier that proves the hardware
+    has let them go."""
+    source = flowtable_source()
+    invalidate = function(source, "ft_invalidate")
+    assert "!READ_ONCE(ft_bound) && !READ_ONCE(ft_xlat_active)" in invalidate, invalidate
+    for name in ("ask_flowtable_exit", "ask_flowtable_init"):
+        body = function(source, name)
+        drain = body.index("ft_xlat_exit();")
+        assert body.index("unregister_netdevice_notifier(") < drain, name
+        assert body.index("cdx_unregister_ft_egress();") < drain, name
+        assert drain < body.index("ft_hw_settle();"), name
+    xlat_exit = function(source, "ft_xlat_exit")
+    assert xlat_exit.index("cancel_delayed_work_sync(&ft_xlat_work);") < \
+        xlat_exit.index("ft_retire_list(&ft_xlat_list)")
+    # Unregistration proves the retirement before it returns.
+    unregister = function(source, "ask_xlat_unregister")
+    assert unregister.index("ft_retire_list(&ft_xlat_list)") < \
+        unregister.index("ft_hw_settle();") < unregister.index("ft_xlat_client = NULL;")
 
 
 def test_hardware_ownership(tmp_path):

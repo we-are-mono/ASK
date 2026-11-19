@@ -63,9 +63,11 @@ unloads.
    `/proc/net/` entry would show that namespace's view.
 6. **Unprefixed keys belong to routed unicast**, the flowtable proper. Every
    other feature's keys carry its prefix: `ipsec_`, `mcast_`, `mroute_`,
-   `l2_`, `detour_`, `qos_`, `wifi_`, `wg_`, and the per-kind `session_`,
-   `vlan_` and `tunnel_`. The old header already followed this rule, so no
-   key is renamed.
+   `l2_`, `detour_`, `qos_`, `wifi_`, `wg_`, `xlat_`, and the per-kind
+   `session_`, `vlan_` and `tunnel_`. The old header already followed this
+   rule, so no key is renamed. A translated direction is an entry like a
+   routed one, so `entries`, the counts and the retirement causes include it;
+   the `xlat_` keys say what of them is translated and what its client asked.
 
 ## Format
 
@@ -110,6 +112,7 @@ pasted on its own.
 |---|---|---|---|
 | Routed unicast IPv4/IPv6 TCP/UDP, including SNAT, MASQUERADE, DNAT, hairpin and IPv6 NAT | one classifier entry per direction | `conntrack -L` (`[HW_OFFLOAD]`, accounting), `/proc/net/stat/nf_flowtable` | `flows` rows; core keys in `status` and `stats` |
 | Transit ESP, GRE, IPIP and 6in4, untranslated | the same entry, protocol 50/47/4/41 | `conntrack -L` | `flows` rows |
+| A translated session (NAT64, SIIT), offered by its translator ([nat64.md](nat64.md)) | one classifier entry per direction, NAT-PT opcodes | the translator's own session table (`jool session display`) | `flows` rows with `xlat=`/`tos=`; `xlat_*` in `status` and `stats` |
 | 802.1Q VLAN, up to two tags per direction | strip/insert opcodes and a plain stats record per VLAN device | `ip -s link show <vlan>` (folded) | `devices` `vlan` rows; `vlan_records`/`vlan_slots` in `status`; `in_vlan=`/`out_vlan=` on `flows` |
 | PPPoE session | strip/insert opcodes and a timestamped record per ppp device | `ip -s link show ppp0` (folded); `/proc/net/pppoe` | `devices` `session` rows; `session_records`/`session_slots`; `in_ppp=`/`out_ppp=` |
 | 6in4/4in6 tunnel hop | L3 insert/strip and a plain record per tunnel device | `ip -s link show <tunnel>` (folded) | `devices` `tunnel` rows; `tunnel_records`/`tunnel_slots`; `in_tnl=`/`out_tnl=` |
@@ -173,6 +176,7 @@ read under the QoS mutex, one port at a time.
 | `mcast_group_ids4`, `mcast_group_ids6`, `mcast_group_id_slots` | group ids held per family, and how many each family has |
 | `mroute_groups`, `mroute_installed`, `mroute_policy_rules`, `mroute_ruleset_settled` | the routed learner's groups, what is in hardware, and the policy rules and ruleset state that hold groups back |
 | `l2_enabled`, `l2_entries`, `l2_hook_kinds`, `l2_confirming` | bridged unicast switching: active, pairs in hardware, the other bridge hooks present, whether frames confirm pairs |
+| `xlat_registered`, `xlat_sessions`, `xlat_entries`, `xlat_max_entries`, `xlat_pending` | translated sessions: whether a translator is registered, the sessions in hardware or being installed, their directions (counted in `entries` too), the most of `max_entries` they may take (half), and the offers queued and not yet decided |
 | `wifi_vaps` | VAPs registered |
 | `wg_devs` | WireGuard devices registered with cdx: every running one in the initial namespace cdx can offload, whether or not a flowtable lists it. One being retired leaves the count when its retirement starts, and `/proc/cdx_wireguard` lists it until cdx has let it go |
 | `qos_channels`, `qos_channels_used`, `qos_channels_held`, `qos_channels_free` | the SoC's CEETM channels: how many the device tree gives (`fsl,ceetm-channel-range`, at most 32), how many are mapped to a port's tree, how many no tree may claim yet -- quarantined for a port whose tree went until its flowtable entries are retired or rebuilt, or out of service after a drain failed -- and the rest |
@@ -225,6 +229,7 @@ the module is loaded. The reader loads each one with `READ_ONCE()` or
 | bridged multicast | `mcast_refused`, `mcast_install_errors`, `mcast_observed`, `mcast_dropped`, `mcast_hook_errors`, `mcast_deferred`, `mcast_passes`, `mcast_forgets`, `mcast_port_probe_errors`, `mcast_discards_evicted`, `mcast_egress_rebuilds` |
 | routed multicast | `mroute_refused`, `mroute_install_errors`, `mroute_lost`, `mroute_capped`, `mroute_xfrm_changes`, `mroute_ruleset_changes`, `mroute_confirm_errors`, `mroute_port_probe_errors`, `mroute_xtables_changes` |
 | bridged unicast | `l2_installs`, `l2_refused`, `l2_held`, `l2_retired`, `l2_dropped`, `l2_deferred`, `l2_unconfirmed`, `l2_ruleset_changes` |
+| translated sessions | `xlat_offers` (offers queued, or folded into what already stands for the session), `xlat_dropped` (offers turned away for a full queue), `xlat_mtu_refused` (offers turned away before queueing for a route MTU certain to refuse them, nothing owed), `xlat_installs` (sessions installed, both directions), `xlat_refused` (queued offers refused, each answered by one `expired`, said once any retired entries of the session have left), `xlat_busy` (offers that waited for RTNL or the tc sample), `xlat_withdrawals` (sessions the translator withdrew), `xlat_expired` and `xlat_used` (the callbacks said), `xlat_restart_invalidations` (sessions retired by a datapath restart) |
 | Wi-Fi | `wifi_refused` |
 | WireGuard | `wg_refused` (running WireGuard devices cdx could offload that were not registered: cdx refused or could not build the registration, the device had stopped or was unregistering by the time it was tried, or there was no memory to track it; each is tried again only on the device's next event) |
 
@@ -235,10 +240,21 @@ where each kind lives has changed. `qos_ports` and `qos_classes` are new.
 
 - **`flows`**: `flow cookie= in= out= in_vlan= out_vlan= in_br= out_br=
   in_ppp= out_ppp= in_tnl= out_tnl= family= src= dst= new_src= new_dst=
-  proto= mtu= qos= sa= in_sa= detour= nexthop= packets= bytes= lastused=`.
+  proto= mtu= qos= sa= in_sa= detour= xlat= tos= nexthop= packets= bytes=
+  lastused=`.
   - The file is paged by cookie-hash bucket. Each read holds the transaction
     for one buffer and resumes by bucket and offset, so a full read at
     capacity runs to several megabytes without one long hold.
+  - A translated direction's row has `family=` for the tuple it arrives with
+    and `xlat=` for the family it leaves in, `4` or `6` (`-` on every other
+    row), and prints `new_src=`/`new_dst=` in that family. `tos=` is the TOS
+    or traffic class it leaves with: `copy` for each packet's own, or a fixed
+    value in hex. Both directions of a session carry its translator's cookie,
+    so `cookie=` joins them with each other and with the translator's session.
+    `nexthop=` is in the egress family, as for an SA of the other family.
+    ```
+    flow cookie=5e55 in=eth3 out=eth4 ... family=6 src=[fd00::2]:40001 dst=[64:ff9b::c633:640a]:5000 new_src=203.0.113.1:61001 new_dst=198.51.100.10:5000 proto=6 mtu=1500 ... detour=0 xlat=4 tos=copy nexthop=198.51.100.10 ...
+    ```
 - **`l2`**: `l2flow in= out= port_in= port_out= br= dst= src= type= vid=
   tagged= in_vlan= out_vlan= packets= bytes=`.
   - Paged the same way, by pair-hash bucket.

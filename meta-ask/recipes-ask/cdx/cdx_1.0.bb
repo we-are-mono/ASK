@@ -16,6 +16,11 @@ PROVIDES = "kernel-module-cdx"
 # so olddefconfig strips it from .config — force it here.
 EXTRA_OEMAKE += "KERNELDIR=${STAGING_KERNEL_DIR} PLATFORM=LS1046A CONFIG_ASK_CDX=m"
 
+# The translation client the rig drives translated-session admission through
+# (cdx/ask_xlat_test.c). Test image only: Kbuild builds it for nothing but
+# CONFIG_ASK_XLAT_TEST, which no consumer's build sets.
+EXTRA_OEMAKE += "CONFIG_ASK_XLAT_TEST=m"
+
 # Debug tripwires (test image only; production Armbian build never sets
 # these). cdx/Makefile forwards CFG_FLAGS into ccflags-y, so the macros
 # reach the probe bodies + their cdx_main.c init hooks. Without them the
@@ -46,6 +51,7 @@ EXTRA_OEMAKE += "CFG_FLAGS='-DCDX_DEBUG_KEY_ZEROING=1 -DCDX_DEBUG_MC_HCSYNC_FAIL
 # version-agnostic across kernel bumps.
 INSANE_SKIP:kernel-module-cdx-${KERNEL_VERSION} += "buildpaths"
 INSANE_SKIP:kernel-module-ask-flowtable-${KERNEL_VERSION} += "buildpaths"
+INSANE_SKIP:kernel-module-ask-xlat-test-${KERNEL_VERSION} += "buildpaths"
 
 # ASK's cdx/Makefile has `modules` and `clean` but no `modules_install`.
 # Compile via `modules` target; install the .ko by hand —
@@ -59,7 +65,7 @@ do_compile:prepend() {
 
 fakeroot do_install() {
     install -d ${D}${nonarch_base_libdir}/modules/${KERNEL_VERSION}/extra/ask
-    install -m 0644 ${S}/cdx.ko ${S}/ask_flowtable.ko \
+    install -m 0644 ${S}/cdx.ko ${S}/ask_flowtable.ko ${S}/ask_xlat_test.ko \
         ${D}${nonarch_base_libdir}/modules/${KERNEL_VERSION}/extra/ask/
 
     # Publish Module.symvers under the name module.bbclass looks for

@@ -387,17 +387,50 @@ static void ft_bridge_text(const struct net_device *bridge, u16 vid, char *text,
 		strscpy(text, bridge->name, size);
 }
 
+/* An address and port as the flow rows print one, in its own family: an IPv6
+ * address bracketed, so the whole stays one whitespace-free token. */
+#define FT_ENDPOINT_TEXT sizeof("[ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255]:65535")
+static void ft_endpoint_text(u8 family, const union nf_inet_addr *addr, __be16 port,
+			     char *text, size_t size)
+{
+	if (family == AF_INET6)
+		scnprintf(text, size, "[%pI6c]:%u", &addr->in6, ntohs(port));
+	else
+		scnprintf(text, size, "%pI4:%u", &addr->ip, ntohs(port));
+}
+
+/* What a translated direction's TOS or traffic class leaves as: each packet's
+ * own, or a fixed value, in hex; "-" for a direction that translates nothing. */
+static void ft_xlat_tos_text(const struct cdx_ft_rule *rule, char *text, size_t size)
+{
+	if (!rule->xlat_family)
+		strscpy(text, "-", size);
+	else if (rule->xlat_tos == CDX_FT_XLAT_TOS_COPY)
+		strscpy(text, "copy", size);
+	else
+		scnprintf(text, size, "%02x", rule->xlat_tos);
+}
+
 static int ft_flows_show(struct seq_file *seq, void *v)
 {
 	struct cdx_ft_entry *entry = v;
+	const struct cdx_ft_rule *rule = &entry->rule;
 	struct cdx_ft_counters stats;
 	char in_vlan[16], out_vlan[16];
 	char in_br[IFNAMSIZ + 8], out_br[IFNAMSIZ + 8];
 	char in_ppp[26], out_ppp[26];
 	char in_tnl[IFNAMSIZ + 100], out_tnl[IFNAMSIZ + 100];
 	char nexthop[sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")];
+	char new_src[FT_ENDPOINT_TEXT], new_dst[FT_ENDPOINT_TEXT];
+	char xlat[2], tos[sizeof("copy")];
+	u8 new_family = ft_new_family(rule);
 
 	cdx_ft_stats(entry->hw, &stats);
+	ft_endpoint_text(new_family, &rule->new_src, rule->new_sport, new_src, sizeof(new_src));
+	ft_endpoint_text(new_family, &rule->new_dst, rule->new_dport, new_dst, sizeof(new_dst));
+	strscpy(xlat, !rule->xlat_family ? "-" : rule->xlat_family == AF_INET6 ? "6" : "4",
+		sizeof(xlat));
+	ft_xlat_tos_text(rule, tos, sizeof(tos));
 	ft_tunnel_text(&entry->rule.in_tunnel, in_tnl, sizeof(in_tnl));
 	ft_tunnel_text(&entry->rule.out_tunnel, out_tnl, sizeof(out_tnl));
 	ft_vlan_text(entry->rule.in_vlan, entry->rule.in_vlans, in_vlan, sizeof(in_vlan));
@@ -414,32 +447,32 @@ static int ft_flows_show(struct seq_file *seq, void *v)
 	else
 		snprintf(nexthop, sizeof(nexthop), "%pI4", &entry->next_hop.ip);
 	/* One row shape per family. Brackets keep an IPv6 address and its port
-	 * a single whitespace-free token, as the IPv4 rows already are. */
-	if (entry->rule.family == AF_INET6)
-		seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%06x sa=%u in_sa=%u detour=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
-			   entry->cookie, entry->rule.in->name, entry->rule.out->name,
+	 * a single whitespace-free token, as the IPv4 rows already are. The
+	 * translated tuple is printed in its own family, which xlat= names
+	 * when it is not the row's. */
+	if (rule->family == AF_INET6)
+		seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=%s new_dst=%s proto=%u mtu=%u qos=%06x sa=%u in_sa=%u detour=%u xlat=%s tos=%s nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
+			   entry->cookie, rule->in->name, rule->out->name,
 			   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 			   in_tnl, out_tnl,
-			   &entry->rule.src.in6, ntohs(entry->rule.sport),
-			   &entry->rule.dst.in6, ntohs(entry->rule.dport),
-			   &entry->rule.new_src.in6, ntohs(entry->rule.new_sport),
-			   &entry->rule.new_dst.in6, ntohs(entry->rule.new_dport),
-			   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
-			   entry->rule.sa_handle, entry->rule.in_sa_handle,
-			   entry->rule.detour,
+			   &rule->src.in6, ntohs(rule->sport),
+			   &rule->dst.in6, ntohs(rule->dport),
+			   new_src, new_dst,
+			   rule->proto, rule->mtu, rule->qos,
+			   rule->sa_handle, rule->in_sa_handle,
+			   rule->detour, xlat, tos,
 			   nexthop, stats.packets, stats.bytes, stats.lastused);
 	else
-		seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%06x sa=%u in_sa=%u detour=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
-			   entry->cookie, entry->rule.in->name, entry->rule.out->name,
+		seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%s new_dst=%s proto=%u mtu=%u qos=%06x sa=%u in_sa=%u detour=%u xlat=%s tos=%s nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
+			   entry->cookie, rule->in->name, rule->out->name,
 			   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 			   in_tnl, out_tnl,
-			   &entry->rule.src.ip, ntohs(entry->rule.sport),
-			   &entry->rule.dst.ip, ntohs(entry->rule.dport),
-			   &entry->rule.new_src.ip, ntohs(entry->rule.new_sport),
-			   &entry->rule.new_dst.ip, ntohs(entry->rule.new_dport),
-			   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
-			   entry->rule.sa_handle, entry->rule.in_sa_handle,
-			   entry->rule.detour,
+			   &rule->src.ip, ntohs(rule->sport),
+			   &rule->dst.ip, ntohs(rule->dport),
+			   new_src, new_dst,
+			   rule->proto, rule->mtu, rule->qos,
+			   rule->sa_handle, rule->in_sa_handle,
+			   rule->detour, xlat, tos,
 			   nexthop, stats.packets, stats.bytes, stats.lastused);
 	return 0;
 }
@@ -736,6 +769,8 @@ static int ft_status_show(struct seq_file *seq, void *v)
 	ft_kv(seq, "mroute_policy_rules", READ_ONCE(ft_mr_policy[0]) + READ_ONCE(ft_mr_policy[1]));
 	ft_kv(seq, "mroute_ruleset_settled", READ_ONCE(ft_mr_gen_open));
 	ft_l2_status(seq);
+	/* The translation client and the sessions it has in hardware. */
+	ft_xlat_status(seq);
 	/* How many AP-mode devices this module currently has registered. With
 	 * wifi_refused, it separates "no Wi-Fi offload because nothing asked"
 	 * from "no Wi-Fi offload because the registration failed", which are
@@ -854,6 +889,7 @@ static int ft_stats_show(struct seq_file *seq, void *v)
 	ft_kv(seq, "mroute_port_probe_errors", READ_ONCE(ft_mr_port_probe_errors));
 	ft_kv(seq, "mroute_xtables_changes", READ_ONCE(ft_mr_xtables_changes));
 	ft_l2_stats(seq);
+	ft_xlat_stats(seq);
 	ft_kv(seq, "wifi_refused", atomic64_read(&ft_wifi_refusals));
 	ft_kv(seq, "wg_refused", atomic64_read(&ft_wg_refusals));
 	return 0;
@@ -1019,30 +1055,6 @@ static void ft_block_drain(void)
 		/* Runs ft_release(), which retires this binding's entries and
 		 * drops its device reference, exactly as an unbind would. */
 		flow_block_cb_free(cb);
-	}
-}
-
-/* Every deletion left unproven, proven: a barrier completes, or -- after one
- * that may have left its key linked -- no port walks the tables any more, as
- * the backend requires of an -EIO. Both unload and a load unwinding its own
- * failure owe this before the device records go and the claim is released,
- * and neither can count on the invalidation worker for it: ft_invalidate()
- * does nothing once ft_stopping is set. It cannot fail, so it waits,
- * releasing the transaction between attempts so configuration and other
- * kernel work can progress. A latch stays in CDX: a later load is refused
- * until CDX has restarted the datapath. */
-static void ft_hw_settle(void)
-{
-	int rc;
-
-	for (;;) {
-		cdx_ft_begin();
-		rc = cdx_ft_recover();
-		cdx_ft_end();
-		if (!rc)
-			return;
-		pr_warn_ratelimited("ask_flowtable: waiting for safe hardware retirement before releasing CDX\n");
-		msleep(1000);
 	}
 }
 
@@ -1234,6 +1246,10 @@ netdev:
 	ft_deferred_destroys_drop();
 	cancel_delayed_work_sync(&ft_work);
 	cancel_delayed_work_sync(&ft_rearm_work);
+	/* No translation client can have registered: the module's symbols
+	 * resolve for nobody until this returns. Its worker is idle for that
+	 * reason, and stopped all the same, as the works above are. */
+	ft_xlat_exit();
 	/* Both chains are unregistered above, so nothing can add a membership
 	 * or an MFC entry while these drain. What already existed was replayed
 	 * at registration -- the FIB notifier dumps every VIF and MFC entry,
@@ -1382,6 +1398,11 @@ static void __exit ask_flowtable_exit(void)
 	/* ft_stopping, set above, already stops a parked rearm requeueing
 	 * itself; this waits out the pass in flight. */
 	cancel_delayed_work_sync(&ft_rearm_work);
+	/* The translated sessions have no binding whose release takes them out
+	 * below. No client can be registered -- one pins this module through
+	 * the symbols it calls -- so their worker is idle: it is stopped, and
+	 * whatever a client left is retired here, its owners marked above. */
+	ft_xlat_exit();
 	/* Direct first: it is the route a DPAA port actually takes, so closing
 	 * it stops new binds before the indirect one is torn down. The
 	 * classifier goes with it, and waits out the frames inside it. */
@@ -1396,8 +1417,9 @@ static void __exit ask_flowtable_exit(void)
 	ft_deferred_destroys_drop();
 	WRITE_ONCE(ft_ready, false);
 	/* Exit cannot fail. Complete every barrier, or prove hardware stopped,
-	 * before releasing CDX. The drain above removed every direction and
-	 * nothing is left that could add one, so the release finds none. */
+	 * before releasing CDX. The drains above removed every direction --
+	 * the bindings' and the translated ones -- and nothing is left that
+	 * could add one, so the release finds none. */
 	ft_hw_settle();
 	cdx_ft_begin();
 	WARN_ON_ONCE(cdx_ft_release());

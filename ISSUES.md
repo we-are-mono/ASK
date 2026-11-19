@@ -174,7 +174,9 @@ result independently of those temporary files.
   image may have run the fragmenter's DMA with zeroed ICIDs.
 
   **Next:** either bisect against a September image, or accept today's measurements. In both cases a full suite
-  must pass before the bound is relaxed, for IPv4 only.
+  must pass before the bound is relaxed, for IPv4 only. The `cdx.xlat_test` hook the shapes above were installed
+  through is gone: its successor, `ask_xlat_test.ko`, admits translated sessions through the adapter only, and
+  admission applies this very bound, so re-measuring needs a hand-install path for plain directions again.
 - [x] **A451 — CEETM teardown drained portal messages, whose callbacks take spinlocks, from an IPI.** Each portal
   CPU's worker syncs it now; 6.18's lockdep flags a drain from an IPI at once (_:/^cdx: sync CEETM portals from_).
 - [x] **A450 — removing a port took the SDK QMan `cgr_lock`, a plain spinlock, in an IPI.** Lockdep's raw-nesting

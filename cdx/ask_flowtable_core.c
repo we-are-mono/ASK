@@ -123,11 +123,15 @@ static bool ft_fault(unsigned int stage)
 #endif
 }
 
+/* With nothing bound and no translation client, nothing can be in the
+ * hardware or about to be, and there is nothing to invalidate; translated
+ * directions have no binding, so a client registered stands for them
+ * (ft_xlat_active). */
 void ft_invalidate(void)
 {
 	bool parked;
 
-	if (!READ_ONCE(ft_bound) || READ_ONCE(ft_stopping))
+	if ((!READ_ONCE(ft_bound) && !READ_ONCE(ft_xlat_active)) || READ_ONCE(ft_stopping))
 		return;
 	/* Counted before the latch is read, with a full barrier between, so
 	 * that ft_rearm(), which clears the latch before reading the count,
@@ -247,17 +251,27 @@ static const struct ft_owner_ops ft_nf_owner_ops = {
 	.release = ft_nf_owner_release,
 };
 
+/* An entry takes its owner before it is published, so no notifier finds it
+ * without one, with a reference the source has already taken on the owner's
+ * behalf and the owner's release gives back (ft_owner_release()). Every
+ * source attaches through here, so ft_handle_refs -- which the drain before a
+ * rearm waits on (ft_drained()) -- counts every such reference, whoever took
+ * it. */
+void ft_owner_attach(struct cdx_ft_entry *entry, struct ft_owner *owner)
+{
+	entry->owner = owner;
+	ft_handle_refs++;
+}
+
 /* The entry admitted for an offer is owned by the generation the offer's
- * handle names, and holds a reference on the handle for as long as it is.
- * Before the entry is published, so no notifier finds it without one. */
+ * handle names, and holds a reference on the handle for as long as it is. */
 static void ft_nf_owner_hold(struct cdx_ft_entry *entry,
 			     struct nf_flow_offload_handle *handle)
 {
 	entry->nf_owner.owner.ops = &ft_nf_owner_ops;
 	entry->nf_owner.handle = handle;
 	nf_flow_offload_handle_get(handle);
-	entry->owner = &entry->nf_owner.owner;
-	ft_handle_refs++;
+	ft_owner_attach(entry, &entry->nf_owner.owner);
 }
 
 /* The entry's reference, whatever owns it, once nothing can find the entry
@@ -367,11 +381,17 @@ void ft_neigh_invalidate(struct cdx_ft_entry *entry)
 	ft_owner_invalidate(entry->owner, &ft_neigh_invalidations);
 }
 
-/* The binding already pins the ingress port for its whole lifetime, so only
- * the egress port and any VLAN device the rule names still need a reference.
- * A logical device equal to its physical port must not be counted twice. */
-static void ft_devices_hold(const struct cdx_ft_rule *rule)
+/* A binding pins its ingress port for its whole lifetime, so for a direction
+ * one admitted only the egress port and any VLAN device the rule names still
+ * need a reference; a direction admitted without a binding -- a translated
+ * one -- pins its ingress port itself. A logical device equal to its physical
+ * port must not be counted twice. */
+static void ft_devices_hold(const struct cdx_ft_entry *entry)
 {
+	const struct cdx_ft_rule *rule = &entry->rule;
+
+	if (!entry->binding)
+		dev_hold(rule->in);
 	dev_hold(rule->out);
 	if (rule->out_logical != rule->out)
 		dev_hold(rule->out_logical);
@@ -388,8 +408,10 @@ static void ft_devices_hold(const struct cdx_ft_rule *rule)
 		dev_hold(rule->in_bridge);
 }
 
-static void ft_devices_put(const struct cdx_ft_rule *rule)
+static void ft_devices_put(const struct cdx_ft_entry *entry)
 {
+	const struct cdx_ft_rule *rule = &entry->rule;
+
 	if (rule->in_bridge && rule->in_bridge != rule->in_logical &&
 	    rule->in_bridge != rule->out_bridge)
 		dev_put(rule->in_bridge);
@@ -400,6 +422,8 @@ static void ft_devices_put(const struct cdx_ft_rule *rule)
 	if (rule->out_logical != rule->out)
 		dev_put(rule->out_logical);
 	dev_put(rule->out);
+	if (!entry->binding)
+		dev_put(rule->in);
 }
 
 bool ft_rule_names(const struct cdx_ft_rule *rule, const struct net_device *dev)
@@ -820,7 +844,7 @@ int ft_unlink(struct cdx_ft_entry *entry)
 	 * the pool until that proof arrives. */
 	ft_stats_detach(entry);
 	ft_owner_release(entry);
-	ft_devices_put(&entry->rule);
+	ft_devices_put(entry);
 	ft_crossed_put_all(entry);
 	kfree(entry);
 	ft_count--;
@@ -926,6 +950,33 @@ static void ft_settle_workfn(struct work_struct *work)
 	cdx_ft_end();
 }
 
+/* The next hop a unicast route of @family sends @daddr to, and whether it is
+ * one the hardware can send to: the route's own answer, read as forwarding
+ * reads it, for a route that forwards at all. RTF_CACHE routes name their own
+ * destination as the next hop, which is correct, but a local or anycast route
+ * is not forwarding; and an IPv4 route through an IPv6 gateway resolves its
+ * neighbour in the other family, which nothing here follows. */
+bool ft_route_next_hop(const struct dst_entry *dst, u8 family,
+		       const union nf_inet_addr *daddr, union nf_inet_addr *next_hop)
+{
+	memset(next_hop, 0, sizeof(*next_hop));
+	if (family == AF_INET6) {
+		const struct rt6_info *rt = dst_rt6_info(dst);
+
+		if (rt->rt6i_flags & (RTF_REJECT | RTF_LOCAL | RTF_ANYCAST))
+			return false;
+		next_hop->in6 = *rt6_nexthop(rt, &daddr->in6);
+	} else {
+		const struct rtable *rt = dst_rtable(dst);
+
+		if (rt->rt_type != RTN_UNICAST ||
+		    (rt->rt_gw_family && rt->rt_gw_family != AF_INET))
+			return false;
+		next_hop->ip = rt_nexthop(rt, daddr->ip);
+	}
+	return ft_nexthop_usable(family, next_hop);
+}
+
 static bool ft_next_hop(const struct flow_cls_offload *cls,
 			struct net_device *dev, u8 family,
 			const union nf_inet_addr *daddr,
@@ -990,24 +1041,14 @@ static bool ft_next_hop(const struct flow_cls_offload *cls,
 			peer.ip = x->id.daddr.a4;
 		daddr = &peer;
 	}
-	memset(next_hop, 0, sizeof(*next_hop));
-	if (family == AF_INET6) {
-		const struct rt6_info *rt = dst_rt6_info(dst);
+	return ft_route_next_hop(dst, family, daddr, next_hop);
+}
 
-		/* RTF_CACHE routes name their own destination as the next hop,
-		 * which is correct, but a local/anycast route is not forwarding. */
-		if (rt->rt6i_flags & (RTF_REJECT | RTF_LOCAL | RTF_ANYCAST))
-			return false;
-		next_hop->in6 = *rt6_nexthop(rt, &daddr->in6);
-	} else {
-		const struct rtable *rt = dst_rtable(dst);
-
-		if (rt->rt_type != RTN_UNICAST ||
-		    (rt->rt_gw_family && rt->rt_gw_family != AF_INET))
-			return false;
-		next_hop->ip = rt_nexthop(rt, daddr->ip);
-	}
-	return ft_nexthop_usable(family, next_hop);
+/* Whether a destination is still the one its route lookup returned, under the
+ * cookie it was selected with. */
+bool ft_dst_current(struct dst_entry *dst, u32 cookie)
+{
+	return dst && dst_check(dst, cookie);
 }
 
 /* Admission holds RTNL. Check both borrowed destinations after taking it:
@@ -1019,9 +1060,8 @@ static bool ft_next_hop(const struct flow_cls_offload *cls,
  */
 static bool ft_routes_valid(const struct flow_cls_offload *cls)
 {
-	return cls->nf_dst && cls->nf_dst_reverse &&
-		dst_check(cls->nf_dst, cls->nf_dst_cookie) &&
-		dst_check(cls->nf_dst_reverse, cls->nf_dst_reverse_cookie);
+	return ft_dst_current(cls->nf_dst, cls->nf_dst_cookie) &&
+		ft_dst_current(cls->nf_dst_reverse, cls->nf_dst_reverse_cookie);
 }
 
 /* The two routes an offer borrows, which no lock orders against it: either
@@ -1049,7 +1089,7 @@ static bool ft_offer_current(const struct flow_cls_offload *cls)
 
 /* A flow endpoint must be globally routable between the two ports: an IPv6
  * link-local address is scoped to one link and cannot be forwarded off it. */
-static bool ft_endpoint(u8 family, const union nf_inet_addr *address)
+bool ft_endpoint(u8 family, const union nf_inet_addr *address)
 {
 	int type;
 
@@ -1478,12 +1518,12 @@ static bool ft_session_current(const struct net_device *ppp,
 	return runs;
 }
 
-static int ft_path_stack(struct net_device *logical, struct net_device *physical,
-			 const struct nf_flow_session *session,
-			 const struct nf_flow_tunnel *tunnel,
-			 struct cdx_ft_vlan *stack, struct net_device **bridge,
-			 u16 *bridge_vid, struct cdx_ft_session *out_session,
-			 struct cdx_ft_tunnel *out_tunnel, struct net_device **source)
+int ft_path_stack(struct net_device *logical, struct net_device *physical,
+		  const struct nf_flow_session *session,
+		  const struct nf_flow_tunnel *tunnel,
+		  struct cdx_ft_vlan *stack, struct net_device **bridge,
+		  u16 *bridge_vid, struct cdx_ft_session *out_session,
+		  struct cdx_ft_tunnel *out_tunnel, struct net_device **source)
 {
 	/* Zeroed so a tag the bridge adds carries no device: ft_bridge_vlan()
 	 * writes the tag and leaves ifindex alone. */
@@ -1805,6 +1845,19 @@ static u32 ft_arriving(const struct net_device *port, unsigned int stripped)
 	return ft_port_arriving(port) - stripped;
 }
 
+/* What a packet of @len bytes arriving on a direction is once the direction
+ * has handed it on: itself, or for a translated direction the same packet
+ * under the other family's header. The two bytes the opcode leaves past every
+ * translated frame are the backend's to account for (CDX_NATPT_SLACK), on top
+ * of the MTU this is measured against. */
+static u32 ft_handed_on(const struct cdx_ft_rule *rule, u32 len)
+{
+	if (!rule->xlat_family)
+		return len;
+	return rule->xlat_family == AF_INET6 ? len + FT_XLAT_GROWTH :
+	       ft_mtu_less(len, FT_XLAT_GROWTH);
+}
+
 /* Whether a direction leaving by a path of @mtu can be carried although a
  * packet arriving on @in could be larger. The microcode fragments an oversized
  * packet itself, and for a frame an Ethernet port received, the fragments it
@@ -1834,12 +1887,28 @@ static u32 ft_arriving(const struct net_device *port, unsigned int stripped)
  * advertisement's can be -- or that sits on the port's wider segment keeps
  * sending such frames. The physical ingress and the path are device and route
  * MTUs, whose changes retire the flow through their own events, so admission
- * alone decides. */
-static bool ft_mtu_carried(const struct cdx_ft_rule *rule, u32 mtu)
+ * alone decides.
+ *
+ * A translated direction is measured by what it hands on (ft_handed_on()): an
+ * IPv4 packet the port accepts whole is twenty bytes longer as IPv6, an IPv6
+ * one twenty shorter as IPv4. It carries no SA and takes no detour. Its TCP
+ * into IPv6 keeps the exemption on other grounds than the clamp: the entry's
+ * DF check sends an IPv4 segment with DF its translation would not fit to the
+ * translator untranslated, for its Fragmentation Needed, and one without DF
+ * leaves as IPv6 fragments, which RFC 7915 asks for. Whether those carry
+ * their payload is A452's question, open: the zero payload above did not
+ * reproduce in any shape measured, and as for any TCP direction here, a
+ * corrupt fragment fails the receiver's checksum rather than being delivered.
+ * Its TCP into IPv4 is held to the bound like UDP: a translator takes its
+ * packets at PREROUTING, before any FORWARD rule that clamps an MSS sees a
+ * SYN, so nothing keeps the IPv6 host's segments to the IPv4 path; and the
+ * entry has no DF check to hand an oversized one over (IPv6 carries no DF),
+ * while the header it builds sets DF. */
+bool ft_mtu_carried(const struct cdx_ft_rule *rule, u32 mtu)
 {
-	return rule->proto == IPPROTO_TCP || rule->detour ||
+	return (rule->proto == IPPROTO_TCP && rule->xlat_family != AF_INET) || rule->detour ||
 	       (rule->family == AF_INET && (rule->sa_handle || rule->in_sa_handle)) ||
-	       ft_arriving(rule->in, ft_rule_stripped(rule)) <= mtu;
+	       ft_handed_on(rule, ft_arriving(rule->in, ft_rule_stripped(rule))) <= mtu;
 }
 
 /* Whether a direction into a smaller path is carried through the offline-port
@@ -1886,8 +1955,10 @@ static u32 ft_ipv6_dev_mtu(const struct net_device *dev)
  * follows its device. Its MTU is never above the device's when Linux creates
  * the flow, so a retired flow comes back carried and nothing loops. Checked at
  * admission, since Linux's flow keeps the MTU it was created with and the
- * sysctl may have dropped since, and on every stats pass and re-offer. */
-static bool ft_egress_mtu_current(const struct cdx_ft_rule *rule)
+ * sysctl may have dropped since, and on every stats pass and re-offer. A
+ * translated direction follows its egress family's rules: one into IPv6 asks
+ * this of its egress device, one into IPv4 never does. */
+bool ft_egress_mtu_current(const struct cdx_ft_rule *rule)
 {
 	return !rule->mtu_follows_dev || ft_ipv6_dev_mtu(rule->out_logical) >= rule->mtu;
 }
@@ -2109,14 +2180,17 @@ static u8 ft_tc_side(const struct net_device *port, const struct net_device *log
  * no device has anything to say. Read afresh at each recheck, so a policy
  * configured since admission widens the way in, and the readmission that
  * follows a retirement decides again. Admission asks it of the rule as the
- * recheck will find it, the SA that decrypts the direction included. */
+ * recheck will find it, the SA that decrypts the direction included. A
+ * translated direction never meets the fast path: the translator takes its
+ * packets at a hook of its own, behind every device of the receive stack, so
+ * the whole stack counts on the way in. */
 bool ft_rule_tc_soft(const struct cdx_ft_rule *rule)
 {
 	u8 in;
 
 	if (!ft_tc_any())
 		return false;
-	if (ft_fast_path(rule->in_tunnel.present, rule->in_sa_handle))
+	if (!rule->xlat_family && ft_fast_path(rule->in_tunnel.present, rule->in_sa_handle))
 		in = ft_tc_dev_bits(rule->in);
 	else
 		in = ft_tc_side(rule->in, rule->in_logical, rule->in_bridge, rule->in_vlan,
@@ -2220,7 +2294,7 @@ static bool ft_tunnel_inbound_allowed(const struct cdx_ft_tunnel *tunnel)
 	return xfrm_flowtable_in_plain(&init_net, &flow, tunnel->family);
 }
 
-static bool ft_bridge_egress_filtered(const struct cdx_ft_rule *rule)
+bool ft_bridge_egress_filtered(const struct cdx_ft_rule *rule)
 {
 	return rule->out_bridge &&
 	       ft_bridge_hooked_routed(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING));
@@ -2673,9 +2747,106 @@ static u32 ft_key_hash(const struct cdx_ft_rule *rule)
 			   ft_hash_seed ^ hash_ptr(rule->in, 32) ^ rule->proto);
 }
 
+/* The entry, of whichever source, holding the hardware key @rule would take:
+ * the classifier keys on the physical ingress port and the tuple alone, so a
+ * second entry with the same key would shadow the first, never sit beside it.
+ * Every source refuses on it, which is what refuses a collision between a
+ * Netfilter flow and a translated direction in either order. */
+struct cdx_ft_entry *ft_key_holder(const struct cdx_ft_rule *rule)
+{
+	struct cdx_ft_entry *other;
+
+	hash_for_each_possible(ft_keys, other, key_node, ft_key_hash(rule))
+		if (ft_same_key(&other->rule, rule))
+			return other;
+	return NULL;
+}
+
+/* An entry for a rule a source has decoded, to be handed to ft_install() once
+ * the source has attached its owner and said whose binding it is, if anyone's.
+ * ft_neigh_detach() unlinks by emptiness, because an entry can reach the watch
+ * list holding no neighbour, and a kzalloc'd list head is not an empty one. */
+struct cdx_ft_entry *ft_entry_alloc(const struct cdx_ft_rule *rule,
+				    const union nf_inet_addr *next_hop,
+				    unsigned long cookie, u8 dir)
+{
+	struct cdx_ft_entry *entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+
+	if (!entry)
+		return NULL;
+	INIT_LIST_HEAD(&entry->neigh_list);
+	entry->rule = *rule;
+	entry->next_hop = *next_hop;
+	entry->cookie = cookie;
+	entry->dir = dir;
+	return entry;
+}
+
+/* The install every admission source shares, under the transaction and the
+ * admission's RTNL: the devices the rule names and the ones its walk crossed
+ * held, the neighbour attached and the entry published on the watch list --
+ * before the hardware entry exists, so a notifier during the insertion
+ * latches what the source's recheck then finds -- the device records claimed,
+ * the hardware entry added through the backend, and the entry published on
+ * ft_entries, on @owned (its binding's entries, or the source's own list when
+ * it has no binding), and in the cookie and key indexes.
+ *
+ * The entry comes from ft_entry_alloc() with its owner attached. On failure
+ * everything is given back, the owner's reference included, and the entry is
+ * freed. What has to be rechecked once the entry is watched -- whatever no
+ * lock ordered against the decode -- the source rechecks itself. */
+int ft_install(struct cdx_ft_entry *entry, struct list_head *owned)
+{
+	struct cdx_ft_stats_binding stats;
+	int rc;
+
+	ft_devices_hold(entry);
+	/* Before the watch list can see the entry, so an event on any of them
+	 * finds it from the moment it is published. */
+	ft_crossed_hold_all(entry);
+	rc = ft_neigh_attach(entry);
+	if (!rc) {
+		/* Claimed before the hardware entry exists, so the indices the
+		 * encoder writes name a record this entry already holds a
+		 * reference to; a record acquired afterwards could be the one
+		 * a concurrent retirement had just returned. */
+		ft_stats_attach(entry);
+		ft_stats_binding(entry, &stats);
+		rc = ft_fault(2) ? -EIO : cdx_ft_add(&entry->rule, &stats, &entry->hw);
+	}
+	if (rc) {
+		ft_stats_detach(entry);
+		ft_neigh_detach(entry);
+		ft_owner_release(entry);
+		ft_devices_put(entry);
+		ft_crossed_put_all(entry);
+		kfree(entry);
+		return rc;
+	}
+	list_add_tail(&entry->list, &ft_entries);
+	list_add_tail(&entry->binding_node, owned);
+	hash_add(ft_cookies, &entry->cookie_node,
+		 entry->cookie ^ (unsigned long)entry->binding);
+	hash_add(ft_keys, &entry->key_node, ft_key_hash(&entry->rule));
+	ft_stats_kick();
+	ft_count++;
+	ft_installs++;
+	return 0;
+}
+
+/* The recheck every source makes once its entry is published and watched, on
+ * top of whatever of its own no lock ordered against the decode: no global
+ * invalidation latched, and the owner still wanting the direction -- a
+ * notifier that fired during the insertion marked one or the other. False
+ * means the source takes the entry out again. */
+bool ft_install_current(const struct cdx_ft_entry *entry)
+{
+	return !atomic_read(&ft_invalid) && ft_owner_valid(entry->owner);
+}
+
 static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *cls)
 {
-	struct cdx_ft_entry *entry = ft_find(binding, cls->cookie), *other;
+	struct cdx_ft_entry *entry = ft_find(binding, cls->cookie);
 	struct cdx_ft_rule rule;
 	u64 ipsec_genid = atomic64_read_acquire(&ft_ipsec_genid);
 	union nf_inet_addr next_hop;
@@ -2716,9 +2887,8 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 		if (rc)
 			return ask_refuse(rc);
 	}
-	hash_for_each_possible(ft_keys, other, key_node, ft_key_hash(&rule))
-		if (ft_same_key(&other->rule, &rule))
-			return ask_refuse(-EEXIST);
+	if (ft_key_holder(&rule))
+		return ask_refuse(-EEXIST);
 	if (ft_count >= CDX_FT_MAX_ENTRIES)
 		return ask_refuse(-ENOSPC);
 	if (ft_fault(1))
@@ -2727,52 +2897,14 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	 * whose barrier is merely owed is that until it is asked for. */
 	if (ft_settle())
 		return ask_refuse(-EAGAIN);
-	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	entry = ft_entry_alloc(&rule, &next_hop, cls->cookie, cls->nf_dir);
 	if (!entry)
 		return ask_refuse(-ENOMEM);
-	/* ft_neigh_detach() unlinks by emptiness, because an entry can reach
-	 * the watch list holding no neighbour, and a kzalloc'd list head is
-	 * not an empty one. */
-	INIT_LIST_HEAD(&entry->neigh_list);
-	entry->rule = rule;
-	entry->next_hop = next_hop;
 	entry->binding = binding;
-	entry->cookie = cls->cookie;
-	entry->dir = cls->nf_dir;
 	ft_nf_owner_hold(entry, cls->nf_handle);
-	ft_devices_hold(&rule);
-	/* Before the watch list can see the entry, so an event on any of them
-	 * finds it from the moment it is published. */
-	ft_crossed_hold_all(entry);
-	rc = ft_neigh_attach(entry);
-	if (!rc) {
-		struct cdx_ft_stats_binding binding;
-
-		/* Claimed before the hardware entry exists, so the indices the
-		 * encoder writes name a record this entry already holds a
-		 * reference to; a record acquired afterwards could be the one
-		 * a concurrent retirement had just returned. */
-		ft_stats_attach(entry);
-		ft_stats_binding(entry, &binding);
-		rc = ft_fault(2) ? -EIO : cdx_ft_add(&rule, &binding, &entry->hw);
-	}
-	if (rc) {
-		ft_stats_detach(entry);
-		ft_neigh_detach(entry);
-		ft_owner_release(entry);
-		ft_devices_put(&rule);
-		ft_crossed_put_all(entry);
-		kfree(entry);
+	rc = ft_install(entry, &binding->entries);
+	if (rc)
 		return ask_refuse(rc);
-	}
-	list_add_tail(&entry->list, &ft_entries);
-	list_add_tail(&entry->binding_node, &binding->entries);
-	hash_add(ft_cookies, &entry->cookie_node,
-		 entry->cookie ^ (unsigned long)entry->binding);
-	hash_add(ft_keys, &entry->key_node, ft_key_hash(&entry->rule));
-	ft_stats_kick();
-	ft_count++;
-	ft_installs++;
 	/* An SA may expire before this entry joins the dependency watch. */
 	if (ipsec_genid != atomic64_read_acquire(&ft_ipsec_genid))
 		ft_handle_invalidate(cls->nf_handle, &ft_ipsec_invalidations);
@@ -2783,7 +2915,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	 * wraps -- then retires it below through the same path as a change
 	 * observed during insertion. */
 	ft_offer_current(cls);
-	if (ft_fault(3) || atomic_read(&ft_invalid) || !ft_owner_valid(entry->owner)) {
+	if (ft_fault(3) || !ft_install_current(entry)) {
 		ft_remove(entry);
 		return -EIO;
 	}
@@ -2942,16 +3074,30 @@ static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 #define FT_STATS_BATCH 256U
 static unsigned int ft_stats_ms = 1000;
 u64 ft_stats_passes, ft_stats_requests;
-static u32 ft_stats_pass;
+u32 ft_stats_pass;
 static void ft_stats_workfn(struct work_struct *work);
 DECLARE_DELAYED_WORK(ft_stats_work, ft_stats_workfn);
 
-/* A pass, stats_ms from now, unless one is already queued: from each install,
+/* How often a pass runs while translated directions are installed and stats_ms
+ * is zero: Netfilter asks for none of their counters, so a pass is the only
+ * thing that tells their translator they are in use (ask_xlat.h, `used'). */
+#define FT_STATS_XLAT_MS 1000U
+
+/* The period passes run at: stats_ms, or, with that zero, the translated
+ * directions' own while any is installed. */
+static unsigned int ft_stats_period_ms(void)
+{
+	unsigned int ms = READ_ONCE(ft_stats_ms);
+
+	return ms ?: (READ_ONCE(ft_xlat_count) ? FT_STATS_XLAT_MS : 0);
+}
+
+/* A pass, a period from now, unless one is already queued: from each install,
  * and from a change of stats_ms. Unload disables the work, so nothing queued
  * from here outlives the module. */
 void ft_stats_kick(void)
 {
-	unsigned int ms = READ_ONCE(ft_stats_ms);
+	unsigned int ms = ft_stats_period_ms();
 
 	if (ms && !READ_ONCE(ft_stopping))
 		queue_delayed_work(system_unbound_wq, &ft_stats_work, msecs_to_jiffies(ms));
@@ -2975,6 +3121,9 @@ static int ft_stats_ms_set(const char *val, const struct kernel_param *kp)
 	if (ms && ms < FT_STATS_MS_MIN)
 		return -EINVAL;
 	WRITE_ONCE(*(unsigned int *)kp->arg, ms);
+	/* Zero still leaves the translated directions' own period, while any is
+	 * installed. */
+	ms = ft_stats_period_ms();
 	if (!ms)
 		cancel_delayed_work(&ft_stats_work);
 	else if (READ_ONCE(ft_ready) && !READ_ONCE(ft_stopping))
@@ -2987,13 +3136,16 @@ static const struct kernel_param_ops ft_stats_ms_ops = {
 	.get = param_get_uint,
 };
 module_param_cb(stats_ms, &ft_stats_ms_ops, &ft_stats_ms, 0644);
-MODULE_PARM_DESC(stats_ms, "How often every offloaded flow's counters reach conntrack (ms, 100 or more, up to half the flowtable timeout); 0 leaves it to Netfilter's per-flow requests, which cost more");
+MODULE_PARM_DESC(stats_ms, "How often every offloaded flow's counters reach conntrack (ms, 100 or more, up to half the flowtable timeout); 0 leaves it to Netfilter's per-flow requests, which cost more, except while translated sessions are installed, which a pass every second keeps alive");
 
 /* One entry's part of a pass: what it counted since its last report and when
  * it was last used, through its owner, as a counter read's reply carries
  * them (ft_stats()). A direction ft_stats() would refuse to answer for is
  * left to Netfilter: its collector retires a flow whose handle is invalid
- * within a second, and one that goes unreported is asked for again. */
+ * within a second, and one that goes unreported is asked for again. A
+ * translated direction's owner takes the same pair in place of Netfilter's,
+ * and tells its translator the session is in use (ask_flowtable_xlat.c); what
+ * the pass refuses for one, its owner's invalidation retires. */
 static void ft_stats_report(struct cdx_ft_entry *entry)
 {
 	struct cdx_ft_counters now;
@@ -3052,7 +3204,7 @@ static void ft_stats_workfn(struct work_struct *work)
 		if (more)
 			cdx_ft_let_waiters();
 	} while (more);
-	period = msecs_to_jiffies(READ_ONCE(ft_stats_ms));
+	period = msecs_to_jiffies(ft_stats_period_ms());
 	if (left && period && !READ_ONCE(ft_stopping))
 		queue_delayed_work(system_unbound_wq, &ft_stats_work,
 				   time_after(began + period, jiffies) ? began + period - jiffies : 0);
@@ -3333,13 +3485,22 @@ bool ft_can_rearm(void)
  * not proven, including one CDX parked for a path of its own. While every
  * binding is parked nothing else retries that barrier, so this does, and comes
  * back every second until it succeeds.
+ *
+ * A translation client with no flowtable bound at all waits on the latch with
+ * no binding to park: its sessions are admitted under the latch's rules, and
+ * the worker's pass retires them like any other entry. So the same drain
+ * rearms it, and the client's own registration asks too. Without a client the
+ * latch stays as it always has, until the next bind (the lazy latch
+ * docs/flowtable/procfs.md describes).
  */
 void ft_rearm(void)
 {
 	struct cdx_ft_binding *binding;
+	bool unbound;
 
 	cdx_ft_assert_held();
-	if (!ft_parked || !ft_drained())
+	unbound = !ft_bound && READ_ONCE(ft_xlat_active);
+	if ((!ft_parked && !unbound) || !ft_drained())
 		return;
 	if (cdx_ft_pending()) {
 		cdx_ft_recover();
@@ -3361,8 +3522,11 @@ void ft_rearm(void)
 		binding->parked = false;
 	/* And one refused while they were parked. */
 	ft_l2_refusals_reset();
-	pr_info("cdx flowtable: admission rearmed for %u parked binding%s\n",
-		ft_parked, ft_parked == 1 ? "" : "s");
+	if (ft_parked)
+		pr_info("cdx flowtable: admission rearmed for %u parked binding%s\n",
+			ft_parked, ft_parked == 1 ? "" : "s");
+	else
+		pr_info("cdx flowtable: admission rearmed for translated sessions\n");
 	WRITE_ONCE(ft_parked, 0);
 	ft_invalid_done = false;
 	ft_rearms++;
@@ -3375,20 +3539,50 @@ static void ft_rearm_workfn(struct work_struct *work)
 	cdx_ft_end();
 }
 
-/* At most FT_RETIRE_BATCH of the binding's entries, taken from its own list
- * rather than found by walking everyone's, and settled as ft_retire_batch()
- * settles. True while it has more. */
-static bool ft_retire_bound(struct cdx_ft_binding *binding)
+/* At most FT_RETIRE_BATCH of the entries on one owner's list -- a binding's
+ * own, or the translated directions' -- taken from that list rather than
+ * found by walking everyone's, and settled as ft_retire_batch() settles. True
+ * while it has more. */
+bool ft_retire_list(struct list_head *entries)
 {
 	unsigned int n;
 
 	cdx_ft_assert_held();
-	for (n = 0; n < FT_RETIRE_BATCH && !list_empty(&binding->entries); n++)
-		ft_unlink(list_first_entry(&binding->entries, struct cdx_ft_entry,
-					   binding_node));
-	if (list_empty(&binding->entries) || cdx_ft_owed() >= FT_SETTLE_BOUND)
+	for (n = 0; n < FT_RETIRE_BATCH && !list_empty(entries); n++)
+		ft_unlink(list_first_entry(entries, struct cdx_ft_entry, binding_node));
+	if (list_empty(entries) || cdx_ft_owed() >= FT_SETTLE_BOUND)
 		ft_settle();
-	return !list_empty(&binding->entries);
+	return !list_empty(entries);
+}
+
+static bool ft_retire_bound(struct cdx_ft_binding *binding)
+{
+	return ft_retire_list(&binding->entries);
+}
+
+/* Every deletion left unproven, proven: a barrier completes, or -- after one
+ * that may have left its key linked -- no port walks the tables any more, as
+ * the backend requires of an -EIO. Unload, a load unwinding its own failure,
+ * and a translation client unregistering owe this before what the entries
+ * named is let go, and none can count on the invalidation worker for it:
+ * ft_invalidate() does nothing once ft_stopping is set, nor without a binding
+ * or a client. It cannot fail, so it waits, releasing the transaction between
+ * attempts so configuration and other kernel work can progress. A latch stays
+ * in CDX: a later load is refused until CDX has restarted the datapath. Called
+ * without the transaction. */
+void ft_hw_settle(void)
+{
+	int rc;
+
+	for (;;) {
+		cdx_ft_begin();
+		rc = cdx_ft_recover();
+		cdx_ft_end();
+		if (!rc)
+			return;
+		pr_warn_ratelimited("ask_flowtable: waiting for safe hardware retirement before releasing CDX\n");
+		msleep(1000);
+	}
 }
 
 void ft_release(void *priv)

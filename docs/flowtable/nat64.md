@@ -1,11 +1,12 @@
 # NAT64 and SIIT offload
 
-Status: **feasibility proved, prototype encoder on the `nat64-offload` branch;
-not in the [supported scope](README.md#supported-scope).** This document
-records what the hardware does with a translation between IPv4 and IPv6, how
-cdx encodes one, what has to stay in software, where hardware translation
-differs from Jool's, and the design for admitting Jool's translations. The
-measurements are in [the feasibility record](history/nat64-feasibility.md).
+Status: **feasibility proved; encoder and translator-neutral admission source
+on the `nat64-offload` branch, no translator patched yet; not in the
+[supported scope](README.md#supported-scope).** This document records what the
+hardware does with a translation between IPv4 and IPv6, how cdx encodes one,
+what has to stay in software, where hardware translation differs from Jool's,
+and the design for admitting Jool's translations. The measurements are in
+[the feasibility record](history/nat64-feasibility.md).
 
 ## Why the flowtable path never sees a translation
 
@@ -180,27 +181,85 @@ small and upstreamable, plus an ASK adapter on the other side.
 of through a `struct ft_owner`, with five operations: valid, invalidate,
 account, used and release. Flowtable entries embed `struct ft_nf_owner`, which
 wraps Netfilter's handle. A translated pair gets its own owner, shared by the
-two directions. What a translated entry still has to deal with, from the
-refactor's review:
+two directions (`cdx/ask_flowtable_xlat.c`). How a translated entry deals with
+what the refactor's review listed:
 
-* **No binding.** `ft_unlink()` removes `entry->binding_node` unconditionally,
-  so a binding-less entry needs an initialised node or a guard.
-* **Unload.** It drains entries through each binding's release, and so does
-  the `ft_handle_refs` zero check. Translated entries need their own
-  retirement on exit and on a port's unregister.
-* **The count.** `ft_handle_refs` is raised by the Netfilter owner's hold and
-  lowered by the generic release, so a second hold path must raise it too.
-* **The shared owner** is refcounted, one release per entry. Since invalidate
-  is for good, re-admission takes a fresh owner.
-* **A key collision** between a translated entry and a Netfilter offer
-  refuses the offer (`-EEXIST`), and where software does not re-offer, that
-  generation is invalidated.
-* **`account(dir, …)`** uses Netfilter's direction naming, with bytes
-  restated by `ft_l2_overhead()` in the ingress family's units. A translated
-  owner has to define both.
-* **Marks after publication.** `ft_replace()` marks through `cls->nf_handle`
-  after publication. That is right for Netfilter admission only; a second
-  admission path marks its own owner.
+* **No binding.** Every published entry is on a list by its `binding_node`:
+  its binding's, or `ft_xlat_list` for a translated one, so `ft_unlink()`
+  takes it off unconditionally, and the translated directions drain by that
+  list as a binding's drain by its own (`ft_retire_list()`). Their cookie,
+  the translator's, shares `ft_cookies` with Netfilter's under a NULL
+  binding, which no Netfilter lookup matches.
+* **Unload and unregistration** retire the translated list explicitly, and
+  unregistration waits for the barrier that proves it (`ft_hw_settle()`). A
+  port's unregistration latches the global invalidation, which retires every
+  entry on `ft_entries` and now runs with a translation client registered
+  and nothing bound (`ft_xlat_active`); the same drain rearms admission for
+  such a client.
+* **The count.** `ft_owner_attach()` raises `ft_handle_refs` for every owner
+  reference, whichever source took it.
+* **The shared owner** holds one reference per entry and the admission's own
+  while it installs them; its last release says `expired`. Invalidate is for
+  good, and a re-offer takes a fresh owner, the retiring one superseded.
+* **A key collision** refuses in both orders through `ft_key_holder()`: a
+  translated offer refused by a live Netfilter entry, a Netfilter offer
+  (`-EEXIST`) by a live translated one. A key whose holder's owner is retired
+  goes to the translated newcomer at once.
+* **`account(dir, …)`** only notes that a direction moved: the translator
+  counts its sessions by their timers. `used` says the keepalive, once a
+  counter pass per session.
+* **Marks after publication.** The translated admission rechecks both of its
+  routes (`ft_dst_current()`), the latch and its own owner after publishing,
+  and marks that owner.
+* **The ingress port** is pinned by the entry itself, a binding pinning it for
+  a Netfilter one.
+* **Route watches** match each address in its own family (`ft_new_family()`),
+  and so does `ft_policy_covers()`.
+
+**What the client gets.** `cdx/ask_xlat.h` is the interface: one client
+registers its two callbacks, offers a session (the netns, TCP or UDP, the TOS
+mode, a cookie, and both directions with the tuple each arrives with, the one
+it leaves with and the device it arrives on) from softirq, and withdraws it by
+cookie. An offer is copied into a bounded ring and decided by a worker under
+the backend transaction and RTNL taken without waiting, as the bridged learner
+decides its pairs. Each direction's egress is the route the translator would
+take for its translated destination; its next hop, neighbour, physical port
+(the kernel's forwarding-path walk) and tags, bridge and session
+(`ft_path_stack()`) follow, and each direction's ingress is its sibling's
+egress, which the translator's ingress device has to match. Both go in
+through the install Netfilter's offers use (`ft_install()`), or neither.
+
+Each session offered is answered by exactly one `expired`, unless the client
+withdraws it first. At any moment one thing owes that answer: the offer that
+stands for the session, queued or in the worker's hands, or the owner it
+installed. An offer of a session something already stands for is folded
+into it; one of a session whose retired owner is still leaving the hardware
+is queued and takes the answer from that owner at once, so whichever of the
+old entries' retirement and the offer's decision comes first, nothing is
+said before the new session is installed. A refused offer hands the answer
+back to such an owner, which says it once its entries have left. An offer or
+a withdrawal landing while an `expired` is being said cannot stop it: the
+offer is turned away (`false`), the withdrawal returns `false`, and the call
+answers the session as it was. `ask_xlat_unregister()` takes the ops it
+registered and refuses any other.
+
+A withdrawn session, and every session a datapath restart retires, is found
+by its cookie and retired directly by the translation worker, never by
+walking the table. `used` comes from the counter pass, which runs while
+translated sessions are installed even with `stats_ms` at 0. A restart's
+sessions are said `expired`, and the translator offers them again.
+
+The MTU bound is the flowtable's, measured on what a direction hands on: an
+IPv4 packet the port takes whole is 20 bytes longer as IPv6. UDP, and TCP
+into IPv4, are carried only where the largest such packet fits. TCP into
+IPv4 has no MSS clamp to rely on, because the translator steals its packets
+at PREROUTING, before any FORWARD rule sees a SYN. TCP into IPv6 keeps the
+exemption: the entry's DF check hands an oversized IPv4 segment with DF to
+the translator. An offer the route's MTU alone is certain to refuse is turned
+away before it is queued (`xlat_mtu_refused`), without RTNL. The default
+NAT64 shape is one: UDP from a 1500-byte IPv4 uplink into a 1500-byte LAN.
+The route is read again at each offer, so nothing is cached that could go
+stale.
 
 **SIIT** has no per-flow state at all: address mapping goes through pool6,
 the EAMT and the denylist per packet. The adapter keeps its own per-flow
@@ -217,23 +276,48 @@ configuration change or local IPv4 address change.
      parameter byte the microcode reads, for both directions, TCP and UDP,
      and both TOS modes.
    - The rig checks the wire.
-2. The Jool patch and the adapter for stateful NAT64, TCP and UDP. Jool goes
-   into the test image so the rig can run a real NAT64 (`set nat64` under
-   VyOS, Jool's netfilter mode in meta-ask), with line-rate and lifecycle
-   tests.
+2. The adapter: done, translator-neutral (`ask_xlat.h`), proved on the host
+   (`flowtable.c`'s translated-session cases) and drivable on the rig through
+   the test client. Then the Jool patch for stateful NAT64, TCP and UDP. Jool
+   goes into the test image so the rig can run a real NAT64 (`set nat64`
+   under VyOS, Jool's netfilter mode in meta-ask), with line-rate and
+   lifecycle tests.
 3. SIIT.
 4. VyOS packaging of the patched Jool modules.
 
-## Feasibility hook
+## Test client
 
-Until the adapter exists, `cdx.xlat_test` installs a direction by hand:
+Until a translator is patched, `ask_xlat_test.ko` (`cdx/ask_xlat_test.c`)
+stands in for one. It is built only for the test image (`CONFIG_ASK_XLAT_TEST`,
+which meta-ask's recipe sets and no consumer's build does), registers with
+`ask_xlat.h` when it loads and unregisters when it goes, and offers sessions
+described by hand, admitted exactly as a translator's would be:
 
 ```text
-echo "in=eth4 out=eth4 proto=udp src=<v6 src> dst=64:ff9b::a00:e8 sport=40001 dport=5000
+modprobe ask_xlat_test
+echo "in=eth3 proto=tcp src=<v6 client> dst=64:ff9b::a00:e8 sport=40001 dport=5000
       nsrc=10.0.0.62 ndst=10.0.0.232 nsport=40001 ndport=5000
-      smac=<eth4 MAC> dmac=<next hop MAC> mtu=1500 tos=0" > /sys/module/cdx/parameters/xlat_test
-cat /sys/module/cdx/parameters/xlat_test      # each entry's hardware hits
-echo flush > /sys/module/cdx/parameters/xlat_test
+      tos=copy cookie=1" > /sys/module/ask_xlat_test/parameters/session
+cat /sys/module/ask_xlat_test/parameters/session    # sessions still owed an answer, and totals
+echo "withdraw cookie=1" > /sys/module/ask_xlat_test/parameters/session
+echo flush > /sys/module/ask_xlat_test/parameters/session   # withdraw them all
 ```
 
-The hook is test-only. The adapter replaces it.
+One line describes the first direction, as it arrives on `in` and as it
+leaves translated; the second is its inverse, arriving on `rin=` if given,
+else on the device the route to `ndst` leaves by. `tos` is `copy` (the
+default) or a fixed value. Routes, neighbours, ports and the MTU are the
+adapter's to find, as they are for a translator's offer; `/proc/ask_flowtable/
+flows` shows the two rows (`xlat=`, `tos=`), and `status` and `stats` the
+`xlat_*` keys. With both ports at 1500 bytes only TCP is offloaded: the IPv4
+side's 1500-byte UDP packets are 1520 bytes as IPv6, so a UDP session needs
+the LAN port at an MTU of 1520 or more, and is refused otherwise (the write
+fails with `EOPNOTSUPP`). A session's slot is given back when it is said
+expired, or withdrawn with nothing more to say. A withdrawal that lands while
+its expired is being said keeps the slot until that call arrives, and the
+cookie cannot be offered again until then (`EBUSY`).
+
+It replaces the earlier `cdx.xlat_test` hook, which installed one direction by
+hand straight through the encoder, MACs and MTU included. That hook could also
+give a plain direction a tunnel or a session (`tun=`, `sess=`), which A452's
+fragment measurements used; that shape is no longer installable by hand.

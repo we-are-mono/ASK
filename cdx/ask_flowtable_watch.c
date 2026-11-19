@@ -63,6 +63,28 @@ bool ft_neigh_moved(u8 family, struct net_device *dev,
 	return moved;
 }
 
+/* The address of the usable neighbour at @dst on @dev, for an admission with
+ * no offer to read one from: a translated direction, whose translator resolved
+ * the neighbour for its own packets (ask_flowtable_xlat.c). Usable is what
+ * ft_neigh_attach() then requires of the same neighbour, so an answer here
+ * that changes before the attach is refused there. */
+bool ft_neigh_resolve(u8 family, struct net_device *dev,
+		      const union nf_inet_addr *dst, u8 *mac)
+{
+	struct neighbour *neigh = neigh_lookup(ft_neigh_table(family), dst, dev);
+	bool valid;
+
+	if (!neigh)
+		return false;
+	read_lock_bh(&neigh->lock);
+	valid = ft_neigh_matches(neigh, neigh->ha) && is_valid_ether_addr(neigh->ha);
+	if (valid)
+		ether_addr_copy(mac, neigh->ha);
+	read_unlock_bh(&neigh->lock);
+	neigh_release(neigh);
+	return valid;
+}
+
 /* A gateway is normally link-local, which a flow endpoint may never be, so
  * this is deliberately weaker than the endpoint test. */
 bool ft_nexthop_usable(u8 family, const union nf_inet_addr *next_hop)
@@ -709,7 +731,10 @@ int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		 * same RTNL transaction, and the retirement that causes runs
 		 * asynchronously, so the watch list can still name the device
 		 * when this arrives. Only a port's removal stops admission
-		 * globally, below. */
+		 * globally, below -- translated directions through it
+		 * included, which no binding's release would reach: the
+		 * invalidation they latch retires every entry on ft_entries,
+		 * and serves them with nothing bound (ft_invalidate()). */
 		if (ft_device_role(dev) != FT_DEV_PORT) {
 			ft_device_retire(dev, &ft_link_invalidations);
 			break;
@@ -780,11 +805,13 @@ static int ft_route_event(const struct netevent_ipv4_route *event)
 		/* After NAT, current egress uses new_dst; reverse egress uses src.
 		 * Check both endpoints even if only one direction installed. Match
 		 * all tables/DSCP aliases conservatively: a new more-specific route
-		 * can supersede a route which never emitted a deletion event. */
-		if (entry->rule.family != AF_INET)
-			continue;
-		if (!((entry->rule.new_dst.ip ^ event->dst) & mask) ||
-		    !((entry->rule.src.ip ^ event->dst) & mask))
+		 * can supersede a route which never emitted a deletion event. Each
+		 * in its own family: a translated direction's new_dst is in the
+		 * other one, and so is the route its egress was found by. */
+		if ((ft_new_family(&entry->rule) == AF_INET &&
+		     !((entry->rule.new_dst.ip ^ event->dst) & mask)) ||
+		    (entry->rule.family == AF_INET &&
+		     !((entry->rule.src.ip ^ event->dst) & mask)))
 			ft_owner_invalidate(entry->owner, &ft_route_invalidations);
 	}
 	spin_unlock_bh(&ft_watch_lock);
@@ -815,10 +842,10 @@ static int ft_route6_event(const struct netevent_ipv6_route *event)
 			ft_owner_invalidate(entry->owner, &ft_route_invalidations);
 			continue;
 		}
-		if (entry->rule.family != AF_INET6)
-			continue;
-		if (ipv6_prefix_equal(&entry->rule.new_dst.in6, &event->dst, event->prefixlen) ||
-		    ipv6_prefix_equal(&entry->rule.src.in6, &event->dst, event->prefixlen))
+		if ((ft_new_family(&entry->rule) == AF_INET6 &&
+		     ipv6_prefix_equal(&entry->rule.new_dst.in6, &event->dst, event->prefixlen)) ||
+		    (entry->rule.family == AF_INET6 &&
+		     ipv6_prefix_equal(&entry->rule.src.in6, &event->dst, event->prefixlen)))
 			ft_owner_invalidate(entry->owner, &ft_route_invalidations);
 	}
 	spin_unlock_bh(&ft_watch_lock);
@@ -1317,11 +1344,17 @@ static int ft_egress_drain(struct net_device *dev)
  * here: both learners reconsider every group, every SA has its peer looked up
  * again -- which rebuilds only the ones that need it -- and a parked binding is
  * rearmed if its invalidation has drained. Each queues its own work and takes
- * no lock of CDX's here. */
+ * no lock of CDX's here.
+ *
+ * Nothing offers a translated session again the way Netfilter re-offers a
+ * flow, and through the restart its translator ran it in software with no
+ * keepalive from the hardware. So every translated session is retired and
+ * said expired, and the translator offers again what it still has. */
 static void ft_egress_restarted(void)
 {
 	/* A bridged pair the latched backend refused is asked again. */
 	ft_l2_refusals_reset();
+	ft_xlat_restarted();
 	ft_mc_kick_all();
 	ft_mr_kick();
 	ft_ipsec_all_moved();

@@ -52,6 +52,7 @@ IMAGE_INSTALL = " \
     config \
     kernel-module-nf-conntrack-netlink \
     kernel-module-ask-flowtable \
+    kernel-module-ask-xlat-test \
     kernel-module-nft-flow-offload \
     kernel-module-nf-flow-table-inet \
     kernel-module-nft-ct \
