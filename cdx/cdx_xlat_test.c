@@ -15,6 +15,8 @@
  * the same is plain NAT and goes through the same encoder. */
 #include <linux/etherdevice.h>
 #include <linux/inet.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/netdevice.h>
@@ -134,6 +136,29 @@ static int xlat_test_parse(char *line, struct cdx_ft_rule *rule)
 			rc = kstrtou16(value, 0, &rule->mtu);
 		} else if (!strcmp(token, "tos")) {
 			rc = kstrtou8(value, 0, &rule->xlat_tos);
+		} else if (!strcmp(token, "tun")) {
+			/* An egress tunnel on a plain direction: the outer header the
+			 * entry inserts, its endpoints from tlocal/tremote. */
+			bool six = !strcmp(value, "4o6");
+
+			if (!six && strcmp(value, "6o4"))
+				return -EINVAL;
+			rule->out_tunnel.present = true;
+			rule->out_tunnel.mode = six ? CDX_FT_TUNNEL_4O6 : CDX_FT_TUNNEL_6O4;
+			rule->out_tunnel.family = six ? AF_INET6 : AF_INET;
+			rule->out_tunnel.proto = six ? IPPROTO_IPIP : IPPROTO_IPV6;
+			rule->out_tunnel.header_size = six ? sizeof(struct ipv6hdr) : sizeof(struct iphdr);
+			if (!rule->out_tunnel.ttl)
+				rule->out_tunnel.ttl = 64;
+		} else if (!strcmp(token, "tlocal") || !strcmp(token, "tremote")) {
+			rc = xlat_test_addr(value, token[1] == 'l' ? &rule->out_tunnel.local :
+					    &rule->out_tunnel.remote, &f);
+		} else if (!strcmp(token, "tttl")) {
+			rc = kstrtou8(value, 0, &rule->out_tunnel.ttl);
+		} else if (!strcmp(token, "sess")) {
+			/* An egress PPPoE session; the concentrator is dmac. */
+			rc = kstrtou16(value, 0, &rule->out_session.id);
+			rule->out_session.present = true;
 		} else {
 			rc = -EINVAL;
 		}
@@ -146,6 +171,12 @@ static int xlat_test_parse(char *line, struct cdx_ft_rule *rule)
 	rule->next_hop_family = xfamily;
 	if (xfamily != family)
 		rule->xlat_family = xfamily;
+	if (rule->out_session.present)
+		ether_addr_copy(rule->out_session.mac, rule->dst_mac);
+	if (rule->out_tunnel.present) {
+		ether_addr_copy(rule->out_tunnel.mac, rule->dst_mac);
+		rule->next_hop_family = rule->out_tunnel.family;
+	}
 	return 0;
 }
 

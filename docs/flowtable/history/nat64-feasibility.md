@@ -135,6 +135,35 @@ of IPv6. With this microcode the slack is 0 and the 4to6 expansion is 20.
 
 **Back to stock:** a plain reboot loads the flash copy.
 
+## Fragment payloads (2026-11-19)
+
+**The question.** The adapter keeps non-TCP directions out of paths smaller
+than their ingress, on A202's finding (2026-09-24, repeated in A316 and A385)
+that the microcode's fragments of a frame received on a port carry an
+all-zero payload.
+
+**Method.** Each case sent one patterned UDP datagram with DF clear through
+an entry installed by the test hook (stock 210.10.1, this branch's 6.18
+image), then reassembled what came back and compared it byte for byte.
+
+**Results:**
+
+| Entry | Datagram | Fragments | Payload |
+| --- | --- | --- | --- |
+| Hairpin eth4, plain IPv4 NAT, MTU 1000 | 1400 B | 2 | identical |
+| Hairpin eth4, NAT-PT 4to6, MTU 1500 | 1472 B (IPv6 1520) | 2 IPv6 | identical |
+| Hairpin eth4, IPv6 into a 6o4 tunnel, MTU 1480 | 1452 B | 2 outer IPv4 | identical |
+| Hairpin eth4, IPv4 into a PPPoE session, MTU 1492 | 1472 B | 2 | identical |
+| eth3 → eth4 (loki), SNAT, MTU 1000 | 1400 B | 2 | identical |
+| eth3 → eth4, into a PPPoE session, MTU 1492 (A202's shape) | 1472 B | 2 | identical |
+| eth3 → eth4, into a 4o6 tunnel, MTU 1460 (A202's shape) | 1472 B | 2 outer IPv6 | identical |
+| eth3 at MTU 9000 → eth4, MTU 1500 (A316's jumbo shape) | 3000 B | 3 | identical |
+
+An unfragmented control alongside each case was intact too.
+
+**Conclusion.** A202's zero payload does not reproduce on this build in any
+recorded shape. What changed since is not known.
+
 ## Not measured
 
 * Line rate with a real LAN client (loki's NIC was detached).
