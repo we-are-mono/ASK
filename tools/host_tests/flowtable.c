@@ -171,6 +171,8 @@ struct list_head { struct list_head *next, *prev; };
 #define list_entry(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
 #define list_first_entry(h, t, m) list_entry((h)->next, t, m)
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+/* Only ever handed a const pointer here, which the kernel's keeps const. */
+#define container_of_const(p, t, m) ((const t *)((const char *)(p) - offsetof(t, m)))
 #define list_for_each_entry(p, h, m) \
     for (p = list_entry((h)->next, typeof(*p), m); &p->m != (h); p = list_entry(p->m.next, typeof(*p), m))
 #define list_for_each_entry_safe(p, n, h, m) \
@@ -6473,7 +6475,7 @@ static void test_batched_retirement(void)
         connection_rule(1);
         cls.nf_handle = &gens[1];
         stale = ft_find(&binding, cls.cookie);
-        assert(stale && stale->handle == &gens[1] && gens[1].refs == 2);
+        assert(stale && ft_owner_is_handle(stale->owner, &gens[1]) && gens[1].refs == 2);
         before = settles; unlinked = unlinks; queued = neigh_scheduled;
         work_queued_retire = false;
         transaction_busy = true;
@@ -6504,7 +6506,8 @@ static void test_batched_retirement(void)
         assert(!ft_find(&binding, cls.cookie) && ft_count == 2 && gens[1].refs == 1);
         assert(handle_validity_checks == checks && !ft_deferred_destroys.first);
         assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
-        assert(ft_find(&binding, cls.cookie)->handle == &next && next.refs == 2 && ft_count == 3);
+        assert(ft_owner_is_handle(ft_find(&binding, cls.cookie)->owner, &next) &&
+               next.refs == 2 && ft_count == 3);
         while (ft_entries.next != &ft_entries)
             assert(ft_remove(list_entry(ft_entries.next, struct cdx_ft_entry, list)) == 0);
         assert(gens[0].refs == 1 && gens[2].refs == 1 && next.refs == 1);
@@ -7041,7 +7044,7 @@ static void test_installed_reoffer(void)
             assert(ft_find(&binding, cls.cookie) == installed && ft_count == 1 && live_hw == 1);
             if (stale < 2) {
                 assert(rc == 0 && !handle.invalid && handle.refs == 2 && ft_rejects == rejects);
-                assert(installed->handle == &handle && ft_handle_refs == 1);
+                assert(ft_owner_is_handle(installed->owner, &handle) && ft_handle_refs == 1);
                 assert(ft_ipsec_policy_invalidations == policy);
                 remove_all();
                 continue;

@@ -598,7 +598,7 @@ static void ft_ipsec_retire_sa(u16 handle)
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
 		if (entry->rule.sa_handle == handle ||
 		    entry->rule.in_sa_handle == handle)
-			ft_handle_invalidate(entry->handle, &ft_ipsec_invalidations);
+			ft_owner_invalidate(entry->owner, &ft_ipsec_invalidations);
 	spin_unlock_bh(&ft_watch_lock);
 }
 
@@ -614,7 +614,7 @@ static void ft_ipsec_path_moved(u16 handle)
 
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
 		if (handle && entry->rule.sa_handle == handle)
-			ft_handle_invalidate(entry->handle, &ft_mtu_invalidations);
+			ft_owner_invalidate(entry->owner, &ft_mtu_invalidations);
 }
 
 /* ------------------------------------------- following a peer that moves
@@ -2702,8 +2702,8 @@ static void ft_ipsec_retire_work(struct work_struct *work)
 			if (!marked) {
 				list_for_each_entry(entry, &ft_entries, list)
 					if (ft_names_sa(entry, &handle))
-						ft_handle_invalidate(entry->handle,
-								     &ft_ipsec_invalidations);
+						ft_owner_invalidate(entry->owner,
+								    &ft_ipsec_invalidations);
 				marked = true;
 			}
 			more = ft_retire_batch(ft_names_sa, &handle);

@@ -366,7 +366,7 @@ static void ft_device_retire(const struct net_device *dev, atomic64_t *counter)
 	spin_lock_bh(&ft_watch_lock);
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
 		if (ft_entry_uses(entry, dev))
-			ft_handle_invalidate(entry->handle, counter);
+			ft_owner_invalidate(entry->owner, counter);
 	spin_unlock_bh(&ft_watch_lock);
 }
 
@@ -774,7 +774,7 @@ static int ft_route_event(const struct netevent_ipv4_route *event)
 		if (entry->rule.out_tunnel.present &&
 		    entry->rule.out_tunnel.family == AF_INET &&
 		    !((entry->rule.out_tunnel.remote.ip ^ event->dst) & mask)) {
-			ft_handle_invalidate(entry->handle, &ft_route_invalidations);
+			ft_owner_invalidate(entry->owner, &ft_route_invalidations);
 			continue;
 		}
 		/* After NAT, current egress uses new_dst; reverse egress uses src.
@@ -785,7 +785,7 @@ static int ft_route_event(const struct netevent_ipv4_route *event)
 			continue;
 		if (!((entry->rule.new_dst.ip ^ event->dst) & mask) ||
 		    !((entry->rule.src.ip ^ event->dst) & mask))
-			ft_handle_invalidate(entry->handle, &ft_route_invalidations);
+			ft_owner_invalidate(entry->owner, &ft_route_invalidations);
 	}
 	spin_unlock_bh(&ft_watch_lock);
 	return NOTIFY_DONE;
@@ -812,14 +812,14 @@ static int ft_route6_event(const struct netevent_ipv6_route *event)
 		    entry->rule.out_tunnel.family == AF_INET6 &&
 		    ipv6_prefix_equal(&entry->rule.out_tunnel.remote.in6, &event->dst,
 				      event->prefixlen)) {
-			ft_handle_invalidate(entry->handle, &ft_route_invalidations);
+			ft_owner_invalidate(entry->owner, &ft_route_invalidations);
 			continue;
 		}
 		if (entry->rule.family != AF_INET6)
 			continue;
 		if (ipv6_prefix_equal(&entry->rule.new_dst.in6, &event->dst, event->prefixlen) ||
 		    ipv6_prefix_equal(&entry->rule.src.in6, &event->dst, event->prefixlen))
-			ft_handle_invalidate(entry->handle, &ft_route_invalidations);
+			ft_owner_invalidate(entry->owner, &ft_route_invalidations);
 	}
 	spin_unlock_bh(&ft_watch_lock);
 	return NOTIFY_DONE;
@@ -842,10 +842,10 @@ int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		 * rest on the generation alone. */
 		spin_lock_bh(&ft_watch_lock);
 		list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
-			if (nf_flow_offload_handle_valid(entry->handle) &&
+			if (ft_owner_valid(entry->owner) &&
 			    ft_policy_covers(change->pol, &entry->rule))
-				ft_handle_invalidate(entry->handle,
-						     &ft_ipsec_policy_invalidations);
+				ft_owner_invalidate(entry->owner,
+						    &ft_ipsec_policy_invalidations);
 		spin_unlock_bh(&ft_watch_lock);
 		/* An output policy can govern a routed multicast copy, which
 		 * nothing else about the group changes to report: every group
@@ -892,7 +892,7 @@ static void ft_retire_all(atomic64_t *counter)
 
 	spin_lock_bh(&ft_watch_lock);
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
-		ft_handle_invalidate(entry->handle, counter);
+		ft_owner_invalidate(entry->owner, counter);
 	spin_unlock_bh(&ft_watch_lock);
 	/* Nothing re-offers an SA the way a packet re-offers a flow. */
 	ft_ipsec_all_moved();
@@ -1019,7 +1019,7 @@ int ft_fdb_event(struct notifier_block *nb, unsigned long event, void *ptr)
 		    !ether_addr_equal(entry->rule.dst_mac, info->addr) ||
 		    (event == SWITCHDEV_FDB_ADD_TO_DEVICE && ft_out_port(&entry->rule, port)))
 			continue;
-		ft_handle_invalidate(entry->handle, &ft_fdb_invalidations);
+		ft_owner_invalidate(entry->owner, &ft_fdb_invalidations);
 	}
 	spin_unlock_bh(&ft_watch_lock);
 	/* A bridged pair is chosen by both its stations' entries. */

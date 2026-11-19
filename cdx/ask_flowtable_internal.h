@@ -172,6 +172,78 @@ struct ft_delta {
 	unsigned long lastused;
 };
 
+/* What a direction is in the hardware on behalf of: today a Netfilter flow
+ * generation, through the handle its offer carried (patch 140). The owner is
+ * what every retirement marks -- and the direction's sibling goes with it,
+ * since both directions of one flow answer to one owner's state -- where the
+ * direction's counters go, its last delta included as it leaves the hardware,
+ * and what the entry holds until it is unlinked.
+ *
+ * valid and invalidate are asked under ft_watch_lock, from softirq, as well
+ * as in the backend transaction, so neither may sleep; account, used and
+ * release run in the transaction only. An entry's owner is set before the
+ * entry is published and stays until ft_unlink() releases it.
+ */
+struct ft_owner;
+
+struct ft_owner_ops {
+	/* Whether the owner still wants the direction in hardware. */
+	bool (*valid)(const struct ft_owner *owner);
+	/* Mark it retired, for good. True only for the call that marked it,
+	 * which is the one a retirement counts. */
+	bool (*invalidate)(struct ft_owner *owner);
+	/* What direction dir has counted since it last reported, in the units
+	 * Netfilter counts in (struct ft_delta). */
+	void (*account)(struct ft_owner *owner, u8 dir, u64 packets, u64 bytes);
+	/* When the flow was last used, said after a pass's deltas: what keeps
+	 * Netfilter from asking for them (ft_stats_workfn()). */
+	void (*used)(struct ft_owner *owner, unsigned long lastused);
+	/* The entry's reference, given back once the entry is out of the
+	 * adapter. */
+	void (*release)(struct ft_owner *owner);
+};
+
+struct ft_owner {
+	const struct ft_owner_ops *ops;
+};
+
+/* The owner of a direction Netfilter's flowtable offered. Each direction's
+ * entry carries its own, holding its own reference on the one handle both
+ * directions' offers share, and that handle is the owner's whole state: so a
+ * mark through either entry's owner is seen through the other's, exactly as a
+ * single shared owner would be. Kept in the entry, so admission allocates
+ * nothing, and can fail on nothing, it did not before. */
+struct ft_nf_owner {
+	struct ft_owner owner;
+	struct nf_flow_offload_handle *handle;
+};
+
+static inline bool ft_owner_valid(const struct ft_owner *owner)
+{
+	return owner->ops->valid(owner);
+}
+
+/* A mark with nothing else to it, for unload: ft_stopping, set in the same
+ * transaction, keeps the retirement worker away, and each binding's release
+ * takes its entries out after. Everything else marks an entry's owner with
+ * ft_owner_invalidate(), which counts the mark and sends the retirement
+ * worker after it. */
+static inline bool ft_owner_mark(struct ft_owner *owner)
+{
+	return owner->ops->invalidate(owner);
+}
+
+static inline void ft_owner_account(struct ft_owner *owner, u8 dir,
+				    u64 packets, u64 bytes)
+{
+	owner->ops->account(owner, dir, packets, bytes);
+}
+
+static inline void ft_owner_used(struct ft_owner *owner, unsigned long lastused)
+{
+	owner->ops->used(owner, lastused);
+}
+
 struct cdx_ft_entry {
 	struct list_head list;
 	/* On its binding's entries. */
@@ -184,7 +256,12 @@ struct cdx_ft_entry {
 	struct hlist_node fdb_node;
 	struct hlist_node neigh_node;
 	struct neighbour *neigh;
-	struct nf_flow_offload_handle *handle;
+	/* What the direction is in the hardware on behalf of. Fixed from
+	 * before the entry is published until it is unlinked, so the
+	 * notifiers read it under ft_watch_lock as they read the rule. */
+	struct ft_owner *owner;
+	/* Where owner points for a direction Netfilter offered. */
+	struct ft_nf_owner nf_owner;
 	union nf_inet_addr next_hop;
 	struct cdx_ft_binding *binding;
 	/* The ppp device record each half of this direction's session counts
@@ -211,7 +288,7 @@ struct cdx_ft_entry {
 	unsigned int ncrossed;
 	unsigned long cookie;
 	/* Which of the flow's directions this is, as Netfilter names it: where
-	 * its last delta goes through the handle. */
+	 * its deltas go through the owner. */
 	u8 dir;
 	struct cdx_ft_rule rule;
 	struct cdx_ft_hw *hw;
@@ -831,6 +908,8 @@ extern unsigned int ft_bound, ft_count;
 extern unsigned int ft_parked;
 extern unsigned int ft_passive;
 extern unsigned int ft_neighbour_refs;
+/* The owner references the entries hold, one each; /proc reports it as
+ * handle_refs, which is what every owner is today. */
 extern unsigned int ft_handle_refs;
 extern atomic64_t ft_neigh_invalidations;
 extern atomic64_t ft_route_invalidations;
@@ -867,6 +946,7 @@ extern struct work_struct ft_dev_stats_work;
 void ft_invalidate(void);
 void ft_handle_invalidate(struct nf_flow_offload_handle *handle,
 			  atomic64_t *counter);
+void ft_owner_invalidate(struct ft_owner *owner, atomic64_t *counter);
 void ft_neigh_invalidate(struct cdx_ft_entry *entry);
 bool ft_rule_names(const struct cdx_ft_rule *rule, const struct net_device *dev);
 void ft_dev_stats_gone(const struct net_device *dev);

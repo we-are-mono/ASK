@@ -47,7 +47,8 @@ def test_decoder_and_lifecycle(tmp_path):
         + re.search(r"^struct ft_bridge_port_walk \{.*?^\};\n", source, re.M | re.S).group()
     )
     names = ["ft_fault", "ft_devices_hold", "ft_devices_put", "ft_rule_names", "ft_crossed_hold", "ft_crossed_hold_all", "ft_crossed_put_all",
-             "ft_find", "ft_retire_kick", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches",
+             "ft_find", "ft_retire_kick", "ft_retire_marked", "ft_handle_invalidate", "ft_owner_invalidate",
+             "ft_nf_owner_hold", "ft_owner_release", "ft_owner_is_handle", "ft_neigh_invalidate", "ft_neigh_matches",
              "ft_neigh_table", "ft_neigh_check", "ft_neigh_moved", "ft_nexthop_usable",
              "ft_next_hop", "ft_routes_valid", "ft_offer_routes_current", "ft_offer_current", "ft_policy_covers", "ft_fdb_key", "ft_watch_publish", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used",
              "ft_route_event", "ft_route6_event", "ft_neigh_event", "ft_retire_all", "ft_fib_event", "ft_nexthop_event",
@@ -59,7 +60,7 @@ def test_decoder_and_lifecycle(tmp_path):
              "ft_l2_overhead", "ft_delta_read", "ft_reported", "ft_delta_report",
              "ft_unlink", "ft_settle", "ft_remove",
              "ft_destroy_defer", "ft_retire_deferred", "ft_deferred_destroys_drop", "ft_retire_batch",
-             "ft_handle_retired", "ft_retire_workfn", "ft_settle_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_qos_remarks", "ft_qos_params_check", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
+             "ft_owner_retired", "ft_retire_workfn", "ft_settle_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_qos_remarks", "ft_qos_params_check", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
              "ft_vlan_lower", "ft_bridge_vlan", "ft_bridge_port_one", "ft_bridge_port", "ft_tunnel_dev", "ft_tunnel_hop", "ft_session_current", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_port_arriving", "ft_mtu_less", "ft_port_mtu", "ft_rule_stripped", "ft_arriving", "ft_mtu_carried", "ft_detours", "ft_ipv6_dev_mtu", "ft_egress_mtu_current", "ft_mtu_refused", "ft_fast_path", "ft_software_reoffers", "ft_tc_rx_bit", "ft_tc_side", "ft_rule_tc_soft", "ft_tc_offer_refused", "ft_bridge_egress_filtered", "ft_tunnel_inbound_allowed", "ft_parse", "ft_same_key", "ft_key_hash",
              "ft_replace", "ft_entry_bounded", "ft_stats", "ft_request_owned", "ft_offer_installed", "ft_admission_fault", "ft_rule_callback",
              "ft_invalid_complete", "ft_drained", "ft_can_rearm", "ft_rearm", "ft_rearm_workfn",
@@ -70,6 +71,11 @@ def test_decoder_and_lifecycle(tmp_path):
              "ft_port_stopped", "ft_stopped_clean", "ft_stopped_workfn", "ft_netdev_event",
              "ft_out_port", "ft_fdb_event", "ft_stp_stopped", "ft_swdev_event", "ft_egress_changed", "ft_egress_drain", "ft_egress_restarted", "ft_block_drain", "ft_hw_settle", "ft_init_fault", "ft_proc_init", "ask_flowtable_init", "ask_flowtable_exit", "ft_flow_at", "ft_flows_start", "ft_flows_next", "ft_l2_at", "ft_l2_start", "ft_l2_next", "ft_rows_stop",
              "ft_stats_kick", "ft_stats_report", "ft_stats_workfn"]
+    # The owner every Netfilter direction's entry takes: its ops over the
+    # handle stub, and the table naming them, ahead of everything that sets
+    # or compares an entry's owner.
+    owner = ["ft_nf_handle", "ft_nf_owner_valid", "ft_nf_owner_invalidate", "ft_nf_owner_account",
+             "ft_nf_owner_used", "ft_nf_owner_release"]
     (tmp_path / "flowtable_production.inc").write_text(
         # The stopped-port sweep's queue, lock and work item, as declared.
         source[source.index("struct ft_stopped {"):source.index("static void ft_port_stopped(")]
@@ -80,6 +86,9 @@ def test_decoder_and_lifecycle(tmp_path):
         # And what the work has taken off that list and not yet looked at.
         + source[source.index("struct ft_deferred_destroy {"):
                  source.index("\n", source.index("static LLIST_HEAD(ft_deferred_destroys);")) + 1]
+        + "\n".join(function(source, name) for name in owner)
+        + re.search(r"^static const struct ft_owner_ops ft_nf_owner_ops = \{.*?^\};\n",
+                    source, re.M | re.S).group()
         + "\n".join(function(source, name) for name in names))
     binary = tmp_path / "flowtable"
     run_process([

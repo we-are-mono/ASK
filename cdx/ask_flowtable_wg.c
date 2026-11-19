@@ -128,7 +128,7 @@ static bool ft_wg_drained(const struct net_device *dev)
 
 	list_for_each_entry(entry, &ft_entries, list)
 		if (ft_entry_uses(entry, dev))
-			ft_handle_invalidate(entry->handle, &ft_link_invalidations);
+			ft_owner_invalidate(entry->owner, &ft_link_invalidations);
 	/* A batch at a time, letting the transaction go between batches: RTNL,
 	 * which the caller keeps, is the lock outside it. */
 	while (ft_retire_batch(ft_wg_uses, dev)) {

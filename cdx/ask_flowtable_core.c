@@ -38,7 +38,7 @@ static DEFINE_HASHTABLE(ft_keys, CDX_FT_HASH_BITS);
 u32 ft_hash_seed;
 /* Flow watch publication/removal is serialized by the backend transaction.
  * Neighbour, route and device notifiers share the immutable rule, neigh and
- * handle, protected against entry removal here. Never take a neighbour lock
+ * owner, protected against entry removal here. Never take a neighbour lock
  * or start a backend transaction while holding this lock. */
 LIST_HEAD(ft_neigh_entries);
 /* The same entries by what the FDB and neighbour notifiers carry: the
@@ -170,20 +170,112 @@ static void ft_retire_kick(void)
 		queue_work(system_unbound_wq, &ft_retire_work);
 }
 
-/* Called with either the backend transaction or the notifier's ft_watch_lock held. The
- * handle is immutable, owned before watch publication and shared by both
- * directions. Marking it also excludes Linux's cached flow immediately;
- * native GC later retires that generation without flushing unrelated flows.
- */
+/* After a mark, by whichever call made it: counted once, by the call that
+ * marked, however many entries or callers ask. */
+static void ft_retire_marked(bool marked, atomic64_t *counter)
+{
+	if (marked)
+		atomic64_inc(counter);
+	/* The worker has to walk the table for this one: nothing says which
+	 * entries the mark retires. */
+	atomic_set(&ft_retire_scan, 1);
+	ft_retire_kick();
+}
+
+/* An offer's generation, before or as it is admitted: the handle it carries
+ * is the one its entry's owner will wrap. Called with either the backend
+ * transaction or a notifier's ft_watch_lock held. Marking it also excludes
+ * Linux's cached flow immediately; native GC later retires that generation
+ * without flushing unrelated flows. */
 void ft_handle_invalidate(struct nf_flow_offload_handle *handle,
 			  atomic64_t *counter)
 {
-	if (nf_flow_offload_handle_invalidate(handle))
-		atomic64_inc(counter);
-	/* The worker has to walk the table for this one: nothing says which
-	 * entries name the handle. */
-	atomic_set(&ft_retire_scan, 1);
-	ft_retire_kick();
+	ft_retire_marked(nf_flow_offload_handle_invalidate(handle), counter);
+}
+
+/* An installed direction's owner, with either the backend transaction or a
+ * notifier's ft_watch_lock held. The owner is fixed before watch publication,
+ * and both directions of a flow answer to its state, so the sibling goes too.
+ * For a Netfilter flow this marks its handle, exactly as above. */
+void ft_owner_invalidate(struct ft_owner *owner, atomic64_t *counter)
+{
+	ft_retire_marked(ft_owner_mark(owner), counter);
+}
+
+/* The Netfilter owner's ops are patch 140's handle calls, one for one, so a
+ * direction Netfilter offered is marked, counted, kept alive and let go of
+ * exactly as it was while the entry named the handle itself. */
+static struct nf_flow_offload_handle *ft_nf_handle(const struct ft_owner *owner)
+{
+	return container_of_const(owner, struct ft_nf_owner, owner)->handle;
+}
+
+static bool ft_nf_owner_valid(const struct ft_owner *owner)
+{
+	return nf_flow_offload_handle_valid(ft_nf_handle(owner));
+}
+
+static bool ft_nf_owner_invalidate(struct ft_owner *owner)
+{
+	return nf_flow_offload_handle_invalidate(ft_nf_handle(owner));
+}
+
+/* Into the flow's conntrack, which the handle holds: so a delta reaches it
+ * whenever the direction leaves, after the flow, its table and the binding
+ * are gone. */
+static void ft_nf_owner_account(struct ft_owner *owner, u8 dir, u64 packets,
+				u64 bytes)
+{
+	nf_flow_offload_handle_account(ft_nf_handle(owner), dir, packets, bytes);
+}
+
+static void ft_nf_owner_used(struct ft_owner *owner, unsigned long lastused)
+{
+	nf_flow_offload_handle_used(ft_nf_handle(owner), lastused);
+}
+
+static void ft_nf_owner_release(struct ft_owner *owner)
+{
+	nf_flow_offload_handle_put(ft_nf_handle(owner));
+}
+
+static const struct ft_owner_ops ft_nf_owner_ops = {
+	.valid = ft_nf_owner_valid,
+	.invalidate = ft_nf_owner_invalidate,
+	.account = ft_nf_owner_account,
+	.used = ft_nf_owner_used,
+	.release = ft_nf_owner_release,
+};
+
+/* The entry admitted for an offer is owned by the generation the offer's
+ * handle names, and holds a reference on the handle for as long as it is.
+ * Before the entry is published, so no notifier finds it without one. */
+static void ft_nf_owner_hold(struct cdx_ft_entry *entry,
+			     struct nf_flow_offload_handle *handle)
+{
+	entry->nf_owner.owner.ops = &ft_nf_owner_ops;
+	entry->nf_owner.handle = handle;
+	nf_flow_offload_handle_get(handle);
+	entry->owner = &entry->nf_owner.owner;
+	ft_handle_refs++;
+}
+
+/* The entry's reference, whatever owns it, once nothing can find the entry
+ * any more: after it is off every list and watch, before it is freed. */
+static void ft_owner_release(struct cdx_ft_entry *entry)
+{
+	entry->owner->ops->release(entry->owner);
+	ft_handle_refs--;
+}
+
+/* Whether an entry was admitted for this Netfilter generation. A request
+ * names its direction by a cookie a later generation can reuse, and only the
+ * handle tells the two apart; an entry another source owns is no Netfilter
+ * generation's at all. */
+static bool ft_owner_is_handle(const struct ft_owner *owner,
+			       const struct nf_flow_offload_handle *handle)
+{
+	return owner->ops == &ft_nf_owner_ops && ft_nf_handle(owner) == handle;
 }
 
 /* A Linux deletion that found the transaction held (ft_rule_callback()):
@@ -244,7 +336,7 @@ static bool ft_retire_deferred(void)
 		deferred = llist_entry(ft_deferred_backlog, struct ft_deferred_destroy, node);
 		ft_deferred_backlog = ft_deferred_backlog->next;
 		entry = ft_find(deferred->binding, deferred->cookie);
-		if (entry && entry->handle == deferred->handle) {
+		if (entry && ft_owner_is_handle(entry->owner, deferred->handle)) {
 			ft_unlink(entry);
 			n++;
 		}
@@ -272,7 +364,7 @@ void ft_deferred_destroys_drop(void)
 
 void ft_neigh_invalidate(struct cdx_ft_entry *entry)
 {
-	ft_handle_invalidate(entry->handle, &ft_neigh_invalidations);
+	ft_owner_invalidate(entry->owner, &ft_neigh_invalidations);
 }
 
 /* The binding already pins the ingress port for its whole lifetime, so only
@@ -696,12 +788,12 @@ static void ft_stats_binding(const struct cdx_ft_entry *entry,
  * sooner asks for it.
  *
  * What the entry has counted since its last report is read as it goes and
- * reported through the flow's handle, which holds the conntrack: so it gets
- * there whatever takes the entry out and whenever -- Linux's deletion, one
- * deferred for the transaction, a retirement of this adapter's, the binding's
- * release, unload -- even when no deletion will ever reach this binding. A
- * sample that went backwards delivers nothing, as a read of it would have,
- * and is escalated the same way. */
+ * reported through its owner -- for a Netfilter flow the handle, which holds
+ * the conntrack: so it gets there whatever takes the entry out and whenever --
+ * Linux's deletion, one deferred for the transaction, a retirement of this
+ * adapter's, the binding's release, unload -- even when no deletion will ever
+ * reach this binding. A sample that went backwards delivers nothing, as a
+ * read of it would have, and is escalated the same way. */
 int ft_unlink(struct cdx_ft_entry *entry)
 {
 	struct cdx_ft_counters now;
@@ -713,8 +805,7 @@ int ft_unlink(struct cdx_ft_entry *entry)
 		ft_invalidate();
 	}
 	if (!ft_delta_read(entry, &now, &delta) && delta.packets) {
-		nf_flow_offload_handle_account(entry->handle, entry->dir,
-					       delta.packets, delta.bytes);
+		ft_owner_account(entry->owner, entry->dir, delta.packets, delta.bytes);
 		ft_finals++;
 	}
 	list_del(&entry->list);
@@ -728,8 +819,7 @@ int ft_unlink(struct cdx_ft_entry *entry)
 	 * every record the entry names, so a record freed here stays out of
 	 * the pool until that proof arrives. */
 	ft_stats_detach(entry);
-	nf_flow_offload_handle_put(entry->handle);
-	ft_handle_refs--;
+	ft_owner_release(entry);
 	ft_devices_put(&entry->rule);
 	ft_crossed_put_all(entry);
 	kfree(entry);
@@ -793,9 +883,9 @@ bool ft_retire_batch(bool (*match)(const struct cdx_ft_entry *entry, const void 
 	return more;
 }
 
-static bool ft_handle_retired(const struct cdx_ft_entry *entry, const void *arg)
+static bool ft_owner_retired(const struct cdx_ft_entry *entry, const void *arg)
 {
-	return !nf_flow_offload_handle_valid(entry->handle);
+	return !ft_owner_valid(entry->owner);
 }
 
 static void ft_retire_workfn(struct work_struct *work)
@@ -804,7 +894,7 @@ static void ft_retire_workfn(struct work_struct *work)
 
 	cdx_ft_begin();
 	/* Deferred deletions first: each names its entry, so retiring them
-	 * costs nothing like a walk of the table, which only marked handles
+	 * costs nothing like a walk of the table, which only marked owners
 	 * nothing names need. */
 	more = ft_retire_deferred();
 	/* A failed retirement escalates to the existing global recovery.
@@ -812,7 +902,7 @@ static void ft_retire_workfn(struct work_struct *work)
 	 * reporting completion. Nothing rearms while CDX's latch holds:
 	 * it clears only once CDX has restarted the datapath. */
 	if (!ft_stopping && !atomic_read(&ft_invalid) && atomic_xchg(&ft_retire_scan, 0) &&
-	    ft_retire_batch(ft_handle_retired, NULL)) {
+	    ft_retire_batch(ft_owner_retired, NULL)) {
 		atomic_set(&ft_retire_scan, 1);
 		more = true;
 	}
@@ -2593,7 +2683,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 
 	/* A delayed request must never replace a different flow generation
 	 * merely because its opaque directional cookie has the same value. */
-	if (entry && entry->handle != cls->nf_handle)
+	if (entry && !ft_owner_is_handle(entry->owner, cls->nf_handle))
 		return ask_refuse(-ESTALE);
 	/* An invalid generation is refused by the parse below. */
 	ft_offer_current(cls);
@@ -2649,9 +2739,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	entry->binding = binding;
 	entry->cookie = cls->cookie;
 	entry->dir = cls->nf_dir;
-	entry->handle = cls->nf_handle;
-	nf_flow_offload_handle_get(entry->handle);
-	ft_handle_refs++;
+	ft_nf_owner_hold(entry, cls->nf_handle);
 	ft_devices_hold(&rule);
 	/* Before the watch list can see the entry, so an event on any of them
 	 * finds it from the moment it is published. */
@@ -2671,8 +2759,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	if (rc) {
 		ft_stats_detach(entry);
 		ft_neigh_detach(entry);
-		nf_flow_offload_handle_put(entry->handle);
-		ft_handle_refs--;
+		ft_owner_release(entry);
 		ft_devices_put(&rule);
 		ft_crossed_put_all(entry);
 		kfree(entry);
@@ -2692,11 +2779,11 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	/* IPv6 commits routes from softirq without RTNL, so a change between
 	 * the validation above and publication here reaches neither: the entry
 	 * was not yet watched, and RTNL did not exclude it. Recheck once the
-	 * notifier can see this entry; an invalid handle then retires it below
-	 * through the same path as a change observed during insertion. */
+	 * notifier can see this entry; an invalid handle -- the one its owner
+	 * wraps -- then retires it below through the same path as a change
+	 * observed during insertion. */
 	ft_offer_current(cls);
-	if (ft_fault(3) || atomic_read(&ft_invalid) ||
-	    !nf_flow_offload_handle_valid(entry->handle)) {
+	if (ft_fault(3) || atomic_read(&ft_invalid) || !ft_owner_valid(entry->owner)) {
 		ft_remove(entry);
 		return -EIO;
 	}
@@ -2751,18 +2838,18 @@ static unsigned int ft_l2_overhead(const struct cdx_ft_rule *rule)
 static bool ft_entry_bounded(struct cdx_ft_entry *entry)
 {
 	if (ft_bridge_egress_filtered(&entry->rule)) {
-		ft_handle_invalidate(entry->handle, &ft_admission_invalidations);
+		ft_owner_invalidate(entry->owner, &ft_admission_invalidations);
 		return false;
 	}
 	if (!ft_egress_mtu_current(&entry->rule)) {
-		ft_handle_invalidate(entry->handle, &ft_mtu_invalidations);
+		ft_owner_invalidate(entry->owner, &ft_mtu_invalidations);
 		return false;
 	}
 	/* tc that came to run in software on its path after the sample it was
 	 * admitted by, which the sample's worker retires too, unless the entry
 	 * was published after the worker looked (ask_flowtable_tc.c). */
 	if (ft_rule_tc_soft(&entry->rule)) {
-		ft_handle_invalidate(entry->handle, &ft_tc_invalidations);
+		ft_owner_invalidate(entry->owner, &ft_tc_invalidations);
 		return false;
 	}
 	return true;
@@ -2822,7 +2909,7 @@ static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 	struct ft_delta delta;
 	int rc;
 
-	if (!nf_flow_offload_handle_valid(entry->handle)) {
+	if (!ft_owner_valid(entry->owner)) {
 		ft_neigh_invalidate(entry);
 		return -EOPNOTSUPP;
 	}
@@ -2903,7 +2990,7 @@ module_param_cb(stats_ms, &ft_stats_ms_ops, &ft_stats_ms, 0644);
 MODULE_PARM_DESC(stats_ms, "How often every offloaded flow's counters reach conntrack (ms, 100 or more, up to half the flowtable timeout); 0 leaves it to Netfilter's per-flow requests, which cost more");
 
 /* One entry's part of a pass: what it counted since its last report and when
- * it was last used, through its handle, as a counter read's reply carries
+ * it was last used, through its owner, as a counter read's reply carries
  * them (ft_stats()). A direction ft_stats() would refuse to answer for is
  * left to Netfilter: its collector retires a flow whose handle is invalid
  * within a second, and one that goes unreported is asked for again. */
@@ -2912,13 +2999,13 @@ static void ft_stats_report(struct cdx_ft_entry *entry)
 	struct cdx_ft_counters now;
 	struct ft_delta delta;
 
-	if (!nf_flow_offload_handle_valid(entry->handle) || !ft_entry_bounded(entry))
+	if (!ft_owner_valid(entry->owner) || !ft_entry_bounded(entry))
 		return;
 	cdx_ft_stats(entry->hw, &now);
 	if (ft_delta_read(entry, &now, &delta) || !ft_neigh_used(entry, delta.packets != 0))
 		return;
-	nf_flow_offload_handle_account(entry->handle, entry->dir, delta.packets, delta.bytes);
-	nf_flow_offload_handle_used(entry->handle, delta.lastused);
+	ft_owner_account(entry->owner, entry->dir, delta.packets, delta.bytes);
+	ft_owner_used(entry->owner, delta.lastused);
 	ft_reported(entry, &now);
 }
 
@@ -3003,7 +3090,7 @@ static bool ft_request_owned(const struct cdx_ft_binding *binding,
 static bool ft_offer_installed(const struct cdx_ft_entry *entry,
 			       const struct flow_cls_offload *cls)
 {
-	return entry && entry->handle == cls->nf_handle &&
+	return entry && ft_owner_is_handle(entry->owner, cls->nf_handle) &&
 	       nf_flow_offload_handle_valid(cls->nf_handle) && !cdx_ft_observing() &&
 	       !atomic_read(&ft_invalid) && !ft_stopping && !cdx_ft_failed();
 }
@@ -3016,7 +3103,8 @@ static bool ft_admission_fault(const struct flow_cls_offload *cls)
 	if (READ_ONCE(ft_fail_stage) != 4)
 		return false;
 	list_for_each_entry(entry, &ft_entries, list)
-		if (entry->handle == cls->nf_handle && entry->cookie != cls->cookie)
+		if (ft_owner_is_handle(entry->owner, cls->nf_handle) &&
+		    entry->cookie != cls->cookie)
 			return ft_fault(4);
 #endif
 	return false;
@@ -3072,7 +3160,7 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 	if (cls->command != FLOW_CLS_DESTROY)
 		cdx_ft_begin();
 	entry = ft_find(binding, cls->cookie);
-	if (entry && entry->handle != cls->nf_handle)
+	if (entry && !ft_owner_is_handle(entry->owner, cls->nf_handle))
 		entry = NULL;
 	switch (cls->command) {
 	case FLOW_CLS_REPLACE:

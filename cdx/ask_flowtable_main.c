@@ -1194,7 +1194,7 @@ indirect:
 		struct cdx_ft_entry *entry;
 
 		list_for_each_entry(entry, &ft_entries, list)
-			nf_flow_offload_handle_invalidate(entry->handle);
+			ft_owner_mark(entry->owner);
 	}
 	cdx_ft_end();
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
@@ -1305,7 +1305,7 @@ static void __exit ask_flowtable_exit(void)
 	cdx_ft_begin();
 	WRITE_ONCE(ft_stopping, true);
 	list_for_each_entry(entry, &ft_entries, list)
-		nf_flow_offload_handle_invalidate(entry->handle);
+		ft_owner_mark(entry->owner);
 	cdx_ft_end();
 	unregister_switchdev_blocking_notifier(&ft_swdev_nb);
 	/* After the chain that queues it, and while the rule callbacks its

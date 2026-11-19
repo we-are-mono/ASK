@@ -144,10 +144,13 @@ struct list_head { struct list_head *next, *prev; };
          &pos->member != (head); \
          pos = container_of(pos->member.next, __typeof__(*pos), member))
 struct cdx_ft_rule { const struct net_device *out; };
-struct nf_flow_offload_handle { bool invalid; };
+/* What a direction is in the hardware on behalf of, as far as the sample sees
+ * one: something a retirement marks. The flowtable's own, over the flow's
+ * handle, is flowtable.c's to prove. */
+struct ft_owner { bool invalid; };
 struct cdx_ft_entry {
     struct cdx_ft_rule rule;
-    struct nf_flow_offload_handle *handle;
+    struct ft_owner *owner;
     struct list_head neigh_list;
 };
 static struct list_head ft_neigh_entries = { &ft_neigh_entries, &ft_neigh_entries };
@@ -158,10 +161,10 @@ bool ft_rule_tc_soft(const struct cdx_ft_rule *rule)
 {
     return ft_tc_dev_bits(rule->out) & FT_TC_TX;
 }
-static void ft_handle_invalidate(struct nf_flow_offload_handle *handle, atomic64_t *counter)
+static void ft_owner_invalidate(struct ft_owner *owner, atomic64_t *counter)
 {
     assert(ft_watch_lock);
-    handle->invalid = true;
+    owner->invalid = true;
     (*counter)++;
 }
 
@@ -196,13 +199,13 @@ void ft_mr_kick(void) { mr_kicks++; }
 
 /* ---- cases ---------------------------------------------------------------- */
 
-static struct nf_flow_offload_handle up_handle, down_handle;
-static struct cdx_ft_entry upload = { .rule = { &wan }, .handle = &up_handle },
-                           download = { .rule = { &lan }, .handle = &down_handle };
+static struct ft_owner up_owner, down_owner;
+static struct cdx_ft_entry upload = { .rule = { &wan }, .owner = &up_owner },
+                           download = { .rule = { &lan }, .owner = &down_owner };
 
 static void install(struct cdx_ft_entry *e)
 {
-    e->handle->invalid = false;
+    e->owner->invalid = false;
     e->neigh_list.next = &ft_neigh_entries;
     e->neigh_list.prev = ft_neigh_entries.prev;
     ft_neigh_entries.prev->next = &e->neigh_list;
@@ -258,7 +261,7 @@ int main(void)
     install(&download);
     pass();
     assert(!reports && !devs_changed && !refusal_resets && !mc_kicks && !mr_kicks);
-    assert(!up_handle.invalid && !down_handle.invalid);
+    assert(!up_owner.invalid && !down_owner.invalid);
 
     /* cake at the WAN root: the answer tightens. The upload, which leaves
      * by the WAN port, is retired and counted; the download is not. Every
@@ -267,18 +270,18 @@ int main(void)
     wan.answer = tx | rx | esp;
     retired = ft_tc_invalidations;
     pass();
-    assert(up_handle.invalid && !down_handle.invalid && ft_tc_invalidations == retired + 1);
+    assert(up_owner.invalid && !down_owner.invalid && ft_tc_invalidations == retired + 1);
     assert(changed(&wan) && devs_changed == 1 && mc_kicks == 1 && mr_kicks == 1);
 
     /* cake goes: the answer only loosens. Nothing is retired, and no bridged
      * pair through the port either -- each was admitted by an answer at
      * least as tight, and keeping it is still right. A pair refused lately,
      * perhaps for what went, is asked again. */
-    up_handle.invalid = false;
+    up_owner.invalid = false;
     wan.answer = rx | esp;
     retired = ft_tc_invalidations;
     pass();
-    assert(!up_handle.invalid && ft_tc_invalidations == retired);
+    assert(!up_owner.invalid && ft_tc_invalidations == retired);
     assert(!devs_changed && refusal_resets == 1 && mc_kicks == 1 && mr_kicks == 1);
 
     /* A change only a routed direction meets -- the flower police filter

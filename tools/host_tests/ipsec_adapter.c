@@ -1118,12 +1118,16 @@ struct flow_cls_offload {
 };
 static atomic64_t ft_admission_invalidations, ft_ipsec_invalidations;
 static atomic64_t ft_mtu_invalidations;
+/* What a direction is in the hardware on behalf of, as far as the SA watches
+ * see one: something a retirement marks, once. The flowtable's own, over the
+ * flow's handle, is flowtable.c's to prove. */
+struct ft_owner { bool valid; };
 struct cdx_ft_entry {
 	struct list_head list;
 	/* The dependency watch's list, which a moved path is looked up on. */
 	struct list_head neigh_list;
 	struct { u16 sa_handle, in_sa_handle; } rule;
-	struct nf_flow_offload_handle *handle;
+	struct ft_owner *owner;
 };
 static LIST_HEAD(ft_entries);
 static LIST_HEAD(ft_neigh_entries);
@@ -1170,7 +1174,7 @@ static int cdx_ft_recover(void)
 /* Every marking an SA's retirement asks for, already marked or not: one walk
  * of the flows marks each once. */
 static unsigned ipsec_markings;
-static void ft_handle_invalidate(struct nf_flow_offload_handle *h, atomic64_t *count)
+static void retirement_mark(bool *valid, atomic64_t *count)
 {
 	/* A moved path's flows are walked on the watch's list, which the
 	 * watch lock guards. */
@@ -1178,7 +1182,17 @@ static void ft_handle_invalidate(struct nf_flow_offload_handle *h, atomic64_t *c
 		assert(ft_watch_lock);
 	if (count == &ft_ipsec_invalidations)
 		ipsec_markings++;
-	if (h->valid) { h->valid = false; (*count)++; }
+	if (*valid) { *valid = false; (*count)++; }
+}
+/* An offer's generation, before it has an entry, and an installed
+ * direction's owner: marked the same way. */
+static void ft_handle_invalidate(struct nf_flow_offload_handle *h, atomic64_t *count)
+{
+	retirement_mark(&h->valid, count);
+}
+static void ft_owner_invalidate(struct ft_owner *owner, atomic64_t *count)
+{
+	retirement_mark(&owner->valid, count);
 }
 
 /* The route the FIB should answer with, and the neighbour on it. Every answer
@@ -2001,9 +2015,9 @@ static void test_state_add(void)
 	 * and complete deferred barriers before its handle can be reused --
 	 * however long they are withheld, which a datapath restart can make
 	 * minutes: asked again soon at first, then no more than once a second. */
-	struct nf_flow_offload_handle late_handle = { .valid = true };
+	struct ft_owner late_owner = { .valid = true };
 	struct cdx_ft_entry *late = calloc(1, sizeof(*late));
-	late->handle = &late_handle;
+	late->owner = &late_owner;
 	late->rule.in_sa_handle = sa_pool[0].handle;
 	list_add_tail(&late->list, &ft_entries);
 	retirement_flows = 1;
@@ -2011,7 +2025,7 @@ static void test_state_add(void)
 	unsigned slept_before = slept;
 	longest_sleep = 0;
 	bench_drain_retirements();
-	assert(!late_handle.valid && !retirement_flows && !retirement_barriers);
+	assert(!late_owner.valid && !retirement_flows && !retirement_barriers);
 	assert(slept == slept_before + 11 && sa_deleted == 1);
 	assert(longest_sleep == MSEC_PER_SEC);
 	assert(!ft_ipsec_retire_pending());
@@ -2023,7 +2037,7 @@ static void test_state_add(void)
 	 * between batches. A flow naming another SA stays. */
 	{
 		enum { NAMING = 2 * FT_RETIRE_BATCH + 5, OTHERS = 3 };
-		struct nf_flow_offload_handle handles[NAMING + OTHERS];
+		struct ft_owner owners[NAMING + OTHERS];
 		unsigned batches = (NAMING + FT_RETIRE_BATCH - 1) / FT_RETIRE_BATCH;
 		unsigned barriers = (NAMING - 1) / FT_SETTLE_BOUND + 1;
 		unsigned before = settles, drops = reschedules, deleted = sa_deleted;
@@ -2037,8 +2051,8 @@ static void test_state_add(void)
 			struct cdx_ft_entry *e = calloc(1, sizeof(*e));
 
 			assert(e);
-			handles[i].valid = true;
-			e->handle = &handles[i];
+			owners[i].valid = true;
+			e->owner = &owners[i];
 			if (i % 40 == 3 && i / 40 < OTHERS)
 				e->rule.sa_handle = sa + 1;
 			else if (i & 1)
@@ -2057,7 +2071,7 @@ static void test_state_add(void)
 		assert(reschedules == drops + batches - 1 && slept == slept_before);
 		assert(sa_deleted == deleted + 1 && !ft_ipsec_retire_pending());
 		for (unsigned i = 0; i < NAMING + OTHERS; i++)
-			assert(handles[i].valid == (i % 40 == 3 && i / 40 < OTHERS));
+			assert(owners[i].valid == (i % 40 == 3 && i / 40 < OTHERS));
 		for (unsigned i = 0; i < OTHERS; i++) {
 			struct cdx_ft_entry *e = list_entry(ft_entries.next, struct cdx_ft_entry, list);
 
@@ -3357,10 +3371,10 @@ static void test_watch_route_and_device(void)
 
 /* Flows riding the bench SA, on the list a moved path is looked up on: one
  * direction it encrypts, one it decrypts, and one another SA encrypts. */
-static struct nf_flow_offload_handle sending_handle, receiving_handle, other_handle;
-static struct cdx_ft_entry sending_flow = { .handle = &sending_handle };
-static struct cdx_ft_entry receiving_flow = { .handle = &receiving_handle };
-static struct cdx_ft_entry other_flow = { .handle = &other_handle };
+static struct ft_owner sending_owner, receiving_owner, other_owner;
+static struct cdx_ft_entry sending_flow = { .owner = &sending_owner };
+static struct cdx_ft_entry receiving_flow = { .owner = &receiving_owner };
+static struct cdx_ft_entry other_flow = { .owner = &other_owner };
 
 static void flows_ride(u16 handle)
 {
@@ -3368,7 +3382,7 @@ static void flows_ride(u16 handle)
 	sending_flow.rule.sa_handle = handle;
 	receiving_flow.rule.in_sa_handle = handle;
 	other_flow.rule.sa_handle = handle + 1;
-	sending_handle.valid = receiving_handle.valid = other_handle.valid = true;
+	sending_owner.valid = receiving_owner.valid = other_owner.valid = true;
 	list_add_tail(&sending_flow.neigh_list, &ft_neigh_entries);
 	list_add_tail(&receiving_flow.neigh_list, &ft_neigh_entries);
 	list_add_tail(&other_flow.neigh_list, &ft_neigh_entries);
@@ -3380,11 +3394,11 @@ static void flows_ride(u16 handle)
  * left alone. Rearms them for the next ask. */
 static bool flows_retired(void)
 {
-	bool retired = !sending_handle.valid;
+	bool retired = !sending_owner.valid;
 
-	assert(receiving_handle.valid && other_handle.valid);
+	assert(receiving_owner.valid && other_owner.valid);
 	assert(ft_mtu_invalidations == retired);
-	sending_handle.valid = true;
+	sending_owner.valid = true;
 	ft_mtu_invalidations = 0;
 	return retired;
 }

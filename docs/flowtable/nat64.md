@@ -176,6 +176,32 @@ small and upstreamable, plus an ASK adapter on the other side.
   drive the flowtable's timeouts. The existing route, neighbour and device
   invalidation retires entries, as for flowtable directions.
 
+**The adapter's seam.** Every entry reaches what it is in hardware on behalf
+of through a `struct ft_owner`, with five operations: valid, invalidate,
+account, used and release. Flowtable entries embed `struct ft_nf_owner`, which
+wraps Netfilter's handle. A translated pair gets its own owner, shared by the
+two directions. What a translated entry still has to deal with, from the
+refactor's review:
+
+* **No binding.** `ft_unlink()` removes `entry->binding_node` unconditionally,
+  so a binding-less entry needs an initialised node or a guard.
+* **Unload.** It drains entries through each binding's release, and so does
+  the `ft_handle_refs` zero check. Translated entries need their own
+  retirement on exit and on a port's unregister.
+* **The count.** `ft_handle_refs` is raised by the Netfilter owner's hold and
+  lowered by the generic release, so a second hold path must raise it too.
+* **The shared owner** is refcounted, one release per entry. Since invalidate
+  is for good, re-admission takes a fresh owner.
+* **A key collision** between a translated entry and a Netfilter offer
+  refuses the offer (`-EEXIST`), and where software does not re-offer, that
+  generation is invalidated.
+* **`account(dir, …)`** uses Netfilter's direction naming, with bytes
+  restated by `ft_l2_overhead()` in the ingress family's units. A translated
+  owner has to define both.
+* **Marks after publication.** `ft_replace()` marks through `cls->nf_handle`
+  after publication. That is right for Netfilter admission only; a second
+  admission path marks its own owner.
+
 **SIIT** has no per-flow state at all: address mapping goes through pool6,
 the EAMT and the denylist per packet. The adapter keeps its own per-flow
 table with an idle timeout from hardware counters, and flushes on any SIIT

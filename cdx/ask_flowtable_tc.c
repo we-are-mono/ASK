@@ -193,7 +193,7 @@ static void ft_tc_retire(void)
 	spin_lock_bh(&ft_watch_lock);
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
 		if (ft_rule_tc_soft(&entry->rule))
-			ft_handle_invalidate(entry->handle, &ft_tc_invalidations);
+			ft_owner_invalidate(entry->owner, &ft_tc_invalidations);
 	spin_unlock_bh(&ft_watch_lock);
 }
 
