@@ -2610,10 +2610,12 @@ static int insert_opcodeonly_hm(struct ins_entry_info *info, uint8_t opcode)
  *   in the checksum: a template that names the protocol has it counted twice;
  * - TTL/hop limit comes from the replaced header, decremented (bit 24), and a
  *   frame with TTL 1 or 0 goes to the CPU untouched;
- * - TOS/traffic class comes from the template only: bit 25 (NXP's "copy")
- *   does nothing, nor does any bit up to 31;
+ * - TOS/traffic class is the template's, unless the template's is 0xff: then
+ *   it is the arriving packet's, ECN included (4to6 by that alone, 6to4 with
+ *   bit 25 as well), the IPv4 checksum following it;
  * - the IPv4 identification counts per flow from the word's low half unless
- *   bit 26 takes the template's;
+ *   bit 26 takes the template's; DF and the fragment field are the
+ *   template's;
  * - it writes no EtherType, so the Ethernet header is rebuilt;
  * - it leaves the frame CDX_NATPT_SLACK bytes longer than the packet. */
 #ifndef NATPT_4to6
@@ -2622,6 +2624,7 @@ static int insert_opcodeonly_hm(struct ins_entry_info *info, uint8_t opcode)
 #endif
 #define NATPT_HLU	(1 << 24)	/* 4to6: hop limit from the IPv4 TTL */
 #define NATPT_TLU	(1 << 24)	/* 6to4: TTL from the IPv6 hop limit */
+#define NATPT_TOU	(1 << 25)	/* 6to4: a template TOS of 0xff copies */
 /* The word carries the flags above, the template's length in bits 16-23 (it
  * must be the header's exact size) and, for 6to4, the identification a flow
  * starts counting from. */
@@ -2651,11 +2654,17 @@ static int create_natpt_hm(struct ins_entry_info *info)
 	if (IS_IPV4_FLOW(twin)) {
 		struct iphdr *ip = (struct iphdr *)param->l3hdr;
 
-		param->word = cpu_to_be32(NATPT_TLU | (hdrlen << 16) | IPID_STARTVAL);
+		param->word = cpu_to_be32(NATPT_TLU | (hdrlen << 16) | IPID_STARTVAL |
+					  (entry->natpt_tos == CDX_NATPT_TOS_COPY ?
+					   NATPT_TOU : 0));
 		ip->version = 4;
 		ip->ihl = 5;
 		ip->tos = entry->natpt_tos;
-		/* No protocol: the microcode writes and checksums it. */
+		/* RFC 7915 sets DF on a translation over 1260 bytes, so that the
+		 * IPv6 sender learns the IPv4 path's MTU; the template's applies
+		 * to every packet, and the large ones are the ones it matters
+		 * for. No protocol: the microcode writes and checksums it. */
+		ip->frag_off = htons(IP_DF);
 		ip->saddr = twin->Daddr_v4;
 		ip->daddr = twin->Saddr_v4;
 		*(info->opcptr) = NATPT_6to4;

@@ -39,20 +39,29 @@ host; [record](history/nat64-feasibility.md)):
 | IPv4 header | Length, checksum and protocol (from the IPv6 next header) computed. The protocol is counted in the checksum on top of the template's, so the template must leave it 0 |
 | IPv6 header | Payload length computed; next header from the template |
 | TTL / hop limit | Carried over from the replaced header and decremented (bit 24). TTL 1 or 0 goes to the CPU untranslated |
-| TOS / traffic class | From the template only. Bit 25 (NXP's "copy") does nothing; nor does any bit up to 31 |
+| TOS / traffic class | The template's, unless the template's is **0xff**: then each arriving packet's, ECN included, with the IPv4 checksum following it. 4to6 needs only the template value; 6to4 needs bit 25 as well |
 | IPv4 identification | Counted per flow from the word's low half; bit 26 takes the template's instead |
+| IPv4 DF / fragment field (6to4) | The template's, checksummed |
 | EtherType | Not written: the Ethernet header has to be stripped and rebuilt |
-| Frame length | Shrinks or grows by the header difference **plus 2**: every translated frame carries 2 bytes past its IP packet |
+| Frame length | Shrinks or grows by the header difference **plus 2**: every translated frame carries 2 bytes past its IP packet. The 2 is a literal in the handler (word 10438 for 4to6, 10596 for 6to4), with no flag |
 | Template length field | Must be the header's exact size (20, 40); any other value loses the frame |
 | UDP checksum 0 (IPv4) | Passed through as 0, which IPv6 forbids |
+| IPv6 extension headers | Not handled. The handler drops everything up to L4 but writes the IPv4 protocol from the first next header, so such packets must not reach the entry |
+| IPv4 options | Dropped. The replaced header's length is the parser's |
 | TCP SYN | Never reaches the flow entry: the classifier gives it to the CPU |
+
+The handlers are at words 10408-10730 of the stock blob (dispatch: opcode
+high nibble 5 at w8699). The decoded walk-through, word by word, is in the
+[feasibility record](history/nat64-feasibility.md#the-handlers).
 
 ## The encoder
 
 The prototype adds one field pair to the backend's direction,
 `cdx_ft_rule.xlat_family` and `xlat_tos`: the family `new_src`/`new_dst` are
 in when it is not `family`'s, and the TOS/traffic class translated frames
-leave with. `ft_hw_add_one()` builds the usual entry/twin pair with the entry
+leave with. That is `CDX_NATPT_TOS_COPY` (0xff) to carry each packet's over,
+as RFC 7915 does, or a fixed value for Jool's `reset-tos`/`new-tos` and
+`reset-traffic-class`. `ft_hw_add_one()` builds the usual entry/twin pair with the entry
 in its own family (it is what the classifier keys on) and the twin in the
 other, marks the entry `FFTYPE_NATPT`, and leaves the entry's own `twin_*`
 fields alone (they are IPv4 NAT's and overlay an IPv6 destination). A
@@ -65,8 +74,11 @@ the opcode replaces the first IP header, which any of those would be.
 2. strip Ethernet, then the ingress VLAN/PPPoE strips;
 3. `UPDATE_SPORT|UPDATE_DPORT` from the twin, while the frame is still in the
    family its checksum covers;
-4. `NATPT_6to4` or `NATPT_4to6` with the template (addresses from the twin,
-   TOS from the rule, protocol 0) and TTL/hop-limit carry-over;
+4. `NATPT_6to4` or `NATPT_4to6` with the template and TTL/hop-limit
+   carry-over. The template carries the addresses from the twin and the TOS
+   from the rule (with bit 25 on 6to4 when it is the copy sentinel), and
+   leaves the protocol, length, ID and checksum fields 0. On 6to4 it also
+   sets DF;
 5. the egress VLAN/PPPoE inserts;
 6. `INSERT_L2_HDR` with the other family's EtherType;
 7. `ENQUEUE_PKT`.
@@ -94,8 +106,10 @@ none); its translations only shrink.
 * Expiring TTL (seen), and DF packets too big once translated (seen).
 * ICMP and ICMPv6 of every kind: Jool rewrites types, ids and inner packets,
   and the ICMPv6 checksum depends on the length.
-* Fragments, IPv4 options and IPv6 extension headers, which Jool strips or
-  answers.
+* Fragments and IPv6 extension headers. The opcode mistranslates an
+  extension header (above), so the classifier's handling of them has to be
+  confirmed before the entry can see one. IPv4 options the opcode drops, as
+  Jool does, but Jool answers an unexpired source route with an ICMP error.
 * IPv4 UDP with checksum 0, which Jool recomputes (NAT64) or drops (SIIT
   without `compute-udp-csum-zero`). Hardware would emit it as 0. Admission
   refuses a UDP flow whose packets reached Jool with checksum 0; whether a
@@ -105,10 +119,10 @@ none); its translations only shrink.
 
 | Field | Jool | Hardware | Proposal |
 | --- | --- | --- | --- |
-| TOS / traffic class | Copied per packet, ECN included (unless `reset-tos` / `reset-traffic-class`) | Fixed per flow | The template carries the admitting packet's TOS. A CE mark set upstream is lost on an offloaded flow. Either accept that, or keep ECN-capable flows (ECT set) in software. **Decision needed** |
-| Trailing bytes | None | 2 per frame | MTU accounting absorbs them. A full-MTU translated frame is 1520 bytes on the wire (FCS included), 2 over the 1518 a strict untagged receiver accepts; the bench's NIC and switch took it. Look for the cause in the microcode before calling it permanent |
+| TOS / traffic class | Copied per packet, ECN included (unless `reset-tos` / `reset-traffic-class`) | The same, through the 0xff sentinel; or a fixed value | Matches. A fixed value follows Jool's reset configuration |
+| Trailing bytes | None | 2 per frame | **Stock microcode stays** (decided 2026-11-19) and NXP is asked to fix it. MTU accounting absorbs the bytes. A full-MTU translated frame is 1520 bytes on the wire (FCS included), 2 over the 1518 a strict untagged receiver accepts; the bench's NIC and switch took it. Changing words 10438 and 10596 to `…00` removes the bytes (measured), but is not shipped. When a fixed microcode arrives, `CDX_NATPT_SLACK` must follow the loaded version: a slack of 2 on fixed firmware lets packets 1-2 bytes over the MTU through |
 | IPv4 identification | `__ip_select_ident()` per packet | Counted per flow | Equivalent for uniqueness (RFC 6864) |
-| DF on 6to4 output | Set when over 1260 bytes | The template's, fixed per flow | Measure whether the microcode honours a template DF; otherwise output carries DF clear |
+| DF on 6to4 output | Set when over 1260 bytes | The template's, fixed per flow (measured honoured) | DF set always: the large packets are the ones it matters for |
 | Fragmenting DF-clear 4to6 | Down to `lowest-ipv6-mtu` (default 1280) | Down to the egress MTU | Matches when `lowest-ipv6-mtu` is the link MTU; otherwise program `min(egress MTU, lowest-ipv6-mtu)` as the entry MTU and accept a lower DF bound |
 
 ## Admission: a Jool hook and an adapter

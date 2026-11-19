@@ -86,8 +86,8 @@ typedef struct _tCtEntry {
 	/* CDX_DETOUR_*: the entry of an offline-port detour this one is, for
 	 * a direction whose path is smaller than its ingress delivers. */
 	U8 detour;
-	/* FFTYPE_NATPT: the TOS/traffic class translated frames leave with; the
-	 * microcode takes it from the template only. */
+	/* FFTYPE_NATPT: the TOS/traffic class translated frames leave with, or
+	 * CDX_NATPT_TOS_COPY for the arriving packet's. */
 	U8 natpt_tos;
 
 	struct _tCtEntry *twin;
@@ -121,6 +121,9 @@ typedef struct _tCtEntry {
 /* The bytes past the IP packet a NAT-PT opcode leaves in the frame (measured on
  * 210.10.1): its frame shrinks or grows by the header difference plus this. */
 #define CDX_NATPT_SLACK	2
+/* The template TOS/traffic class by which a NAT-PT opcode carries the arriving
+ * packet's over instead, ECN included. */
+#define CDX_NATPT_TOS_COPY	0xff
 
 #define CT_TWIN(pentry)		(((PCtEntry)(pentry))->twin)
 

@@ -179,8 +179,10 @@ struct cdx_ft_rule {
 	/* Zero, or the family new_src and new_dst are in when it is not
 	 * family's: a direction translated between IPv4 and IPv6 (NAT64,
 	 * SIIT), whose L3 header the hardware replaces with one built from the
-	 * new tuple, with xlat_tos as its TOS/traffic class: the hardware
-	 * cannot carry the arriving packet's over. */
+	 * new tuple, with xlat_tos as its TOS/traffic class:
+	 * CDX_NATPT_TOS_COPY (0xff) carries each arriving packet's over, ECN
+	 * included, as RFC 7915 does; any other value is a fixed one, as
+	 * Jool's reset-tos/new-tos or reset-traffic-class configure. */
 	u8 xlat_family;
 	u8 xlat_tos;
 	/* Adapter state: the family of the next hop dst_mac was resolved for.
