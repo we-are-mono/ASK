@@ -87,7 +87,15 @@ static char dpa_stats_global[][ETH_GSTRING_LEN] = {
 	/* congestion related stats */
 	"congestion time (ms)",
 	"entered congestion",
-	"congested (0/1)"
+	"congested (0/1)",
+
+	/* The receive pool all private ports share, the same on each: what
+	 * BMan holds of it, beside the per-CPU "bp count" the driver keeps;
+	 * and the episodes its watch found it dry in, and the buffers they
+	 * put back (dpaa_eth_pool.c). */
+	"bp free",
+	"bp dry episodes",
+	"bp buffers reseeded"
 };
 
 #define DPA_STATS_PERCPU_LEN ARRAY_SIZE(dpa_stats_percpu)
@@ -527,6 +535,10 @@ static void dpa_get_ethtool_stats(struct net_device *net_dev,
 	data[offset++] = cg_time;
 	data[offset++] = cg_num;
 	data[offset++] = cg_status;
+
+	data[offset++] = priv->dpa_bp ? bman_query_free_buffers(priv->dpa_bp->pool) : 0;
+	dpa_pool_watch_stats(&data[offset], &data[offset + 1]);
+	offset += 2;
 
 #ifdef CONFIG_CPE_FAST_PATH
 	/* Read rather than accumulated: these are hardware counters, and they

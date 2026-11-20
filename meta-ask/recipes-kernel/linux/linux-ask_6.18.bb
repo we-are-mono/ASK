@@ -48,5 +48,4 @@ SRC_URI += "\
            file://185-netfilter-flowtable-neigh-resolution.patch \
            file://186-netfilter-flowtable-walk-latency.patch \
            file://187-netfilter-flowtable-closing-handback.patch \
-           file://189-sdk_dpaa-rx-pool-recovery.patch \
           "

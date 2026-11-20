@@ -1218,6 +1218,11 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
 
 	/* Get the buffer pools assigned to this interface;
 	 * run only once the default pool probing code
+	 *
+	 * The pool's record is the first port's device memory, which every
+	 * later port borrows: unbinding that port by hand would leave the
+	 * others' record, and the pool watch's, dangling. Private ports are
+	 * never removed.
 	 */
 	dpa_bp = (dpa_bpid2pool(dpa_priv_common_bpid)) ? :
 			dpa_priv_bp_probe(dev);
@@ -1421,6 +1426,9 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
 
 	priv->ifinfo = NULL;
 
+	/* Watched from here, as it receives into the shared pool. */
+	dpa_pool_watch_add(priv);
+
 	pr_info("fsl_dpa: Probed interface %s\n", net_dev->name);
 
 	return 0;
@@ -1456,6 +1464,16 @@ alloc_etherdev_mq_failed:
 	return err;
 }
 
+/* Off the pool's watch first: dpa_remove() takes down the port's congestion
+ * groups and its hold on the pool, which the watch reads through it. */
+static void __cold dpaa_eth_priv_remove(struct platform_device *of_dev)
+{
+	struct net_device *net_dev = dev_get_drvdata(&of_dev->dev);
+
+	dpa_pool_watch_del(netdev_priv(net_dev));
+	dpa_remove(of_dev);
+}
+
 static const struct of_device_id dpa_match[] = {
 	{
 		.compatible	= "fsl,dpa-ethernet"
@@ -1472,7 +1490,7 @@ static struct platform_driver dpa_driver = {
 		.pm		= DPAA_PM_OPS,
 	},
 	.probe		= dpaa_eth_priv_probe,
-	.remove		= dpa_remove
+	.remove		= dpaa_eth_priv_remove
 };
 
 /* A port's max frame length depends on its uppers as well as its MTU, so
@@ -1571,6 +1589,7 @@ static void __exit __cold dpa_unload(void)
 #endif
 
 	platform_driver_unregister(&dpa_driver);
+	dpa_pool_watch_stop();
 	unregister_netdevice_notifier(&dpa_netdev_nb);
 
 #ifdef CONFIG_FSL_DPAA_DBG_LOOP

@@ -284,16 +284,17 @@ struct dpa_jumbo_carve {
 	unsigned int left;
 };
 
-static void *dpa_jumbo_buf(struct dpa_jumbo_carve *c, unsigned int size)
+static void *dpa_jumbo_buf(struct dpa_jumbo_carve *c, unsigned int size,
+			   gfp_t gfp)
 {
 	unsigned int order = DPA_JUMBO_PAGE_ORDER;
 	void *buf;
 
 	if (!c->left) {
-		c->page = alloc_pages(GFP_ATOMIC | __GFP_COMP | __GFP_NOWARN, order);
+		c->page = alloc_pages(gfp | __GFP_COMP | __GFP_NOWARN, order);
 		if (!c->page) {
 			order = get_order(size);
-			c->page = alloc_pages(GFP_ATOMIC | __GFP_COMP | __GFP_NOWARN,
+			c->page = alloc_pages(gfp | __GFP_COMP | __GFP_NOWARN,
 					      order);
 			if (!c->page)
 				return NULL;
@@ -317,7 +318,10 @@ static void dpa_jumbo_end(struct dpa_jumbo_carve *c)
 }
 #endif
 
-static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
+/* gfp is GFP_ATOMIC from the receive path, which refills from softirq;
+ * the pool watch reseeds from process context (dpaa_eth_reseed_bpool()).
+ * netdev_alloc_frag() and build_skb() allocate atomically either way. */
+static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp, gfp_t gfp)
 {
 	void *new_buf, *fman_buf;
 	struct bm_buffer bmb[8];
@@ -341,7 +345,7 @@ static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
 		 * an entire cacheline for performance reasons.
 		 */
 		if (unlikely(fm_has_errata_a050385())) {
-			struct page *new_page = alloc_page(GFP_ATOMIC);
+			struct page *new_page = alloc_page(gfp);
 			if (unlikely(!new_page)) {
 				dev_err_ratelimited(dev, "%s: alloc_page() failed\n",
 						    __func__);
@@ -351,7 +355,7 @@ static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
 		} else {
 #ifdef CONFIG_FSL_DPAA_ETH_JUMBO_FRAME
 			new_buf = dpa_jumbo_buf(&carve, SMP_CACHE_BYTES +
-						DPA_BP_RAW_SIZE_JUMBO);
+						DPA_BP_RAW_SIZE_JUMBO, gfp);
 			if (unlikely(!new_buf)) {
 				dev_err_ratelimited(dev, "%s: jumbo buffer of %zu bytes failed\n",
 						    __func__, SMP_CACHE_BYTES +
@@ -453,7 +457,7 @@ int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *countptr, int threshold)
 
 	if (unlikely(count <= (percpu_buf_cfg_count - threshold))) {
 		do {
-			new_bufs = _dpa_bp_add_8_bufs(dpa_bp);
+			new_bufs = _dpa_bp_add_8_bufs(dpa_bp, GFP_ATOMIC);
 			if (unlikely(!new_bufs)) {
 				/* Avoid looping forever if we've temporarily
 				 * run out of memory. We'll try again at the
@@ -472,6 +476,29 @@ int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *countptr, int threshold)
 	return 0;
 }
 EXPORT_SYMBOL(dpaa_eth_refill_bpools);
+
+/* Put back into the pool, for the pool watch (dpaa_eth_pool.c), buffers its
+ * per-CPU counts already hold to be there: none of them is raised. Eight at
+ * a time, as the receive path's refill adds them, while eight more stay
+ * within @count -- never past it, so short of it by up to seven -- or until
+ * an allocation fails, and returns how many went in. Process context: it
+ * may sleep, and it neither dips into the atomic reserves the receive path's
+ * own refill needs nor has the OOM killer free memory for it. */
+int dpaa_eth_reseed_bpool(struct dpa_bp *dpa_bp, int count)
+{
+	int added = 0, new_bufs;
+
+	might_sleep();
+	while (count - added >= 8) {
+		new_bufs = _dpa_bp_add_8_bufs(dpa_bp, GFP_KERNEL | __GFP_NORETRY |
+					      __GFP_NOWARN);
+		if (!new_bufs)
+			break;
+		added += new_bufs;
+		cond_resched();
+	}
+	return added;
+}
 
 /* Cleanup function for outgoing frame descriptors that were built on Tx path,
  * either contiguous frames or scatter/gather ones.

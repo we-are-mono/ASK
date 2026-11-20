@@ -742,6 +742,10 @@ void dpa_bp_drain(struct dpa_bp *bp)
 			dma_unmap_single(bp->dev, addr, bp->size,
 					DMA_BIDIRECTIONAL);
 
+			/* For the private ports' pool this puts the page and
+			 * leaves the skb built on it (_dpa_bp_add_8_bufs()).
+			 * Reached only as the last private port is removed,
+			 * which never happens to this built-in driver. */
 			bp->free_buf_cb(phys_to_virt(addr));
 		}
 	} while (ret > 0);

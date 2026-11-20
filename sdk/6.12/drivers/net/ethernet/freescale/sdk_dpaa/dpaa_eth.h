@@ -447,6 +447,11 @@ struct dpa_priv_s {
 #endif
 #endif
 	void *ifinfo;
+	/* The receive pool's watch (dpaa_eth_pool.c), private ports only:
+	 * the port on its list, and the port's out-of-buffer discard count
+	 * as last read. Under dpa_pool_lock. */
+	struct list_head pool_watch;
+	u32 pool_discards;
 };
 
 struct fm_port_fqs {
@@ -462,6 +467,11 @@ extern struct net_device *dpa_loop_netdevs[20];
 #endif
 
 int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *count_ptr, int threshold);
+int dpaa_eth_reseed_bpool(struct dpa_bp *dpa_bp, int count);
+void dpa_pool_watch_add(struct dpa_priv_s *priv);
+void dpa_pool_watch_del(struct dpa_priv_s *priv);
+void dpa_pool_watch_stop(void);
+void dpa_pool_watch_stats(u64 *episodes, u64 *reseeded);
 void __hot _dpa_rx(struct net_device *net_dev,
 		struct qman_portal *portal,
 		const struct dpa_priv_s *priv,

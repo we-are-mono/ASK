@@ -267,7 +267,10 @@ handle_fail:
 EXPORT_SYMBOL(dpaa_bp_alloc_n_add_buffs);
 
 
-static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
+/* gfp is GFP_ATOMIC from the receive path, which refills from softirq;
+ * the pool watch reseeds from process context (dpaa_eth_reseed_bpool()).
+ * netdev_alloc_frag() and build_skb() allocate atomically either way. */
+static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp, gfp_t gfp)
 {
 	void *new_buf, *fman_buf;
 	struct bm_buffer bmb[8];
@@ -289,7 +292,7 @@ static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
 		 */
 #ifdef FM_ERRATUM_A050385
 		if (unlikely(fm_has_errata_a050385())) {
-			struct page *new_page = alloc_page(GFP_ATOMIC);
+			struct page *new_page = alloc_page(gfp);
 			if (unlikely(!new_page))
 				goto netdev_alloc_failed;
 			new_buf = page_address(new_page);
@@ -353,7 +356,9 @@ dma_map_failed:
 build_skb_failed:
 netdev_alloc_failed:
 	net_err_ratelimited("%s failed\n", __func__);
-	WARN_ONCE(1, "Memory allocation failure on Rx\n");
+	/* The pool watch's reseed asks for no warning: it tries again at
+	 * its next reading, and says what it could not add itself. */
+	WARN_ONCE(!(gfp & __GFP_NOWARN), "Memory allocation failure on Rx\n");
 
 	bm_buffer_set64(&bmb[i], 0);
 	/* Avoid releasing a completely null buffer; bman_release() requires
@@ -376,7 +381,7 @@ int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *countptr, int threshold)
 
 	if (unlikely(count <= (percpu_buf_cfg_count - threshold))) {
 		do {
-			new_bufs = _dpa_bp_add_8_bufs(dpa_bp);
+			new_bufs = _dpa_bp_add_8_bufs(dpa_bp, GFP_ATOMIC);
 			if (unlikely(!new_bufs)) {
 				/* Avoid looping forever if we've temporarily
 				 * run out of memory. We'll try again at the
@@ -395,6 +400,31 @@ int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *countptr, int threshold)
 	return 0;
 }
 EXPORT_SYMBOL(dpaa_eth_refill_bpools);
+
+/* Put back into the pool, for the pool watch (dpaa_eth_pool.c), buffers its
+ * per-CPU counts already hold to be there: none of them is raised. Eight at
+ * a time, as the receive path's refill adds them, while eight more stay
+ * within @count -- never past it, so short of it by up to seven -- or until
+ * an allocation fails, and returns how many went in. Process context: it
+ * may sleep between batches. On this line the buffers come from
+ * netdev_alloc_frag(), which allocates atomically whatever @gfp says, as the
+ * receive path's own refill does: only the erratum's pages take @gfp, and
+ * none has the OOM killer free memory for it. */
+int dpaa_eth_reseed_bpool(struct dpa_bp *dpa_bp, int count)
+{
+	int added = 0, new_bufs;
+
+	might_sleep();
+	while (count - added >= 8) {
+		new_bufs = _dpa_bp_add_8_bufs(dpa_bp, GFP_KERNEL | __GFP_NORETRY |
+					      __GFP_NOWARN);
+		if (!new_bufs)
+			break;
+		added += new_bufs;
+		cond_resched();
+	}
+	return added;
+}
 
 /* Cleanup function for outgoing frame descriptors that were built on Tx path,
  * either contiguous frames or scatter/gather ones.
