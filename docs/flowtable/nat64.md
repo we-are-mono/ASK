@@ -3,9 +3,9 @@
 Status:
 - **Implemented:** the encoder and the translator-neutral admission source
   (`cdx/ask_xlat.h`).
-- **Proved:** on the 6.18 test image, through the test client: host suites,
-  the rig test and a line-rate load. 6.12 builds the same sources and passes
-  the host suite.
+- **Proved:** through the test client, on both lines' test images. 6.18 passed
+  the full suite, the rig test included, and a line-rate load. 6.12 passed
+  the host suite and the rig test.
 - **Not done yet:** no translator is patched, so the feature is outside the
   [supported scope](README.md#supported-scope) until one ships
   ([Translator integration](#translator-integration-not-implemented)).
@@ -440,7 +440,6 @@ without it. All of its cases are TCP sessions:
 * FIN/RST handling with a real translator.
 * A translated direction combined with VLAN or PPPoE.
 * How the classifier treats IPv6 extension headers on an offloaded flow.
-* The rig suite on the 6.12 line.
 
 ## Test client
 
