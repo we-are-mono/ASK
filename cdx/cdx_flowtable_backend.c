@@ -79,8 +79,10 @@ static unsigned long ft_restart_backoff = HZ;
  * classifier runs -- for an operator, and for the platform's report of a
  * failure that does reset the board. Written under the parameter lock its
  * reader takes, so a read never sees two reasons at once; that lock is taken
- * under the control mutex, so no parameter of CDX's may take the control mutex
- * in its set or get. */
+ * under the control mutex, so no parameter's set or get may take the control
+ * mutex, RTNL, under which the control mutex is taken, or a lock held while
+ * either is. Every module's parameter lock is one lock class to lockdep, so
+ * that holds for the parameters of every ASK module, not CDX's alone. */
 static char ft_degraded_reason[96];
 module_param_string(flowtable_degraded_reason, ft_degraded_reason, sizeof(ft_degraded_reason), 0444);
 MODULE_PARM_DESC(flowtable_degraded_reason, "What keeps the datapath forwarding in software after an unproven deletion; empty while the classifier runs");

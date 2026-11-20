@@ -491,6 +491,7 @@ static int __init cdx_module_init(void)
 	 * fatal either: without it they stay in software (cdx_detour.c). */
 	cdx_detour_init();
 	cdx_portal_faults_init();
+	cdx_pool_faults_init();
 	return 0;
 
 exit:

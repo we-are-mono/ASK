@@ -296,6 +296,28 @@ half (A341, qos.md, "A port without a hardware qdisc"). Both are 32 bits, so
 the statistics sampler reads them every 30 s besides every `dev_get_stats()`;
 at 10G minimum-size frames take one round in under five minutes.
 
+Only the CPU's receive puts buffers into that pool, once its per-CPU count --
+what it seeded, less what it took out -- runs low, so a buffer the hardware
+loses (A453) leaves every count as it was. A pool emptied that way stayed
+empty: every port missed everything, no frame reached a CPU to refill it, and
+nothing was logged (A454). The driver's pool watch (`dpaa_eth_pool.c`, kernel
+patch 189) reads the pool's BMan count once a second beside every port's
+out-of-buffers discards. Dry at two readings in a row, with a frame discarded
+for want of a buffer since the first, it logs `receive pool N ran dry` once,
+with the per-CPU counts and the ports' counts; puts back what the counts hold
+the pool to have, less the frames waiting for the CPU and within the pool's
+size, without raising a count; tops it up while it holds less than half its
+size; and logs `receive pool N is receiving again` once it holds half. An
+episode adds at most the pool's size, so a loss that persists shows as
+repeated episodes.
+`ethtool -S` reports the same on every port: `bp free`, BMan's count beside
+the driver's `bp count [TOTAL]` (at idle they match, and a gap is a loss),
+`bp dry episodes` and `bp buffers reseeded`. Measured with CDX's test knob
+taking all 12,696 buffers: the DUT answered pings again 1.8 s later, after one
+episode put back 12,696, and at idle BMan held what the driver counts again,
+as it did on a second leak the same boot (`dpaa_rx_pool_recovery.py`);
+without the watch it answered none for 16 minutes, until rebooted.
+
 A frame the receive MAC had no room for in its own FIFO, because FMan had not
 yet drained it, never reaches FMan whole. The MAC drops it, or passes it on
 cut short and marked bad (`FM_FD_ERR_PHYSICAL`), which the port's discard mask

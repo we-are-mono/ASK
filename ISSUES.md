@@ -167,29 +167,8 @@ result independently of those temporary files.
   fragments sealed and the fragment pool's low point. Then either bound the seal queues' fragment-pool frames by a
   share of that pool, or set `FRAG_DISABLE` on WireGuard egress entries and prove that the seal's `-EMSGSIZE` slow
   path delivers an oversized segment as Linux's own path would.
-- [ ] **A454 — an empty receive pool stays empty, and says nothing.**
-
-  **Where:** the SDK dpaa receive path's refill (`dpaa_eth_refill_bpools()`, patch 010), the only thing that adds
-  buffers to the Ethernet pool (bpid 32) after boot; and the Ethernet ports and offline ports that draw from it.
-
-  **Why it matters:** the refill runs only on CPU receive, and only when that CPU's per-CPU count is below the
-  threshold. That count follows what the CPU took from and gave back to the pool, not what the pool holds, so
-  buffers hardware loses (A453: one per detoured frame, for ~15 h) leave every count high. Once the pool is empty
-  every port discards every frame for want of a buffer (`port_rx_out_of_buffers_discard` climbs), no frame
-  reaches a CPU, and no refill ever runs: a latch, silent in the log. A production router stopped receiving and
-  only a reboot brought it back, which breaks the no-reboot requirement. Any future leak, or a consumer holding
-  buffers past its share, ends the same way.
-
-  **Next:** detect and recover, in the kernel, without a reboot:
-  - a periodic check (the accounting pass, or a delayed work of its own) that reads the pool's free count from
-    BMan beside each port's out-of-buffers discard counter;
-  - when the pool is near empty while those discards rise, log loudly, once per episode, with the pool, its
-    count, the per-CPU counts and the counters, and count the episode where `ethtool -S` or
-    `/proc/ask_flowtable/stats` shows it;
-  - reseed the pool from the CPU up to its configured size, bounded per episode, so a leak that persists shows
-    as repeated episodes rather than as unbounded memory;
-  - a rig test that drains the pool on purpose (a debug knob acquiring its buffers), sees the episode logged,
-    and sees receive come back on the same boot.
+- [x] **A454 — an empty receive pool stayed empty, and said nothing.** The driver's pool watch now logs a dry pool
+  and puts back what its counts hold, on the same boot (_:/^sdk_dpaa: refill the receive pool when it runs dry_).
 - [x] **A453 — an offline port's entry into a WireGuard or VAP queue lost a buffer per frame.** Its `rspid` copied each
   frame; without it the frame waits outside its pool's budget. Refused (_:/^cdx: no CPU egress from an offline port_).
 - [ ] **A452 — A202's zero-payload fragments do not reproduce; the bound on non-TCP into a smaller path may be stale.**

@@ -50,6 +50,8 @@ typedef void (*cdx_deinit_func)(void);
 void register_cdx_deinit_func(cdx_deinit_func func);
 /* Test-only portal loads (cdx_portal_faults.c); nothing in production. */
 void cdx_portal_faults_init(void);
+/* Test-only receive pool leak (cdx_pool_faults.c); nothing in production. */
+void cdx_pool_faults_init(void);
 /* Enter/leave a configuration or terminal teardown transaction; entry must
  * hold neither RTNL nor ctrl.mutex. Runtime callbacks use the backend API. */
 void cdx_ctrl_lock_with_rtnl(void);
