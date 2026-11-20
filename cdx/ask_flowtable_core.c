@@ -1858,6 +1858,14 @@ static u32 ft_handed_on(const struct cdx_ft_rule *rule, u32 len)
 	       ft_mtu_less(len, FT_XLAT_GROWTH);
 }
 
+/* The largest packet a direction hands on: the most its ingress port delivers
+ * whole, less what the ingress strips, as the direction hands it on. What the
+ * MTU bound measures a path against, and what a refusal of it names. */
+u32 ft_rule_handed_on(const struct cdx_ft_rule *rule)
+{
+	return ft_handed_on(rule, ft_arriving(rule->in, ft_rule_stripped(rule)));
+}
+
 /* Whether a direction leaving by a path of @mtu can be carried although a
  * packet arriving on @in could be larger. The microcode fragments an oversized
  * packet itself, and for a frame an Ethernet port received, the fragments it
@@ -1908,7 +1916,7 @@ bool ft_mtu_carried(const struct cdx_ft_rule *rule, u32 mtu)
 {
 	return (rule->proto == IPPROTO_TCP && rule->xlat_family != AF_INET) || rule->detour ||
 	       (rule->family == AF_INET && (rule->sa_handle || rule->in_sa_handle)) ||
-	       ft_handed_on(rule, ft_arriving(rule->in, ft_rule_stripped(rule))) <= mtu;
+	       ft_rule_handed_on(rule) <= mtu;
 }
 
 /* Whether a direction into a smaller path is carried through the offline-port

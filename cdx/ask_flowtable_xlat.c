@@ -91,6 +91,26 @@ static_assert(ASK_XLAT_TOS_COPY == CDX_FT_XLAT_TOS_COPY);
 #define FT_XLAT_RETRY		(HZ / 20)
 #define FT_XLAT_HASH_BITS	10
 
+/* Why a session went no further, under the ask_debug knob's refusal bit
+ * (cdx_flowtable_backend.h), as the flowtable's refusals are traced: named by
+ * the client's cookie and, where one direction decided it, `dir=' and that
+ * direction, with the operands that decided it. With the knob off it costs a
+ * test of a cold mask, and no argument is evaluated. ft_xlat_door() is the
+ * same for the offer itself, which a translator may make once a packet from
+ * softirq, so it is rate-limited as well. */
+#define ft_xlat_dbg(flow, fmt, ...)					\
+	ask_dbg(ASK_DBG_REFUSE, "xlat cookie=%llu " fmt "\n",		\
+		(unsigned long long)(flow)->cookie, ##__VA_ARGS__)
+#define ft_xlat_door(flow, fmt, ...)					\
+	ask_dbg_ratelimited(ASK_DBG_REFUSE, "xlat cookie=%llu " fmt "\n", \
+			    (unsigned long long)(flow)->cookie, ##__VA_ARGS__)
+/* A wait, not a refusal: the worker tries the offer again every FT_XLAT_RETRY
+ * for as long as the wait lasts, for every offer queued, so it is rate-limited
+ * too. */
+#define ft_xlat_wait(flow, fmt, ...)	ft_xlat_door(flow, fmt, ##__VA_ARGS__)
+/* The longest address the trace prints. */
+#define FT_XLAT_TEXT		sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")
+
 /* A session in the hardware, or being put there, on its translator's behalf;
  * see the file's head. */
 struct ft_xlat_owner {
@@ -153,14 +173,17 @@ struct ft_xlat_path {
 	bool mtu_follows_dev;
 };
 
-/* What one admission works on: both directions' paths and rules, and the
- * forwarding-path walk a port is found by -- more than a worker's stack takes
- * under KASAN, which pads every one of them. Admission is the worker's alone,
- * under the backend transaction, which is what this is guarded by. */
+/* What one admission works on: both directions' paths and rules, the
+ * forwarding-path walk a port is found by, and the addresses its trace prints
+ * -- more than a worker's stack takes under KASAN, which pads every one of
+ * them. Admission and refusal are the worker's alone, or an unregistration's
+ * with the worker stopped, under the backend transaction, which is what this
+ * is guarded by. */
 static struct {
 	struct ft_xlat_path path[2];
 	struct cdx_ft_rule rule[2];
 	struct net_device_path_stack walk;
+	char text[2][FT_XLAT_TEXT];
 } ft_xlat_scratch;
 
 static DEFINE_SPINLOCK(ft_xlat_lock);
@@ -335,6 +358,25 @@ static bool ft_xlat_retire(struct ft_xlat_owner *o)
 
 /* ---------------------------------------------------------------- offers */
 
+/* An address in its own family, as the trace prints it, into @text, which
+ * holds FT_XLAT_TEXT. Only ever an argument of the trace, so it is formatted
+ * only with the knob on. */
+static inline const char *ft_xlat_ntop(char *text, u8 family, const union nf_inet_addr *addr)
+{
+	if (family == AF_INET6)
+		snprintf(text, FT_XLAT_TEXT, "%pI6c", &addr->in6);
+	else
+		snprintf(text, FT_XLAT_TEXT, "%pI4", &addr->ip);
+	return text;
+}
+
+/* The same into slot @i of the admission's scratch, for the trace of what the
+ * worker decides, which the transaction serializes. */
+static inline const char *ft_xlat_text(unsigned int i, u8 family, const union nf_inet_addr *addr)
+{
+	return ft_xlat_ntop(ft_xlat_scratch.text[i], family, addr);
+}
+
 /* One side of a direction a hardware entry can be keyed on, or translate to:
  * a unicast pair the two ports route between, with both ports. */
 static bool ft_xlat_tuple_valid(const struct ask_xlat_tuple *t)
@@ -349,18 +391,37 @@ static bool ft_xlat_flow_valid(const struct ask_xlat_flow *flow)
 {
 	unsigned int d;
 
-	if (!net_eq(flow->net, &init_net) ||
-	    (flow->proto != IPPROTO_TCP && flow->proto != IPPROTO_UDP))
+	if (!net_eq(flow->net, &init_net)) {
+		ft_xlat_door(flow, "offered from a namespace other than the initial one");
 		return false;
+	}
+	if (flow->proto != IPPROTO_TCP && flow->proto != IPPROTO_UDP) {
+		ft_xlat_door(flow, "proto %u, neither TCP nor UDP", flow->proto);
+		return false;
+	}
 	for (d = 0; d < ARRAY_SIZE(flow->dir); d++) {
 		const struct ask_xlat_dir *dir = &flow->dir[d];
 
-		if (!ft_xlat_tuple_valid(&dir->match) || !ft_xlat_tuple_valid(&dir->xlat) ||
-		    dir->match.family == dir->xlat.family || dir->ifindex <= 0)
+		if (!ft_xlat_tuple_valid(&dir->match) || !ft_xlat_tuple_valid(&dir->xlat)) {
+			ft_xlat_door(flow, "dir=%u tuple not unicast with both ports: family %u ports %u>%u, translated family %u ports %u>%u",
+				     d, dir->match.family, ntohs(dir->match.sport),
+				     ntohs(dir->match.dport), dir->xlat.family,
+				     ntohs(dir->xlat.sport), ntohs(dir->xlat.dport));
 			return false;
+		}
+		if (dir->match.family == dir->xlat.family || dir->ifindex <= 0) {
+			ft_xlat_door(flow, "dir=%u family %u into %u, arriving on ifindex %d",
+				     d, dir->match.family, dir->xlat.family, dir->ifindex);
+			return false;
+		}
 	}
 	/* The sibling translates the other way between the same two. */
-	return flow->dir[0].match.family == flow->dir[1].xlat.family;
+	if (flow->dir[0].match.family != flow->dir[1].xlat.family) {
+		ft_xlat_door(flow, "dir=1 leaves in family %u, not the %u dir=0 arrives in",
+			     flow->dir[1].xlat.family, flow->dir[0].match.family);
+		return false;
+	}
+	return true;
 }
 
 /* The unused words of an IPv4 address zeroed, as everything a rule is built
@@ -428,19 +489,29 @@ static struct dst_entry *ft_xlat_route(const struct ask_xlat_tuple *x, u8 proto,
  * session, a tunnel being refused anyway -- and the entry's MTU is never more
  * than the route's. The directions the bound applies to are UDP, and TCP into
  * IPv4 (ft_mtu_carried()). */
-static bool ft_xlat_mtu_refused(const struct ask_xlat_dir *dir, u8 proto)
+static bool ft_xlat_mtu_refused(const struct ask_xlat_flow *flow, unsigned int d)
 {
+	const struct ask_xlat_dir *dir = &flow->dir[d];
 	u32 least = ETH_DATA_LEN - PPPOE_SES_HLEN, cookie;
 	struct dst_entry *dst;
 	bool refused;
 
-	if (proto == IPPROTO_TCP && dir->xlat.family == AF_INET6)
+	if (flow->proto == IPPROTO_TCP && dir->xlat.family == AF_INET6)
 		return false;
 	least = dir->xlat.family == AF_INET6 ? least + FT_XLAT_GROWTH : least - FT_XLAT_GROWTH;
-	dst = ft_xlat_route(&dir->xlat, proto, &cookie);
+	dst = ft_xlat_route(&dir->xlat, flow->proto, &cookie);
 	if (!dst)
 		return false;
 	refused = least > dst_mtu(dst);
+	/* An offer comes from softirq on any CPU: the address is formatted on
+	 * this frame rather than in the worker's scratch, and only with the
+	 * knob on. */
+	if (refused)
+		ft_xlat_door(flow, "dir=%u mtu %u of the route to %s by %s below the %u bytes the least packet a port delivers whole hands on (proto %u)",
+			     d, dst_mtu(dst),
+			     ft_xlat_ntop((char [FT_XLAT_TEXT]){ 0 }, dir->xlat.family,
+					  &dir->xlat.dst),
+			     dst->dev ? netdev_name(dst->dev) : "-", least, flow->proto);
 	dst_release(dst);
 	return refused;
 }
@@ -490,10 +561,14 @@ bool ask_xlat_offer(const struct ask_xlat_flow *flow)
 	unsigned int d;
 	int folded;
 
-	if (!ft_xlat_flow_valid(flow) || !READ_ONCE(ft_xlat_client))
+	if (!ft_xlat_flow_valid(flow))
 		return false;
+	if (!READ_ONCE(ft_xlat_client)) {
+		ft_xlat_door(flow, "no client registered");
+		return false;
+	}
 	for (d = 0; d < ARRAY_SIZE(flow->dir); d++)
-		if (ft_xlat_mtu_refused(&flow->dir[d], flow->proto)) {
+		if (ft_xlat_mtu_refused(flow, d)) {
 			atomic64_inc(&ft_xlat_mtu_refusals);
 			return false;
 		}
@@ -505,13 +580,18 @@ bool ask_xlat_offer(const struct ask_xlat_flow *flow)
 		ft_xlat_tuple_clean(&offer.flow.dir[d].xlat);
 	}
 	spin_lock_bh(&ft_xlat_lock);
-	if (!ft_xlat_client || ft_xlat_closing)
+	if (!ft_xlat_client || ft_xlat_closing) {
+		ft_xlat_door(flow, "client unregistering");
 		goto out;
+	}
 	folded = ft_xlat_fold(&offer);
-	if (folded < 0)
+	if (folded < 0) {
+		ft_xlat_door(flow, "its expired is being said: offer again after it");
 		goto out;
+	}
 	if (!folded) {
 		if (ft_xlat_head - ft_xlat_tail >= FT_XLAT_RING) {
+			ft_xlat_door(flow, "queue full (%u offers)", FT_XLAT_RING);
 			ft_xlat_dropped++;
 			goto out;
 		}
@@ -620,11 +700,12 @@ out:
 	return port;
 }
 
-/* One direction's egress, from the route to its translated destination.
+/* Direction @d's egress, from the route to its translated destination.
  * Under the transaction and RTNL. */
-static int ft_xlat_path(const struct ask_xlat_dir *dir, u8 proto, struct ft_xlat_path *path)
+static int ft_xlat_path(const struct ask_xlat_flow *flow, unsigned int d,
+			struct ft_xlat_path *path)
 {
-	const struct ask_xlat_tuple *x = &dir->xlat;
+	const struct ask_xlat_tuple *x = &flow->dir[d].xlat;
 	struct nf_flow_session session = {};
 	struct nf_flow_tunnel tunnel = {};
 	struct cdx_ft_tunnel no_tunnel;
@@ -633,9 +714,12 @@ static int ft_xlat_path(const struct ask_xlat_dir *dir, u8 proto, struct ft_xlat
 	int vlans;
 
 	memset(path, 0, sizeof(*path));
-	path->dst = ft_xlat_route(x, proto, &path->cookie);
-	if (!path->dst)
+	path->dst = ft_xlat_route(x, flow->proto, &path->cookie);
+	if (!path->dst) {
+		ft_xlat_dbg(flow, "dir=%u no route to %s from %s", d,
+			    ft_xlat_text(0, x->family, &x->dst), ft_xlat_text(1, x->family, &x->src));
 		return -EOPNOTSUPP;
+	}
 	dev = path->dst->dev;
 	/* An encapsulation or a tunnel would put a header of its own before the
 	 * one the opcode replaces; a WireGuard egress is not proven to take a
@@ -643,38 +727,64 @@ static int ft_xlat_path(const struct ask_xlat_dir *dir, u8 proto, struct ft_xlat
 	 * the translator's own, does none, and a policy change retires the
 	 * session anyway (ft_policy_covers()). */
 	if (!dev || !net_eq(dev_net(dev), &init_net) || path->dst->lwtstate ||
-	    ft_tunnel_dev(dev) || cdx_ft_wg_dev(dev) ||
-	    !ft_route_next_hop(path->dst, x->family, &x->dst, &path->next_hop))
+	    ft_tunnel_dev(dev) || cdx_ft_wg_dev(dev)) {
+		ft_xlat_dbg(flow, "dir=%u route to %s leaves by %s: %s", d,
+			    ft_xlat_text(0, x->family, &x->dst),
+			    dev ? netdev_name(dev) : "-",
+			    !dev || !net_eq(dev_net(dev), &init_net) ? "no device here" :
+			    path->dst->lwtstate ? "an encapsulation" :
+			    ft_tunnel_dev(dev) ? "a tunnel" : "WireGuard");
 		return -EOPNOTSUPP;
+	}
+	if (!ft_route_next_hop(path->dst, x->family, &x->dst, &path->next_hop)) {
+		ft_xlat_dbg(flow, "dir=%u route to %s by %s has no next hop to send to", d,
+			    ft_xlat_text(0, x->family, &x->dst), netdev_name(dev));
+		return -EOPNOTSUPP;
+	}
 	path->logical = dev;
 	path->mtu = dst_mtu(path->dst);
 	dev_mtu = READ_ONCE(dev->mtu);
 	/* A route's MTU set above its device's, which the device's own sends
 	 * are bounded by, refuses the direction, as the decoder refuses a
 	 * flow's (ft_parse()). */
-	if (path->mtu > dev_mtu)
+	if (path->mtu > dev_mtu) {
+		ft_xlat_dbg(flow, "dir=%u route mtu %u above %s's %u", d, path->mtu,
+			    netdev_name(dev), dev_mtu);
 		return -EOPNOTSUPP;
+	}
 	/* As the decoder takes it: an unlocked IPv6 route's MTU is its device's
 	 * IPv6 MTU (ft_egress_mtu_current()). In the egress family. */
 	path->mtu_follows_dev = x->family == AF_INET6 && !dst_metric_locked(path->dst, RTAX_MTU);
 	/* A ppp device resolves no neighbour: below it the frame goes to the
 	 * session's concentrator, which the walk names. */
 	if (dev->type != ARPHRD_PPP &&
-	    !ft_neigh_resolve(x->family, dev, &path->next_hop, path->mac))
+	    !ft_neigh_resolve(x->family, dev, &path->next_hop, path->mac)) {
+		ft_xlat_dbg(flow, "dir=%u neigh %s on %s unresolved", d,
+			    ft_xlat_text(0, x->family, &path->next_hop), netdev_name(dev));
 		return -EOPNOTSUPP;
+	}
 	port = ft_xlat_port(dev, path->mac, &session);
-	if (!port)
+	if (!port) {
+		ft_xlat_dbg(flow, "dir=%u no port the walk from %s to %pM ends on, or a device on the way it cannot cross",
+			    d, netdev_name(dev), path->mac);
 		return -EOPNOTSUPP;
+	}
 	vlans = ft_path_stack(dev, port, &session, &tunnel, path->vlan, &path->bridge,
 			      &path->bridge_vid, &path->session, &no_tunnel, &path->source);
-	if (vlans < 0)
+	if (vlans < 0) {
+		ft_xlat_dbg(flow, "dir=%u path from %s down to %s refused (%d)", d,
+			    netdev_name(dev), netdev_name(port), vlans);
 		return vlans;
+	}
 	path->vlans = vlans;
 	path->port = port;
 	if (path->session.present)
 		ether_addr_copy(path->mac, path->session.mac);
-	if (!path->source || !is_valid_ether_addr(path->source->dev_addr))
+	if (!path->source || !is_valid_ether_addr(path->source->dev_addr)) {
+		ft_xlat_dbg(flow, "dir=%u no valid source address on the path from %s",
+			    d, netdev_name(dev));
 		return -EOPNOTSUPP;
+	}
 	return 0;
 }
 
@@ -693,8 +803,11 @@ static int ft_xlat_rule(const struct ask_xlat_flow *flow, unsigned int d,
 	/* The translator received the direction on the device its sibling
 	 * leaves by, or the port and tags the hardware would key it on are not
 	 * the ones its frames arrive with. */
-	if (in->logical->ifindex != dir->ifindex)
+	if (in->logical->ifindex != dir->ifindex) {
+		ft_xlat_dbg(flow, "dir=%u arrives on ifindex %d, its sibling leaves by %s (%d)",
+			    d, dir->ifindex, netdev_name(in->logical), in->logical->ifindex);
 		return -EOPNOTSUPP;
+	}
 	memset(rule, 0, sizeof(*rule));
 	rule->family = dir->match.family;
 	rule->xlat_family = dir->xlat.family;
@@ -727,22 +840,48 @@ static int ft_xlat_rule(const struct ask_xlat_flow *flow, unsigned int d,
 	ether_addr_copy(rule->src_mac, out->source->dev_addr);
 	/* Both ends DPAA ports: a translated frame into a VAP or out of one is
 	 * not proven on the wire. */
-	if (!cdx_ft_port_supported(rule->in) || !cdx_ft_port_supported(rule->out))
+	if (!cdx_ft_port_supported(rule->in) || !cdx_ft_port_supported(rule->out)) {
+		ft_xlat_dbg(flow, "dir=%u port %s or %s not one the classifier programs",
+			    d, netdev_name(rule->in), netdev_name(rule->out));
 		return -EOPNOTSUPP;
+	}
 	/* No conntrack, so no mark: the default class. */
 	rule->qos = ft_qos_class(0);
-	if (!ft_qos_class_valid(rule->qos) || ft_bridge_egress_filtered(rule) ||
-	    ft_rule_tc_soft(rule))
+	if (!ft_qos_class_valid(rule->qos)) {
+		ft_xlat_dbg(flow, "dir=%u default QoS class %06x not usable", d, rule->qos);
 		return -EOPNOTSUPP;
+	}
+	if (ft_bridge_egress_filtered(rule)) {
+		ft_xlat_dbg(flow, "dir=%u leaves through bridge %s, which a bridge-family output or postrouting hook filters",
+			    d, netdev_name(rule->out_bridge));
+		return -EOPNOTSUPP;
+	}
+	if (ft_rule_tc_soft(rule)) {
+		ft_xlat_dbg(flow, "dir=%u tc in software on the path in by %s or out by %s",
+			    d, netdev_name(rule->in_logical), netdev_name(rule->out_logical));
+		return -EOPNOTSUPP;
+	}
 	/* The route's MTU, and no more than the port carries (ft_port_mtu()).
 	 * The backend adds the opcode's slack itself (CDX_NATPT_SLACK). */
 	mtu = min_t(u32, out->mtu, ft_port_mtu(rule));
-	if (mtu < (rule->xlat_family == AF_INET6 ? IPV6_MIN_MTU : 68) || mtu > U16_MAX)
+	if (mtu < (rule->xlat_family == AF_INET6 ? IPV6_MIN_MTU : 68) || mtu > U16_MAX) {
+		ft_xlat_dbg(flow, "dir=%u mtu %u out of the range family %u carries",
+			    d, mtu, rule->xlat_family);
 		return -EOPNOTSUPP;
+	}
 	rule->mtu = mtu;
 	rule->mtu_follows_dev = out->mtu_follows_dev;
-	if (!ft_mtu_carried(rule, mtu) || !ft_egress_mtu_current(rule))
+	if (!ft_mtu_carried(rule, mtu)) {
+		ft_xlat_dbg(flow, "dir=%u mtu %u out by %s below the %u bytes a packet from %s hands on (proto %u)",
+			    d, mtu, netdev_name(rule->out_logical), ft_rule_handed_on(rule),
+			    netdev_name(rule->in), rule->proto);
 		return -EOPNOTSUPP;
+	}
+	if (!ft_egress_mtu_current(rule)) {
+		ft_xlat_dbg(flow, "dir=%u mtu %u above the IPv6 MTU of %s",
+			    d, mtu, netdev_name(rule->out_logical));
+		return -EOPNOTSUPP;
+	}
 	/* Last, as the decoder asks it: a police filter matches the finished
 	 * tuple, the one the direction arrives with. */
 	policer = cdx_police_lookup(rule);
@@ -766,7 +905,7 @@ static bool ft_xlat_admissible(void)
  * and one held for a live owner refuses the session. A Netfilter offer meets
  * a translated key the same way (ft_replace()). What this unlinks, the
  * worker's run settles. Under the transaction. */
-static int ft_xlat_keys_free(const struct cdx_ft_rule *rule)
+static int ft_xlat_keys_free(const struct ask_xlat_flow *flow, const struct cdx_ft_rule *rule)
 {
 	struct cdx_ft_entry *holder;
 	unsigned int d;
@@ -775,8 +914,12 @@ static int ft_xlat_keys_free(const struct cdx_ft_rule *rule)
 		holder = ft_key_holder(&rule[d]);
 		if (!holder)
 			continue;
-		if (ft_owner_valid(holder->owner))
+		if (ft_owner_valid(holder->owner)) {
+			ft_xlat_dbg(flow, "dir=%u key on %s held by the live %s entry cookie=%lx",
+				    d, netdev_name(rule[d].in),
+				    holder->binding ? "flowtable" : "translated", holder->cookie);
 			return -EEXIST;
+		}
 		ft_unlink(holder);
 	}
 	return 0;
@@ -800,6 +943,7 @@ static int ft_xlat_admit(struct ft_xlat_offer *offer)
 	/* What tc runs on each device decides admission, and with no sample
 	 * nothing is known yet: a moment will tell (ask_flowtable_tc.c). */
 	if (!ft_tc_known()) {
+		ft_xlat_wait(flow, "waits for the first tc sample");
 		ft_tc_kick();
 		return -EAGAIN;
 	}
@@ -817,7 +961,7 @@ static int ft_xlat_admit(struct ft_xlat_offer *offer)
 	 * one's. */
 	memset(path, 0, sizeof(ft_xlat_scratch.path));
 	for (d = 0; d < 2; d++) {
-		rc = ft_xlat_path(&flow->dir[d], flow->proto, &path[d]);
+		rc = ft_xlat_path(flow, d, &path[d]);
 		if (rc)
 			goto out;
 	}
@@ -826,16 +970,19 @@ static int ft_xlat_admit(struct ft_xlat_offer *offer)
 		if (rc)
 			goto out;
 	}
-	rc = ft_xlat_keys_free(rule);
+	rc = ft_xlat_keys_free(flow, rule);
 	if (rc)
 		goto out;
 	if (ft_count + 2 > CDX_FT_MAX_ENTRIES || ft_xlat_count + 2 > FT_XLAT_MAX_ENTRIES) {
+		ft_xlat_dbg(flow, "budget: %u of %u entries, %u of %u translated",
+			    ft_count, CDX_FT_MAX_ENTRIES, ft_xlat_count, FT_XLAT_MAX_ENTRIES);
 		rc = -ENOSPC;
 		goto out;
 	}
 	/* The backend admits nothing while a retirement is unproven, and one
 	 * whose barrier is merely owed is that until it is asked for. */
 	if (ft_settle()) {
+		ft_xlat_wait(flow, "waits for a retirement's barrier to complete");
 		rc = -EAGAIN;
 		goto out;
 	}
@@ -857,6 +1004,7 @@ static int ft_xlat_admit(struct ft_xlat_offer *offer)
 		hash_add(ft_xlat_owners, &o->node, o->cookie);
 	spin_unlock_bh(&ft_xlat_lock);
 	if (cancelled) {
+		ft_xlat_dbg(flow, "withdrawn before the install");
 		kfree(o);
 		rc = -ECANCELED;
 		goto out;
@@ -878,6 +1026,8 @@ static int ft_xlat_admit(struct ft_xlat_offer *offer)
 			break;
 		entry[d] = e;
 	}
+	if (rc)
+		ft_xlat_dbg(flow, "dir=%u not installed (%d)", d, rc);
 	if (!rc) {
 		/* A route can change between its lookup and publication with
 		 * nothing to retire yet: IPv6 commits them from softirq without
@@ -886,11 +1036,17 @@ static int ft_xlat_admit(struct ft_xlat_offer *offer)
 		 * landed during the insertion retires them here -- taken out
 		 * below, so nothing need walk the table for them. */
 		for (d = 0; d < 2; d++)
-			if (!ft_dst_current(path[d].dst, path[d].cookie) &&
-			    ft_owner_mark(&o->owner))
-				atomic64_inc(&ft_route_invalidations);
-		if (!ft_install_current(entry[0]))
+			if (!ft_dst_current(path[d].dst, path[d].cookie)) {
+				ft_xlat_dbg(flow, "dir=%u route to %s changed during the install",
+					    d, ft_xlat_text(0, flow->dir[d].xlat.family,
+							    &flow->dir[d].xlat.dst));
+				if (ft_owner_mark(&o->owner))
+					atomic64_inc(&ft_route_invalidations);
+			}
+		if (!ft_install_current(entry[0])) {
+			ft_xlat_dbg(flow, "retired, or a latch set, during the install");
 			rc = -EIO;
+		}
 	}
 	if (rc) {
 		/* Neither direction stays without the other. */
@@ -960,6 +1116,8 @@ static void ft_xlat_refuse(struct ft_xlat_offer *offer)
 			heir->answers = true;
 		else
 			say = offer->answering = true;
+		ft_xlat_dbg(&offer->flow, "refused: %s", say ? "expired said now" :
+			    "expired said once the session's retired entries have left");
 	}
 	if (!say)
 		offer->done = true;
@@ -1040,13 +1198,22 @@ static void ft_xlat_workfn(struct work_struct *work)
 	for (i = 0; i < n; i++) {
 		struct ft_xlat_offer *offer = &ft_xlat_inflight[i];
 
-		if (!ft_xlat_admissible())
+		if (!ft_xlat_admissible()) {
+			ft_xlat_dbg(&offer->flow, "latched: observe %d invalid %d stopping %d failed %d",
+				    cdx_ft_observing(), atomic_read(&ft_invalid), ft_stopping,
+				    cdx_ft_failed());
 			rc = -EOPNOTSUPP;
-		else
-			rc = rtnl ? ft_xlat_admit(offer) : -EAGAIN;
+		} else if (!rtnl) {
+			ft_xlat_wait(&offer->flow, "waits for RTNL, taken elsewhere");
+			rc = -EAGAIN;
+		} else {
+			rc = ft_xlat_admit(offer);
+		}
 		if (rc == -EAGAIN) {
 			ft_xlat_busy++;
 			rc = ft_xlat_requeue(offer);
+			if (rc == -ENOSPC)
+				ft_xlat_dbg(&offer->flow, "queue filled behind it while it waited");
 			if (!rc) {
 				retry++;
 				continue;
@@ -1147,6 +1314,7 @@ int ask_xlat_unregister(const struct ask_xlat_ops *ops)
 	cancel_delayed_work_sync(&ft_xlat_work);
 	cdx_ft_begin();
 	while ((offer = ft_xlat_unqueue())) {
+		ft_xlat_dbg(&offer->flow, "client unregistering with the offer queued");
 		ft_xlat_refuse(offer);
 		spin_lock_bh(&ft_xlat_lock);
 		ft_xlat_ninflight = 0;

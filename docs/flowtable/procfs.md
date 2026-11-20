@@ -249,8 +249,10 @@ where each kind lives has changed. `qos_ports` and `qos_classes` are new.
     and `xlat=` for the family it leaves in, `4` or `6` (`-` on every other
     row), and prints `new_src=`/`new_dst=` in that family. `tos=` is the TOS
     or traffic class it leaves with: `copy` for each packet's own, or a fixed
-    value in hex. Both directions of a session carry its translator's cookie,
-    so `cookie=` joins them with each other and with the translator's session.
+    value in hex. Both directions of a session carry its translator's cookie.
+    `cookie=` prints it in hex, as on every row (a translator's cookie 20 is
+    `cookie=14`), and joins the two directions with each other and with the
+    translator's session.
     `nexthop=` is in the egress family, as for an SA of the other family.
     ```
     flow cookie=5e55 in=eth3 out=eth4 ... family=6 src=[fd00::2]:40001 dst=[64:ff9b::c633:640a]:5000 new_src=203.0.113.1:61001 new_dst=198.51.100.10:5000 proto=6 mtu=1500 ... detour=0 xlat=4 tos=copy nexthop=198.51.100.10 ...

@@ -1573,6 +1573,7 @@ static unsigned int ft_passive;
 /* ASK-DEBUG tracing is a printk in production; nothing to observe here. */
 #define ask_refuse(err) (err)
 #define ask_dbg(bit, fmt, ...) do { } while (0)
+#define ask_dbg_ratelimited(bit, fmt, ...) do { } while (0)
 /* Both tables read key_len bytes from the front of the address union, so the
  * caller hands over the same pointer for either family. */
 static struct neighbour *neigh_lookup(struct neigh_table *table, const void *dst, struct net_device *dev)

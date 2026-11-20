@@ -589,6 +589,15 @@ extern unsigned int cdx_ft_debug_mask;
 			pr_info("ASK-DEBUG: " fmt, ##__VA_ARGS__);	\
 	} while (0)
 
+/* The same for a site a sender can reach once a packet -- an offer made from
+ * softirq -- where a trace of every one would flood the log the moment the
+ * knob is on, as meta-ask has it from boot. */
+#define ask_dbg_ratelimited(bit, fmt, ...)				\
+	do {								\
+		if (unlikely(cdx_ft_debug_mask & (bit)))			\
+			pr_info_ratelimited("ASK-DEBUG: " fmt, ##__VA_ARGS__); \
+	} while (0)
+
 /* Wraps a refusal so that it names itself. Function and line rather than a
  * hand-written reason per site: there are two dozen of them, a string at each
  * would be one more thing to keep true, and the line is what a reader needs to

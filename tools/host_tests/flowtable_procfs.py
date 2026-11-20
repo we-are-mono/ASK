@@ -128,3 +128,16 @@ def test_qos_rows_and_the_class_width():
     flows = function(source, "ft_flows_show")
     assert flows.count("qos=%06x") == 2 and "qos=%05x" not in flows
     assert '"%06x"' in function(source, "ft_qos_class_row")
+
+
+def test_flows_rows_are_documented():
+    """Both families' flows rows print the fields the page lists, in its
+    order."""
+    flows = function(flowtable_source(), "ft_flows_show")
+    formats = re.findall(r'seq_printf\(seq, "flow (.*?)\\n"', flows)
+    assert len(formats) == 2, formats
+    rows = [re.findall(r"\b([a-z_]+)=", row) for row in formats]
+    assert rows[0] == rows[1], rows
+    entry = re.search(r"^- \*\*`flows`\*\*: `flow (.*?)`\.$", DOC.read_text(), re.M | re.S)
+    assert entry, f"flows has no fields line in {DOC.name}"
+    assert entry.group(1).split() == [f + "=" for f in rows[0]], entry.group(1)

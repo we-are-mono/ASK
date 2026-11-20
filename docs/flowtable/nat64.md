@@ -316,14 +316,34 @@ leaves translated; the second is its inverse, arriving on `rin=` if given,
 else on the device the route to `ndst` leaves by. `tos` is `copy` (the
 default) or a fixed value. Routes, neighbours, ports and the MTU are the
 adapter's to find, as they are for a translator's offer; `/proc/ask_flowtable/
-flows` shows the two rows (`xlat=`, `tos=`), and `status` and `stats` the
-`xlat_*` keys. With both ports at 1500 bytes only TCP is offloaded: the IPv4
+flows` shows the two rows (`xlat=`, `tos=`, and the cookie in hex), and
+`status` and `stats` the `xlat_*` keys. Why an offer went no
+further is in the kernel log under cdx's `ask_debug` refusal bit, one line per
+refusal naming the cookie, the direction and what decided it:
+
+```text
+ASK-DEBUG: xlat cookie=1 dir=0 neigh 10.0.0.232 on eth4 unresolved
+```
+
+With both ports at 1500 bytes only TCP is offloaded: the IPv4
 side's 1500-byte UDP packets are 1520 bytes as IPv6, so a UDP session needs
 the LAN port at an MTU of 1520 or more, and is refused otherwise (the write
 fails with `EOPNOTSUPP`). A session's slot is given back when it is said
 expired, or withdrawn with nothing more to say. A withdrawal that lands while
 its expired is being said keeps the slot until that call arrives, and the
 cookie cannot be offered again until then (`EBUSY`).
+
+`tools/tests/flowtable_xlat.py` drives it on the rig and skips on an image
+without it. Its cases cover:
+- a refusal, with its trace;
+- the rows;
+- the wire on a hairpin through the WAN port and from the LAN VM to the WAN
+  host, both ways, read from raw bytes;
+- the keepalive;
+- withdrawal;
+- retirement by a neighbour change and by a route going;
+- the drain on unload;
+- a load through the upload's entry.
 
 It replaces the earlier `cdx.xlat_test` hook, which installed one direction by
 hand straight through the encoder, MACs and MTU included. That hook could also

@@ -210,11 +210,17 @@ report.
 
 The bit stops fragmentation and nothing else, so it cannot keep UDP safe.
 
-**Found:**
-- the admission path logs no refusal reason (the flowtable path does, under
-  `ask_debug`);
-- a translated `flows` row's `cookie=` is the adapter's own, not the client's
-  session cookie.
+**Automated (2026-11-20):** `tools/tests/flowtable_xlat.py` covers all of
+the above apart from `FRAG_DISABLE`, plus the refusal trace. It passed all 10
+cases in about 50 s, and again later on the same boot. The attempt between
+those two stopped in setup, before any case ran: the WAN host's `nft` call
+creating the probe-drop table got no answer within 20 s, with nothing in that
+host's kernel log. `nft` on that host waits for an RCU grace period whenever a
+table with a hook goes, and this was probably one of those waits running long.
+
+**Found:** the admission path logged no refusal reason (the flowtable path
+does, under `ask_debug`). It does now. A translated row's `cookie=` looked
+like the adapter's own, but it is the client's cookie in hex (`14` for 20).
 
 ## Not measured
 
