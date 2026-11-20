@@ -163,7 +163,8 @@ result independently of those temporary files.
   hardware, without the detour's second pass or its exclusions (sessions, tunnels, jumbo ports). IPv6 stays in
   software regardless: a router may not fragment it.
 
-  **Measured 2026-11-19** (stock 210.10.1, 6.18 test image, `docs/flowtable/history/nat64-feasibility.md`):
+  **Measured 2026-11-19** (stock 210.10.1, 6.18 test image; one patterned UDP datagram with DF clear per shape,
+  reassembled and compared byte for byte, with an unfragmented control beside each):
   - Every payload came back byte-identical in 8 shapes:
     - hairpin eth4: plain NAT, NAT-PT 4to6, 6o4, PPPoE;
     - eth3→eth4: SNAT, into a PPPoE session and into a 4o6 tunnel (A202's own two shapes);
