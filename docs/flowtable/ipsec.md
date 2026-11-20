@@ -967,8 +967,8 @@ by the increments a dense burst loses (above), and `ipsec_sec_refused_<class>`
 gives each class under the names in `ft_sec_refusal[]`. Beside them,
 `ipsec_offline_port_rejected` counts what SEC did produce and the IPsec offline
 port then dropped because QMan would not take it: its exception queues full,
-the CPU behind; an egress port's queues for SEC's frames full; the Wi-Fi
-VAPs'; or, for a flow going back into SEC, SEC's own input group. And
+the CPU behind; an egress port's queues for SEC's frames full; or, for a flow
+going back into SEC, SEC's own input group. And
 `ipsec_sec_input_refused` counts the frames of a packet-offloaded SA that Linux
 handed SEC itself, either way, and SEC's input group refused ("Nor its own
 input", below); the driver had already counted each as given to SEC. No xfrm
@@ -1502,20 +1502,33 @@ offloaded TCP keeps 2.27 Gbit/s.
 case; `flowtable_service_ipsec_policy.py::test_receive_leaves_the_pool` proves
 the receive path borrows nothing, with every refill allocation failing.
 
-The Wi-Fi VAP forward queues are the same case. A decrypted flow leaving by a
-VAP is enqueued there by the offline port, and the CPU drains them -- copying a
-pool-34 frame out, taking an Ethernet-pool frame as it is -- into the radio's
-own queue behind `dev_queue_xmit()`, which drops rather than pushes back. They
-had no group (A334), so a decrypted stream faster than that drain, or a stall
-in it, took the pool the same way, and Ethernet traffic into a VAP the
-Ethernet pool. Every VAP's queues now join one group in frame mode with tail
-drop at `VWD_FWD_FRAMES`, 128 frames (`dpa_wifi.c`), set up before a VAP can
-open and released after the last queue: a share of SEC's pool, and of the
-Ethernet pool, for the CPU's lag only. One group for all VAPs rather than one
-per portal, which would multiply the pool's commitment; a CPU that falls behind
-holds it at its threshold for every VAP until it catches up. No rig test sends
-a flow out of a VAP; `tools/host_tests/wifi_forward_queues.py` compiles the
-queues with the group.
+The Wi-Fi VAP forward queues are the same case. The CPU drains them into the
+radio's own queue behind `dev_queue_xmit()`, which drops rather than pushes
+back. They had no group (A334), so Ethernet traffic into a VAP faster than that
+drain, or a stall in it, took the Ethernet pool the same way. Every VAP's queues
+now join one group in frame mode with tail drop at `VWD_FWD_FRAMES`, 128 frames
+(`dpa_wifi.c`), set up before a VAP can open and released after the last
+queue: a share of the pool for the CPU's lag only. One group for all VAPs
+rather than one per portal, which would multiply the pool's commitment; a CPU
+that falls behind holds it at its threshold for every VAP until it catches up.
+No rig test sends a flow out of a VAP; `tools/host_tests/wifi_forward_queues.py`
+compiles the queues with the group.
+
+A decrypted flow leaves only by a DPAA port, never by a CPU egress, a VAP or a
+WireGuard device: the walk refuses one, and the encoder would (A453). Its entry
+is on the offline port, which has no safe way to hand a CPU egress a frame of
+pool 34. Such an enqueue carries a storage profile, the one of the Ethernet
+port the flow arrived by, and on an offline port the microcode then copies the
+frame into a fresh buffer of that profile's pool, the Ethernet pool, and never
+releases the pool-34 buffer it came in, since an offline port has no
+`BMI_EBD`: measured out of a WireGuard device, one pool-34 buffer per frame.
+Without the profile the frame would stay in pool 34 inside the CPU egress's
+queues -- WireGuard's group bounds 2048 frames, sized for the Ethernet pool --
+and then on the port's forwarding queues rather than those for SEC's frames,
+which breaks the rule this section rests on: a pool-34 frame waits only in a
+queue bounded by a pool-34 share. Such a direction stays in software.
+`tools/host_tests/enqueue_hm.py` compiles the encoder's refusal, and
+`flowtable.c`'s `test_detour_egress` the walk's.
 
 #### Nor the ports it forwards to
 
@@ -1539,8 +1552,8 @@ its own that counts frames and drops at the tail (`sec_cgr`). An SA's ESP
 output takes them (`dpa_get_out_tx_info_by_itf_id()`, which builds only the
 offline port's entries), and so does a decrypted flow once
 `cdx_ipsec_fill_sec_info()` has moved it to the offline port's tables
-(`dpa_get_sec_tx_fqid()`); one that goes back into SEC, or out by a Wi-Fi VAP,
-keeps its queue. The group is sized as the forwarding group is, as many of the
+(`dpa_get_sec_tx_fqid()`); one that goes back into SEC keeps its queue. The
+group is sized as the forwarding group is, as many of the
 largest frames the port's MTU admits as take two milliseconds at the link's
 speed, never fewer than a burst of standard frames needs, so these frames wait
 no longer than the rest, but at most `IPSEC_EGRESS_FRAMES`, 128: 128 on a

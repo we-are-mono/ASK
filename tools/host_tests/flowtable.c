@@ -8697,6 +8697,102 @@ static void test_wireguard_egress(void)
     wg_unfixture();
 }
 
+/* Which egress the offline-port detour (cdx_detour.c) takes, and which a
+ * decrypted direction may leave by: a DPAA port only. Both put the direction's
+ * entry on an offline port, which cannot hand a CPU egress -- a WireGuard seal
+ * queue or a Wi-Fi VAP's -- its frame safely (create_enque_hm()): through the
+ * ingress port's storage profile it copies the frame and loses the buffer it
+ * arrived in, one per frame; without one the frame would wait in the CPU
+ * egress's queues outside its own pool's budget. */
+static void test_detour_egress(void)
+{
+    static const int ports[] = { 1500, 9000 };
+    static const u16 paths[] = { 68, 1280, 1419, 1420, 1421, 1499, 1500, 1501, 8999, 9000 };
+    struct cdx_ft_rule decoded;
+
+    detour_up = true;
+    /* UDP from the 1500-byte LAN port into a WireGuard device at 1420 takes
+     * no detour and stays in software, whether or not an unrelated policy is
+     * configured: refused before RTNL without one, and by the walk either
+     * way. With one the early refusal steps aside, as for every direction an
+     * SA could exempt, and the walk's answer is the same. */
+    for (unsigned policies = 0; policies < 2; policies++) {
+        wg_fixture(); udp_flow();
+        xfrm_policies = policies;
+        assert(ft_mtu_refused(&cls, binding.dev) == !policies);
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    }
+    /* Nor with the detour down. */
+    detour_up = false;
+    wg_fixture(); udp_flow();
+    assert(ft_mtu_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    /* The early refusal is sound for a WireGuard egress, the detour up or
+     * down, with no policy, a policy claiming nothing, an SA sending or one
+     * receiving; with nothing but the MTU to decide, exact; and nothing into
+     * WireGuard ever detours. */
+    for (unsigned up = 0; up < 2; up++)
+    for (unsigned tcp = 0; tcp < 2; tcp++)
+    for (unsigned sec = 0; sec < 4; sec++)
+    for (unsigned w = 0; w < ARRAY_SIZE(ports); w++)
+    for (unsigned p = 0; p < ARRAY_SIZE(paths); p++) {
+        wg_fixture();
+        if (!tcp) udp_flow();
+        detour_up = up;
+        xfrm_policies = sec > 0;
+        ipsec_sa = sec == 2 ? 7 : 0;
+        ipsec_in_sa = sec == 3 ? 8 : 0;
+        in.mtu = ports[w];
+        out.mtu = cls.nf_mtu = paths[p];
+        bool early = ft_mtu_refused(&cls, binding.dev);
+        int rc = ft_parse(&binding, &cls, &decoded, &next_hop);
+        assert(!early || rc == -EOPNOTSUPP);
+        if (!sec && !tcp)
+            assert(early == (rc != 0));
+        assert(rc || !decoded.detour);
+    }
+    detour_up = true;
+    in.mtu = 1500;
+    wg_unfixture();
+
+    /* A VAP never: UDP into it from the LAN port, on a path smaller than what
+     * arrives, stays in software. Into a path it fits, it is carried as
+     * before, with no detour. */
+    fixture(); vap_dev = &out; cls.nf_mtu = 1492;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    fixture(); vap_dev = &out;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && !decoded.detour);
+    /* A DPAA port still does. */
+    vap_dev = NULL;
+    fixture(); cls.nf_mtu = 1492;
+    assert(!ft_mtu_refused(&cls, binding.dev));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.detour);
+
+    /* A decrypted direction leaves only by a DPAA port: by a VAP or a
+     * WireGuard device the walk refuses it, so the backend, which would
+     * refuse it, is not asked at every offer. */
+    for (unsigned tcp = 0; tcp < 2; tcp++) {
+        fixture(); vap_dev = &out;
+        if (tcp) tcp_flow();
+        xfrm_policies = true; ipsec_in_sa = 8;
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+        vap_dev = NULL;
+        wg_fixture();
+        if (!tcp) udp_flow();
+        xfrm_policies = true; ipsec_in_sa = 8;
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+        wg_unfixture();
+        fixture();
+        if (tcp) tcp_flow();
+        xfrm_policies = true; ipsec_in_sa = 8;
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.in_sa_handle &&
+               !decoded.detour);
+    }
+    detour_up = false;
+    xfrm_policies = false;
+    ipsec_sa = ipsec_in_sa = 0;
+}
+
 static void test_device_dependencies(void)
 {
     struct net other_net;
@@ -11543,6 +11639,7 @@ int main(void)
     test_pppoe_stats();
     test_pppoe_session_ended();
     test_wireguard_egress();
+    test_detour_egress();
     test_tunnel();
     test_tunnel_stats();
     test_snat();

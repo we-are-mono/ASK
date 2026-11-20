@@ -4,8 +4,9 @@
  * Ethernet egress takes the port's queues for SEC's frames, which a group
  * counting frames bounds, never its forwarding queues, which a group counting
  * bytes bounds at thousands of small frames. A flow that goes back into SEC,
- * or out by a Wi-Fi VAP, keeps the queue it was given; one whose egress port
- * is gone stays in software.
+ * or out by a CPU egress, keeps the queue it was given -- the enqueue then
+ * refuses a CPU egress on this port (enqueue_hm.c) -- and one whose egress
+ * port is gone stays in software.
  */
 #include <assert.h>
 #include <stdbool.h>
@@ -146,7 +147,7 @@ int main(void)
     assert(!fill(1, 2, &eth_itf, false, &info, &ct));
     assert(info.to_sec_fqid == 0x5005 && info.l2_info.fqid == 0x103 && sec_lookups == 1);
 
-    /* Out by a Wi-Fi VAP: its own queues, bounded on their own. */
+    /* Out by a CPU egress: its own queue. */
     assert(!fill(1, 0, &vap_itf, true, &info, &ct));
     assert(info.l2_info.fqid == 0x700 && sec_lookups == 1);
 
@@ -161,6 +162,6 @@ int main(void)
     assert(fill(1, 3, &eth_itf, false, &info, &ct) == -1);
 
     puts("IPsec offline port egress: decrypted flows take the queues for SEC's frames; "
-         "re-encrypted, Wi-Fi and vanished egress handled");
+         "re-encrypted, CPU and vanished egress handled");
     return 0;
 }

@@ -537,17 +537,17 @@ rel_fd:
 
 /* Frames every VAP's forwarding queues may hold together before QMan refuses
  * the classifier's enqueue and FMan drops the frame. The CPU drains them,
- * copying out a frame in SEC's output pool and taking one in an Ethernet pool
- * as it is, and hands each to the radio's own queue behind dev_queue_xmit(),
- * which is where Wi-Fi traffic is meant to wait. A stream faster than that
- * drain -- a tunnel at its line rate into one radio -- backed up here without
- * bound: SEC's buffers until SEC refused every SA's jobs, an Ethernet pool's
- * until the ports dropped what they received. This covers the CPU's lag, and
- * is the Wi-Fi share of SEC's pool beside the exception queues' and each
- * Ethernet port's (IPSEC_EGRESS_FRAMES). One group for every VAP, though a
- * flow's queue is drained by one CPU: a share per portal would multiply the
- * pool's commitment, and a CPU that falls behind holds the group at its
- * threshold for every VAP until it catches up. */
+ * taking each frame in an Ethernet pool as it is, and hands each to the
+ * radio's own queue behind dev_queue_xmit(), which is where Wi-Fi traffic is
+ * meant to wait. A stream faster than that drain backed up here without bound,
+ * an Ethernet pool's buffers until the ports dropped what they received. Only
+ * a receive port's entry leaves by a VAP: a decrypted direction, whose frames
+ * are in SEC's output pool, is never offered one (create_enque_hm(), A453),
+ * so this group's share of SEC's pool (IPSEC_SHARE_FRAMES, dpa_ipsec.h) is
+ * headroom no frame of SEC's holds. One group for every VAP, though a flow's
+ * queue is drained by one CPU: a share per portal would multiply the pool's
+ * commitment, and a CPU that falls behind holds the group at its threshold for
+ * every VAP until it catches up. */
 #define VWD_FWD_FRAMES	IPSEC_SHARE_FRAMES
 
 /* No state-change notifications, so no portal owns the group; the egress

@@ -1350,7 +1350,9 @@ static bool cdx_wg_seal(struct cdx_wg_sealq *sq, struct net_device *dev,
  * port it may not send on -- handed to the device's own transmit, the
  * Ethernet header the classifier wrote dropped. Copied out: it is the rare
  * case, and a copy leaves the buffer's pool accounting alone whichever pool
- * it came from (an Ethernet port's, SEC's output, the fragment pool). */
+ * it came from: an Ethernet port's, or the fragment pool's for a fragment the
+ * receive entry made. No offline port's entry, so no frame of SEC's, reaches
+ * a seal queue (create_enque_hm(), A453). */
 static void cdx_wg_seal_slow(struct cdx_wg_dev *w, struct net_device *dev,
 			     const struct qm_fd *fd)
 {

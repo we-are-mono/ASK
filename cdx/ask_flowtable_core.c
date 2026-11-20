@@ -1929,7 +1929,10 @@ bool ft_mtu_carried(const struct cdx_ft_rule *rule, u32 mtu)
  * frame of such a direction came back from the port, measured (A393). Nor is
  * a port that delivers more than a standard frame: a jumbo one arrives in
  * several buffers, and a flood of them through the offline port timed out the
- * FMan's host-command channel, measured (A394). The port's
+ * FMan's host-command channel, measured (A394). And the egress is a DPAA
+ * port, never a CPU egress -- a WireGuard device or a Wi-Fi VAP -- which the
+ * offline port's entry cannot hand its frame safely and the backend refuses
+ * (create_enque_hm(), A453). The port's
  * readiness is fixed for CDX's life, and cdx's `detour` parameter is read
  * here, at admission. */
 static bool ft_detours(const struct cdx_ft_rule *rule)
@@ -1937,6 +1940,7 @@ static bool ft_detours(const struct cdx_ft_rule *rule)
 	return rule->family == AF_INET && rule->proto == IPPROTO_UDP &&
 	       !rule->sa_handle && !rule->in_sa_handle && !rule->in_session.present &&
 	       !rule->in_tunnel.present && !rule->out_tunnel.present &&
+	       cdx_ft_port_supported(rule->out) &&
 	       ft_port_arriving(rule->in) <= ETH_DATA_LEN && cdx_ft_detour_ready();
 }
 
@@ -2035,7 +2039,12 @@ static bool ft_mtu_refused(const struct flow_cls_offload *cls, const struct net_
 	}
 	/* An IPv4 UDP direction may take the detour unless it arrives by a
 	 * session, a tunnel or a jumbo port or leaves by a tunnel
-	 * (ft_detours()); what else would refuse it, the walk finds. */
+	 * (ft_detours()); what else would refuse it, the walk finds. Its
+	 * egress is a DPAA port, which only an Ethernet or ppp device can have
+	 * beneath it: a WireGuard device, which is its own egress, never
+	 * detours and is refused here as by the walk, and a Wi-Fi VAP, an
+	 * Ethernet device the request does not tell from a port, is left to the
+	 * walk. */
 	out = READ_ONCE(cls->nf_dst->dev);
 	detours = cdx_ft_detour_ready() &&
 		  basic.key->n_proto == htons(ETH_P_IP) && basic.key->ip_proto == IPPROTO_UDP &&
@@ -2624,6 +2633,16 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	if ((out->out_tunnel.present || out->in_tunnel.present) &&
 	    (out->sa_handle || out->in_sa_handle))
 		return ask_refuse(-EOPNOTSUPP);
+	/* A decrypted direction's entry is on the IPsec offline port, which
+	 * cannot hand a CPU egress -- a WireGuard device or a Wi-Fi VAP -- a
+	 * frame of SEC's pool safely, and the backend refuses one
+	 * (create_enque_hm(), A453). So it leaves only by a DPAA port; refused
+	 * here, the backend is not asked at every offer only to refuse. */
+	if (out->in_sa_handle && !cdx_ft_port_supported(out->out)) {
+		ask_dbg(ASK_DBG_DEVICE, "decrypted direction out by %s, not a DPAA port\n",
+			netdev_name(out->out));
+		return ask_refuse(-EOPNOTSUPP);
+	}
 	/* A port-less flow is keyed in the three-tuple tables, whose key binds
 	 * a session frame to its session ID but not to its concentrator
 	 * (cdx_pcd_session_key()): one received in a session is carried. One

@@ -3043,6 +3043,23 @@ static int create_enque_hm(struct ins_entry_info *info)
 		return FAILURE;
 	if (sizeof(struct en_ehash_enqueue_param) > info->param_size)
 		return FAILURE;
+	/* No offline port's entry leaves by a CPU egress, a WireGuard seal
+	 * queue or a Wi-Fi VAP's. Such an enqueue names the storage profile of
+	 * the Ethernet port the direction arrived by (rspid, below), and on an
+	 * offline port the microcode then copies the frame into a fresh buffer
+	 * of that profile's pool and never releases the one it arrived in (an
+	 * offline port has no BMI_EBD): measured, one buffer per frame, from
+	 * the Ethernet pool for a detoured frame and from SEC's output pool for
+	 * a decrypted one. Without the profile the frame would wait in the CPU
+	 * egress's queues in its own pool -- SEC's, the fragmenter's -- which
+	 * those queues' bound does not budget. Neither is safe; the adapter
+	 * offers no such direction. */
+	if (!info->to_sec_fqid && info->l2_info.is_wlan_iface &&
+	    dpaa_is_oh_port(info->port_id)) {
+		DPA_ERROR("%s::no CPU egress from offline port %u\n",
+			  __func__, info->port_id);
+		return FAILURE;
+	}
 	info->enqueue_params = info->paramptr;
 	param = (struct en_ehash_enqueue_param *)info->paramptr;
 	param->mtu = cpu_to_be16(info->l2_info.mtu);

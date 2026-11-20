@@ -263,6 +263,24 @@ FMan's host-command channel (A394). That leaves
 a download from a session into a LAN path below 1492, and UDP from a jumbo
 LAN into a standard path, in software.
 
+The detour leaves only by a DPAA port (`ft_detours()`), never by a CPU egress,
+a WireGuard device or a Wi-Fi VAP, which the frame reaches on a queue the CPU
+drains. An offline port has no safe way to hand one its frame. With the
+enqueue naming a storage profile, as a CPU egress's does -- the one of the
+Ethernet port the direction arrived by -- the microcode copies the frame into a
+fresh buffer of the profile's pool and never releases the one it arrived in,
+since an offline port has no `BMI_EBD`. A direction detoured into a WireGuard
+device at its default MTU of 1420 lost one Ethernet-pool buffer per frame, and
+a router's pool ran dry after some fifteen hours (A453; that an empty pool
+stays empty is A454). Without the profile the frame would wait in the CPU egress's queues in
+its own pool -- a fragment in the fragmenter's 512 buffers, under WireGuard's
+2048-frame bound -- which that bound does not budget. So the encoder refuses
+any CPU egress on an offline port (`create_enque_hm()`), and UDP into a
+WireGuard device smaller than what arrives stays in software until a seal path
+budgeted per source pool exists: refused by the walk whether or not an xfrm
+policy is configured, and before RTNL when none is. A receive port's own entry into
+WireGuard or a VAP is unchanged.
+
 An IPv4 direction into an SA is exempt because its entry is bounded
 differently; an IPv6 one is not, because out of SEC the offline port would
 fragment the decrypted IPv6 packet itself. The
@@ -282,7 +300,10 @@ before RTNL is taken, counted as a reject and never as busy, retiring nothing:
 anything other than TCP whose path is below the port bound less the most the
 ingress device's kind can strip: nothing through an Ethernet device, a
 session's 8 bytes through a ppp one, 28 through a sit tunnel and 48 through
-any other (a session and a 4in6 outer header). It does
+any other (a session and a 4in6 outer header), unless it is IPv4 UDP the
+detour could carry, from an Ethernet device on a standard port into an
+Ethernet or ppp device (a VAP is an Ethernet device too; the walk refuses its
+detour). It does
 so only while no xfrm policy or blocking default is configured and neither
 destination carries a transform, because an SA exempts an IPv4 direction and a
 policy denial retires the generation, and only the walk under RTNL finds out

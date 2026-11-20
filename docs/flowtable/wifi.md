@@ -377,6 +377,17 @@ VAP's frame queue instead of a MAC port's.
 Proof: a WAN-to-Wi-Fi transfer offloaded, with the entry's own packet counter
 tracking the transfer and the software forwarding path idle.
 
+Only from the receive port's own entry. The enqueue carries the storage
+profile of the Ethernet port the flow arrived by, over the Ethernet pool VWD
+refills (`cdx/vsp_cfg.c`); harmless on a receive port, it makes an offline
+port copy the frame into a fresh buffer and never release the one it came in,
+and without it the frame would wait in the VAP's queues in a pool they do not
+budget. So no offline port's entry leaves by a VAP, as by any CPU egress --
+not the detour's, not a decrypted flow's: admission does not offer one and
+`create_enque_hm()` refuses one (A453,
+[architecture](architecture.md#the-offline-port-detour), [IPsec](ipsec.md)).
+Such a flow stays in software.
+
 ### 6. The ingress half -- not built, and the measurement says why
 
 Step 4 was allowed to conclude that the ingress half buys nothing. It does.

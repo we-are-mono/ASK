@@ -100,8 +100,10 @@ struct sec_descriptor {
  * pool:
  *
  *   - fixed shares of IPSEC_SHARE_FRAMES each: the exception queues
- *     (IPSEC_EXCEPTION_FRAMES), the Wi-Fi VAPs' queues (VWD_FWD_FRAMES) and
- *     each Ethernet port's queues for these frames (IPSEC_EGRESS_FRAMES) --
+ *     (IPSEC_EXCEPTION_FRAMES), each Ethernet port's queues for these frames
+ *     (IPSEC_EGRESS_FRAMES), and one kept for the Wi-Fi VAPs' queues
+ *     (VWD_FWD_FRAMES), which no frame of SEC's reaches since a decrypted
+ *     direction never leaves by a CPU egress (A453), so it is headroom --
  *     896 on a board of five ports;
  *   - four shares for the SAs' input queues (IPSEC_TO_SEC_FRAMES), where a
  *     frame one SA decrypted waits for the SA that encrypts it again, among

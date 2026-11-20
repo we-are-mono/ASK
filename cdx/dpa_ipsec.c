@@ -1309,10 +1309,10 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 
 /* The frames the IPsec offline port dropped because QMan refused to enqueue
  * them: the exception group full (IPSEC_EXCEPTION_FRAMES), the CPU behind;
- * an egress port's group for SEC's frames full (IPSEC_EGRESS_FRAMES); the
- * Wi-Fi VAPs' (VWD_FWD_FRAMES); or, for a flow going back into SEC, the
- * to-SEC group (IPSEC_TO_SEC_FRAMES). 32 bits, wrapping; -ENODEV without the
- * port. */
+ * an egress port's group for SEC's frames full (IPSEC_EGRESS_FRAMES); or, for
+ * a flow going back into SEC, the to-SEC group (IPSEC_TO_SEC_FRAMES). No entry
+ * on the port leaves by a CPU egress (A453). 32 bits, wrapping; -ENODEV
+ * without the port. */
 int cdx_dpa_ipsec_offline_port_rejected(u32 *count)
 {
 	if (!cdx_dpa_ipsec_ready())
