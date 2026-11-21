@@ -36,6 +36,7 @@ import _wire_loss as wire_loss
 # Written on the DUT by a case that ends its boot, before it starts. The
 # rootfs is an initramfs, so only a new boot clears it.
 BOOT_SPENT = "/run/ask-test-boot-spent"
+KMEMLEAK = "/sys/kernel/debug/kmemleak"
 
 
 # ---- per-test aiohttp ---------------------------------------------------
@@ -124,6 +125,15 @@ async def bench_health(request, hardware_bench, dmesg_allowlist, dut_uart):
         kernel_config = gzip.decompress(bytes.fromhex(config["content_hex"])).decode()
         assert "CONFIG_KASAN=y" in kernel_config.splitlines(), (
             "DUT tests require KASAN; rebuild with make ask-image, stage and boot it")
+        # kmemleak's own scanner walks the whole heap every ten minutes and
+        # holds a CPU for 30-60 s of it on this image: a CPU-bound measurement
+        # it overlaps reads low (an SQM ingress download fell to 7 Mbit/s under
+        # its 20 Mbit/s cap while one ran). Every leak check here scans on
+        # demand (Agent.kmemleak), so the background scan is off for the boot;
+        # switching it off waits out a scan already running.
+        if "CONFIG_DEBUG_KMEMLEAK=y" in kernel_config.splitlines():
+            result = await client.TARGET.fs_write(session, KMEMLEAK, "scan=off", timeout_ms=120000)
+            assert result["errno"] == 0, ("switching kmemleak's background scan off", result)
         boot = await client.TARGET.boot_log(session)
         record("boot-kernel", boot, nodeid="session")
         try:
