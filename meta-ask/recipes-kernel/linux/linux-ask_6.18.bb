@@ -1,11 +1,11 @@
-# The 6.18 kernel line: Linux 6.18.63 with NXP's lf-6.18.37-2.1.0 SDK. What
+# The 6.18 kernel line: Linux 6.18.64 with NXP's lf-6.18.37-2.1.0 SDK. What
 # every line shares is in linux-ask.inc.
 ASK_KERNEL_LINE = "6.18"
 
-LINUX_VERSION = "6.18.63"
+LINUX_VERSION = "6.18.64"
 KERNEL_BRANCH = "linux-6.18.y"
-# v6.18.63, peeled.
-KERNEL_SRCREV = "1cdda838e8475edf89b73ff0cc952005dd0b1fa7"
+# v6.18.64, peeled.
+KERNEL_SRCREV = "fd7cfd39c88596fec816639ad83cbf3e9d316372"
 NXP_SDK_BRANCH = "lf-6.18.y"
 
 require linux-ask.inc

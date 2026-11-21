@@ -763,10 +763,15 @@ def test_legacy_tables_and_tc_are_judged_as_well():
         return body[body.index(line):]
 
     # Where a table's hooks are built and registered: by xt_register_table()
-    # itself, which also waits out a failed registration's readers (6.18), or
-    # by each family's registration, which patch 148 makes wait (6.12).
-    xt_hooks = "nf_register_net_hooks(" in function(
-        (kernel / "net/netfilter/x_tables.c").read_text(), "xt_register_table")
+    # itself, which also waits out a failed registration's readers (6.12.117
+    # on, 6.18), or by each family's registration, which patch 148 makes
+    # wait (6.12 before). And where the table goes on removal: freed by
+    # xt_unregister_table() (6.12.117 on), or by the family's own removal
+    # after it (6.18).
+    x_tables = (kernel / "net/netfilter/x_tables.c").read_text()
+    xt_hooks = "nf_register_net_hooks(" in function(x_tables, "xt_register_table")
+    xt_frees = (re.search(r"\bxt_unregister_table\(struct xt_table \*table\)", x_tables) is not None
+                and "kfree(table);" in function(x_tables, "xt_unregister_table"))
     for path, prefix in (("net/ipv4/netfilter/ip_tables.c", "ipt"),
                          ("net/ipv6/netfilter/ip6_tables.c", "ip6t")):
         body = sections[path]
@@ -791,7 +796,8 @@ def test_legacy_tables_and_tc_are_judged_as_well():
                  " \t\tgoto put_module;", counted)
         if xt_hooks:
             _ordered(_hunk_in(body, f"__{prefix}_unregister_table("),
-                     " \txt_free_table_info(private);", " \tkfree(table);", counted)
+                     " \txt_free_table_info(private);",
+                     *(() if xt_frees else (" \tkfree(table);",)), counted)
             register = next(h for head, h in _hunks(body)
                             if f"int {prefix}_register_table(" in head)
             _ordered(register, " \t\treturn PTR_ERR(new_table);", counted, " \treturn ret;")
@@ -849,8 +855,14 @@ def test_legacy_tables_and_tc_are_judged_as_well():
                  "synchronize_rcu();", "goto out;", "kfree(ops);")
         failed = after("net/netfilter/nf_nat_core.c", "nf_nat_register_fn",
                        "ret = nf_register_net_hooks(net, nat_ops, ops_count);")
-        _ordered(failed, "goto err_free_hooks;", "err_free_hooks:",
-                 "kfree_rcu(priv, rcu_head);", "kfree_rcu(nat_ops, rcu);")
+        # By a label after the function's return (6.18), or freed in place
+        # before the failure returns (6.12.117 on): by RCU either way.
+        if "goto err_free_hooks;" in failed:
+            _ordered(failed, "goto err_free_hooks;", "err_free_hooks:",
+                     "kfree_rcu(priv, rcu_head);", "kfree_rcu(nat_ops, rcu);")
+        else:
+            _ordered(failed, "if (ret < 0) {", "kfree_rcu(priv, rcu_head);",
+                     "kfree_rcu(nat_ops, rcu);\n\t\t\treturn ret;")
         unregistered = after("net/netfilter/nf_nat_core.c", "nf_nat_unregister_fn",
                              "nf_unregister_net_hooks(net, nat_ops, ops_count);")
         _ordered(unregistered, "kfree_rcu(priv, rcu_head);", "kfree_rcu(nat_ops, rcu);")
@@ -858,8 +870,11 @@ def test_legacy_tables_and_tc_are_judged_as_well():
         for path, init, prefix, family in (
                 ("net/ipv4/netfilter/iptable_nat.c", "iptable_nat_table_init", "ipt", "IPV4"),
                 ("net/ipv6/netfilter/ip6table_nat.c", "ip6table_nat_table_init", "ip6t", "IPV6")):
-            _ordered(after(path, init, f"ret = {prefix}_nat_register_lookups(net);"),
-                     "if (ret < 0) {", f"xt_unregister_table_pre_exit(net, NFPROTO_{family}, \"nat\");",
+            # Linux's own wait, behind taking the table out of the list
+            # (6.18), or patch 148's (6.12).
+            lookups = after(path, init, f"ret = {prefix}_nat_register_lookups(net);")
+            pre_exit = f"xt_unregister_table_pre_exit(net, NFPROTO_{family}, \"nat\");"
+            _ordered(lookups, "if (ret < 0) {", *((pre_exit,) if pre_exit in lookups else ()),
                      "synchronize_rcu();", f"{prefix}_unregister_table_exit(net, \"nat\");")
     else:
         failed = next(text for head, text in _hunks(nat) if "nf_nat_register_fn(" in head and

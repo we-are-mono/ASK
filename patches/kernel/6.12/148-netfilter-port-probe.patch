@@ -1,4 +1,4 @@
-From 4701fce758818a32cc0838bb62db1516a6e91cab Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 24 Sep 2026 01:55:38 +0200
 Subject: [PATCH] netfilter: let an offload ask whether the ruleset reads a
@@ -90,21 +90,21 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  include/net/netfilter/nf_nat.h         |   11 +
  include/net/netfilter/nf_port_probe.h  |  117 ++
  include/net/netfilter/nf_tables.h      |   21 +
- include/net/netfilter/nf_tables_core.h |   56 +
+ include/net/netfilter/nf_tables_core.h |   55 +
  include/net/netfilter/nft_nat.h        |   34 +
  include/net/netns/netfilter.h          |    5 +
- net/ipv4/netfilter/ip_tables.c         |  309 +++-
+ net/ipv4/netfilter/ip_tables.c         |  290 ++-
  net/ipv4/netfilter/iptable_nat.c       |    8 +-
- net/ipv6/netfilter/ip6_tables.c        |  350 +++-
+ net/ipv6/netfilter/ip6_tables.c        |  331 +++-
  net/ipv6/netfilter/ip6table_nat.c      |    8 +-
  net/netfilter/Makefile                 |    2 +-
  net/netfilter/core.c                   |   54 +
- net/netfilter/nf_nat_core.c            |   19 +-
+ net/netfilter/nf_nat_core.c            |    8 +-
  net/netfilter/nf_tables_api.c          |    1 +
- net/netfilter/nf_tables_port_probe.c   | 2365 ++++++++++++++++++++++++
+ net/netfilter/nf_tables_port_probe.c   | 2370 ++++++++++++++++++++++++
  net/netfilter/nfnetlink_hook.c         |    2 +
  net/netfilter/nft_bitwise.c            |   10 -
- net/netfilter/nft_byteorder.c          |    8 -
+ net/netfilter/nft_byteorder.c          |    7 -
  net/netfilter/nft_cmp.c                |    7 -
  net/netfilter/nft_ct.c                 |    2 +
  net/netfilter/nft_dynset.c             |    5 +
@@ -114,14 +114,14 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/netfilter/nft_objref.c             |    6 -
  net/netfilter/nft_range.c              |    8 -
  net/netfilter/nft_redir.c              |    7 +-
- net/netfilter/x_tables.c               |   58 +
- 30 files changed, 3421 insertions(+), 88 deletions(-)
+ net/netfilter/x_tables.c               |   65 +-
+ 30 files changed, 3389 insertions(+), 81 deletions(-)
  create mode 100644 include/net/netfilter/nf_port_probe.h
  create mode 100644 include/net/netfilter/nft_nat.h
  create mode 100644 net/netfilter/nf_tables_port_probe.c
 
 diff --git a/include/linux/netfilter.h b/include/linux/netfilter.h
-index 2b8aac2c70ad..42ac5238fc3c 100644
+index 9b3357d8d8c3e..3e625ddc60d04 100644
 --- a/include/linux/netfilter.h
 +++ b/include/linux/netfilter.h
 @@ -92,6 +92,12 @@ enum nf_hook_ops_type {
@@ -138,10 +138,10 @@ index 2b8aac2c70ad..42ac5238fc3c 100644
  
  struct nf_hook_ops {
 diff --git a/include/linux/netfilter/x_tables.h b/include/linux/netfilter/x_tables.h
-index 5897f3dbaf7c..84fcad81c91b 100644
+index 3716b42a4ad60..c30c2525ab660 100644
 --- a/include/linux/netfilter/x_tables.h
 +++ b/include/linux/netfilter/x_tables.h
-@@ -449,6 +449,9 @@ xt_get_per_cpu_counter(struct xt_counters *cnt, unsigned int cpu)
+@@ -450,6 +450,9 @@ xt_get_per_cpu_counter(struct xt_counters *cnt, unsigned int cpu)
  
  struct nf_hook_ops *xt_hook_ops_alloc(const struct xt_table *, nf_hookfn *);
  
@@ -152,7 +152,7 @@ index 5897f3dbaf7c..84fcad81c91b 100644
  void xt_unregister_template(const struct xt_table *t);
  
 diff --git a/include/net/netfilter/nf_nat.h b/include/net/netfilter/nf_nat.h
-index 9877f064548a..71112fad66ce 100644
+index 9877f064548a2..71112fad66ce3 100644
 --- a/include/net/netfilter/nf_nat.h
 +++ b/include/net/netfilter/nf_nat.h
 @@ -100,6 +100,17 @@ void nf_nat_ipv6_unregister_fn(struct net *net, const struct nf_hook_ops *ops);
@@ -175,7 +175,7 @@ index 9877f064548a..71112fad66ce 100644
  	       const struct nf_hook_state *state);
 diff --git a/include/net/netfilter/nf_port_probe.h b/include/net/netfilter/nf_port_probe.h
 new file mode 100644
-index 000000000000..bd0516c48fe2
+index 0000000000000..bd0516c48fe2f
 --- /dev/null
 +++ b/include/net/netfilter/nf_port_probe.h
 @@ -0,0 +1,117 @@
@@ -297,7 +297,7 @@ index 000000000000..bd0516c48fe2
 +
 +#endif /* _NF_PORT_PROBE_H */
 diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
-index 9cbad535ddc4..59e675307b1d 100644
+index ca6061bd73f3b..4be81cf250649 100644
 --- a/include/net/netfilter/nf_tables.h
 +++ b/include/net/netfilter/nf_tables.h
 @@ -11,6 +11,7 @@
@@ -308,7 +308,7 @@ index 9cbad535ddc4..59e675307b1d 100644
  #include <net/netlink.h>
  #include <net/flow_offload.h>
  #include <net/netns/generic.h>
-@@ -563,6 +564,8 @@ struct nft_set_elem_expr {
+@@ -572,6 +573,8 @@ struct nft_set_elem_expr {
   * 	@klen: key length
   * 	@dlen: data length
   *	@num_exprs: numbers of exprs
@@ -317,7 +317,7 @@ index 9cbad535ddc4..59e675307b1d 100644
   *	@exprs: stateful expression
   *	@catchall_list: list of catch-all set element
   * 	@data: private set data
-@@ -598,6 +601,7 @@ struct nft_set {
+@@ -607,6 +610,7 @@ struct nft_set {
  	u8				klen;
  	u8				dlen;
  	u8				num_exprs;
@@ -325,7 +325,7 @@ index 9cbad535ddc4..59e675307b1d 100644
  	struct nft_expr			*exprs[NFT_SET_EXPR_MAX];
  	struct list_head		catchall_list;
  	unsigned char			data[]
-@@ -1954,4 +1958,21 @@ static inline bool nft_commit_in_progress(const struct net *net)
+@@ -1958,4 +1962,21 @@ static inline bool nft_commit_in_progress(const struct net *net)
  	return smp_load_acquire(&net->nft.commit_applying);
  }
  
@@ -348,7 +348,7 @@ index 9cbad535ddc4..59e675307b1d 100644
 +
  #endif /* _NET_NF_TABLES_H */
 diff --git a/include/net/netfilter/nf_tables_core.h b/include/net/netfilter/nf_tables_core.h
-index 04699eac5b52..3ff5af4cc605 100644
+index 04699eac5b524..9ccb83691cf33 100644
 --- a/include/net/netfilter/nf_tables_core.h
 +++ b/include/net/netfilter/nf_tables_core.h
 @@ -69,6 +69,10 @@ struct nft_ct {
@@ -362,7 +362,7 @@ index 04699eac5b52..3ff5af4cc605 100644
  };
  
  struct nft_payload {
-@@ -78,6 +82,58 @@ struct nft_payload {
+@@ -78,6 +82,57 @@ struct nft_payload {
  	u8			dreg;
  };
  
@@ -399,7 +399,6 @@ index 04699eac5b52..3ff5af4cc605 100644
 +	u8			sreg;
 +	u8			dreg;
 +	enum nft_byteorder_ops	op:8;
-+	u8			len;
 +	u8			size;
 +};
 +
@@ -423,7 +422,7 @@ index 04699eac5b52..3ff5af4cc605 100644
  extern const struct nft_expr_ops nft_bitwise_fast_ops;
 diff --git a/include/net/netfilter/nft_nat.h b/include/net/netfilter/nft_nat.h
 new file mode 100644
-index 000000000000..faf9a762bd5c
+index 0000000000000..faf9a762bd5c8
 --- /dev/null
 +++ b/include/net/netfilter/nft_nat.h
 @@ -0,0 +1,34 @@
@@ -462,7 +461,7 @@ index 000000000000..faf9a762bd5c
 +
 +#endif
 diff --git a/include/net/netns/netfilter.h b/include/net/netns/netfilter.h
-index a6a0bf4a247e..aa8d6d05927e 100644
+index a6a0bf4a247e5..aa8d6d05927e3 100644
 --- a/include/net/netns/netfilter.h
 +++ b/include/net/netns/netfilter.h
 @@ -3,6 +3,7 @@
@@ -484,7 +483,7 @@ index a6a0bf4a247e..aa8d6d05927e 100644
  };
  #endif
 diff --git a/net/ipv4/netfilter/ip_tables.c b/net/ipv4/netfilter/ip_tables.c
-index 0ba456c4c634..3a1bac1db1b3 100644
+index 2411ef91d2962..21bef5f6c0b0d 100644
 --- a/net/ipv4/netfilter/ip_tables.c
 +++ b/net/ipv4/netfilter/ip_tables.c
 @@ -25,6 +25,8 @@
@@ -815,49 +814,15 @@ index 0ba456c4c634..3a1bac1db1b3 100644
  }
  
  int ipt_register_table(struct net *net, const struct xt_table *table,
-@@ -1755,8 +2039,10 @@ int ipt_register_table(struct net *net, const struct xt_table *table,
- 	/* No template? No need to do anything. This is used by 'nat' table, it registers
- 	 * with the nat core instead of the netfilter core.
- 	 */
--	if (!template_ops)
-+	if (!template_ops) {
-+		nf_xt_changed(net);
- 		return 0;
-+	}
- 
- 	num_ops = hweight32(table->valid_hooks);
- 	if (num_ops == 0) {
-@@ -1770,15 +2056,27 @@ int ipt_register_table(struct net *net, const struct xt_table *table,
- 		goto out_free;
+@@ -1750,6 +2034,7 @@ int ipt_register_table(struct net *net, const struct xt_table *table,
+ 		return PTR_ERR(new_table);
  	}
- 
--	for (i = 0; i < num_ops; i++)
-+	/* Typed, so that the port probe finds the table behind the hook,
-+	 * whichever function the table's module runs it with.
-+	 */
-+	for (i = 0; i < num_ops; i++) {
- 		ops[i].priv = new_table;
-+		ops[i].hook_ops_type = NF_HOOK_OP_XTABLES;
-+	}
- 
- 	new_table->ops = ops;
- 
- 	ret = nf_register_net_hooks(net, ops, num_ops);
--	if (ret != 0)
-+	if (ret != 0) {
-+		/* The hooks that did register were unregistered again, but a
-+		 * reader of the hook list under RCU may still hold them, the
-+		 * table behind them and their ops, which go below.
-+		 */
-+		synchronize_rcu();
- 		goto out_free;
-+	}
  
 +	nf_xt_changed(net);
  	return ret;
+ }
  
- out_free:
-@@ -1865,6 +2163,7 @@ static int __init ip_tables_init(void)
+@@ -1832,6 +2117,7 @@ static int __init ip_tables_init(void)
  	if (ret < 0)
  		goto err4;
  
@@ -865,7 +830,7 @@ index 0ba456c4c634..3a1bac1db1b3 100644
  	return 0;
  
  err4:
-@@ -1877,6 +2176,8 @@ static int __init ip_tables_init(void)
+@@ -1844,6 +2130,8 @@ static int __init ip_tables_init(void)
  
  static void __exit ip_tables_fini(void)
  {
@@ -875,7 +840,7 @@ index 0ba456c4c634..3a1bac1db1b3 100644
  
  	xt_unregister_targets(ipt_builtin_tg, ARRAY_SIZE(ipt_builtin_tg));
 diff --git a/net/ipv4/netfilter/iptable_nat.c b/net/ipv4/netfilter/iptable_nat.c
-index a5db7c67d61b..61e71912c96a 100644
+index 625a1ca13b1ba..245b7cd1ae1c0 100644
 --- a/net/ipv4/netfilter/iptable_nat.c
 +++ b/net/ipv4/netfilter/iptable_nat.c
 @@ -119,8 +119,14 @@ static int iptable_nat_table_init(struct net *net)
@@ -895,7 +860,7 @@ index a5db7c67d61b..61e71912c96a 100644
  	kfree(repl);
  	return ret;
 diff --git a/net/ipv6/netfilter/ip6_tables.c b/net/ipv6/netfilter/ip6_tables.c
-index f4e01f451d57..be15f987985c 100644
+index 551d3ca1036d7..18b3d8b38d5f5 100644
 --- a/net/ipv6/netfilter/ip6_tables.c
 +++ b/net/ipv6/netfilter/ip6_tables.c
 @@ -29,6 +29,8 @@
@@ -1267,49 +1232,15 @@ index f4e01f451d57..be15f987985c 100644
  }
  
  int ip6t_register_table(struct net *net, const struct xt_table *table,
-@@ -1766,8 +2091,10 @@ int ip6t_register_table(struct net *net, const struct xt_table *table,
+@@ -1764,6 +2089,7 @@ int ip6t_register_table(struct net *net, const struct xt_table *table,
  		return PTR_ERR(new_table);
  	}
  
--	if (!template_ops)
-+	if (!template_ops) {
-+		nf_xt_changed(net);
- 		return 0;
-+	}
- 
- 	num_ops = hweight32(table->valid_hooks);
- 	if (num_ops == 0) {
-@@ -1781,15 +2108,27 @@ int ip6t_register_table(struct net *net, const struct xt_table *table,
- 		goto out_free;
- 	}
- 
--	for (i = 0; i < num_ops; i++)
-+	/* Typed, so that the port probe finds the table behind the hook,
-+	 * whichever function the table's module runs it with.
-+	 */
-+	for (i = 0; i < num_ops; i++) {
- 		ops[i].priv = new_table;
-+		ops[i].hook_ops_type = NF_HOOK_OP_XTABLES;
-+	}
- 
- 	new_table->ops = ops;
- 
- 	ret = nf_register_net_hooks(net, ops, num_ops);
--	if (ret != 0)
-+	if (ret != 0) {
-+		/* The hooks that did register were unregistered again, but a
-+		 * reader of the hook list under RCU may still hold them, the
-+		 * table behind them and their ops, which go below.
-+		 */
-+		synchronize_rcu();
- 		goto out_free;
-+	}
- 
 +	nf_xt_changed(net);
  	return ret;
+ }
  
- out_free:
-@@ -1877,6 +2216,7 @@ static int __init ip6_tables_init(void)
+@@ -1847,6 +2173,7 @@ static int __init ip6_tables_init(void)
  	if (ret < 0)
  		goto err4;
  
@@ -1317,7 +1248,7 @@ index f4e01f451d57..be15f987985c 100644
  	return 0;
  
  err4:
-@@ -1889,6 +2229,8 @@ static int __init ip6_tables_init(void)
+@@ -1859,6 +2186,8 @@ static int __init ip6_tables_init(void)
  
  static void __exit ip6_tables_fini(void)
  {
@@ -1327,7 +1258,7 @@ index f4e01f451d57..be15f987985c 100644
  
  	xt_unregister_targets(ip6t_builtin_tg, ARRAY_SIZE(ip6t_builtin_tg));
 diff --git a/net/ipv6/netfilter/ip6table_nat.c b/net/ipv6/netfilter/ip6table_nat.c
-index e119d4f090cc..2417720dfbc7 100644
+index 5be723232df8f..697da17eb6f41 100644
 --- a/net/ipv6/netfilter/ip6table_nat.c
 +++ b/net/ipv6/netfilter/ip6table_nat.c
 @@ -121,8 +121,14 @@ static int ip6table_nat_table_init(struct net *net)
@@ -1347,7 +1278,7 @@ index e119d4f090cc..2417720dfbc7 100644
  	kfree(repl);
  	return ret;
 diff --git a/net/netfilter/Makefile b/net/netfilter/Makefile
-index f0aa4d7ef499..0ebadc026948 100644
+index f0aa4d7ef4998..0ebadc0269480 100644
 --- a/net/netfilter/Makefile
 +++ b/net/netfilter/Makefile
 @@ -92,7 +92,7 @@ nf_tables-objs := nf_tables_core.o nf_tables_api.o nft_chain_filter.o \
@@ -1360,7 +1291,7 @@ index f0aa4d7ef499..0ebadc026948 100644
  ifdef CONFIG_X86_64
  ifndef CONFIG_UML
 diff --git a/net/netfilter/core.c b/net/netfilter/core.c
-index b9f551f02c81..d3cbdf19ac3c 100644
+index b9f551f02c813..d3cbdf19ac3c5 100644
 --- a/net/netfilter/core.c
 +++ b/net/netfilter/core.c
 @@ -23,6 +23,7 @@
@@ -1432,7 +1363,7 @@ index b9f551f02c81..d3cbdf19ac3c 100644
  u8 nf_ctnetlink_has_listener;
  EXPORT_SYMBOL_GPL(nf_ctnetlink_has_listener);
 diff --git a/net/netfilter/nf_nat_core.c b/net/netfilter/nf_nat_core.c
-index 041ab3733baa..f7737e648b06 100644
+index 109c12fdc57d7..5a6fa297dbd5a 100644
 --- a/net/netfilter/nf_nat_core.c
 +++ b/net/netfilter/nf_nat_core.c
 @@ -39,12 +39,6 @@ static struct hlist_head *nf_nat_bysource __read_mostly;
@@ -1448,7 +1379,7 @@ index 041ab3733baa..f7737e648b06 100644
  struct nf_nat_hooks_net {
  	struct nf_hook_ops *nat_hook_ops;
  	unsigned int users;
-@@ -1231,6 +1225,8 @@ int nf_nat_register_fn(struct net *net, u8 pf, const struct nf_hook_ops *ops,
+@@ -1232,6 +1226,8 @@ int nf_nat_register_fn(struct net *net, u8 pf, const struct nf_hook_ops *ops,
  		}
  
  		for (i = 0; i < ops_count; i++) {
@@ -1457,36 +1388,11 @@ index 041ab3733baa..f7737e648b06 100644
  			priv = kzalloc(sizeof(*priv), GFP_KERNEL);
  			if (priv) {
  				nat_ops[i].priv = priv;
-@@ -1246,6 +1242,10 @@ int nf_nat_register_fn(struct net *net, u8 pf, const struct nf_hook_ops *ops,
- 		ret = nf_register_net_hooks(net, nat_ops, ops_count);
- 		if (ret < 0) {
- 			mutex_unlock(&nf_nat_proto_mutex);
-+			/* As on unregistration: the hooks that did register
-+			 * may still be held by a reader of the hook list.
-+			 */
-+			synchronize_rcu();
- 			for (i = 0; i < ops_count; i++)
- 				kfree(nat_ops[i].priv);
- 			kfree(nat_ops);
-@@ -1312,7 +1312,12 @@ void nf_nat_unregister_fn(struct net *net, u8 pf, const struct nf_hook_ops *ops,
- 		}
- 
- 		nat_proto_net->nat_hook_ops = NULL;
--		kfree(nat_ops);
-+		/* After a grace period, as the private data is: a reader of the
-+		 * hook list under RCU -- the hook dump, the x_tables port probe
-+		 * -- may hold a pointer into the array, which the unregistration
-+		 * only replaces in the list it leaves behind.
-+		 */
-+		kvfree_rcu_mightsleep(nat_ops);
- 	}
- unlock:
- 	mutex_unlock(&nf_nat_proto_mutex);
 diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
-index 63c141040997..ce5a6ce6a7a3 100644
+index b4eb8eaefcc16..c3013e062f32a 100644
 --- a/net/netfilter/nf_tables_api.c
 +++ b/net/netfilter/nf_tables_api.c
-@@ -2655,6 +2655,7 @@ static int nf_tables_updchain(struct nft_ctx *ctx, u8 genmask, u8 policy,
+@@ -2671,6 +2671,7 @@ static int nf_tables_updchain(struct nft_ctx *ctx, u8 genmask, u8 policy,
  				h->ops.priority	= basechain->ops.priority;
  				h->ops.priv	= basechain->ops.priv;
  				h->ops.hook	= basechain->ops.hook;
@@ -1496,10 +1402,10 @@ index 63c141040997..ce5a6ce6a7a3 100644
  					list_del(&h->list);
 diff --git a/net/netfilter/nf_tables_port_probe.c b/net/netfilter/nf_tables_port_probe.c
 new file mode 100644
-index 000000000000..df7c6cbef8c0
+index 0000000000000..c314ee8dc9e4a
 --- /dev/null
 +++ b/net/netfilter/nf_tables_port_probe.c
-@@ -0,0 +1,2365 @@
+@@ -0,0 +1,2370 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Whether nf_tables could tell two UDP streams apart by their ports.
@@ -2150,21 +2056,26 @@ index 000000000000..df7c6cbef8c0
 +}
 +
 +/* nft_byteorder_eval() on one register array. A byte swap moves whole bytes,
-+ * so the same moves applied to the known bits keep them with their values.
++ * so the same moves applied to the known bits keep them with their values. A
++ * 16-bit result clears the rest of its register (nft_reg_store16()), which
++ * becomes fill: zero in the data, known in the known bits.
 + */
 +static void nft_probe_byteorder_apply(u32 *dst, const u32 *src,
-+				      const struct nft_byteorder *priv)
++				      const struct nft_byteorder *priv,
++				      u32 fill)
 +{
-+	u16 *d16 = (void *)dst;
-+	const u16 *s16 = (const void *)src;
 +	unsigned int i;
++	u16 v16;
 +
++	/* The operation covers one value of the given size: the expression
++	 * refuses any other length (nft_byteorder_init()).
++	 */
 +	switch (priv->size) {
 +	case 8: {
 +		u64 *dst64 = (void *)dst;
 +		u64 src64;
 +
-+		for (i = 0; i < priv->len / 8; i++) {
++		for (i = 0; i < priv->size / 8; i++) {
 +			src64 = nft_reg_load64(&src[i]);
 +			if (priv->op == NFT_BYTEORDER_NTOH)
 +				src64 = be64_to_cpu((__force __be64)src64);
@@ -2175,7 +2086,7 @@ index 000000000000..df7c6cbef8c0
 +		break;
 +	}
 +	case 4:
-+		for (i = 0; i < priv->len / 4; i++) {
++		for (i = 0; i < priv->size / 4; i++) {
 +			if (priv->op == NFT_BYTEORDER_NTOH)
 +				dst[i] = ntohl((__force __be32)src[i]);
 +			else
@@ -2183,12 +2094,12 @@ index 000000000000..df7c6cbef8c0
 +		}
 +		break;
 +	case 2:
-+		for (i = 0; i < priv->len / 2; i++) {
-+			if (priv->op == NFT_BYTEORDER_NTOH)
-+				d16[i] = ntohs((__force __be16)s16[i]);
-+			else
-+				d16[i] = (__force u16)htons(s16[i]);
-+		}
++		if (priv->op == NFT_BYTEORDER_NTOH)
++			v16 = ntohs(nft_reg_load_be16(src));
++		else
++			v16 = (__force u16)htons(nft_reg_load16(src));
++		*dst = fill;
++		*(u16 *)dst = v16;
 +		break;
 +	}
 +}
@@ -2199,15 +2110,15 @@ index 000000000000..df7c6cbef8c0
 +	const struct nft_byteorder *priv = nft_expr_priv(expr);
 +	struct nft_probe_regs *regs = &ctx->regs;
 +
-+	/* Every size reads and writes within the first len bytes. */
-+	if (!nft_probe_span(priv->sreg, priv->len) ||
-+	    !nft_probe_span(priv->dreg, priv->len))
++	/* Reads and writes the first size bytes. */
++	if (!nft_probe_span(priv->sreg, priv->size) ||
++	    !nft_probe_span(priv->dreg, priv->size))
 +		return nft_probe_stop(ctx, -EINVAL);
 +
 +	nft_probe_byteorder_apply(&regs->data[priv->dreg],
-+				  &regs->data[priv->sreg], priv);
++				  &regs->data[priv->sreg], priv, 0);
 +	nft_probe_byteorder_apply(&regs->known[priv->dreg],
-+				  &regs->known[priv->sreg], priv);
++				  &regs->known[priv->sreg], priv, ~0U);
 +	return NFT_PROBE_MATCH;
 +}
 +
@@ -3866,7 +3777,7 @@ index 000000000000..df7c6cbef8c0
 +}
 +EXPORT_SYMBOL_GPL(nft_port_dependent);
 diff --git a/net/netfilter/nfnetlink_hook.c b/net/netfilter/nfnetlink_hook.c
-index ade8ee1988b1..abd08ac814f6 100644
+index ade8ee1988b1e..abd08ac814f61 100644
 --- a/net/netfilter/nfnetlink_hook.c
 +++ b/net/netfilter/nfnetlink_hook.c
 @@ -220,6 +220,8 @@ static int nfnl_hook_dump_one(struct sk_buff *nlskb,
@@ -3879,7 +3790,7 @@ index ade8ee1988b1..abd08ac814f6 100644
  		break;
  	default:
 diff --git a/net/netfilter/nft_bitwise.c b/net/netfilter/nft_bitwise.c
-index 0fc21b729eba..b3fbff4484de 100644
+index b6e6143989a98..a317ebceb9e60 100644
 --- a/net/netfilter/nft_bitwise.c
 +++ b/net/netfilter/nft_bitwise.c
 @@ -15,16 +15,6 @@
@@ -3900,10 +3811,10 @@ index 0fc21b729eba..b3fbff4484de 100644
  				      const struct nft_bitwise *priv)
  {
 diff --git a/net/netfilter/nft_byteorder.c b/net/netfilter/nft_byteorder.c
-index 744878773dac..dcc724e69b94 100644
+index 391aade36ef3c..ad97fa948c5d2 100644
 --- a/net/netfilter/nft_byteorder.c
 +++ b/net/netfilter/nft_byteorder.c
-@@ -15,14 +15,6 @@
+@@ -15,13 +15,6 @@
  #include <net/netfilter/nf_tables_core.h>
  #include <net/netfilter/nf_tables.h>
  
@@ -3911,7 +3822,6 @@ index 744878773dac..dcc724e69b94 100644
 -	u8			sreg;
 -	u8			dreg;
 -	enum nft_byteorder_ops	op:8;
--	u8			len;
 -	u8			size;
 -};
 -
@@ -3919,7 +3829,7 @@ index 744878773dac..dcc724e69b94 100644
  			struct nft_regs *regs,
  			const struct nft_pktinfo *pkt)
 diff --git a/net/netfilter/nft_cmp.c b/net/netfilter/nft_cmp.c
-index b61dc9c3383e..8f93d7254d61 100644
+index b61dc9c3383ee..8f93d7254d613 100644
 --- a/net/netfilter/nft_cmp.c
 +++ b/net/netfilter/nft_cmp.c
 @@ -16,13 +16,6 @@
@@ -3937,7 +3847,7 @@ index b61dc9c3383e..8f93d7254d61 100644
  		  struct nft_regs *regs,
  		  const struct nft_pktinfo *pkt)
 diff --git a/net/netfilter/nft_ct.c b/net/netfilter/nft_ct.c
-index 8feea8b2422b..36c2dd4c2a74 100644
+index 07a879f66fabe..e52b734e75f75 100644
 --- a/net/netfilter/nft_ct.c
 +++ b/net/netfilter/nft_ct.c
 @@ -389,6 +389,7 @@ static int nft_ct_get_init(const struct nft_ctx *ctx,
@@ -3957,10 +3867,10 @@ index 8feea8b2422b..36c2dd4c2a74 100644
  #ifdef CONFIG_NF_CONNTRACK_MARK
  	case NFT_CT_MARK:
 diff --git a/net/netfilter/nft_dynset.c b/net/netfilter/nft_dynset.c
-index 0d78de9d2d75..6fc6408481c1 100644
+index 59b14e6a2ca82..a7e5c503b103c 100644
 --- a/net/netfilter/nft_dynset.c
 +++ b/net/netfilter/nft_dynset.c
-@@ -335,6 +335,11 @@ static int nft_dynset_init(const struct nft_ctx *ctx,
+@@ -337,6 +337,11 @@ static int nft_dynset_init(const struct nft_ctx *ctx,
  	if (set->size == 0)
  		set->size = 0xffff;
  
@@ -3973,7 +3883,7 @@ index 0d78de9d2d75..6fc6408481c1 100644
  	return 0;
  
 diff --git a/net/netfilter/nft_lookup.c b/net/netfilter/nft_lookup.c
-index 699254cb3ecd..b7a7f6a40d79 100644
+index 699254cb3ecd6..b7a7f6a40d79f 100644
 --- a/net/netfilter/nft_lookup.c
 +++ b/net/netfilter/nft_lookup.c
 @@ -15,15 +15,6 @@
@@ -3993,7 +3903,7 @@ index 699254cb3ecd..b7a7f6a40d79 100644
  __nft_set_do_lookup(const struct net *net, const struct nft_set *set,
  		    const u32 *key)
 diff --git a/net/netfilter/nft_masq.c b/net/netfilter/nft_masq.c
-index 2b01128737a3..e8d471eecfc9 100644
+index 2b01128737a3a..e8d471eecfc96 100644
 --- a/net/netfilter/nft_masq.c
 +++ b/net/netfilter/nft_masq.c
 @@ -12,12 +12,7 @@
@@ -4011,7 +3921,7 @@ index 2b01128737a3..e8d471eecfc9 100644
  static const struct nla_policy nft_masq_policy[NFTA_MASQ_MAX + 1] = {
  	[NFTA_MASQ_FLAGS]		=
 diff --git a/net/netfilter/nft_nat.c b/net/netfilter/nft_nat.c
-index cdbd800cac96..70b02d974420 100644
+index cdbd800cac969..70b02d9744209 100644
 --- a/net/netfilter/nft_nat.c
 +++ b/net/netfilter/nft_nat.c
 @@ -18,18 +18,9 @@
@@ -4035,7 +3945,7 @@ index cdbd800cac96..70b02d974420 100644
  			       const struct nft_regs *regs,
  			       const struct nft_nat *priv)
 diff --git a/net/netfilter/nft_objref.c b/net/netfilter/nft_objref.c
-index 633cce69568f..82b012e865cd 100644
+index 633cce69568f1..82b012e865cd1 100644
 --- a/net/netfilter/nft_objref.c
 +++ b/net/netfilter/nft_objref.c
 @@ -125,12 +125,6 @@ static const struct nft_expr_ops nft_objref_ops = {
@@ -4052,7 +3962,7 @@ index 633cce69568f..82b012e865cd 100644
  			 struct nft_regs *regs,
  			 const struct nft_pktinfo *pkt)
 diff --git a/net/netfilter/nft_range.c b/net/netfilter/nft_range.c
-index cbb02644b836..adf2d4aea6e8 100644
+index cbb02644b8362..adf2d4aea6e84 100644
 --- a/net/netfilter/nft_range.c
 +++ b/net/netfilter/nft_range.c
 @@ -12,14 +12,6 @@
@@ -4071,7 +3981,7 @@ index cbb02644b836..adf2d4aea6e8 100644
  		    struct nft_regs *regs, const struct nft_pktinfo *pkt)
  {
 diff --git a/net/netfilter/nft_redir.c b/net/netfilter/nft_redir.c
-index 58ae802db8f5..36864002a3c8 100644
+index 58ae802db8f52..36864002a3c8e 100644
 --- a/net/netfilter/nft_redir.c
 +++ b/net/netfilter/nft_redir.c
 @@ -12,12 +12,7 @@
@@ -4089,10 +3999,25 @@ index 58ae802db8f5..36864002a3c8 100644
  static const struct nla_policy nft_redir_policy[NFTA_REDIR_MAX + 1] = {
  	[NFTA_REDIR_REG_PROTO_MIN]	= { .type = NLA_U32 },
 diff --git a/net/netfilter/x_tables.c b/net/netfilter/x_tables.c
-index efe7b7d71e7f..29cfd9a8872b 100644
+index fb777d2c73753..4bd6484523c48 100644
 --- a/net/netfilter/x_tables.c
 +++ b/net/netfilter/x_tables.c
-@@ -1782,6 +1782,64 @@ xt_hook_ops_alloc(const struct xt_table *table, nf_hookfn *fn)
+@@ -1534,8 +1534,13 @@ struct xt_table *xt_register_table(struct net *net,
+ 	if (ops) {
+ 		int i;
+ 
+-		for (i = 0; i < num_ops; i++)
++		/* Typed, so that the port probe finds the table behind the
++		 * hook, whichever function the table's module runs it with.
++		 */
++		for (i = 0; i < num_ops; i++) {
+ 			ops[i].priv = table;
++			ops[i].hook_ops_type = NF_HOOK_OP_XTABLES;
++		}
+ 
+ 		ret = nf_register_net_hooks(net, ops, num_ops);
+ 		if (ret != 0) {
+@@ -1827,6 +1832,64 @@ xt_hook_ops_alloc(const struct xt_table *table, nf_hookfn *fn)
  }
  EXPORT_SYMBOL_GPL(xt_hook_ops_alloc);
  

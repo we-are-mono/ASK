@@ -252,10 +252,10 @@ index 61c240d846ee2..ac698fef6757f 100644
  }
  
 diff --git a/drivers/net/ppp/pppoe.c b/drivers/net/ppp/pppoe.c
-index 7ee63051a1619..91c485c640282 100644
+index 0bfb048c291a3..66cd698899c60 100644
 --- a/drivers/net/ppp/pppoe.c
 +++ b/drivers/net/ppp/pppoe.c
-@@ -284,7 +284,7 @@ static void pppoe_flush_dev(struct net_device *dev)
+@@ -281,7 +281,7 @@ static void pppoe_flush_dev(struct net_device *dev)
  		struct sock *sk;
  
  		while (po) {
@@ -264,7 +264,7 @@ index 7ee63051a1619..91c485c640282 100644
  				po = rcu_dereference_protected(po->next,
  							       lockdep_is_held(&pn->hash_lock));
  			}
-@@ -310,7 +310,7 @@ static void pppoe_flush_dev(struct net_device *dev)
+@@ -307,7 +307,7 @@ static void pppoe_flush_dev(struct net_device *dev)
  			    sk->sk_state & (PPPOX_CONNECTED | PPPOX_BOUND)) {
  				pppox_unbind_sock(sk);
  				sk->sk_state_change(sk);
@@ -273,7 +273,7 @@ index 7ee63051a1619..91c485c640282 100644
  				dev_put(dev);
  			}
  
-@@ -467,7 +467,7 @@ static void pppoe_unbind_sock_work(struct work_struct *work)
+@@ -464,7 +464,7 @@ static void pppoe_unbind_sock_work(struct work_struct *work)
  	lock_sock(sk);
  	if (po->pppoe_dev) {
  		dev_put(po->pppoe_dev);
@@ -282,7 +282,7 @@ index 7ee63051a1619..91c485c640282 100644
  	}
  	pppox_unbind_sock(sk);
  	release_sock(sk);
-@@ -587,7 +587,7 @@ static int pppoe_release(struct socket *sock)
+@@ -584,7 +584,7 @@ static int pppoe_release(struct socket *sock)
  
  	if (po->pppoe_dev) {
  		dev_put(po->pppoe_dev);
@@ -291,8 +291,8 @@ index 7ee63051a1619..91c485c640282 100644
  	}
  
  	pppox_unbind_sock(sk);
-@@ -657,7 +657,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
- 			    po->pppoe_pa.remote, po->pppoe_ifindex);
+@@ -652,7 +652,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+ 		delete_item(pn, po);
  		if (po->pppoe_dev) {
  			dev_put(po->pppoe_dev);
 -			po->pppoe_dev = NULL;
@@ -300,7 +300,7 @@ index 7ee63051a1619..91c485c640282 100644
  		}
  
  		po->pppoe_ifindex = 0;
-@@ -665,7 +665,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+@@ -660,7 +660,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
  		memset(&po->pppoe_relay, 0, sizeof(po->pppoe_relay));
  		memset(&po->chan, 0, sizeof(po->chan));
  		po->next = NULL;
@@ -309,7 +309,7 @@ index 7ee63051a1619..91c485c640282 100644
  
  		sk->sk_state = PPPOX_NONE;
  	}
-@@ -678,7 +678,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+@@ -673,7 +673,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
  		if (!dev)
  			goto err_put;
  
@@ -318,7 +318,7 @@ index 7ee63051a1619..91c485c640282 100644
  		po->pppoe_ifindex = dev->ifindex;
  		pn = pppoe_pernet(net);
  		if (!(dev->flags & IFF_UP)) {
-@@ -713,7 +713,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+@@ -707,7 +707,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
  		sk->sk_state = PPPOX_CONNECTED;
  	}
  
@@ -327,7 +327,7 @@ index 7ee63051a1619..91c485c640282 100644
  
  end:
  	release_sock(sk);
-@@ -721,7 +721,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
+@@ -715,7 +715,7 @@ static int pppoe_connect(struct socket *sock, struct sockaddr *uservaddr,
  err_put:
  	if (po->pppoe_dev) {
  		dev_put(po->pppoe_dev);
@@ -336,7 +336,7 @@ index 7ee63051a1619..91c485c640282 100644
  	}
  	goto end;
  }
-@@ -923,7 +923,7 @@ static int pppoe_sendmsg(struct socket *sock, struct msghdr *m,
+@@ -917,7 +917,7 @@ static int pppoe_sendmsg(struct socket *sock, struct msghdr *m,
  static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
  {
  	struct pppox_sock *po = pppox_sk(sk);
@@ -345,7 +345,7 @@ index 7ee63051a1619..91c485c640282 100644
  	struct pppoe_hdr *ph;
  	int data_len = skb->len;
  
-@@ -933,6 +933,13 @@ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
+@@ -927,6 +927,13 @@ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
  	 * But, we also can't do a lock_sock since that introduces a potential
  	 * deadlock as we'd reverse the lock ordering used when calling
  	 * ppp_unregister_channel().
@@ -359,7 +359,7 @@ index 7ee63051a1619..91c485c640282 100644
  	 */
  
  	if (sock_flag(sk, SOCK_DEAD) || !(sk->sk_state & PPPOX_CONNECTED))
-@@ -954,7 +961,7 @@ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
+@@ -948,7 +955,7 @@ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
  	ph->ver	= 1;
  	ph->type = 1;
  	ph->code = 0;
@@ -368,7 +368,7 @@ index 7ee63051a1619..91c485c640282 100644
  	ph->length = htons(data_len);
  
  	skb->protocol = cpu_to_be16(ETH_P_PPP_SES);
-@@ -983,21 +990,38 @@ static int pppoe_xmit(struct ppp_channel *chan, struct sk_buff *skb)
+@@ -977,21 +984,38 @@ static int pppoe_xmit(struct ppp_channel *chan, struct sk_buff *skb)
  	return __pppoe_xmit(sk, skb);
  }
  
@@ -410,7 +410,7 @@ index 7ee63051a1619..91c485c640282 100644
  	memcpy(path->encap.h_dest, po->pppoe_pa.remote, ETH_ALEN);
  	memcpy(ctx->daddr, po->pppoe_pa.remote, ETH_ALEN);
  	path->dev = ctx->dev;
-@@ -1041,17 +1065,32 @@ static int pppoe_seq_show(struct seq_file *seq, void *v)
+@@ -1035,17 +1059,32 @@ static int pppoe_seq_show(struct seq_file *seq, void *v)
  {
  	struct pppox_sock *po;
  	char *dev_name;

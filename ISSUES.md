@@ -236,7 +236,7 @@ result independently of those temporary files.
 - [x] **A446 — 6.18 refused SEC-owned SAs' frames with IPv4 options and pre-empted ASK's bundle check.** Upstream's
   core checks now leave both to SEC for a state it owns, as 6.12 did (_:/^xfrm: leave SEC's own SAs' headers_).
 - [x] **A445 — 6.12 lacked upstream's flowtable GC fix for pending offload work.** 6.12.113's fix, its two
-  prerequisites and their two follow-ups are carried as patches 001-005 (_:/^netfilter: carry 6.12.113's flowtable_).
+  prerequisites and their two follow-ups were carried as patches 001-005 until 6.12.118 (_:/^netfilter: carry 6.12.113's flowtable_).
 - [ ] **A444 — a DHCP renewal's unicast ACK was lost once on its way to the DUT.** Seen once on 6.18.63 (KASAN),
   `flowtable_dhcp::test_renewal_and_address_change` in the full suite after `flowtable_masquerade`: udhcpc sent its
   T1 renew to the server, dnsmasq logged the DHCPREQUEST and its DHCPACK, and the DUT's client never saw the ACK,

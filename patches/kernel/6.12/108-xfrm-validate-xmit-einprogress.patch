@@ -1,4 +1,4 @@
-From d09a5084e8a7b1f57a4dfb4fbdf3b6da828fd87f Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Petr Wozniak <petr.wozniak@gmail.com>
 Date: Sun, 21 Jun 2026 12:03:26 +0200
 Subject: [PATCH] xfrm: propagate -EINPROGRESS from validate_xmit_xfrm()
@@ -36,10 +36,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  2 files changed, 10 insertions(+), 4 deletions(-)
 
 diff --git a/net/core/dev.c b/net/core/dev.c
-index 3f68d968b237..0c15c90691b3 100644
+index 2b5317f48b6d9..ee12e5050e5bb 100644
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
-@@ -3765,6 +3765,9 @@ int skb_csum_hwoffload_help(struct sk_buff *skb,
+@@ -3780,6 +3780,9 @@ int skb_csum_hwoffload_help(struct sk_buff *skb,
  }
  EXPORT_SYMBOL(skb_csum_hwoffload_help);
  
@@ -49,7 +49,7 @@ index 3f68d968b237..0c15c90691b3 100644
  static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev, bool *again)
  {
  	netdev_features_t features;
-@@ -3842,7 +3845,7 @@ struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *d
+@@ -3857,7 +3860,7 @@ struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *d
  		skb->prev = skb;
  
  		skb = validate_xmit_skb(skb, dev, again);
@@ -58,7 +58,7 @@ index 3f68d968b237..0c15c90691b3 100644
  			continue;
  
  		if (!head)
-@@ -4548,8 +4551,11 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
+@@ -4601,8 +4604,11 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
  				goto recursion_alert;
  
  			skb = validate_xmit_skb(skb, dev, &again);
@@ -72,7 +72,7 @@ index 3f68d968b237..0c15c90691b3 100644
  			HARD_TX_LOCK(dev, txq, cpu);
  
 diff --git a/net/xfrm/xfrm_device.c b/net/xfrm/xfrm_device.c
-index f2a7fa2704a4..d55c0cfeb929 100644
+index cb9140f381e70..0e6cab1330e67 100644
 --- a/net/xfrm/xfrm_device.c
 +++ b/net/xfrm/xfrm_device.c
 @@ -208,7 +208,7 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
@@ -84,9 +84,9 @@ index f2a7fa2704a4..d55c0cfeb929 100644
  
  			XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTSTATEPROTOERROR);
  			kfree_skb(skb);
-@@ -250,7 +250,7 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
- 		pskb = skb2;
- 	}
+@@ -258,7 +258,7 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
+ 	if (skb)
+ 		skb->prev = pskb;
  
 -	return skb;
 +	return skb ? skb : ERR_PTR(-EINPROGRESS);

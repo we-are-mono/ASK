@@ -74,8 +74,8 @@ they conflict with modern kernel APIs or clean design, prefer the modern approac
   Never raw `bitbake`, never standalone `make modules` / GCC-15 recipes — those use
   different toolchains/defines and don't prove the shipped build is clean. A GCC 15
   cross toolchain is fine for compile-only warning checks; it isn't a build.
-- **One checkout builds both kernel lines**, 6.12 (v6.12.112, NXP lf-6.12.49-2.2.0,
-  what OpenWrt ships) and 6.18 (v6.18.63, NXP lf-6.18.37-2.1.0).
+- **One checkout builds both kernel lines**, 6.12 (v6.12.118, NXP lf-6.12.49-2.2.0,
+  what OpenWrt ships) and 6.18 (v6.18.64, NXP lf-6.18.37-2.1.0).
   `make ask-image LINE=6.12|6.18` picks one (default: the newest); kas reads it as
   `ASK_LINE`, the distro conf turns it into `PREFERRED_VERSION_linux-ask` and the
   `ask612`/`ask618` override, and each line builds in its own

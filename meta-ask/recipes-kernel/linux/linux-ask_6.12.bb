@@ -1,11 +1,11 @@
-# The 6.12 kernel line: Linux 6.12.112 with NXP's lf-6.12.49-2.2.0 SDK, the
+# The 6.12 kernel line: Linux 6.12.118 with NXP's lf-6.12.49-2.2.0 SDK, the
 # line OpenWrt ships. What every line shares is in linux-ask.inc.
 ASK_KERNEL_LINE = "6.12"
 
-LINUX_VERSION = "6.12.112"
+LINUX_VERSION = "6.12.118"
 KERNEL_BRANCH = "linux-6.12.y"
-# v6.12.112, peeled (the annotated tag object is 1092ff66...).
-KERNEL_SRCREV = "7aba70ab2e8d8ab3cd45abcaa15e1119a00dc42a"
+# v6.12.118, peeled (the annotated tag object is c246b196...).
+KERNEL_SRCREV = "b869a5313cbfe7102873d3de318ddb68675146d0"
 NXP_SDK_BRANCH = "lf-6.12.y"
 
 require linux-ask.inc
@@ -13,13 +13,7 @@ require linux-ask.inc
 # The series, in order: one entry per patch in patches/kernel/6.12 (a glob
 # once dropped every patch numbered 100 or above).
 SRC_URI += "\
-           file://001-netfilter-conntrack-nf_ct_refresh-without-skb.patch \
-           file://002-netfilter-conntrack-offload-timeout-from-flowtable-gc.patch \
-           file://003-netfilter-flowtable-pending-status-bit.patch \
-           file://004-netfilter-conntrack-offload-bit-removal.patch \
-           file://005-netfilter-flowtable-offload-ct-timeout-extension.patch \
            file://010-ask-fman-dpaa-ehash.patch \
-           file://030-ipv6-addrconf-modified-prefix-route-expiry.patch \
            file://040-ask-xfrm-ipsec-offload.patch \
            file://070-ask-ppp-hooks.patch \
            file://080-wext-core-restore-ndo_do_ioctl.patch \

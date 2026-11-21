@@ -181,12 +181,11 @@ async def conntrack(r):
 
 
 @asynccontextmanager
-async def tcp_timeouts(r):
+async def netfilter_sysctls(r, settings):
+    """net.netfilter values set while held, each put back as it was."""
     saved = []
     try:
-        for name, value in [("nf_flowtable_tcp_timeout", FLOWTABLE_TCP_TIMEOUT),
-                            ("nf_conntrack_tcp_timeout_last_ack", 10),
-                            ("nf_conntrack_tcp_timeout_time_wait", 10)]:
+        for name, value in settings:
             old = (await read(r.target, r.session, f"/proc/sys/net/netfilter/{name}")).strip()
             await command(r.target, r.session, "sysctl", "-w", f"net.netfilter.{name}={value}")
             saved.append((name, old))
@@ -194,6 +193,14 @@ async def tcp_timeouts(r):
     finally:
         for name, value in reversed(saved):
             await command(r.target, r.session, "sysctl", "-w", f"net.netfilter.{name}={value}")
+
+
+@asynccontextmanager
+async def tcp_timeouts(r):
+    async with netfilter_sysctls(r, [("nf_flowtable_tcp_timeout", FLOWTABLE_TCP_TIMEOUT),
+                                     ("nf_conntrack_tcp_timeout_last_ack", 10),
+                                     ("nf_conntrack_tcp_timeout_time_wait", 10)]):
+        yield
 
 
 async def capture_fin(r, conn):
@@ -354,36 +361,39 @@ async def tcp_retransmit_withdraw_rst(rig):
         await tcp_table(r)
         await installed(r, conn)
         await hardware_transfer(r, conn, "upload", label="tcp-hardware-after-withdraw")
-        await conn.close("rst")
-        removed = await r.wait(lambda s: s["entries"] == 0, timeout=3)
-        counters = await control_counters(r)
-        assert counters["tcp_rst"] >= 1, counters
-        ct = await conntrack(r)
+        close_timeout = int((await read(r.target, r.session,
+                                       "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close")).strip())
         # nf_conntrack_proto_tcp intentionally retains ESTABLISHED when the
         # RST sequence differs from its last observed ACK, allowing a possible
         # RFC5961 challenge ACK. Offloaded data makes that observation stale.
-        # Its RST path still applies the short CLOSE timeout. Where the
-        # flowtable forwards the RST itself, the flow stays, closing, until it
-        # times out, and conntrack is set CLOSE then (flowtable_closing()).
-        # Require reset at the endpoint, Linux visibility, prompt removal and
-        # bounded CT expiry.
-        closing = await flowtable_closing(r)
-        states = tcp_closed_states(closing) if closing else ("CLOSE ", "ESTABLISHED")
-        assert any(state in ct["stdout"] for state in states), ct["stdout"]
-        close_timeout = int((await read(r.target, r.session,
-                                       "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close")).strip())
-        bound = close_timeout
-        if closing:
-            bound += int((await read(r.target, r.session,
-                                     "/proc/sys/net/netfilter/nf_flowtable_tcp_timeout")).strip())
-        else:
-            assert "OFFLOAD" not in ct["stdout"] and int(ct["stdout"].split()[2]) <= close_timeout, ct
-        r.record("tcp-rst", {"state": removed, "counters": counters, "conntrack": ct})
-        deadline = time.monotonic() + bound + 2
-        while time.monotonic() < deadline:
-            final_ct = await conntrack(r)
-            if not final_ct["stdout"].strip():
-                break
-            await asyncio.sleep(0.1)
-        assert not final_ct["stdout"].strip(), final_ct
-        r.record("tcp-rst-expired", final_ct)
+        # Such an RST lowers the timeout to the unacknowledged one (upstream
+        # "use UNACK timeout for non-closing RST packets", in 6.12.116 and
+        # 6.18), CLOSE's before; it is held at CLOSE's here, so either rule
+        # expires within one short bound. Where the flowtable forwards the RST
+        # itself, the flow stays, closing, until it times out, and conntrack is
+        # set CLOSE then (flowtable_closing()). Require reset at the endpoint,
+        # Linux visibility, prompt removal and bounded CT expiry.
+        async with netfilter_sysctls(r, [("nf_conntrack_tcp_timeout_unacknowledged", close_timeout)]):
+            await conn.close("rst")
+            removed = await r.wait(lambda s: s["entries"] == 0, timeout=3)
+            counters = await control_counters(r)
+            assert counters["tcp_rst"] >= 1, counters
+            ct = await conntrack(r)
+            closing = await flowtable_closing(r)
+            states = tcp_closed_states(closing) if closing else ("CLOSE ", "ESTABLISHED")
+            assert any(state in ct["stdout"] for state in states), ct["stdout"]
+            bound = close_timeout
+            if closing:
+                bound += int((await read(r.target, r.session,
+                                         "/proc/sys/net/netfilter/nf_flowtable_tcp_timeout")).strip())
+            else:
+                assert "OFFLOAD" not in ct["stdout"] and int(ct["stdout"].split()[2]) <= close_timeout, ct
+            r.record("tcp-rst", {"state": removed, "counters": counters, "conntrack": ct})
+            deadline = time.monotonic() + bound + 2
+            while time.monotonic() < deadline:
+                final_ct = await conntrack(r)
+                if not final_ct["stdout"].strip():
+                    break
+                await asyncio.sleep(0.1)
+            assert not final_ct["stdout"].strip(), final_ct
+            r.record("tcp-rst-expired", final_ct)
