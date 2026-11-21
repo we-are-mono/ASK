@@ -431,6 +431,9 @@ static struct cdx_wg_steer {
 	/* Set with the entry, cleared before the queue is freed; statistics
 	 * read it under RCU, which the free waits out (cdx_destroy_fq()). */
 	struct cdx_wg_rxq *rxq;
+	/* When the tunnel's first sealed frame noted it, in jiffies: until its
+	 * entry is in, the peer's packets take the miss path. */
+	unsigned long noted;
 } cdx_wg_steers[CDX_WG_STEERS];
 /* The next CPU, round robin over the affine ones; under the control mutex. */
 static unsigned int cdx_wg_steer_cpu;
@@ -484,8 +487,13 @@ static void cdx_wg_steer_note(struct net_device *wg, const struct wg_fastpath_tx
 	WRITE_ONCE(s->daddr, tx->saddr);
 	WRITE_ONCE(s->sport, tx->dport);
 	WRITE_ONCE(s->dport, tx->sport);
+	WRITE_ONCE(s->noted, jiffies);
 	smp_store_release(&s->state, CDX_WG_STEER_PENDING);
-	schedule_work(&cdx_wg_steer_work);
+	/* Not this CPU's worker: it seals the tunnel, and under load its
+	 * softirq can keep a bound worker from running for as long as it
+	 * lasts, every packet back on the miss path meanwhile (A456, as the
+	 * flow retirement found, A402). */
+	queue_work(system_unbound_wq, &cdx_wg_steer_work);
 }
 
 #define cdx_wg_count(q, f)	this_cpu_inc((q)->pc->f)
@@ -1163,6 +1171,7 @@ static void cdx_wg_inline_fn(struct work_struct *work)
 
 static void cdx_wg_steer_work_fn(struct work_struct *work)
 {
+	unsigned long late;
 	unsigned int i, j;
 
 	cdx_ft_begin();
@@ -1202,6 +1211,13 @@ static void cdx_wg_steer_work_fn(struct work_struct *work)
 			continue;
 		}
 		smp_store_release(&s->state, CDX_WG_STEER_INSTALLED);
+		/* Every packet of the peer's took the miss path meanwhile: say
+		 * when that went on long enough to matter (A456). */
+		late = jiffies - s->noted;
+		if (late > HZ)
+			pr_warn_ratelimited("cdx: WireGuard rx steer %pI4:%u -> %pI4:%u went in %u ms after its tunnel's first sealed frame\n",
+					    &s->saddr, ntohs(s->sport), &s->daddr,
+					    ntohs(s->dport), jiffies_to_msecs(late));
 	}
 	if (!READ_ONCE(cdx_wg_stopping))
 		schedule_delayed_work(&cdx_wg_inline_work, HZ);

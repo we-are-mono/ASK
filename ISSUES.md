@@ -152,6 +152,26 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A456 — a WireGuard receive steer went in 7.6 s and 10.2 s after its tunnel's first sealed frame.**
+
+  **Where:** the steer worker (`cdx_wg_steer_work_fn()`, `cdx/cdx_wg.c`), which installs each tuple a seal noted
+  (`cdx_wg_steer_note()`) under the control transaction. Until the entry is in, the peer's packets take the miss
+  path (one Ethernet queue, the exception policer, the stack's UDP input) instead of the steer queue.
+
+  **Why it matters:** `flowtable_wireguard::test_rate[4T-upload]` failed twice, both on one 6.18 KASAN boot, in
+  full suites (tests 149 and 309): two tunnels' steers went in 7.6 s after the others, then one 10.2 s after
+  (1 of 68,862 of its packets through cdx). It passed in four other full suites, in 90 runs of the rate cases
+  alone and in two replays of the failing orders with the worker timed: note to worker start at most 451 ms,
+  its wait for the transaction at most 1,011 ms, no single hold over a second. Ruled out by code and by the
+  fixture: a stale slot or a device at a reused address (every registration is released between cases),
+  a lost note, a full table. The worker predates the NAT64 branch (f138f4e6).
+
+  **Done so far:** the worker is queued unbound rather than on the noting CPU, whose softirq can keep a bound
+  worker off it (the shape A402 measured for flow retirement), and a steer that goes in more than a second
+  after its first seal is logged with how long it took.
+
+  **Next:** on a recurrence that log gives the delay; time the worker's wait for the transaction then (its
+  holder's call site and duration), to tell a held transaction from a starved worker.
 - [ ] **A455 — TCP into a WireGuard device above its MTU without DF waits in the fragment pool, outside its budget.**
 
   **Where:** a receive port's entry into a WireGuard seal queue (`create_enque_hm()`, fragmentation enabled), for TCP,
