@@ -302,13 +302,20 @@ async def test_wred_drops_before_the_tail(qos):
     assert int(rows[0]["qos"], 16) == HIGH_CQ, rows
     idle = await asyncio.to_thread(probe, r.lan_ip, 1.5)
     base = statistics.median(idle["rtts"])
+    # A dropped probe costs the window its whole timeout, and the curve drops
+    # about ten in the narrow band: at the default quarter second those ate
+    # most of the window and left the reply floor below to chance. No reply
+    # waits longer than the deepest queue the class holds, its tail, so ten
+    # times that (a tenth of a second at least) still tells a drop from a
+    # late reply.
+    lost_after = max(0.1, 10 * TAIL_FRAMES * (TCP_FRAME + OAL) * 8 / rate)
 
     async def loaded():
         before = await egress(r, TARGET_LAN_IF)
         bulk = asyncio.create_task(iperf(r, PORT_BULK, seconds=6, streams=4))
         try:
             await asyncio.sleep(2.0)
-            sample = await asyncio.to_thread(probe, r.lan_ip, 3.0)
+            sample = await asyncio.to_thread(probe, r.lan_ip, 3.0, timeout=lost_after)
             state = await r.state()
             report = await bulk
         finally:
