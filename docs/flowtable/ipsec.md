@@ -1487,7 +1487,7 @@ rejections (`qm_set_dc(..., ed=1)`). The offline port counts those drops in its
 BMI WRED-discard counter (`fmbm_ofwdc` in its `fm_port_bmi_regs`), not in its
 filter count, and so does every other group it enqueues to (below). The
 accounting pass reads it (`dpa_cfg_port_rejected()`, through
-`FM_PORT_GetCounter()`, which patch 010 exports) and folds it into
+`FM_PORT_GetCounter()`, which the SDK copy exports) and folds it into
 `/proc/ask_flowtable/stats` as `ipsec_offline_port_rejected` (A336). And
 `ipsec_exception_pkt_handler()` copies a contiguous frame into
 an skb of its own size and gives the buffer straight back
@@ -2016,7 +2016,7 @@ firmware gave every producer the same one, and for GCM, CCM or CTR a second
 identity repeats nonces under one key, not just sequence numbers. So the IPsec
 init checks before it arms: `dpa_cfg_shared_icid()` compares each classifier
 port's live `FMBM_SPLIODN` (`fm_port_get_icid()`) and each CPU portal's FICID
-(`qman_portal_ficid()`, both exported by patch 106). Any disagreement is logged
+(`qman_portal_ficid()`, both exported by the SDK copy). Any disagreement is logged
 with the port or CPU that differs. IPsec offload then stays off for the boot,
 and the gateway runs IPsec in software.
 
@@ -2027,7 +2027,7 @@ CPU-path ICMP flood on one SA for 4 s, ESP captured at the peer. The DECO ICID
 row samples SEC's per-DECO debug register while only hardware traffic runs.
 
 ```
-                              before patch 106    after
+                              before ICID fix     after
 CPU-fed frames                292                 1,965
 (SPI, seq) pairs sent twice   272                 0
 peer replay drops             274                 0

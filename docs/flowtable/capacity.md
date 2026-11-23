@@ -13,10 +13,10 @@ The deployed [classifier configuration](../../config/pcd/cdx_pcd.xml) gives
 each IPv4 TCP and UDP table a `0x7fff` hash mask: 32,768 buckets per protocol.
 The enhanced external-hash implementation allocates entries in DDR as needed;
 its allocation path does not treat the XML `max="512"` field as a 512-entry
-ceiling. See `ExternalHashTableSet()` and `ExternalHashTableAllocEntry()` in the
-pinned kernel's `fm_ehash.c`, introduced by
-[patch 010](../../patches/kernel/6.18/010-ask-fman-dpaa-ehash.patch) (each kernel line carries
-its own, in `patches/kernel/<line>/`).
+ceiling. See `ExternalHashTableSet()` and `ExternalHashTableAllocEntry()` in
+[`fm_ehash.c`](../../sdk/6.18/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c),
+ASK's addition to the SDK (each kernel line carries its own copy, in
+`sdk/<line>/`).
 
 At this adapter cap, an all-TCP or all-UDP workload averages one directional
 entry per classifier bucket; a balanced mix averages half an entry per bucket.

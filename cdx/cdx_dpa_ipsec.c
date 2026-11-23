@@ -375,8 +375,8 @@ static bool cdx_ipsec_cipher_is_gcm(uint32_t cipher_type)
  * frames sharing a sequence number, not wire duplicates. SEC orders
  * an SA's jobs only among frames carrying the same ICID (RM §7.3.2),
  * and FMan-fed frames carried ICID 0 against the CPU portals' 63
- * until the SDK FMan driver kept the firmware's port ICIDs (kernel
- * patch 106). NEVER sharing is documented by the RM itself to
+ * until the SDK FMan driver kept the firmware's port ICIDs (in the SDK
+ * copy, sdk/<line>). NEVER sharing is documented by the RM itself to
  * duplicate sequence numbers.
  */
 static uint32_t cdx_ipsec_sh_desc_hdr_flags(PSAEntry sa)

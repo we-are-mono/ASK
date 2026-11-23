@@ -62,7 +62,7 @@ direction admitted, so it still joins with the flow rows.
 
 ### Read-back
 
-The kernel patch `010-ask-fman-dpaa-ehash.patch` has always hooked
+The kernel patch `010-ask-fast-path-core.patch` has always hooked
 `dev_get_stats()` in `net/core/dev.c` to a CDX callback,
 `virt_iface_stats_callback()` in `cdx/devman.c`, which adds a registered
 interface's firmware record to the `rtnl_link_stats64` the kernel is about to
@@ -216,8 +216,8 @@ delivered protocol handler overwrites it, so a frame consumed on the
 `NF_NETDEV_INGRESS` hook comes back as `NET_RX_DROP` after being forwarded, and
 the driver counted nothing — not even `rx_dropped`. GRO would have hidden it for
 TCP, but `dpa_fix_features()` clears `NETIF_F_RXCSUM`, so every frame takes
-that path. Kernel patch `104-sdk_dpaa-rx-stats-before-stack-verdict.patch`
-counts the frame before the handoff, as every other driver does; the core's
+that path. `sdk_dpaa` (in the SDK copy, `sdk/<line>/`) now counts the frame
+before the handoff, as every other driver does; the core's
 own `rx_dropped` and `rx_nohandler` still record real drops.
 
 **`ethtool -S` stays the driver's.** It reports the per-CPU software counters
@@ -300,8 +300,8 @@ Only the CPU's receive puts buffers into that pool, once its per-CPU count --
 what it seeded, less what it took out -- runs low, so a buffer the hardware
 loses (A453) leaves every count as it was. A pool emptied that way stayed
 empty: every port missed everything, no frame reached a CPU to refill it, and
-nothing was logged (A454). The driver's pool watch (`dpaa_eth_pool.c`, kernel
-patch 189) reads the pool's BMan count once a second beside every port's
+nothing was logged (A454). The driver's pool watch (`dpaa_eth_pool.c` in the
+SDK copy) reads the pool's BMan count once a second beside every port's
 out-of-buffers discards. Dry at two readings in a row, with a frame discarded
 for want of a buffer since the first, it logs `receive pool N ran dry` once,
 with the per-CPU counts and the ports' counts; puts back what the counts hold
@@ -357,7 +357,7 @@ frames each way per case:
   sees it bare.
 - **Software path.** With a software flowtable bound, the port's `ethtool -S`
   receive count and its native counters both move by the burst, which they did
-  not before patch 104; and the VLAN device's own transmit counter, fed by
+  not before A159's fix; and the VLAN device's own transmit counter, fed by
   Linux alone here, reads 298 per 302-byte frame, which is the convention the
   hardware fold restates to.
 - **Session** (`flowtable_pppoe.py::test_session_counters`, a session over a tagged
@@ -400,7 +400,7 @@ form the flow rows use.
   bridge path suppressed the pointer for exactly these tags.
 - **The software fast path is blind to VLAN devices.** Netfilter's flowtable
   hook runs on the physical port and forwards from there, so a frame it handles
-  in software is counted by the port (after patch 104) but never reaches the
+  in software is counted by the port (since A159's fix) but never reaches the
   8021q layer whose counters it would otherwise have crossed. That is the
   kernel's design, not a gap in the fold; the hardware path does not have it,
   because the record is the VLAN device's.

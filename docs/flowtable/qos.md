@@ -458,8 +458,8 @@ negative case: a mark outside the mask must not change the class.
 ### 2a. TX queue foundation
 
 Nothing in `sdk_dpaa` supports a per-queue model yet, and the gaps are
-structural rather than incidental. Delivered as
-`patches/kernel/150-sdk_dpaa-tx-queue-headroom.patch`.
+structural rather than incidental. Delivered in `sdk_dpaa`, in ASK's SDK copy
+(`sdk/<line>/`).
 
 - `DPAA_ETH_TX_QUEUES` was literally `NR_CPUS` (`dpaa_eth.h:201`) — 64 queues
   under OpenWrt, 16 under meta-ask. Pinned at sixteen, which is what the more
@@ -893,7 +893,7 @@ headers, read from `skb->data` through any VLAN tags and a PPPoE session header:
   what the upstream will carry has to hold everything it sends to that rate,
   or the queue builds at the upstream, where no priority applies.
 - **The driver's mark-based resolution is unreachable on a port with a tree.**
-  `struct dpa_qdisc_ops.txq_fq` is handed the skb (patch 150) and answers for
+  `struct dpa_qdisc_ops.txq_fq` is handed the skb (by `sdk_dpaa`) and answers for
   ordinary Tx queues as well as leaf ones whenever the tree is live; only a
   port without a tree answers `NULL` and falls back to `skb->mark` and the
   legacy DSCP table. That also takes the legacy table's unlocked read off every
@@ -2617,14 +2617,14 @@ The 256 are spent like this:
 | one per Ethernet port, at most 8 | port-private | the port's own rate limiter, `matchall`'s profile |
 | the rest, 104 at least | unpartitioned | spare |
 
-The shared count is the FMD's partition, which patch 010 sets to 144
+The shared count is the FMD's partition, which the SDK copy sets to 144
 (`LNXWRP_FM_NUM_OF_SHARED_PROFILES`, sized for NXP's 128 egress class-queue
 profiles, long removed; see [what CMM actually does](#what-cmm-actually-does)).
 A profile created past it fails `FM_PCD_PlcrProfileSet()`, so cdx asserts at
 build time that its last shared profile sits inside that header's number.
 
 **Leaves: sixty-four per port.** Sixteen leaf classes would not hold thirty
-devices, so patch 150 reserves sixty-four Tx queues of headroom
+devices, so `sdk_dpaa` reserves sixty-four Tx queues of headroom
 (`DPAA_ETH_CEETM_LEAF_QUEUES`) and `CDX_HTB_MAX_LEAVES` follows it. That is
 still well below what the hardware could give one port -- every channel's
 sixteen class queues, 512 -- and stays there for three reasons. The frame
@@ -3217,11 +3217,11 @@ contract](#the-consumer-contract)), under the names in the last column.
 | Resource | Hardware | ASK | Scope | Where ASK enforces it | Reported as |
 | --- | --- | --- | --- | --- | --- |
 | CEETM channels | 32 (one CEETM instance; the device tree's `fsl,ceetm-channel-range`) | the same: the device tree's count | the whole SoC, shared by every port | `ceetm_channel_count()`, ceiling `CDX_CEETM_MAX_CHANNELS` | `qos_channels`, `_used`, `_held`, `_free`; each port's `channels=` in `qos_ports` |
-| Leaf classes | 512 per port (32 channels × 16 class queues) | 64 per port: the frame budget, per-queue memory and the ethtool names ([increment 12](#12-the-ceilings-raised-to-the-hardwares)) | per port | `DPAA_ETH_CEETM_LEAF_QUEUES` (patch 150), `CDX_HTB_MAX_LEAVES` | `qos_leaves_per_port`; each port's `leaves=`, `leaves_free=` |
+| Leaf classes | 512 per port (32 channels × 16 class queues) | 64 per port: the frame budget, per-queue memory and the ethtool names ([increment 12](#12-the-ceilings-raised-to-the-hardwares)) | per port | `DPAA_ETH_CEETM_LEAF_QUEUES` (`sdk_dpaa`), `CDX_HTB_MAX_LEAVES` | `qos_leaves_per_port`; each port's `leaves=`, `leaves_free=` |
 | Weighted leaves | 8 per channel (class queues 8-15, as one group or as A and B) | the same, all in group A | per channel | `qman_ceetm_cq_claim_A` | the refusal |
 | Strict priorities | 8 per channel | the same | per channel | CEETM | the refusal |
 | Tail-drop depth | the pools: what every queue holds is a buffer | 128 frames per leaf, or a RED leaf's limit in frames, asked for; the whole tree within the port's Ethernet share (1,280 with four CPUs) and, across every live tree, 2,048 of SEC's 3,584 buffers shared max-min fair by what each tree asks (an even share at least), what the asks leave over shared the same way as room, each queue counted at the larger of its depth and what it holds; reported per class as `depth=` | per tree, and across trees | `cdx_htb_cap()`, shared max-min fair between trees and between a tree's queues; the hardware default is 8, far too shallow | -- |
-| Per-flow ingress profiles | 256 profiles on the FMan, of which 144 are the FMD's shared partition (patch 010) | 64 in one pool for every port, of which **63** are addressable: the policer field's six bits | the whole FMan, shared by every port | `INGRESS_FLOW_POLICER_QUEUES`, `CDX_FT_QOS_MAX_POLICER` | `qos_policers`, `_used`, `_free`; each port's `policers=` |
+| Per-flow ingress profiles | 256 profiles on the FMan, of which 144 are the FMD's shared partition (set in the SDK copy) | 64 in one pool for every port, of which **63** are addressable: the policer field's six bits | the whole FMan, shared by every port | `INGRESS_FLOW_POLICER_QUEUES`, `CDX_FT_QOS_MAX_POLICER` | `qos_policers`, `_used`, `_free`; each port's `policers=` |
 | Ingress rate limiter | 1 profile per port, private | the same | per port | `matchall`, one per port | -- |
 | DSCP→class egress map | **1 port at a time** | the same | SoC-wide | "Now supporting only one interface", and the second port is refused | the refusal |
 | Mark bits | 32 of `ct->mark` | a 23-bit class, anywhere in the word, contiguous | per box | `qos_mark_mask`, validated at load | `qos_mark_shift`, `qos_mark_bits`, `qos_class_*` |

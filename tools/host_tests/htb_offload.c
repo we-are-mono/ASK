@@ -27,7 +27,7 @@ typedef int64_t s64;
 #define MAX_SCHEDULER_QUEUES		(NUM_PQS + NUM_WBFQS)
 #define GFP_KERNEL			0
 /* The ceilings as production states them: the channels one CEETM instance
- * has, from cdx_ceetm_app.h, and the direct and leaf-class Tx queues patch 150
+ * has, from cdx_ceetm_app.h, and the direct and leaf-class Tx queues sdk_dpaa
  * gives the netdev (htb_limits.inc). A copy kept here would let the file
  * that sizes a table and the test that fills it disagree. */
 #include "htb_limits.inc"

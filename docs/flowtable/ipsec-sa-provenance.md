@@ -202,7 +202,7 @@ would fail the "retain hardware forwarding" objective.
 
 - **Key widths fit.** Packed IPv4 TCP/UDP tuple = 14 bytes, IPv6 = 38
   (`cdx/cdx_common.h`); +6 source-MAC gives 20 / 44, both under the 56-byte external-hash
-  key limit (`patches/kernel/<line>/010-ask-fman-dpaa-ehash.patch`). This proves the two keys
+  key limit (`MAX_KEY_LEN` in the SDK copy's `fm_ehash.h`). This proves the two keys
   fit the format — not the generated extraction order, unit availability, or performance.
 - **Action space.** `cdx/cdx_ehash.c` rounds the key to 4 bytes before the action
   region; IPv4 16->20 and IPv6 40->44 each consume 4 more action bytes. The entry need not

@@ -8085,7 +8085,7 @@ static void test_mtu_refusal_sound(void)
 }
 
 /* What a direction is handed is what its port's MAC takes, not what the
- * device it is routed from says (A316). Since patch 109 a DPAA port's MAXFRM
+ * device it is routed from says (A316). A DPAA port's MAXFRM (sdk_dpaa)
  * follows its own MTU, never under a full Ethernet frame, so a 1500-byte VLAN
  * or bridge over a 9000-byte port still receives 9000-byte frames: UDP from it
  * into a 1500-byte path would be fragmented by the microcode with zero

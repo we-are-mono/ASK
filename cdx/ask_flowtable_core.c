@@ -1748,11 +1748,12 @@ static bool ft_vlan_actions(const struct flow_action *actions,
 }
 
 /* The largest untagged payload @port's MAC accepts: its MTU, but never less
- * than a standard Ethernet frame. Patch 109 programs each DPAA port's MAXFRM
+ * than a standard Ethernet frame. sdk_dpaa programs each DPAA port's MAXFRM
  * from its MTU as max(mtu, 1500) plus the Ethernet header and FCS, and a tag
  * more while the port has any upper device -- a VLAN, a bridge, a bond, a
  * macvlan -- or two once a VLAN on it is 802.1ad, carries a VLAN, or is a
- * bridge port (patch 109), so that a tagged frame still carries a full
+ * bridge port (dpa_set_mac_max_frame() and dpa_upper_tags() in the SDK
+ * copy's dpaa_eth.c), so that a tagged frame still carries a full
  * payload. A port lowered below 1500 thus keeps receiving full frames, and a
  * port raised above it receives what its MTU allows whatever the devices above
  * it say.

@@ -112,7 +112,8 @@ static void kfree_skb(struct sk_buff *skb) { (void)skb; bench.frees++; }
 static void dev_core_stats_tx_dropped_inc(struct net_device *dev) { dev->tx_dropped++; }
 static void netif_trans_update(struct net_device *dev) { dev->trans++; }
 /* The submit holds RCU across the hook's lookup and the enqueue using its
- * answer (patch 107); the frame queue is looked up only inside it. */
+ * answer (sdk_dpaa's dpaa_eth_sg.c); the frame queue is looked up only inside
+ * it. */
 static int rcu_depth;
 static void rcu_read_lock(void) { rcu_depth++; }
 static void rcu_read_unlock(void) { assert(rcu_depth > 0); rcu_depth--; }

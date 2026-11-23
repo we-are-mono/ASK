@@ -210,7 +210,7 @@ result independently of those temporary files.
     - a 9000-byte frame into 1500 (A316's shape).
   - Restoring the pre-`b957f822` fragment pool (2048 × 1500 B) changed nothing.
 
-  **Cause of A202's zeros:** unknown. Lead: patch 106 (port ICIDs) landed the day before A202's commit, so its
+  **Cause of A202's zeros:** unknown. Lead: the SDK's port-ICID fix landed the day before A202's commit, so its
   image may have run the fragmenter's DMA with zeroed ICIDs.
 
   **Next:** either bisect against a September image, or accept today's measurements. In both cases a full suite
@@ -449,8 +449,8 @@ result independently of those temporary files.
   exception queue on CPU0; it now leads at WQ0, and a late one reopens the channel (_:/^sdk_fman, cdx: answer host commands first_).
 
 - [ ] **A400 — a 10G MAC at 2500base-x would take a 1G MAC's interrupt and frame-limit slots.** `macdev2enetinterface()`
-  (sdk_dpaa/mac-api.c, patch 110) gives SPEED_2500 `e_ENET_MODE_SGMII_2500`, whose speed is below 10000, so memac files
-  MAC9/MAC10 as 1G MAC 0/1: MAC1's or MAC2's slots (MAC2 is live on the DK). 1000base-x got the 10G speed in patch 110;
+  (sdk_dpaa/mac-api.c in the SDK copy) gives SPEED_2500 `e_ENET_MODE_SGMII_2500`, whose speed is below 10000, so memac
+  files MAC9/MAC10 as 1G MAC 0/1: MAC1's or MAC2's slots (MAC2 is live on the DK). 1000base-x already gets the 10G speed;
   2.5G cannot take the same rewrite, since `SetupSgmiiInternalPhy()` (memac.c) disables AN by matching
   `e_ENET_MODE_SGMII_2500` exactly. Fix direction: pass 2.5G to memac separately from the mode's speed field. Neither
   shipping RCW (0x1133, 0x1333) runs MAC9/MAC10 at 2.5G today.

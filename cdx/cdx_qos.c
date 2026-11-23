@@ -63,8 +63,8 @@ static_assert(CDX_FT_QOS_MAX_POLICER == INGRESS_FLOW_POLICER_QUEUES - 1,
 /* Every profile cdx creates as shared -- the exception path's, then the
  * per-flow ones, then SEC's, relative ids 0..CDX_INGRESS_ALL_PROFILES -- has
  * to be inside the shared pool the FMan wrapper configures the FMD with at
- * PCD init, LNXWRP_FM_NUM_OF_SHARED_PROFILES (lnxwrp_fm.h, set to 144 by
- * patch 010; the hardware has 256 profiles, shared and per-port together).
+ * PCD init, LNXWRP_FM_NUM_OF_SHARED_PROFILES (lnxwrp_fm.h, set to 144 in
+ * the SDK copy; the hardware has 256 profiles, shared and per-port together).
  * Past it the FMD refuses the profile at module load
  * (FmPcdPlcrGetAbsoluteIdByProfileParams()), which this says at build time
  * instead. */

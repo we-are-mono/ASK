@@ -84,9 +84,10 @@
 #include "cdx_dscp.h"
 #include "dpa_ipsec.h"
 
-/* Leaf classes are handed netdev Tx queue indices out of the headroom patch 150
- * reserved above the direct queues, and sch_htb turns the index this file
- * returns straight into netdev_get_tx_queue() with no bounds check.
+/* Leaf classes are handed netdev Tx queue indices out of the headroom sdk_dpaa
+ * reserves above the direct queues (DPAA_ETH_CEETM_LEAF_QUEUES), and sch_htb
+ * turns the index this file returns straight into netdev_get_tx_queue() with
+ * no bounds check.
  *
  * real_num_tx_queues grows to cover them as classes come into service, because
  * netdev_cap_txqueue() rewrites anything at or above it to queue zero. The
@@ -2217,7 +2218,7 @@ static int cdx_htb_leaf_alloc(struct cdx_htb_port *port,
 	u8 channel, cq;
 	int rc;
 
-	/* Each leaf takes one of the Tx queues patch 150 reserved, whichever
+	/* Each leaf takes one of the Tx queues sdk_dpaa reserves, whichever
 	 * channel it is on. */
 	if (port->leaves == CDX_HTB_MAX_LEAVES) {
 		NL_SET_ERR_MSG_FMT_MOD(opt->extack,

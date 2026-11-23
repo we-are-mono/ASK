@@ -170,7 +170,7 @@ correct headers and an all-zero payload, so the receiver discards them; a
 6o4 insert's outer IPv4 header carries no DF, so an oversized 6o4 packet goes
 the same way. Fragments of the SEC output, which
 reaches the classifier through the offline port, are correct. What can arrive
-is bounded by the physical port's MAC: patch 109 programs each DPAA port's
+is bounded by the physical port's MAC: `sdk_dpaa` programs each DPAA port's
 max frame from its MTU as `max(mtu, 1500)` plus header and FCS, plus one VLAN
 tag while the port has any upper device (a VLAN, a bridge, a bond, a macvlan)
 and two once a VLAN on it is 802.1ad or carries a VLAN, so a frame over that
