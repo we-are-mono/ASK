@@ -152,17 +152,24 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A457 — WireGuard offload never yields a port a hardware qdisc shapes.**
+- [ ] **A458 — attaching an HTB tree strands the frames already bound for the port's plain queues.**
 
-  **Where:** `cdx_wg_can_tx()` (`cdx/cdx_wg.c`) means to keep a port whose HTB tree owns its transmit
-  (`dpa_priv_s.ceetm_en`) on the slow path, but tests it only under `CONFIG_FSL_DPAA_CEETM`: the SDK's own CEETM
-  qdisc, off in every build and gone from the SDK copy. cdx's hardware qdisc sets `ceetm_en` through
-  `dpa_enable_ceetm()` (`cdx/cdx_ceetm_app.c`) under `CONFIG_CPE_FAST_PATH`, as `devman.c` reads it.
+  **Where:** `ceetm_enable_or_disable_qos()` (`cdx/cdx_ceetm_app.c`) puts the sub-portal into CEETM mode, then
+  sets `ceetm_en` (`dpa_enable_ceetm()`), with no wait between. QMan stops serving the dedicated channel at the
+  switch, so a frame already queued there, or put there by a sender that read `ceetm_en` just before (the driver's
+  `__cpe_fp_tx()`, the WireGuard fast path, a classifier entry not yet moved to the class queues), waits until the
+  tree goes and then leaves stale. NXP's original has the same order; detach is already ordered
+  (`dpa_disable_ceetm()`, `synchronize_net()`, drain).
 
-  **Why it matters:** since the WireGuard split (_f138f4e6_), offloaded WireGuard frames on a shaped port go out
-  through the port's own Tx queues, not the tree's class queues, so the tree's rate and priorities do not hold for
-  them. Found by code reading while removing dead SDK options; not reproduced on the rig. Fix direction: test
-  `ceetm_en` under `CONFIG_CPE_FAST_PATH`; prove with a WireGuard rate test on a port with an HTB tree.
+  **Why it matters:** each attach under load holds a burst (bounded by the queues' congestion group) for the
+  tree's life: TCP retransmits it, UDP loses it. Found reviewing A457; not reproduced on the rig. Fix direction:
+  set `ceetm_en`, `synchronize_net()`, wait (bounded) for the port's egress and forwarding queues to empty, then
+  enable CEETM mode; check that class-queue enqueues before the switch only wait for it, and where the
+  classifier's entries move. Oracle: HTB attach under load, frames left on the dedicated channel after it = 0.
+
+- [x] **A457 — WireGuard offload stranded its frames on a port an HTB tree took.** Its port check sat under a
+  CEETM option no build has, and the seal asked only once a second; both now ask per packet
+  (_:/^cdx, wireguard: keep the fast path off a port a hardware qdisc owns_).
 
 - [ ] **A456 — a WireGuard receive steer went in 7.6 s and 10.2 s after its tunnel's first sealed frame.**
 

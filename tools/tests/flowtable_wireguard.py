@@ -426,3 +426,96 @@ async def test_rate(wg_rig, direction):
             break
     r.record(f"wireguard-{r.tunnels}T-{direction}", {"floor": FLOOR, "samples": samples})
     assert max(samples) >= FLOOR, (samples, FLOOR)
+
+
+# Well under what the kernel's own WireGuard carries on the debug kernel
+# (30-45 Mbit/s measured on 6.12 KASAN), so the tree sets the rate, not the
+# CPU, and a transfer at the cap proves the tree shaped the tunnel's frames.
+TREE_MBIT = 10
+
+
+async def _transfer(r, direction):
+    """One tunnel's TCP transfer from the LAN VM: what its receiving end got,
+    in bits per second, from RAMP on. Upload's receiver is the server on this
+    host; download's (-R) is the client on the LAN VM."""
+    flag = {"upload": [], "download": ["-R"]}[direction]
+    server = await asyncio.create_subprocess_exec(
+        "iperf3", "-s", "-1", "-B", inner(0, 2), "-p", str(PORT), "-J",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        await asyncio.sleep(0.3)
+        argv = ["iperf3", "-c", inner(0, 2), "-B", r.sources[0], "-p", str(PORT), "-P", "2",
+                "-t", str(SECONDS), "-Z", "-J", *flag]
+        script = f'''
+import subprocess
+run = subprocess.run({argv!r}, capture_output=True, text=True, timeout={SECONDS + 30})
+print(run.stdout)
+'''
+        result = await lan_run_python(r.lan, script, label="wireguard-tree", timeout=SECONDS + 60)
+        assert result.rc == 0, result.stdout
+        client = json.loads(result.stdout[result.stdout.index("{"):result.stdout.rindex("}") + 1])
+        assert "error" not in client, client["error"]
+        stdout, _ = await asyncio.wait_for(server.communicate(), 15)
+        report = client if direction == "download" else json.loads(stdout)
+        return received(report)["bits_per_second"]
+    finally:
+        if server.returncode is None:
+            server.kill()
+            await server.wait()
+
+
+@pytest.mark.parametrize("direction", ["upload", "download"])
+@pytest.mark.parametrize("wg_rig", [1], ids=["1T"], indirect=True)
+async def test_tree_takes_the_port(wg_rig, direction):
+    """A port an HTB tree takes keeps the tunnel's traffic, at the tree's
+    rate (A457).
+
+    The fast path puts frames on the port's forwarding queues, and once the
+    tree switches the port to CEETM, QMan stops serving their channel: frames
+    sent there would wait for the tree to go. So the fast path yields the
+    port, from the next frame, and the stack sends the tunnel's frames through
+    the tree, onto its default leaf. Upload leaves by the WAN port, sealed;
+    download by the LAN port, opened. A transfer at the cap proves both that
+    the frames leave and that the tree shapes them; once the tree is gone the
+    port is the fast path's again."""
+    r = wg_rig
+    dev = TARGET_WAN_IF if direction == "upload" else TARGET_LAN_IF
+    cap = TREE_MBIT * 1e6
+    rate = f"{TREE_MBIT}mbit"
+    console = Console.target(log_path=str(artifact_dir() / "wireguard-tree-uart.log"))
+    await asyncio.to_thread(console.login, "root", None)
+    printk = " ".join((await read(r.target, r.session, "/proc/sys/kernel/printk")).split()[:4])
+    # A printk landing inside a console command breaks its framing.
+    await command(r.target, r.session, "sysctl", "-w", "kernel.printk=1 4 1 7")
+    tree = False
+    try:
+        async def tc(*argv):
+            return await console_command(console, "tc", *argv, timeout=30)
+
+        await tc("qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "offload", "default", "10")
+        tree = True
+        await tc("class", "add", "dev", dev, "parent", "1:", "classid", "1:1", "htb", "rate", rate, "ceil", rate)
+        await tc("class", "add", "dev", dev, "parent", "1:1", "classid", "1:10",
+                 "htb", "rate", rate, "ceil", rate, "prio", "1")
+        before = (await wg_counters(r))["wgt0"]
+        shaped = await _transfer(r, direction)
+        during = (await wg_counters(r))["wgt0"]
+        await tc("qdisc", "del", "dev", dev, "root")
+        tree = False
+        free = await _transfer(r, direction)
+        after = (await wg_counters(r))["wgt0"]
+        r.record(f"wireguard-tree-{direction}", {"shaped": shaped, "free": free, "cap": cap,
+                                                 "before": before, "during": during, "after": after})
+        assert 0.6 * cap <= shaped <= 1.1 * cap, (shaped, cap)
+        # The fast path's own count of what it sent on the port stood still
+        # under the tree but for the frames in flight as it went up, and
+        # moved again once it was gone.
+        counter = "sealed" if direction == "upload" else "forwarded"
+        assert during[counter] - before[counter] <= PREADMISSION, (counter, before, during)
+        assert after[counter] - during[counter] > PREADMISSION, (counter, during, after)
+        assert free > 2 * cap, (free, cap)
+    finally:
+        if tree:
+            await console_command(console, "tc", "qdisc", "del", "dev", dev, "root", check=False, timeout=30)
+        await command(r.target, r.session, "sysctl", "-w", f"kernel.printk={printk}")
+        console.close()

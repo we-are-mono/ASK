@@ -319,12 +319,13 @@ static bool cdx_wg_can_tx(const struct net_device *dev)
 {
 	if (!cdx_wg_port(dev))
 		return false;
-#ifdef CONFIG_FSL_DPAA_CEETM
-	/* ponytail: a port a hardware qdisc owns shapes through its class
-	 * queues, which this does not pick; such a port keeps the slow path. */
-	if (((struct dpa_priv_s *)netdev_priv(dev))->ceetm_en)
+	/* A port a hardware qdisc owns (dpa_enable_ceetm()) sends from its
+	 * tree's class queues: QMan stops serving the channel the forwarding
+	 * queues are on, so a frame put there would wait for the tree to go.
+	 * Such a port keeps the slow path, which goes through the tree. Asked
+	 * of every frame, so a tree takes effect from the next one. */
+	if (READ_ONCE(((struct dpa_priv_s *)netdev_priv(dev))->ceetm_en))
 		return false;
-#endif
 	return true;
 }
 

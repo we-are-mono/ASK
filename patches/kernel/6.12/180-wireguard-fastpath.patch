@@ -43,7 +43,7 @@ Offload entry points (include/net/wg_fastpath.h):
  drivers/net/wireguard/allowedips.c    |  35 ++
  drivers/net/wireguard/allowedips.h    |   5 +
  drivers/net/wireguard/device.c        |   8 +
- drivers/net/wireguard/fastpath.c      | 587 ++++++++++++++++++++++++++
+ drivers/net/wireguard/fastpath.c      | 600 ++++++++++++++++++++++++++
  drivers/net/wireguard/main.c          |   1 +
  drivers/net/wireguard/netlink.c       |   6 +-
  drivers/net/wireguard/peer.c          |  18 +-
@@ -56,10 +56,10 @@ Offload entry points (include/net/wg_fastpath.h):
  drivers/net/wireguard/socket.c        |   4 +-
  include/crypto/poly1305.h             |   3 +
  include/net/netfilter/nf_flow_table.h |  17 +
- include/net/wg_fastpath.h             |  58 +++
+ include/net/wg_fastpath.h             |  59 +++
  net/netfilter/nf_flow_table_inet.c    |  18 +
  net/netfilter/nf_flow_table_ip.c      |  99 +++++
- 22 files changed, 1053 insertions(+), 26 deletions(-)
+ 22 files changed, 1067 insertions(+), 26 deletions(-)
  create mode 100644 drivers/net/wireguard/fastpath.c
  create mode 100644 include/net/wg_fastpath.h
 
@@ -182,7 +182,7 @@ index 2346c797eb4d8..768bc03e33e07 100644
  #ifdef DEBUG
  bool wg_allowedips_selftest(void);
 diff --git a/drivers/net/wireguard/device.c b/drivers/net/wireguard/device.c
-index 45e9b908dbfb0..377b59dfd4b7c 100644
+index 055ea38771568..8610fa9ce7c3e 100644
 --- a/drivers/net/wireguard/device.c
 +++ b/drivers/net/wireguard/device.c
 @@ -233,6 +233,14 @@ static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -202,10 +202,10 @@ index 45e9b908dbfb0..377b59dfd4b7c 100644
  	.ndo_stop		= wg_stop,
 diff --git a/drivers/net/wireguard/fastpath.c b/drivers/net/wireguard/fastpath.c
 new file mode 100644
-index 0000000000000..a287e1c56706c
+index 0000000000000..ed7b2fdc8a522
 --- /dev/null
 +++ b/drivers/net/wireguard/fastpath.c
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,600 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Seal a forwarded IPv4 packet for its peer in place, in the buffer a NIC
@@ -515,8 +515,8 @@ index 0000000000000..a287e1c56706c
 +	return t;
 +}
 +
-+static struct wg_fastpath_tmpl *wg_fp_tmpl(struct wg_peer *peer,
-+					   wg_fastpath_can_tx_t can_tx)
++static struct wg_fastpath_tmpl *wg_fp_tmpl_fresh(struct wg_peer *peer,
++						 wg_fastpath_can_tx_t can_tx)
 +{
 +	struct wg_fastpath_tmpl *t = rcu_dereference_bh(peer->fp_tmpl), *n;
 +
@@ -537,6 +537,19 @@ index 0000000000000..a287e1c56706c
 +	}
 +	spin_unlock(&peer->fp_lock);
 +	return t;
++}
++
++/* The header to seal the peer's packet with, or NULL to decline it. The
++ * route and neighbour in it are followed once a second, but whether the
++ * caller can transmit on its device is asked of every packet: a hardware
++ * qdisc can take the port at any moment, and the queues the caller sends
++ * on are not served from then on. */
++static struct wg_fastpath_tmpl *wg_fp_tmpl(struct wg_peer *peer,
++					   wg_fastpath_can_tx_t can_tx)
++{
++	struct wg_fastpath_tmpl *t = wg_fp_tmpl_fresh(peer, can_tx);
++
++	return t && t->dev && can_tx(t->dev) ? t : NULL;
 +}
 +
 +/**
@@ -610,7 +623,7 @@ index 0000000000000..a287e1c56706c
 +		     wg_birthdate_has_expired(kp->sending.birthdate, REJECT_AFTER_TIME)))
 +		goto out;
 +	t = wg_fp_tmpl(peer, can_tx);
-+	if (unlikely(!t || !t->dev))
++	if (unlikely(!t))
 +		goto out;
 +	ctr = atomic64_inc_return(&kp->sending_counter) - 1;
 +	if (unlikely(ctr >= REJECT_AFTER_MESSAGES))
@@ -982,7 +995,7 @@ index ced8117976800..17b5fc2feeaf4 100644
  
  #endif /* _WG_PEERLOOKUP_H */
 diff --git a/drivers/net/wireguard/queueing.h b/drivers/net/wireguard/queueing.h
-index 7eb76724b3edb..fce8893725be8 100644
+index 9fd19e98fcf8b..d47f025ee9be3 100644
 --- a/drivers/net/wireguard/queueing.h
 +++ b/drivers/net/wireguard/queueing.h
 @@ -32,6 +32,10 @@ void wg_packet_receive(struct wg_device *wg, struct sk_buff *skb);
@@ -1004,7 +1017,7 @@ index 7eb76724b3edb..fce8893725be8 100644
  };
  
  #define PACKET_CB(skb) ((struct packet_cb *)((skb)->cb))
-@@ -102,16 +107,29 @@ static inline void wg_reset_packet(struct sk_buff *skb, bool encapsulating)
+@@ -104,16 +109,29 @@ static inline void wg_reset_packet(struct sk_buff *skb, bool encapsulating)
  	skb_reset_inner_headers(skb);
  }
  
@@ -1039,7 +1052,7 @@ index 7eb76724b3edb..fce8893725be8 100644
  		*stored_cpu = cpu;
  	}
  	return cpu;
-@@ -156,7 +174,7 @@ static inline void wg_prev_queue_drop_peeked(struct prev_queue *queue)
+@@ -158,7 +176,7 @@ static inline void wg_prev_queue_drop_peeked(struct prev_queue *queue)
  
  static inline int wg_queue_enqueue_per_device_and_peer(
  	struct crypt_queue *device_queue, struct prev_queue *peer_queue,
@@ -1048,7 +1061,7 @@ index 7eb76724b3edb..fce8893725be8 100644
  {
  	int cpu;
  
-@@ -171,6 +189,10 @@ static inline int wg_queue_enqueue_per_device_and_peer(
+@@ -173,6 +191,10 @@ static inline int wg_queue_enqueue_per_device_and_peer(
  	 * packet as soon as it can.
  	 */
  	cpu = wg_cpumask_next_online(&device_queue->last_cpu);
@@ -1059,7 +1072,7 @@ index 7eb76724b3edb..fce8893725be8 100644
  	if (unlikely(ptr_ring_produce_bh(&device_queue->ring, skb)))
  		return -EPIPE;
  	queue_work_on(cpu, wq, &per_cpu_ptr(device_queue->worker, cpu)->work);
-@@ -183,10 +205,12 @@ static inline void wg_queue_enqueue_per_peer_tx(struct sk_buff *skb, enum packet
+@@ -185,10 +207,12 @@ static inline void wg_queue_enqueue_per_peer_tx(struct sk_buff *skb, enum packet
  	 * peer can be freed from below us.
  	 */
  	struct wg_peer *peer = wg_peer_get(PACKET_PEER(skb));
@@ -1300,10 +1313,10 @@ index fcd87d204ab9b..4a1ef779c2e3c 100644
  extern int nf_flow_register_bpf(void);
 diff --git a/include/net/wg_fastpath.h b/include/net/wg_fastpath.h
 new file mode 100644
-index 0000000000000..66574110a61b9
+index 0000000000000..6ea1c98651d70
 --- /dev/null
 +++ b/include/net/wg_fastpath.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,59 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _NET_WG_FASTPATH_H
 +#define _NET_WG_FASTPATH_H
@@ -1324,7 +1337,8 @@ index 0000000000000..66574110a61b9
 +	__be16 sport, dport;
 +};
 +
-+/* Whether the caller can transmit a sealed frame on @dev; called in softirq. */
++/* Whether the caller can transmit a sealed frame on @dev now; called in
++ * softirq, for every packet sealed. */
 +typedef bool (*wg_fastpath_can_tx_t)(const struct net_device *dev);
 +
 +int wg_fastpath_seal(struct net_device *wg_dev, wg_fastpath_can_tx_t can_tx,
@@ -1392,7 +1406,7 @@ index 4bdcc4f333391..e13311369e276 100644
  {
  	nft_register_flowtable_type(&flowtable_ipv4);
 diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
-index 47b521670e6c1..e8d13abb3996b 100644
+index 945d6f41db6ae..87a4d4d142431 100644
 --- a/net/netfilter/nf_flow_table_ip.c
 +++ b/net/netfilter/nf_flow_table_ip.c
 @@ -14,6 +14,7 @@
@@ -1403,7 +1417,7 @@ index 47b521670e6c1..e8d13abb3996b 100644
  #include <net/xfrm.h>
  #include <net/netfilter/nf_flow_table.h>
  #include <net/netfilter/nf_conntrack.h>
-@@ -557,6 +558,104 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
+@@ -559,6 +560,104 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
  }
  EXPORT_SYMBOL_GPL(nf_flow_offload_ip_hook);
  
