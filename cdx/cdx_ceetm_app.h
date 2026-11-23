@@ -128,6 +128,7 @@ int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info);
 int cdx_disable_ceetm_on_iface(struct dpa_iface_info *iface_info);
 int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx);
 int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper);
+long ceetm_flush_plain(struct tQM_context_ctl *qm_ctx, u64 *flushed);
 int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num);
 int ceetm_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t dscp, uint8_t channel_num, uint8_t clsqueue_num);
 int ceetm_dscp_fq_unmap(struct tQM_context_ctl *qm_ctx, uint8_t dscp);

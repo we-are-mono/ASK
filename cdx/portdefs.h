@@ -326,5 +326,6 @@ uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *markval,
 uint32_t cdx_get_sec_txfqid(struct eth_iface_info *eth_info, void *markval,
 			    uint32_t hash);
 int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_map, void *markval);
+bool cdx_port_plain_queued(const struct eth_iface_info *eth, u64 *frames, u64 *bytes);
 int dpaa_is_oh_port(uint32_t portid);
 #endif

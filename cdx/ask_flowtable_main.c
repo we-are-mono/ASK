@@ -832,9 +832,11 @@ static int ft_stats_show(struct seq_file *seq, void *v)
 	/* Frames the software path forwarded unchanged because their header
 	 * could not be made writable for the remark their class asks for, and
 	 * control frames sent as unclassified traffic because their port's
-	 * control budget was spent. */
+	 * control budget was spent; and frames a tree's switch to CEETM left on
+	 * its port's plain queues, sent once its entries were rebuilt. */
 	ft_kv(seq, "qos_remark_failures", cdx_ft_qos_remark_failures());
 	ft_kv(seq, "qos_control_overruns", cdx_ft_qos_control_overruns());
+	ft_kv(seq, "qos_plain_flushed", cdx_ft_qos_plain_flushed());
 	ft_sec_refusal_stats(seq);
 	/* What the offline port handed back: given to Linux, with no direction
 	 * to give it to, not copied, or in error. */

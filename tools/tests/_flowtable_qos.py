@@ -64,6 +64,8 @@ PORT_STRANDED_GROUP = PORT + 32
 PORT_SQM_UPLOAD, PORT_SQM_LIVE = PORT + 33, PORT + 34
 PORT_SQM_DOWNLOAD, PORT_SQM_DEFAULT = PORT + 35, PORT + 36
 PORT_SQM_FQ = PORT + 37
+# A flow flooding the LAN port, paused, while a tree takes it.
+PORT_ATTACH = PORT + 38
 # One flow per class of a LAN tree with a channel each, and per flower filter
 # of a WAN port with a profile each, past the eight channels and seven profiles
 # ASK once stopped at.

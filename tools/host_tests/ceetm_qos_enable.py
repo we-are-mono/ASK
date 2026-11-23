@@ -30,9 +30,12 @@ def test_is_symmetric(tmp_path):
     source = (ROOT / "cdx/cdx_ceetm_app.c").read_text()
     header = (ROOT / "cdx/cdx_ceetm_app.h").read_text()
     names = ["ceetm_program_port_shaper", "ceetm_program_channel_shaper",
-             "ceetm_setup_lni", "ceetm_enable_or_disable_qos"]
+             "ceetm_setup_lni", "ceetm_flush_plain", "ceetm_enable_or_disable_qos"]
+    flush = re.findall(r"^#define CEETM_FLUSH_\w+\s.*$", source, re.M)
+    assert len(flush) == 2, flush
     (tmp_path / "qos_enable_constants.inc").write_text(
-        re.search(r"^#define CDX_CEETM_MAX_CHANNELS\s.*$", header, re.M).group() + "\n")
+        re.search(r"^#define CDX_CEETM_MAX_CHANNELS\s.*$", header, re.M).group() + "\n"
+        + "\n".join(flush) + "\n")
     (tmp_path / "qos_enable_production.inc").write_text(
         "\n".join(function(source, name) for name in names))
     binary = tmp_path / "ceetm_qos_enable"

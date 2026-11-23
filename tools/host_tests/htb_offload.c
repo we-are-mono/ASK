@@ -343,6 +343,7 @@ static int skb_ensure_writable(struct sk_buff *skb, unsigned int len)
 typedef struct { long long counter; } atomic64_t;
 #define ATOMIC64_INIT(v)	{ (v) }
 static void atomic64_inc(atomic64_t *v) { v->counter++; }
+static void atomic64_add(s64 i, atomic64_t *v) { v->counter += i; }
 static long long atomic64_read(const atomic64_t *v) { return v->counter; }
 static bool atomic64_try_cmpxchg(atomic64_t *v, s64 *old, s64 new)
 {
@@ -386,7 +387,19 @@ static int rcu_depth;
 static void rcu_read_lock(void) { rcu_depth++; }
 static void rcu_read_unlock(void) { assert(rcu_depth > 0); rcu_depth--; }
 static unsigned net_syncs;
-static void synchronize_net(void) { assert(!rcu_depth); net_syncs++; }
+static void *memchr_inv(const void *s, int c, size_t n)
+{
+	const unsigned char *p = s;
+
+	for (size_t i = 0; i < n; i++)
+		if (p[i] != (unsigned char)c)
+			return (void *)(p + i);
+	return NULL;
+}
+
+/* Never under cdx_htb_mutex: it holds up every HTB command meanwhile. */
+static bool htb_mutex_held(void);
+static void synchronize_net(void) { assert(!rcu_depth && !htb_mutex_held()); net_syncs++; }
 
 static int real_num_tx_queues_fails;
 static int netif_set_real_num_tx_queues(struct net_device *dev, unsigned int txq)
@@ -714,6 +727,30 @@ static int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
 	return fault() ? -EIO : 0;
 }
 
+/* What a port's plain queues hold when the flush after a switch to CEETM looks
+ * (ceetm_flush_plain()), by context; whether the port can send it, which a
+ * paused one cannot; and how often it looked. */
+static u64 plain_backlog[MAX_PHY_PORTS];
+static bool plain_stuck;
+static unsigned flushes, flush_syncs;
+static long ceetm_flush_plain(struct tQM_context_ctl *qm_ctx, u64 *flushed)
+{
+	unsigned ii = qm_ctx - gQMCtx;
+
+	flushes++;
+	/* Under the mutex every change of a sub-portal's mode is made under,
+	 * after a synchronize_net() made outside it (net_syncs as it stood). */
+	assert(htb_mutex_held());
+	flush_syncs = net_syncs;
+	assert(qm_ctx->qos_enabled);
+	*flushed = 0;
+	if (plain_stuck)
+		return (long)plain_backlog[ii];
+	*flushed = plain_backlog[ii];
+	plain_backlog[ii] = 0;
+	return 0;
+}
+
 /* The quarantine's end: what the port's entries put on its channels' queues is
  * popped, the entries are known to be installed again -- so they name none of
  * the queues any more -- and the channels are any port's. A channel whose
@@ -813,12 +850,14 @@ static void egress_hook(struct net_device *dev)
  * has happen while it waits, as another thread would. */
 static bool htb_mutex_held(void);
 static void (*drain_meanwhile)(void);
+static struct net_device *drained_dev;
 static void reinstalled_on(struct tQM_context_ctl *qm_ctx);
 static int egress_drain(struct net_device *dev)
 {
 	assert(dev);
 	assert(!htb_mutex_held());
 	egress_drains++;
+	drained_dev = dev;
 	/* A drain that says so has seen every entry on the port marked before
 	 * it was asked retired or rebuilt: none of them names a queue the
 	 * port's trees gave back any more. What changes while it waits is
@@ -1367,6 +1406,9 @@ static void reset_world(void)
 	egress_changed_dev = NULL;
 	egress_changes = egress_drains = srcu_syncs = 0;
 	egress_drain_rc = 0;
+	memset(plain_backlog, 0, sizeof(plain_backlog));
+	plain_stuck = false;
+	flushes = 0;
 	backend_idle = true;
 	stop_calls = 0;
 	fault_point = -1;
@@ -1534,6 +1576,7 @@ static void assert_settled(void)
 		run_release();
 	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_releases); ii++) {
 		assert(!cdx_htb_releases[ii].dev && !cdx_htb_releases[ii].due);
+		assert(!cdx_htb_releases[ii].flush);
 		assert(!memcmp(cdx_htb_releases[ii].given, none, sizeof(none)));
 	}
 	for (ii = 0; ii < ARRAY_SIZE(devices); ii++)
@@ -3983,7 +4026,8 @@ static void test_backlog(void)
  * on a new tree the port built meanwhile; the port goes. */
 static void drain_holds_dev(void)
 {
-	assert(devices[0].refs == 2);
+	/* The release's own hold and the one it took to wait with. */
+	assert(drained_dev->refs == 2);
 }
 
 static void taken_down_again(void)
@@ -4032,6 +4076,8 @@ static void test_release(void)
 	assert(!create(dev, 1, 0));
 	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));	/* channel 0 */
 	assert(chan_owner[0] == &gQMCtx[3]);
+	/* The flush the switch to CEETM armed goes first (test_plain_flush()). */
+	run_release();
 	changes = egress_changes;
 	changed_meanwhile = not_armed_yet;
 	assert(!destroy(dev));
@@ -4066,7 +4112,10 @@ static void test_release(void)
 	drain_meanwhile = drain_holds_dev;
 	run_release();
 	drain_meanwhile = NULL;
-	assert(egress_drains == drains + 1 && !chan_quarantine[0]);
+	/* The other two ports' trees switched them to CEETM, which armed a
+	 * flush of each (test_plain_flush()): their entries are asked about
+	 * too. */
+	assert(egress_drains == drains + 3 && !chan_quarantine[0]);
 	assert(!cq_backlog[0][6] && leftovers_popped == 1);
 	assert(dev->refs == 0 && !cdx_htb_release.pending);
 	assert(cq_depth[1][6] == 768);
@@ -4218,6 +4267,109 @@ static void priority_moved(void)
 	rtnl = false;
 }
 
+/* What a tree's switch to CEETM leaves on the port's plain queues, which
+ * nothing serves in that mode, is sent once the port's entries are rebuilt
+ * against the class queues -- by the release the command arms after marking
+ * them -- and tried again while the port cannot send it; a tree that goes
+ * first takes the port out of CEETM, which leaves nothing to send (A458). */
+static void test_plain_flush(void)
+{
+	struct net_device *dev = &devices[0];
+	unsigned warns, tried, syncs, ends;
+	u64 flushed;
+
+	reset_world();
+	assert(!cdx_register_ft_egress(&egress_ops));
+	flushed = cdx_ft_qos_plain_flushed();
+
+	/* ---- sent once the entries are rebuilt, and tried again meanwhile ---- */
+	plain_backlog[3] = 40;
+	plain_stuck = true;
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
+	/* Armed after the command marked the entries, the netdev held. */
+	assert(cdx_htb_releases[3].flush && dev->refs == 1 && release_armed(0));
+	/* Not before the flowtable says the entries are rebuilt. */
+	egress_drain_rc = -EAGAIN;
+	run_release();
+	assert(!flushes && release_armed(100));
+	egress_drain_rc = 0;
+	/* A paused port: tried, kept, and the log told once. */
+	warns = pr_warns;
+	run_release();
+	run_release();
+	assert(flushes == 2 && plain_backlog[3] == 40 && pr_warns == warns + 1);
+	assert(cdx_htb_releases[3].flush && dev->refs == 1 && cdx_htb_release.pending);
+	plain_stuck = false;
+	syncs = net_syncs;
+	run_release();
+	assert(flushes == 3 && !plain_backlog[3] && cdx_ft_qos_plain_flushed() == flushed + 40);
+	assert(!cdx_htb_releases[3].flush && dev->refs == 0 && !cdx_htb_release.pending);
+	/* The senders that read ceetm_en clear were waited for first, outside
+	 * the mutex (synchronize_net() asserts it), and once. */
+	assert(flush_syncs == syncs + 1 && net_syncs == syncs + 1);
+
+	/* ---- a leaf added to a tree switches nothing ---- */
+	tried = flushes;
+	assert(!add_leaf(dev, 2, 0, 2, 0, 1000000, 1000000, NULL));
+	assert(!cdx_htb_releases[3].flush);
+	/* What the second channel moved is released as ever; nothing flushed. */
+	run_release();
+	assert(flushes == tried);
+
+	/* ---- a tree that goes first leaves nothing to send ---- */
+	assert(!destroy(dev));
+	run_release();
+	plain_backlog[3] = 5;
+	plain_stuck = true;
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
+	run_release();
+	assert(cdx_htb_releases[3].flush && flushes == 4);
+	assert(!destroy(dev));
+	assert(!cdx_htb_releases[3].flush);
+	tried = flushes;
+	run_release();
+	assert(flushes == tried && dev->refs == 0 && !cdx_htb_release.pending);
+
+	/* ---- a quarantine ends once, however long the flush waits ---- */
+	plain_backlog[3] = 5;
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(!destroy(dev));
+	assert(cdx_htb_releases[3].due && !cdx_htb_releases[3].flush);
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
+	assert(cdx_htb_releases[3].due && cdx_htb_releases[3].flush);
+	ends = quarantine_ends;
+	run_release();
+	assert(quarantine_ends == ends + 1 && cdx_htb_releases[3].flush && !cdx_htb_releases[3].due);
+	run_release();
+	run_release();
+	assert(quarantine_ends == ends + 1 && cdx_htb_releases[3].flush && dev->refs == 1);
+	plain_stuck = false;
+	run_release();
+	assert(!cdx_htb_releases[3].flush && dev->refs == 0 && !cdx_htb_release.pending);
+	assert(!destroy(dev));
+	run_release();
+
+	/* ---- a port that goes takes its flush with it ---- */
+	plain_backlog[3] = 5;
+	plain_stuck = true;
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 1, 0, 1000000, 1000000, NULL));
+	run_release();
+	assert(cdx_htb_releases[3].flush && dev->refs == 1);
+	cdx_htb_port_gone(&gQMCtx[3]);
+	assert(!cdx_htb_releases[3].flush && dev->refs == 0);
+	tried = flushes;
+	run_release();
+	assert(flushes == tried && !cdx_htb_release.pending);
+	plain_backlog[3] = 0;
+	plain_stuck = false;
+	cdx_unregister_ft_egress();
+}
+
 /* A queue a change gives back -- a leaf deleted or moved to another priority,
  * a leaf turned into a channel, queues 0 and 7 when the top channel moves,
  * every queue of a tree taken down -- is parked at a frame, which the entries
@@ -4344,7 +4496,10 @@ static void test_given_back_trees(void)
 	assert(cq_depth[1][NUM_PQS - 2] == 2048 - (767 + 2 * 128 + 1) - 2 * 128);
 	assert(regrow_armed(100));
 	run_release();
-	assert(egress_drains == ii && !cdx_htb_release.pending);
+	/* The only port asked about is the second, for the flush its switch
+	 * to CEETM armed (test_plain_flush()): the first's release is
+	 * forgotten. */
+	assert(egress_drains == ii + 1 && drained_dev == other && !cdx_htb_release.pending);
 	/* The context's release parks, drains and detaches its channel with
 	 * the classifier stopped, and the second tree has its 1,024. */
 	context_released(&gQMCtx[3]);
@@ -5484,6 +5639,9 @@ static void test_cap_curve_lost(void)
 	assert(!red_in_frames(B, on10, 0, 1, 1));
 	/* U: empty, asking a frame. */
 	assert(!create(U, 1, 0));
+	/* The flushes T's and B's switches to CEETM armed (test_plain_flush()),
+	 * with nothing on their plain queues. */
+	run_release();
 	assert(!cdx_htb_release.pending && !cdx_htb_regrow.pending);
 	assert(cq_depth[0][6] == 1280 - 2 * 128 && tree_frames(0) == 1280);
 	assert(cq_depth[1][6] == 1 && tree_frames(1) == 1 + 5 * 128);
@@ -5798,7 +5956,7 @@ int main(void)
 		test_tree, test_egress_changed, test_density, test_depth_and_limits,
 		test_channel_reuse, test_software_path, test_unclassified,
 		test_control_budget, test_fragments, test_treeless_port, test_remark,
-		test_class_statistics, test_red, test_cap, test_backlog, test_release,
+		test_class_statistics, test_red, test_cap, test_backlog, test_release, test_plain_flush,
 		test_given_back_trees, test_given_back_rotation, test_build_unconfirmed,
 		test_start_refused, test_qos_levels, test_claim_pick, test_queue_budget,
 		test_faults, test_dispatch, test_refusals, test_wide_tree,

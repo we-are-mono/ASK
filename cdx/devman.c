@@ -2509,26 +2509,21 @@ static bool port_cdx_queued(struct qman_fq *fqs, int count, u64 *frames, u64 *by
 	return true;
 }
 
-/* What is queued for the port to send and not yet taken by FMan: the frames
- * and bytes in the driver's transmit queues, and in CDX's to it -- the
- * classifier's forwarding queues and those the IPsec offline port sends SEC's
- * output to the wire by, both of which the port's record counts -- as QMan
- * counts them: frame descriptors' lengths, the units the driver's tx_bytes and
- * the record count in. Each of the driver's queues once: its egress_fqs[]
- * names one again when there are fewer queues than CPUs. False when a queue
- * cannot be read, and on a port a hardware qdisc owns: its class queues count
- * no bytes. Any context. */
-static bool port_tx_queued(const struct eth_iface_info *eth, u64 *frames, u64 *bytes)
+/* What the port's plain queues hold -- those on its dedicated channel, which
+ * QMan does not serve while a hardware qdisc has the port in CEETM mode: the
+ * driver's transmit queues, and CDX's to it, the classifier's forwarding
+ * queues and those the IPsec offline port sends SEC's output to the wire by --
+ * as QMan counts them: frame descriptors' lengths, the units the driver's
+ * tx_bytes and the port's record count in. Each of the driver's queues once:
+ * its egress_fqs[] names one again when there are fewer queues than CPUs.
+ * False when a queue cannot be read. Any context. */
+bool cdx_port_plain_queued(const struct eth_iface_info *eth, u64 *frames, u64 *bytes)
 {
 	struct dpa_priv_s *priv = netdev_priv(eth->net_dev);
 	struct qm_mcr_queryfq_np np;
 	struct dpa_fq *fq;
 
 	*frames = *bytes = 0;
-#ifdef CONFIG_CPE_FAST_PATH
-	if (priv->ceetm_en)
-		return false;
-#endif
 	list_for_each_entry(fq, &priv->dpa_fq_list, list) {
 		if (fq->fq_type != FQ_TYPE_TX)
 			continue;
@@ -2541,6 +2536,21 @@ static bool port_tx_queued(const struct eth_iface_info *eth, u64 *frames, u64 *b
 			       frames, bytes) &&
 	       port_cdx_queued((struct qman_fq *)eth->sec_tx_fqinfo, DPAA_FWD_TX_QUEUES,
 			       frames, bytes);
+}
+
+/* What is queued for the port to send and not yet taken by FMan, for its
+ * counts: its plain queues' frames and bytes. False when a queue cannot be
+ * read, and on a port a hardware qdisc owns: its class queues count no bytes.
+ * Any context. */
+static bool port_tx_queued(const struct eth_iface_info *eth, u64 *frames, u64 *bytes)
+{
+#ifdef CONFIG_CPE_FAST_PATH
+	if (((struct dpa_priv_s *)netdev_priv(eth->net_dev))->ceetm_en) {
+		*frames = *bytes = 0;
+		return false;
+	}
+#endif
+	return cdx_port_plain_queued(eth, frames, bytes);
 }
 
 /* How long the largest frame the port sends -- its MTU, two tags, preamble,

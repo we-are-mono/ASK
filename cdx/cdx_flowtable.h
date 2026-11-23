@@ -63,6 +63,10 @@ u64 cdx_ft_qos_remark_failures(void);
  * budget was spent, summed over every port, for the adapter's status. */
 u64 cdx_ft_qos_control_overruns(void);
 
+/* Frames a tree's switch to CEETM left on its port's plain queues, sent once
+ * the port's entries were rebuilt (A458), summed over every port. */
+u64 cdx_ft_qos_plain_flushed(void);
+
 /* What the hardware qdisc has to give and what of it is held, for the
  * adapter's status.
  *

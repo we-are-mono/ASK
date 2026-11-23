@@ -1031,6 +1031,72 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 	return CEETM_SUCCESS;
 }
 
+/* How long the plain queues get to drain with the sub-portal out of CEETM
+ * mode, and how often they are read meanwhile: the class queues wait that
+ * long, under cdx_htb_mutex. At 10 Gbit/s a port frees its whole forwarding
+ * share in under two milliseconds; a slower link frees what it can and the
+ * rest goes on a later try, as for a port its link partner pauses, which
+ * sends nothing however long it gets. */
+#define CEETM_FLUSH_US		10000
+#define CEETM_FLUSH_POLL_US	200
+
+/* Send what the port's plain queues still hold after a tree switched it to
+ * CEETM (A458). Called once nothing puts frames there any more: the port's
+ * flowtable entries rebuilt against its class queues, and ceetm_en set before
+ * the switch, with a synchronize_net() since, which the caller makes before it
+ * takes cdx_htb_mutex, finishing any software sender that read it clear. QMan
+ * serves those queues' dedicated channel only outside CEETM mode, so the
+ * sub-portal is taken out of it until they are empty, or for CEETM_FLUSH_US
+ * at most, and put back: the tree's class queues wait meanwhile, as they
+ * waited for the switch, and its shapers send what tokens they gathered in
+ * one burst after.
+ *
+ * Under cdx_htb_mutex: DCP_CFG is one register for every sub-portal of a
+ * portal, written read-modify-write, and every runtime change of a
+ * sub-portal's mode is made under it -- an HTB command's enable and teardown,
+ * and this. Releasing an interface's LNI and sub-portal (ceetm_release_iface())
+ * writes it under the control mutex alone, but only at unload and init
+ * rollback, after cdx_htb_exit() has stopped the work that calls this.
+ *
+ * Returns the frames still there -- zero once the queues are empty, more when
+ * the port could not send them, for the caller to try again later -- or a
+ * negative errno when a queue cannot be read. *flushed is what left. */
+long ceetm_flush_plain(struct tQM_context_ctl *qm_ctx, u64 *flushed)
+{
+	/* The port's own record, load-once like the port: read without the
+	 * control mutex, which ranks above cdx_htb_mutex. */
+	struct dpa_iface_info *iface = qm_ctx->iface_info;
+	u64 before, frames, bytes;
+	ktime_t deadline;
+	long rc;
+
+	*flushed = 0;
+	if (!qm_ctx->qos_enabled || !qm_ctx->lni)
+		return 0;
+	if (!iface || !(iface->if_flags & IF_TYPE_ETHERNET))
+		return -ENODEV;
+	if (!cdx_port_plain_queued(&iface->eth_info, &before, &bytes))
+		return -EIO;
+	if (!before)
+		return 0;
+	qman_sp_disable_ceetm_mode(qm_ctx->lni->sp->dcp_idx, qm_ctx->lni->sp->idx);
+	frames = before;
+	rc = 0;
+	deadline = ktime_add_us(ktime_get(), CEETM_FLUSH_US);
+	while (frames && ktime_before(ktime_get(), deadline)) {
+		usleep_range(CEETM_FLUSH_POLL_US, 2 * CEETM_FLUSH_POLL_US);
+		if (!cdx_port_plain_queued(&iface->eth_info, &frames, &bytes)) {
+			rc = -EIO;
+			break;
+		}
+	}
+	qman_sp_enable_ceetm_mode(qm_ctx->lni->sp->dcp_idx, qm_ctx->lni->sp->idx);
+	if (rc)
+		return rc;
+	*flushed = before > frames ? before - frames : 0;
+	return frames;
+}
+
 int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 {
 	struct qm_ceetm_rate token;
@@ -1042,20 +1108,33 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 		return QOS_ENERR_NOT_CONFIGURED;
 	if (oper) {
 		if (!qm_ctx->qos_enabled) {
+			/* Every sender chooses the tree's class queues from
+			 * here on -- the driver's transmit, cdx_get_txfqid()
+			 * and the WireGuard fast path read the flag per frame
+			 * -- before the sub-portal stops serving the plain
+			 * queues, which ceetm_setup_lni() makes it do
+			 * (qman_ceetm_sp_set_lni() turns its CEETM mode on): a
+			 * frame sent meanwhile waits on its class queue for the
+			 * switch, where on a plain queue it would wait for the
+			 * tree to go (A458). What the plain queues hold
+			 * already, and what a sender that read the flag just
+			 * before puts there, is sent once the port's entries
+			 * have been rebuilt (ceetm_flush_plain()). */
+			dpa_enable_ceetm(qm_ctx->net_dev);
 
 			/* initialize lni */
 			if (ceetm_setup_lni(qm_ctx)) {
 				ceetm_err("%s:ceetm_setup_lni failed \n", __func__);
-				return QOS_ENERR_IO;
+				goto unwind;
 			}
-				
+
 			/* configure all shapers as per configuration in the context */
 			/* program lni, port shaper */
 			if (ceetm_program_port_shaper(qm_ctx, &qm_ctx->shaper_info.token_cr,
 						&qm_ctx->shaper_info.token_er,
 						qm_ctx->shaper_info.bsize)) {
 				ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
-				return QOS_ENERR_IO;
+				goto unwind;
 			}
 			/* Every channel the port holds, whichever of the SoC's
 			 * it is. This walk used to stop at eight, the channels
@@ -1074,19 +1153,19 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 							&chnl_ctx->shaper_info.token_er,
 							chnl_ctx->shaper_info.bsize)) {
 						ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
-						return QOS_ENERR_IO;
+						goto unwind;
 					}
 				}
 			}
 			ceetm_dbg("%s::calling qman_sp_enable_ceetm_mode sp %p\n", __func__,
 				qm_ctx->lni->sp);
-			
-			if (qman_sp_enable_ceetm_mode(qm_ctx->lni->sp->dcp_idx, 
+			/* Set by qman_ceetm_sp_set_lni() already; said again as
+			 * the mode this leaves the sub-portal in. */
+			if (qman_sp_enable_ceetm_mode(qm_ctx->lni->sp->dcp_idx,
 					qm_ctx->lni->sp->idx)) {
 				ceetm_err("%s:qman_sp_enable_ceetm_mode failed \n", __func__);
-				return QOS_ENERR_IO;
-			} 
-			dpa_enable_ceetm(qm_ctx->net_dev);
+				goto unwind;
+			}
 			qm_ctx->qos_enabled = 1;
 			ceetm_dbg("%s::CEETM enabled on iface %s\n", __func__,
 				qm_ctx->iface_info->name);
@@ -1128,6 +1207,24 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 		}
 	}
 	return CEETM_SUCCESS;
+
+unwind:
+	/* An enable that failed leaves the port as it found it, so the next
+	 * attempt starts afresh: the senders back on the plain queues, the
+	 * LNI's shaper off -- the SDK refuses to enable one already on -- and
+	 * the sub-portal serving the plain queues' channel again. What a
+	 * sender put on a class queue meanwhile waits there for the next
+	 * attempt, or the tree's teardown drains it. This used to leave the
+	 * mode on with ceetm_en clear, so the port sent nothing until its
+	 * interface went, and every retry failed on the shaper. */
+	dpa_disable_ceetm(qm_ctx->net_dev);
+	synchronize_net();
+	if (qm_ctx->lni && qman_ceetm_lni_is_shaper_enabled(qm_ctx->lni) &&
+	    qman_ceetm_lni_disable_shaper(qm_ctx->lni))
+		ceetm_err("%s:qman_ceetm_lni_disable_shaper failed\n", __func__);
+	if (qm_ctx->sp)
+		qman_sp_disable_ceetm_mode(qm_ctx->sp->dcp_idx, qm_ctx->sp->idx);
+	return QOS_ENERR_IO;
 }
 
 

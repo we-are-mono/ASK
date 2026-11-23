@@ -34,7 +34,8 @@ import pytest
 
 from _flowtable_qos import HIGH_CQ, HIGH_PRIO, LOW_CQ, LOW_PRIO, LOWER_CQ, LOWER_PRIO, PORT_BE, PORT_BULK, PORT_EF, PORT_EF_BEFORE, PORT_EF_MOVED, PORT_EF_SOFTWARE, PORT_HELD_A, PORT_HELD_B, PORT_HELD_C, PORT_HIGH, PORT_LOW, PORT_POOL, PORT_PROBE, PORT_REMARK_HW, PORT_REMARK_SW, PORT_UNCLASSIFIED_HW, PORT_UNCLASSIFIED_SW, PORT_WEIGHTED, PORT_WEIGHTED_BULK, PORT_STRANDED_GROUP, PORTS_STRANDED, TCP_FRAME, TCP_PAYLOAD
 
-from _flowtable_qos import (CEILING_CLASSES, LEAF_SLOTS, PORTS_CHANNELS, PORTS_POLICERS, WIDE_MASK, reloaded_mask)
+from _flowtable_qos import (CEILING_CLASSES, LEAF_SLOTS, PORT_ATTACH, PORTS_CHANNELS, PORTS_POLICERS, WIDE_MASK,
+                            reloaded_mask)
 from _flowtable_qos import (AF11_TOS, CAP_MBIT, COUNT, DATAGRAM, EF_TOS, FLOW_LABEL, OAL, OFFERED_MBIT, POLICE_BURST, PORT_DECLINED, PORT_DEFAULT, PORT_EF_REPLACED, PORT_EGRESS, PORT_POLICED, PORT_SATURATE, PORT_SHAPED, PROBE_SLACK, REMARK_CLASS, SETTLE, TAIL_FRAMES, UDP_HEADERS, UNSHAPED_GBPS, WEIGHTED_CQ, WINDOW, WRED_BANDS, WRED_LIMIT, WRED_MBIT, WRED_PROBABILITY, admit, assert_remarked, captured, class_field, conntrack_ids, directions, dut_ping, ef_filter, egress, handshakes, inbound, iperf, lan_start, leaf_delta, lockstep, logged, offered, offload, police_counters, policed, probe, qdisc_shown, read_intervals, readmitted, received_bps, received_loss, remark_fields, remark_send, remarking, shaped_bps, timing_slack, tree)
 
 import asyncio
@@ -557,6 +558,90 @@ async def test_shrunk_leaf_backlog_stays_charged(qos):
     # port they arrived on losing nothing for want of a buffer.
     assert idle - lowest <= POOL_SHARE, record
     assert wan["rx_missed_errors"] == 0, record
+
+
+# How long the LAN port is held paused while a flood backs its forwarding
+# queues up and a tree takes it; and how far below idle the pool may stay once
+# the flood and the pause are over, the tree having sent what it took on.
+ATTACH_SECONDS = 4
+ATTACH_LEFT = 200
+
+
+async def test_tree_taking_a_paused_port_strands_nothing(qos):
+    """A tree that takes a port while its forwarding queues are backed up
+    leaves nothing on them (A458).
+
+    The port's forwarding queues, and the driver's transmit queues, are on
+    its sub-portal's dedicated channel, which QMan stops serving once the tree
+    switches the port to CEETM. An offloaded flow floods the LAN port while
+    its link partner pauses it, so those queues hold frames when the tree goes
+    on. Each frame the switch left there holds a buffer of the pool every port
+    receives into, for as long as the tree stays, and is sent when it goes,
+    long after it was due. So once the flood and the pause are over, with the
+    tree still on the port, the pool has to come back to idle.
+
+    The frames are sent once the port's entries have been rebuilt against the
+    class queues, by taking the sub-portal out of CEETM until they have gone;
+    the flood runs on past the pause, so that happens with the tree's own
+    queue sending too, and the port must count no transmit error for it."""
+    r = qos
+    dev = TARGET_LAN_IF
+    rate = f"{CAP_MBIT}mbit"
+    tx_errors = f"/sys/class/net/{dev}/statistics/tx_errors"
+    await offload(r, inbound(r, "udp", PORT_ATTACH))
+    # Admitted while the port still sends: an admission waits for the echo.
+    await lan_start(r, echo=[PORT_ATTACH])
+    await admit(r, PORT_ATTACH)
+    bpid, idle = await pool_lowest(0)
+    before = await r.state()
+    errors = int(await read(r.target, r.session, tx_errors))
+
+    async def backed_up():
+        # On for longer after the pause than the flush waits between tries
+        # (CDX_HTB_RELEASE_LAST_MS, a second), so it runs with the tree's
+        # queue sending.
+        flood = asyncio.create_task(asyncio.to_thread(_flood, r.lan_ip, PORT_ATTACH, ATTACH_SECONDS + 3))
+        try:
+            await asyncio.sleep(1)
+            _, queued = await pool_lowest(0, bpid)
+            await r.tc("qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "offload",
+                       "default", "10")
+            await r.tc("class", "add", "dev", dev, "parent", "1:", "classid", "1:1",
+                       "htb", "rate", rate, "ceil", rate)
+            await r.tc("class", "add", "dev", dev, "parent", "1:1", "classid", "1:10",
+                       "htb", "rate", rate, "ceil", rate, "prio", "1")
+            return {"queued": queued, "sent": await flood}
+        finally:
+            if not flood.done():
+                flood.cancel()
+                await asyncio.gather(flood, return_exceptions=True)
+
+    phases, pauses = await while_lan_port_paused(r, backed_up, ATTACH_SECONDS)
+    await asyncio.sleep(SETTLE)
+    _, left = await pool_lowest(1, bpid)
+    after = await r.state()
+    # The tree still sends, its leaf taking the flow, after the sub-portal
+    # went out of CEETM and back under it.
+    leaves = await egress(r, dev)
+    resent = await asyncio.to_thread(_flood, r.lan_ip, PORT_ATTACH, 1)
+    await asyncio.sleep(0.5)
+    tree_sent = leaf_delta(leaves, await egress(r, dev), 0)
+    record = {"phases": phases, "pauses": pauses, "pool": {"bpid": bpid, "idle": idle, "left": left},
+              "flushed": after["qos_plain_flushed"] - before["qos_plain_flushed"],
+              "tx_errors": int(await read(r.target, r.session, tx_errors)) - errors,
+              "resent": resent, "tree_sent": tree_sent, "state": after}
+    r.record("qos-attach-backed-up", record)
+    # The pause backed the queues up: the tree took a port with frames on its
+    # dedicated channel.
+    assert phases["sent"] > 100_000 and idle - phases["queued"] >= 400, record
+    # None of them stayed there: they went once the port sent again, most of
+    # them by the flush -- some left between the pool's reading and the switch.
+    assert idle - left <= ATTACH_LEFT, record
+    assert record["flushed"] >= (idle - phases["queued"]) // 2, record
+    # And switching the sub-portal out of CEETM and back while the tree sent
+    # cost the port nothing: no transmit error, and the tree sends on.
+    assert record["tx_errors"] == 0, record
+    assert tree_sent["frames"] >= resent // 2, record
 
 
 # How many times the LAN tree is taken down under load with a WAN tree built in

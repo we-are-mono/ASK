@@ -467,13 +467,24 @@ struct cdx_htb_port {
  * waits for the marking that follows the change, and one that saw `gen' move
  * while it waited gives back nothing a later change quarantined or gave
  * back. `told' says the log was told the entries could not yet be shown
- * retired or rebuilt. */
+ * retired or rebuilt.
+ *
+ * `flush' says a tree switched the port to CEETM and its plain queues may
+ * still hold frames, which nothing serves in that mode: once the entries are
+ * rebuilt against the class queues, they are sent (ceetm_flush_plain()), and
+ * tried again while the port cannot send them (A458). `flush_told' says the
+ * log was told of such a port. */
 struct cdx_htb_release {
 	struct net_device *dev;
 	unsigned long gen, marked;
 	u16 given[CDX_CEETM_MAX_CHANNELS];
-	bool due, told;
+	bool due, told, flush, flush_told;
 };
+
+/* Frames a tree's switch to CEETM left on its port's plain queues, sent once
+ * nothing put frames there any more (cdx_htb_release_one()). Reported in
+ * /proc/ask_flowtable/stats. */
+static atomic64_t cdx_htb_plain_flushed = ATOMIC64_INIT(0);
 
 /* Indexed the way gQMCtx is, so a netdev's stashed QoS context names its
  * entry. Ports without CEETM never reach here at all. */
@@ -2160,6 +2171,23 @@ static void cdx_htb_release_due(struct cdx_htb_port *port)
 	if (!r->due)
 		r->told = false;
 	r->due = true;
+	/* The teardown took the port out of CEETM, so its plain queues are
+	 * served again: nothing is left for a flush to send. */
+	r->flush = false;
+}
+
+/* The port has just been switched to CEETM: its plain queues may hold frames
+ * no one serves now, which go once its entries have been rebuilt against the
+ * class queues (cdx_htb_release_one()), by the release the command arms after
+ * marking them. */
+static void cdx_htb_release_flush(struct cdx_htb_port *port)
+{
+	struct cdx_htb_release *r = &cdx_htb_releases[port - cdx_htb_ports];
+
+	if (!cdx_htb_release_hold(port))
+		return;
+	r->flush = true;
+	r->flush_told = false;
 }
 
 /* Teardown, for a command whose return value sch_htb discards.
@@ -2216,6 +2244,7 @@ static int cdx_htb_leaf_alloc(struct cdx_htb_port *port,
 	bool root = opt->parent_classid == TC_HTB_CLASSID_ROOT;
 	struct cdx_htb_class *parent, *cl, probe = {};
 	u8 channel, cq;
+	bool was;
 	int rc;
 
 	/* Each leaf takes one of the Tx queues sdk_dpaa reserves, whichever
@@ -2275,11 +2304,15 @@ static int cdx_htb_leaf_alloc(struct cdx_htb_port *port,
 	 * is inert. It needs a channel bound first, which is why it happens
 	 * here and not at TC_HTB_CREATE. Already-enabled is a no-op, so this
 	 * also recovers a port whose first attempt failed. */
+	was = port->qm_ctx->qos_enabled;
 	if (ceetm_enable_or_disable_qos(port->qm_ctx, 1)) {
 		NL_SET_ERR_MSG_MOD(opt->extack, "CEETM would not start on this port");
 		rc = -EIO;
 		goto err_cq;
 	}
+	/* The switch left whatever the plain queues held there, unserved. */
+	if (!was)
+		cdx_htb_release_flush(port);
 	/* Last thing that can fail: growing the usable range is what lets the
 	 * stack put a frame on this leaf's queue at all. */
 	rc = cdx_htb_resize(port, port->leaves + 1);
@@ -2834,6 +2867,41 @@ void cdx_ft_egress_restarted(void)
  * (cdx_qos_port_next()), and wait for nothing while they have it; its status
  * read takes none (cdx_qos_budget()). */
 
+/* Send what a tree's switch to CEETM left on port `ii''s plain queues, now
+ * that its entries are rebuilt against the class queues (`flush'). Under
+ * cdx_htb_mutex, as every change of a sub-portal's mode is. Returns whether it
+ * has to be tried again: the port could not send them yet. */
+static bool cdx_htb_flush_one(unsigned int ii, struct net_device *dev)
+{
+	struct cdx_htb_release *r = &cdx_htb_releases[ii];
+	struct cdx_htb_port *port = &cdx_htb_ports[ii];
+	u64 flushed;
+	long left;
+
+	/* A teardown since took the port out of CEETM, so its plain queues
+	 * are served again. */
+	if (!port->live || !port->qm_ctx || !port->qm_ctx->qos_enabled) {
+		r->flush = false;
+		return false;
+	}
+	left = ceetm_flush_plain(port->qm_ctx, &flushed);
+	atomic64_add(flushed, &cdx_htb_plain_flushed);
+	if (!left) {
+		r->flush = false;
+		return false;
+	}
+	if (!r->flush_told) {
+		if (left < 0)
+			pr_warn("cdx: %s: cannot read the queues its tree's switch to CEETM may have left frames on (%ld); trying again\n",
+				netdev_name(dev), left);
+		else
+			pr_warn("cdx: %s still holds %ld frames on queues it does not serve while its tree is on; sending them in later tries\n",
+				netdev_name(dev), left);
+	}
+	r->flush_told = true;
+	return true;
+}
+
 /* One port's release, if anything waits on its entries and they have been
  * marked since the last change it waits for. Returns whether it has to be
  * tried again. */
@@ -2841,7 +2909,7 @@ static bool cdx_htb_release_one(unsigned int ii)
 {
 	struct cdx_htb_release *r = &cdx_htb_releases[ii];
 	struct net_device *dev, *put = NULL;
-	bool again = false;
+	bool again = false, flush, given;
 	unsigned long gen;
 	int rc;
 
@@ -2852,10 +2920,16 @@ static bool cdx_htb_release_one(unsigned int ii)
 	}
 	gen = r->gen;
 	dev = r->dev;
+	flush = r->flush;
 	dev_hold(dev);
 	mutex_unlock(&cdx_htb_mutex);
 
 	rc = cdx_ft_egress_drain(dev);
+	/* A flush needs every software sender that read ceetm_en clear, before
+	 * the switch armed it, to have finished: waited for here, where it
+	 * holds up no HTB command. */
+	if (!rc && flush)
+		synchronize_net();
 
 	mutex_lock(&cdx_htb_mutex);
 	/* Gone with its port, or changed again while the drain ran: what was
@@ -2866,13 +2940,17 @@ static bool cdx_htb_release_one(unsigned int ii)
 		dev_put(dev);
 		return false;
 	}
+	given = memchr_inv(r->given, 0, sizeof(r->given));
 	if (rc) {
 		if (!r->told) {
 			if (r->due)
 				pr_warn("cdx: %s keeps the CEETM channels of its last tree out of service until its flowtable entries have been retired or rebuilt (%d)\n",
 					netdev_name(dev), rc);
-			else
+			else if (given)
 				pr_warn("cdx: %s keeps the class queues its tree gave back charged until its flowtable entries have been retired or rebuilt (%d)\n",
+					netdev_name(dev), rc);
+			else
+				pr_warn("cdx: %s keeps what its tree's switch to CEETM left on its plain queues until its flowtable entries have been retired or rebuilt (%d)\n",
 					netdev_name(dev), rc);
 		}
 		r->told = true;
@@ -2881,16 +2959,25 @@ static bool cdx_htb_release_one(unsigned int ii)
 		if (r->due && ceetm_end_quarantine(&gQMCtx[ii]))
 			pr_warn("cdx: %s left frames on a CEETM channel of its last tree that could not be freed; the channel stays out of service\n",
 				netdev_name(dev));
-		put = r->dev;
-		r->dev = NULL;
-		r->due = false;
-		memset(r->given, 0, sizeof(r->given));
 		/* Nothing names the queues given back any more, and what the
 		 * entries left on a quarantined channel is gone: a tree kept
 		 * short for either can grow now, and the channels are any
-		 * port's. */
-		cdx_htb_cap_trees(NULL);
-		cdx_htb_levels_update();
+		 * port's. Once: a flush tried again finds nothing of either. */
+		if (r->due || given) {
+			r->due = false;
+			memset(r->given, 0, sizeof(r->given));
+			cdx_htb_cap_trees(NULL);
+			cdx_htb_levels_update();
+		}
+		/* Nothing sends to the plain queues now either: what a switch
+		 * to CEETM left there can go. The netdev stays held while it
+		 * cannot. */
+		if (r->flush && cdx_htb_flush_one(ii, dev)) {
+			again = true;
+		} else {
+			put = r->dev;
+			r->dev = NULL;
+		}
 	}
 	mutex_unlock(&cdx_htb_mutex);
 	dev_put(dev);
@@ -3217,6 +3304,8 @@ void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
 	put = r->dev;
 	r->dev = NULL;
 	r->due = false;
+	/* Nor is a flush: the port is going, its queues with it. */
+	r->flush = false;
 	for (ii = 0; ii < ceetm_channel_count(); ii++)
 		cdx_htb_departing[ii] |= r->given[ii];
 	memset(r->given, 0, sizeof(r->given));
@@ -3663,6 +3752,12 @@ u64 cdx_ft_qos_control_overruns(void)
 	return atomic64_read(&cdx_htb_control_overruns);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_qos_control_overruns, "ASK_CDX_FLOWTABLE");
+
+u64 cdx_ft_qos_plain_flushed(void)
+{
+	return atomic64_read(&cdx_htb_plain_flushed);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_qos_plain_flushed, "ASK_CDX_FLOWTABLE");
 
 /* The class of the connection a frame belongs to: -1 with no classifier
  * registered, 0 when no connection is known, with *class zero, and 1 when one

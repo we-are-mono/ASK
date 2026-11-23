@@ -57,7 +57,8 @@ def test_port_counters(tmp_path):
 def test_port_tx_queued(tmp_path):
     source = (ROOT / "cdx/devman.c").read_text()
     (tmp_path / "port_tx_queued_production.inc").write_text(
-        "".join(function(source, name) for name in ["port_cdx_queued", "port_tx_queued"]))
+        "".join(function(source, name) for name in ["port_cdx_queued", "cdx_port_plain_queued",
+                                                     "port_tx_queued"]))
     binary = tmp_path / "port_tx_queued"
     run_process([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
