@@ -125,7 +125,8 @@ they conflict with modern kernel APIs or clean design, prefer the modern approac
   refuses one). Written in the newest line's terms; where a kernel line's API
   differs, a `LINUX_VERSION_CODE` guard keyed on the release that changed it (as
   `cdx/compat.h`). NXP's releases come in through the `vendor/nxp-sdk` branch,
-  merged three-way (`sdk/README.md`).
+  merged three-way (`sdk/README.md`). Dead code in it is removed only by proof,
+  with `tools/sdk_prune.py` (`sdk/README.md`, "Removing dead code").
 - **Changing a patch:** `make kernel-series-prepare LINE=<line>` builds the line's
   base (its recipe's `KERNEL_SRCREV` with `sdk/linux/` overlaid, as
   `do_overlay_sdk` lays it) and `series-<line>`,

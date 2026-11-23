@@ -58,7 +58,7 @@ endef
 setup:
 	sudo apt-get update
 	sudo apt-get install -y git kas build-essential chrpath diffstat gawk \
-	    bzip2 lz4 rpcsvc-proto locales
+	    bzip2 lz4 rpcsvc-proto locales unifdef
 	sudo sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
 	sudo locale-gen
 	sudo update-locale LANG=en_US.UTF-8
