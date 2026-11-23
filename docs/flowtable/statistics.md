@@ -216,7 +216,7 @@ delivered protocol handler overwrites it, so a frame consumed on the
 `NF_NETDEV_INGRESS` hook comes back as `NET_RX_DROP` after being forwarded, and
 the driver counted nothing — not even `rx_dropped`. GRO would have hidden it for
 TCP, but `dpa_fix_features()` clears `NETIF_F_RXCSUM`, so every frame takes
-that path. `sdk_dpaa` (in the SDK copy, `sdk/<line>/`) now counts the frame
+that path. `sdk_dpaa` (in the SDK copy, `sdk/linux/`) now counts the frame
 before the handoff, as every other driver does; the core's
 own `rx_dropped` and `rx_nohandler` still record real drops.
 

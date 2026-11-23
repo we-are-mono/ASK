@@ -113,7 +113,7 @@ uint32_t ceetm_egress_fqid(void *ctx, uint32_t channel, uint32_t classque)
  * rather than an object, so it comes from ceetm_egress_fqid() at the one place
  * that wants it; cpe_fp_tx() has always passed zero here and wants the queue
  * itself. Narrowing the typedef means changing sdk_dpaa (the SDK copy,
- * sdk/<line>) for a parameter that is already dead at its only caller.
+ * sdk/linux) for a parameter that is already dead at its only caller.
  */
 static struct qman_fq *ceetm_egressfq_hook(void *ctx, uint32_t channel,
 					   uint32_t classque, uint32_t ff)

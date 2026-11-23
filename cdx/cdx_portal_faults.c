@@ -137,8 +137,9 @@ static int pf_probe_emit(char *buf, int at, const struct pf_probe *probe)
 
 static enum qman_cb_dqrr_result pf_backlog_dqrr(struct qman_portal *portal,
 						 struct qman_fq *fq,
-						 const struct qm_dqrr_entry *dq
-						 CDX_DQRR_POLL)
+						 const struct qm_dqrr_entry *dq,
+						 bool sched_napi,
+						 struct qman_poll_ctx *ctx)
 {
 	int tries;
 

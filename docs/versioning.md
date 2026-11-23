@@ -4,27 +4,28 @@ How ASK is versioned, released and maintained across Linux kernel lines.
 
 ## One trunk, every line
 
-ASK is coupled to its kernel: the patch series, the NXP SDK drivers it overlays
-and the interface between cdx and the kernel hooks all follow the kernel line.
-Rather than a branch per line, one trunk carries every supported line side by
-side, the way OpenWrt carries its targets' kernels:
+ASK is coupled to its kernel: the patch series and the interface between cdx
+and the kernel hooks follow the kernel line. Rather than a branch per line, one
+trunk carries every supported line side by side, the way OpenWrt carries its
+targets' kernels:
 
 ```text
 patches/kernel/6.12/   patches/kernel/6.18/      the series, one per line
-sdk/6.12/              sdk/6.18/                 ASK's copy of the NXP SDK drivers
+sdk/linux/                                       ASK's copy of the NXP SDK drivers
 meta-ask/recipes-kernel/linux/
     linux-ask_6.12.bb  linux-ask_6.18.bb         kernel pin and series order
     linux-ask.inc                                what the lines share
 ```
 
-Each SDK copy is NXP's code for that line with ASK's changes made in place;
-the `vendor/nxp-sdk` branch keeps NXP's code unmodified, so a newer NXP release
+The SDK copy is NXP's code with ASK's changes made in place; the
+`vendor/nxp-sdk` branch keeps NXP's code unmodified, so a newer NXP release
 merges in three-way (`sdk/README.md`).
 
-Everything else -- cdx, ask_flowtable, the flowtable daemon, the tests -- is one
-copy that builds for every line. What differs between kernel or SDK releases is
-kept in `cdx/compat.h`, keyed on the release that changed it, so the sources are
-written once, in the newest line's terms.
+Everything else -- the SDK copy, cdx, ask_flowtable, the flowtable daemon, the
+tests -- is one copy that builds for every line. What differs between kernel
+releases is kept in `LINUX_VERSION_CODE` guards (`cdx/compat.h` for cdx), keyed
+on the release that changed it, so the sources are written once, in the newest
+line's terms.
 
 A build picks its line: `make ask-image LINE=6.12` (the default is the newest).
 Each line builds in its own `meta-ask/build/tmp-<line>`, and the test targets

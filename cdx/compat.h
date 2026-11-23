@@ -4,9 +4,9 @@
  * here so the sources are written once, in the newest line's terms. Included
  * into every object by the Kbuild, ahead of the sources' own headers.
  *
- * Each difference is keyed on the release that made it upstream; the NXP SDK
- * is pinned per kernel line (lf-6.12.y with 6.12, lf-6.18.y with 6.18), so its
- * differences are keyed on the kernel line too.
+ * Each difference is keyed on the release that made it upstream. The NXP SDK
+ * is one copy for every line (sdk/linux), so its API does not differ between
+ * them.
  */
 #ifndef CDX_COMPAT_H
 #define CDX_COMPAT_H
@@ -35,23 +35,6 @@
 /* 6.17 renamed dev_get_port_parent_id(). */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 17, 0)
 #define netif_get_port_parent_id	dev_get_port_parent_id
-#endif
-
-/* The lf-6.18 SDK tells a dequeue callback whether it may schedule its NAPI
- * and passes the portal's poll context; dpaa_eth_napi_schedule() takes the
- * former. A callback's parameter list ends in CDX_DQRR_POLL (no comma before
- * it), and schedules through cdx_napi_schedule(); under lf-6.12 `sched_napi` is
- * not a parameter, and the SDK decides from the calling context (not serving a
- * softirq) instead. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
-struct qman_poll_ctx;
-#define CDX_DQRR_POLL		, bool sched_napi, struct qman_poll_ctx *ctx
-#define cdx_napi_schedule(percpu_priv, qm) \
-	dpaa_eth_napi_schedule(percpu_priv, qm, sched_napi)
-#else
-#define CDX_DQRR_POLL
-#define cdx_napi_schedule(percpu_priv, qm) \
-	dpaa_eth_napi_schedule(percpu_priv, qm)
 #endif
 
 #endif /* CDX_COMPAT_H */

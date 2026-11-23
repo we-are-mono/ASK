@@ -1,9 +1,9 @@
 """The kernel line a build or a test run is about.
 
 One checkout builds every line it has a kernel recipe for, side by side
-(meta-ask/conf/distro/ask.conf): each has its recipe, its patch series, its
-SDK copy and its own build tree. ASK_LINE names the line a run is about, as
-make's LINE does for the image build.
+(meta-ask/conf/distro/ask.conf): each has its recipe, its patch series and its
+own build tree, and every line builds the one SDK copy. ASK_LINE names the
+line a run is about, as make's LINE does for the image build.
 """
 
 import os
@@ -57,9 +57,10 @@ def patches(line=None, root=ROOT):
     return Path(root) / "patches/kernel" / (line or current())
 
 
-def sdk(line=None, root=ROOT):
-    """The line's copy of the NXP SDK drivers, laid out as in a kernel tree."""
-    return Path(root) / "sdk" / (line or current())
+def sdk(root=ROOT):
+    """ASK's copy of the NXP SDK drivers, laid out as in a kernel tree; every
+    line builds it."""
+    return Path(root) / "sdk/linux"
 
 
 def tmpdir(line=None, root=ROOT):

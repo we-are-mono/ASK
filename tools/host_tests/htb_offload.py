@@ -18,10 +18,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def _dpaa_eth_header():
-    """sdk_dpaa's dpaa_eth.h in the line's SDK copy. Its Tx queue counts are
-    the ones without CONFIG_FMAN_PFC, which ASK's kernel config leaves off."""
-    return (ROOT / "sdk" / kernel_line.current()
-            / "drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h").read_text()
+    """sdk_dpaa's dpaa_eth.h in the SDK copy. Its Tx queue counts are the
+    ones without CONFIG_FMAN_PFC, which ASK's kernel config leaves off."""
+    return (kernel_line.sdk() / "drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h").read_text()
 
 
 def function(source, name):

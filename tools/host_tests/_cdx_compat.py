@@ -22,15 +22,11 @@ COMPAT = ROOT / "cdx/compat.h"
 INC = "cdx_compat.inc"
 NAMES = re.compile(r"^#define ((?:CDX_|cdx_|netif_)\w*)(\([^)]*\))?(?: (.*))?$")
 
-# What a harness passes where compat.h's parameters are declared: a caller
-# outside any portal poll (no NAPI of its own to schedule, no poll context),
-# and the state's own device. Each is keyed on the parameters compat.h
-# resolved to, so a change to compat.h that the harnesses do not model yet
-# fails here rather than compiling into something else.
+# What a harness passes where compat.h's parameters are declared: the state's
+# own device. Each is keyed on the parameters compat.h resolved to, so a
+# change to compat.h that the harnesses do not model yet fails here rather
+# than compiling into something else.
 ARGUMENTS = {
-    "CDX_DQRR_POLL": ("CDX_DQRR_POLL_ARGS", {
-        "": "",
-        ", bool sched_napi, struct qman_poll_ctx *ctx": ", false, NULL"}),
     "CDX_XDO_DEV": ("CDX_XDO_DEV_ARG(dev)", {
         "": "",
         "struct net_device *dev,": "dev,"}),

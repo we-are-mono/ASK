@@ -2,9 +2,9 @@
 
 patches/kernel/<line>/*.patch is the series' one source of truth; this builds
 the git history it is edited in, and writes it back. The NXP SDK drivers are
-not patched: their code is the line's copy, sdk/<line>, edited in place.
+not patched: their code is ASK's copy, sdk/linux, edited in place.
 
-  prepare        base-<line>: the line's stable commit with sdk/<line>
+  prepare        base-<line>: the line's stable commit with sdk/linux
                  overlaid, as the recipe's do_overlay_sdk lays it, in one
                  commit; series-<line>: the series applied onto it, strictly
                  (git am, no three-way), in the recipe's SRC_URI order.
@@ -12,7 +12,7 @@ not patched: their code is the line's copy, sdk/<line>, edited in place.
                  (matched by subject); a file whose change did not change --
                  bar its commit id, blob abbreviations and hunk offsets -- is
                  left as it is. A commit that changes the SDK copy's files is
-                 refused: that change belongs in sdk/<line>.
+                 refused: that change belongs in sdk/linux.
   check          the patch files applied onto a fresh base-<line>, strictly,
                  must reproduce series-<line>; the directory and SRC_URI must
                  name the same patches, and no patch may touch the SDK copy.
@@ -65,7 +65,7 @@ class Line:
         recipe = (RECIPES / f"linux-ask_{line}.bb").read_text()
         shared = (RECIPES / "linux-ask.inc").read_text()
         self.kernel = assignment(recipe, "KERNEL_SRCREV")
-        self.sdk = ROOT / "sdk" / line
+        self.sdk = kernel_line.sdk(ROOT)
         block = re.search(r'^NXP_SDK_PATHS = "\\\n(.*?)^"', shared, re.M | re.S)
         if not block:
             raise SystemExit("NXP_SDK_PATHS not found in linux-ask.inc")
@@ -160,11 +160,11 @@ def sdk_patches(line):
 
 
 def overlay(repo, line):
-    """sdk/<line> laid over the checked-out tree, as do_overlay_sdk lays it:
+    """sdk/linux laid over the checked-out tree, as do_overlay_sdk lays it:
     a listed directory replaces mainline's wholesale, a listed file overwrites
     mainline's, and the copy may hold nothing else."""
     if not line.sdk.is_dir():
-        raise SystemExit(f"{line.sdk}: no SDK copy for the {line.line} line")
+        raise SystemExit(f"{line.sdk}: no SDK copy")
     stray = sorted(str(path.relative_to(line.sdk)) for path in line.sdk.rglob("*")
                    if (path.is_file() or path.is_symlink())
                    and not line.in_sdk(str(path.relative_to(line.sdk))))
@@ -190,7 +190,7 @@ def prepare(args, line):
     git(repo, "clean", "-qfdx")
     overlay(repo, line)
     git(repo, "add", "-A")
-    git(repo, *IDENT, "commit", "-qm", f"base: {line.kernel[:12]} + sdk/{line.line}")
+    git(repo, *IDENT, "commit", "-qm", f"base: {line.kernel[:12]} + sdk/linux")
     git(repo, "checkout", "-q", "-B", line.series, line.base)
     apply_series(repo, line, line.dir)
     print(f"{line.series}: {len(line.order)} patches on {line.base} in {repo}")
@@ -205,7 +205,7 @@ def regen(args, line):
         if hits := sorted(path for path in changed if line.in_sdk(path)):
             title = git(repo, "show", "-s", "--format=%s", commit).strip()
             raise SystemExit(f"commit {commit[:12]} ({title}) changes the SDK copy's files "
-                             f"({', '.join(hits)}): make that change in sdk/{line.line}/, then "
+                             f"({', '.join(hits)}): make that change in sdk/linux/, then "
                              "prepare again; nothing was written")
     written = kept = 0
     for commit in commits:
@@ -233,7 +233,7 @@ def check(args, line):
         absent = sorted(set(line.order) - set(names))
         raise SystemExit(f"SRC_URI and {line.dir} differ: not in SRC_URI {missing}, no file {absent}")
     if touching := sdk_patches(line):
-        raise SystemExit(f"patches changing sdk/{line.line} files (count each), which are edited "
+        raise SystemExit(f"patches changing sdk/linux files (count each), which are edited "
                          f"in place instead: {touching}")
     repo = repository(args.work)
     with tempfile.TemporaryDirectory(prefix=f"check-{line.line}-") as scratch:

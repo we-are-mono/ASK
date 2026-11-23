@@ -235,7 +235,7 @@ def test_each_kernel_line_records_what_its_recipe_requires(line):
     required = [path.replace("${ASK_KERNEL_LINE}", line)
                 for path in re.findall(r"^require \$\{ASK_SRCROOT\}/(\S+)$", shared, re.M)]
     assert all((ROOT / path).is_file() for path in required)
-    assert {f"{kernel_line.RECIPES}/linux-ask.inc", f"patches/kernel/{line}", f"sdk/{line}",
+    assert {f"{kernel_line.RECIPES}/linux-ask.inc", f"patches/kernel/{line}", "sdk/linux",
             *required} <= set(paths)
 
 

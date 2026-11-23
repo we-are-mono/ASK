@@ -459,7 +459,7 @@ negative case: a mark outside the mask must not change the class.
 
 Nothing in `sdk_dpaa` supports a per-queue model yet, and the gaps are
 structural rather than incidental. Delivered in `sdk_dpaa`, in ASK's SDK copy
-(`sdk/<line>/`).
+(`sdk/linux/`).
 
 - `DPAA_ETH_TX_QUEUES` was literally `NR_CPUS` (`dpaa_eth.h:201`) — 64 queues
   under OpenWrt, 16 under meta-ask. Pinned at sixteen, which is what the more

@@ -1,5 +1,5 @@
-# The 6.18 kernel line: Linux 6.18.64 with NXP's lf-6.18.37-2.1.0 SDK. What
-# every line shares is in linux-ask.inc.
+# The 6.18 kernel line: Linux 6.18.64. What every line shares, the SDK copy
+# among it, is in linux-ask.inc.
 ASK_KERNEL_LINE = "6.18"
 
 LINUX_VERSION = "6.18.64"
@@ -8,9 +8,6 @@ KERNEL_BRANCH = "linux-6.18.y"
 KERNEL_SRCREV = "fd7cfd39c88596fec816639ad83cbf3e9d316372"
 
 require linux-ask.inc
-
-# NXP's 6.18 qoriq-dpaa-eth.dtsi includes the RCPM binding header.
-NXP_SDK_PATHS += "include/dt-bindings/soc/fsl,qoriq-rcpm.h"
 
 # The series, in order: one entry per patch in patches/kernel/6.18 (a glob
 # once dropped every patch numbered 100 or above).

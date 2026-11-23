@@ -1,6 +1,6 @@
 SUMMARY = "Linux kernel for ASK LS1046A test target"
 DESCRIPTION = "Stock mainline ${LINUX_VERSION} kernel with ASK's copy of the NXP \
-DPAA/FMan/QBMan SDK drivers (sdk/<line>) overlaid on top and the ASK patch \
+DPAA/FMan/QBMan SDK drivers (sdk/linux) overlaid on top and the ASK patch \
 series applied. This is the Yocto twin of the OpenWrt-first build \
 (scripts/mono-sync-ask-kernel.sh): the same mainline base + SDK copy + ASK \
 hooks, producing a bootable Image+initramfs for ASK testing."
@@ -22,7 +22,7 @@ DEPENDS += "bison-native flex-native bc-native"
 # depends on.
 ASK_PROVENANCE_PATHS = "meta-ask/recipes-kernel/linux/linux-ask.inc \
                         patches/kernel/${ASK_KERNEL_LINE} \
-                        sdk/${ASK_KERNEL_LINE} dts"
+                        sdk/linux dts"
 ASK_PROVENANCE_OWNER = "${KERNEL_PACKAGE_NAME}-base"
 
 # The config fragments are one set for every line (files/).
@@ -32,7 +32,7 @@ FILESEXTRAPATHS:prepend := "${ASK_SRCROOT}/patches/kernel/${ASK_KERNEL_LINE}:"
 # ASK repo (dts/mono-gateway-dk.dts); consume it directly rather than keep a
 # drifting copy under files/.
 FILESEXTRAPATHS:prepend := "${ASK_SRCROOT}/dts:"
-# The line's copy of the NXP SDK drivers, sdk/<line> (see do_overlay_sdk).
+# ASK's copy of the NXP SDK drivers, one for every line (see do_overlay_sdk).
 FILESEXTRAPATHS:prepend := "${ASK_SRCROOT}/sdk:"
 
 PV = "${LINUX_VERSION}+git${SRCPV}"
@@ -45,12 +45,13 @@ PV = "${LINUX_VERSION}+git${SRCPV}"
 KERNEL_SRC = "git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git;protocol=https"
 
 # The SDK drivers are not fetched: ASK carries NXP's code, with its own changes
-# made in place, at sdk/<line> (sdk/README.md names the NXP commit each copy
-# came from). A local directory in SRC_URI is checksummed file by file, so an
-# SDK edit re-runs the overlay. The line's recipe appends its patch series, in
-# order, one patch per entry.
+# made in place, at sdk/linux, one copy every line builds (sdk/README.md names
+# the NXP commit it came from; where kernel lines differ, the code says so with
+# LINUX_VERSION_CODE). A local directory in SRC_URI is checksummed file by file,
+# so an SDK edit re-runs the overlay. The line's recipe appends its patch
+# series, in order, one patch per entry.
 SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
-           file://${ASK_KERNEL_LINE};subdir=sdk \
+           file://linux;subdir=sdk \
            file://defconfig \
            file://ask.cfg \
            file://ask-kasan.cfg \
@@ -64,18 +65,18 @@ SRCREV_FORMAT = "kernel"
 # ============================================================================
 # The SDK copy onto stock mainline.
 #
-# What a line's copy (sdk/<line>) holds, and the overlay replaces: OpenWrt's
-# SDK_PATHS list (scripts/mono-sync-ask-kernel.sh) names the same paths. A
-# line's recipe adds what its SDK release needs beyond them. Two kinds of
-# files:
+# What the copy (sdk/linux) holds, and the overlay replaces: OpenWrt's
+# SDK_PATHS list (scripts/mono-sync-ask-kernel.sh) names the same paths. Two
+# kinds of files:
 #   - SDK-only trees (sdk_dpaa, sdk_fman, fsl_qbman, uapi/linux/fmd, the
 #     fsl_{bman,qman,usdpaa}.h headers, the *-portals-sdk / dpaa-eth dtsi):
 #     absent on mainline, added fresh.
 #   - Same-named DPAA device tree (fsl-ls1046a.dtsi, fsl-ls1046-post.dtsi,
 #     qoriq-{q,b}man-portals.dtsi, qoriq-fman3-0*.dtsi): mainline ships these
 #     with mainline FMan/DPAA bindings the NXP SDK drivers cannot probe, so the
-#     overlay must OVERWRITE them.
-# A copy holds exactly these paths (tools/host_tests/sdk_tree.py); files ASK
+#     overlay must OVERWRITE them. The dtsi include the RCPM binding header,
+#     which mainline lacks.
+# The copy holds exactly these paths (tools/host_tests/sdk_tree.py); files ASK
 # adds outside them (e.g. include/linux/fsl_oh_port.h) arrive with the patch
 # series.
 # ============================================================================
@@ -87,6 +88,7 @@ NXP_SDK_PATHS = "\
     include/linux/fsl_bman.h \
     include/linux/fsl_qman.h \
     include/linux/fsl_usdpaa.h \
+    include/dt-bindings/soc/fsl,qoriq-rcpm.h \
     arch/arm64/boot/dts/freescale/qoriq-qman-portals-sdk.dtsi \
     arch/arm64/boot/dts/freescale/qoriq-bman-portals-sdk.dtsi \
     arch/arm64/boot/dts/freescale/qoriq-dpaa-eth.dtsi \
@@ -113,13 +115,13 @@ NXP_SDK_PATHS = "\
 # do_patch (so the ASK series, whose patch 110 is the build glue the SDK needs
 # in mainline's Kconfig and Makefiles, applies on top of the SDK copy).
 do_overlay_sdk() {
-    # The line's copy, unpacked from SRC_URI (file://<line>;subdir=sdk). Fail
-    # loudly if it is not there, or if it holds a file the overlay would not
-    # copy: such a file would be in the checkout and the kernel record, yet in
-    # no kernel tree.
-    sdkroot="${UNPACKDIR}/sdk/${ASK_KERNEL_LINE}"
+    # The copy, unpacked from SRC_URI (file://linux;subdir=sdk). Fail loudly if
+    # it is not there, or if it holds a file the overlay would not copy: such a
+    # file would be in the checkout and the kernel record, yet in no kernel
+    # tree.
+    sdkroot="${UNPACKDIR}/sdk/linux"
     if [ ! -d "${sdkroot}/drivers/net/ethernet/freescale/sdk_dpaa" ]; then
-        bbfatal "SDK overlay: ${sdkroot} is not the SDK copy (sdk/${ASK_KERNEL_LINE} in ${ASK_SRCROOT})"
+        bbfatal "SDK overlay: ${sdkroot} is not the SDK copy (sdk/linux in ${ASK_SRCROOT})"
     fi
     # Kernel-tree paths hold no whitespace, so find's output splits safely.
     for f in $(cd "${sdkroot}" && find . -type f -o -type l | sed 's|^\./||'); do
@@ -133,15 +135,15 @@ do_overlay_sdk() {
             esac
         done
         if [ "${listed}" != 1 ]; then
-            bbfatal "SDK overlay: sdk/${ASK_KERNEL_LINE}/${f} is outside NXP_SDK_PATHS"
+            bbfatal "SDK overlay: sdk/linux/${f} is outside NXP_SDK_PATHS"
         fi
     done
-    bbnote "SDK overlay: copying sdk/${ASK_KERNEL_LINE} into ${S}"
+    bbnote "SDK overlay: copying sdk/linux into ${S}"
     for p in ${NXP_SDK_PATHS}; do
         src="${sdkroot}/${p}"
         dst="${S}/${p}"
         if [ ! -e "${src}" ]; then
-            bbfatal "SDK overlay: '${p}' missing in sdk/${ASK_KERNEL_LINE} (ASK-added files outside NXP_SDK_PATHS come from the patch series)"
+            bbfatal "SDK overlay: '${p}' missing in sdk/linux (ASK-added files outside NXP_SDK_PATHS come from the patch series)"
         fi
         if [ -d "${src}" ]; then
             # Full replace so no stale mainline file lingers under an

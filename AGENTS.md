@@ -70,7 +70,7 @@ they conflict with modern kernel APIs or clean design, prefer the modern approac
 ## Build & deploy
 
 - **Build only through kas/Yocto** (`meta-ask/.config.yaml`): the kernel (one line's
-  mainline + `sdk/<line>/` + `patches/kernel/<line>/`), cdx, ask_flowtable and the
+  mainline + `sdk/linux/` + `patches/kernel/<line>/`), cdx, ask_flowtable and the
   flowtable daemon.
   Never raw `bitbake`, never standalone `make modules` / GCC-15 recipes — those use
   different toolchains/defines and don't prove the shipped build is clean. A GCC 15
@@ -116,16 +116,18 @@ they conflict with modern kernel APIs or clean design, prefer the modern approac
   its recipe, `meta-ask/recipes-kernel/linux/linux-ask_<line>.bb` — hand-edit it for
   every new patch (old `0*`/`0[1-9]*` globs silently dropped patches numbered ≥100).
   What the lines share (SDK overlay, config fragments, provenance, DTS) lives in
-  `linux-ask.inc`; a line's recipe holds only its pin, its overlay additions and its
-  series. A fix that applies to both lines lands in both series, as two patches.
-- **The NXP SDK drivers are ASK's own copy, `sdk/<line>/`**: FMan, DPAA Ethernet,
-  QMan/BMan, their headers and the DPAA dtsi, laid out as in a kernel tree
-  (`NXP_SDK_PATHS` in `linux-ask.inc` names what the copy overlays). Edit those files
-  in place, never through a patch (`make kernel-series-check` refuses one); a fix
-  that applies to both lines lands in both copies. NXP's releases come in through the
-  `vendor/nxp-sdk` branch, merged three-way (`sdk/README.md`).
+  `linux-ask.inc`; a line's recipe holds only its pin and its series. A fix that
+  applies to both lines lands in both series, as two patches.
+- **The NXP SDK drivers are ASK's own copy, `sdk/linux/`, one for every line**:
+  FMan, DPAA Ethernet, QMan/BMan, their headers and the DPAA dtsi, laid out as in a
+  kernel tree (`NXP_SDK_PATHS` in `linux-ask.inc` names what the copy overlays).
+  Edit those files in place, never through a patch (`make kernel-series-check`
+  refuses one). Written in the newest line's terms; where a kernel line's API
+  differs, a `LINUX_VERSION_CODE` guard keyed on the release that changed it (as
+  `cdx/compat.h`). NXP's releases come in through the `vendor/nxp-sdk` branch,
+  merged three-way (`sdk/README.md`).
 - **Changing a patch:** `make kernel-series-prepare LINE=<line>` builds the line's
-  base (its recipe's `KERNEL_SRCREV` with `sdk/<line>/` overlaid, as
+  base (its recipe's `KERNEL_SRCREV` with `sdk/linux/` overlaid, as
   `do_overlay_sdk` lays it) and `series-<line>`,
   the series `git am`'d strictly in `SRC_URI` order, under
   `meta-ask/build/kernel-series`. Change the patch's commit there (fixup + `git
@@ -144,9 +146,10 @@ they conflict with modern kernel APIs or clean design, prefer the modern approac
 
 - **One trunk carries every supported kernel line**, side by side (OpenWrt's model),
   not a branch per line. ASK is coupled to its kernel, so each line keeps its own
-  series (`patches/kernel/<line>/`), SDK copy (`sdk/<line>/`) and recipe; cdx,
+  series (`patches/kernel/<line>/`) and recipe; the SDK copy (`sdk/linux/`), cdx,
   ask_flowtable, the daemon and the tests are shared and build for every line, with
-  what differs in `cdx/compat.h`, keyed on the release that changed it.
+  what differs in `LINUX_VERSION_CODE` guards (`cdx/compat.h` for cdx), keyed on the
+  release that changed it.
   - `master` is the trunk and stays releasable. Work on short-lived branches off
     `master`, test, merge back.
   - **One ASK version across lines, one tag per release:** the release commit is
@@ -157,13 +160,15 @@ they conflict with modern kernel APIs or clean design, prefer the modern approac
     the kernel's: a port to a new line is no major bump. A pushed tag never moves.
     Tags from before the trunk (`mono-1.0.0` to `mono-1.3.1`) are 6.12 releases;
     `mt-6.12.y` stays where it is, and no new `mt-*` branches are made.
-  - **At most two released lines.** A newer one (7.x) is ported into its own series,
-    SDK copy and recipe on a topic branch, merges once it builds and its host suite is green,
+  - **At most two released lines.** A newer one (7.x) is ported into its own series
+    and recipe, with the SDK copy's guards for its API, on a topic branch, merges once
+    it builds and its host suite is green,
     and joins `RELEASED_LINES` at parity (its full suite green; `make release-status
     LINE=<line>`). The older line takes critical fixes only once the fleet's OpenWrt
     has left its kernel, and leaves `RELEASED_LINES` when it retires.
-  - **A fix lands on the newest line first**, then in the other line's series or SDK
-    copy where it applies — a fix to a patch or to the SDK is made in each line's copy.
+  - **A fix lands on the newest line first**, then in the other line's series where
+    it applies — a fix to a patch is made in each line's copy; an SDK fix is made
+    once, in `sdk/linux/`, and reaches every line.
 - **Testing by scope:** per change, the host suite on every line (`make test-host
   LINE=<line>`) and scoped rig tests on the newest line and the line the change
   targets; per stable bump, a review of the upstream commits between the old and new
@@ -283,7 +288,7 @@ VM and NIC) go in the gitignored `.ask-test.mk` (start from `.ask-test.mk.exampl
   it).
 - **SDK staging drivers, not mainline:** FMAN/QMan/BMan/DPAA come from
   `drivers/staging/fsl_qbman/` and `drivers/net/ethernet/freescale/{sdk_dpaa,sdk_fman}/`
-  (ASK's copy, `sdk/<line>/`) — NOT `drivers/soc/fsl/qbman/`. A probe added to the mainline path compiles but never
+  (ASK's copy, `sdk/linux/`) — NOT `drivers/soc/fsl/qbman/`. A probe added to the mainline path compiles but never
   fires (wrong TU linked). Verify with `strings` on the image.
 - **Offload keys on the physical ingress port** (`port_idx` + `portid` + 5-tuple), not
   the logical L3 iface; a VLAN on a vlan-aware bridge (`br-lan.N`) has no single physical

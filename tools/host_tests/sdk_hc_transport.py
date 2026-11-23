@@ -27,13 +27,13 @@ def test_sdk_hc_transport(tmp_path):
     ]))
     wait = re.search(r"^#define HC_ENQUEUE_WAIT_NS\b.*$", wrapper, re.M)
     assert wait, "HC_ENQUEUE_WAIT_NS"
-    # A dequeue callback's parameters past the entry, as the line's SDK types
-    # them (lf-6.18 adds whether it may schedule NAPI, and the poll context):
-    # the confirmation is run outside any poll.
+    # A dequeue callback's parameters past the entry, as the SDK types them
+    # (whether it may schedule NAPI, and the poll context): the confirmation
+    # is run outside any poll.
     callback = re.search(r"typedef enum qman_cb_dqrr_result \(\*qman_cb_dqrr\)\(([^)]*)\)", qman)
     assert callback, "qman_cb_dqrr"
     poll = [" ".join(param.split()) for param in callback[1].split(",")[3:]]
-    assert poll in ([], ["bool sched_napi", "struct qman_poll_ctx *ctx"]), poll
+    assert poll == ["bool sched_napi", "struct qman_poll_ctx *ctx"], poll
     (tmp_path / "hc_wrapper.inc").write_text(
         wait.group(0) + "\n" + f"#define DQRR_POLL_ARGS {', false, NULL' if poll else ''}\n"
         + "\n".join(function(wrapper, name) for name in ["hc_swap_frame", "qm_tx_conf_dqrr_cb",

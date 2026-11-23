@@ -1,5 +1,5 @@
-# The 6.12 kernel line: Linux 6.12.118 with NXP's lf-6.12.49-2.2.0 SDK, the
-# line OpenWrt ships. What every line shares is in linux-ask.inc.
+# The 6.12 kernel line: Linux 6.12.118, the line OpenWrt ships. What every line
+# shares, the SDK copy among it, is in linux-ask.inc.
 ASK_KERNEL_LINE = "6.12"
 
 LINUX_VERSION = "6.12.118"
