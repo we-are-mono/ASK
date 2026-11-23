@@ -56,6 +56,11 @@ from ask_orch.uart import Console
 # eth4 to meet it. Claimed in _topology.py: 3900 is bench furniture, not this
 # file's to create or delete.
 SERVER_IF = os.environ.get("ASK_PPPOE_SERVER_IF", "wan3900")
+# The concentrator's AC-Name, the only one whose offers the DUT's pppd takes:
+# any other concentrator on SERVER_IF -- one other work on the bench left
+# running, and _server_clear() leaves alone -- answers the discovery too, and a
+# session that lands on it fails authentication.
+AC_NAME = os.environ.get("ASK_PPPOE_AC_NAME", "ask-flowtable")
 WAN_VID = int(os.environ.get("ASK_FLOWTABLE_PPPOE_VID", str(VLAN_ID_PPPOE_WAN)))
 # Claimed in _topology.py's VLAN ID conventions block.
 LAN_VID = int(os.environ.get("ASK_FLOWTABLE_PPPOE_LAN_VID", "276"))
@@ -222,7 +227,7 @@ def _server_start(ipv6=False, auth="pap"):
         # what makes teardown PID-targeted -- a pkill pattern broad enough to
         # find a daemonized one also matches the shell running it.
         [server, "-I", SERVER_IF, "-L", INNER_LOCAL, "-R", INNER_REMOTE,
-         "-N", "4", "-O", SERVER_OPTS, "-k", "-F"],
+         "-N", "4", "-O", SERVER_OPTS, "-C", AC_NAME, "-k", "-F"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return proc
 
@@ -338,6 +343,8 @@ async def _dial(console, lower, ipv6=False, demand=False):
         # device the concentrator sits behind.
         "plugin pppoe.so\n"
         f"{lower}\n"
+        # Offers from this run's concentrator only (AC_NAME).
+        f"pppoe-ac {AC_NAME}\n"
         f"name {PPPOE_USER}\n"
         # noauth: we do not demand the concentrator authenticate back.
         # nodefaultroute: the DUT keeps reaching the agent over its own

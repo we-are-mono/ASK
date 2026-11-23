@@ -40,7 +40,7 @@ microcode's to fragment, is carried as it is.
 """
 from __future__ import annotations
 
-from _flowtable_pppoe import QOS_COUNT, QOS_RATE_MBIT, QOS_VOICE_CQ, QOS_VOICE_PRIO
+from _flowtable_pppoe import AC_NAME, QOS_COUNT, QOS_RATE_MBIT, QOS_VOICE_CQ, QOS_VOICE_PRIO
 
 from _flowtable_pppoe import (INNER_LOCAL, INNER_LOCAL6, INNER_REMOTE, INNER_REMOTE6, LAN_VID, LCP_ECHO_INTERVAL, NAT_TABLE, SERVER_IF, PORT_QOS_BULK, PORT_QOS_VOICE, PPP_RX_OVERHEAD, PPP_TX_OVERHEAD, QOS_TABLE, SESSION_MTU, SNAT_ADDR, SPORT6, SourceEcho, UNTAGGED_COUNT, UNTAGGED_DPORT, UNTAGGED_SPORT, WAN_ENDPOINT, WAN_VID, _assert_carried, _assert_session, _assert_undisturbed, _both_directions, _dial, _direction, _established, _exchange6, _hangup, _offload_table6, _ppp_link, _qos_bulk, _qos_bulk_stop, _session_halves, _session_identity, _session_row, _session_text, _snat_table, _tcp_carried, _untagged_directions, _udp_directions, _untagged_path, _untagged_window, _wait_reachable)
 
@@ -1289,8 +1289,12 @@ async def test_session_retires_and_redials(pppoe_rig):
     from scapy.all import PPPoED, PPP_LCP_Echo, rdpcap
     frames = rdpcap(str(pcap))
     # PADI, PADO, PADR, PADS in order (RFC 2516 §5), then an echo request
-    # answered by a reply on the session (RFC 1661 §5.8).
-    discovery = [p[PPPoED].code for p in frames if PPPoED in p]
+    # answered by a reply on the session (RFC 1661 §5.8). Any other
+    # concentrator on SERVER_IF offers too, and the DUT takes this run's
+    # offer only (AC_NAME): the others' are not this exchange.
+    ours = AC_NAME.encode()
+    discovery = [p[PPPoED].code for p in frames if PPPoED in p
+                 and (p[PPPoED].code != 0x07 or ours in bytes(p[PPPoED]))]
     assert discovery[:4] == [0x09, 0x07, 0x19, 0x65], discovery
     echoes = {p[PPP_LCP_Echo].code for p in frames if PPP_LCP_Echo in p}
     assert echoes >= {9, 10}, echoes
