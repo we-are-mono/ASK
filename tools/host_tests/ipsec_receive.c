@@ -159,8 +159,7 @@ static struct xfrm_state *xfrm_state_lookup_byhandle(void *net, unsigned handle)
 static void xfrm_state_put(struct xfrm_state *x) { assert(x == &state && refs); refs--; }
 static struct dpa_priv_s *netdev_priv(struct net_device *dev) { return dev->priv; }
 #ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
-/* Taking what the line's SDK declares (lf-6.18 adds the callback's
- * sched_napi); whether it schedules is the run's to say. */
+/* Taking what the SDK declares; whether it schedules is the run's to say. */
 static bool dpaa_eth_napi_schedule(DPAA_ETH_NAPI_SCHEDULE_PARAMS)
 { return napi_defer; }
 #endif

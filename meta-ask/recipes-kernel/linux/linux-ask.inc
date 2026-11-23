@@ -65,9 +65,9 @@ SRCREV_FORMAT = "kernel"
 # ============================================================================
 # The SDK copy onto stock mainline.
 #
-# What the copy (sdk/linux) holds, and the overlay replaces: OpenWrt's
-# SDK_PATHS list (scripts/mono-sync-ask-kernel.sh) names the same paths. Two
-# kinds of files:
+# What the copy (sdk/linux) holds, and the overlay replaces; a consumer's own
+# sync (OpenWrt's SDK_PATHS in scripts/mono-sync-ask-kernel.sh) has to name
+# the same paths. Two kinds of files:
 #   - SDK-only trees (sdk_dpaa, sdk_fman, fsl_qbman, the
 #     fsl_{bman,qman,usdpaa}.h headers, the *-portals-sdk / dpaa-eth dtsi):
 #     absent on mainline, added fresh.

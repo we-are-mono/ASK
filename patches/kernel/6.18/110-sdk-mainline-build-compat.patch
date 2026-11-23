@@ -4,7 +4,7 @@ Date: Sun, 23 Aug 2026 18:48:54 +0200
 Subject: [PATCH] sdk: build the vendored SDK on stock mainline
 
 The NXP DPAA SDK drivers (sdk_fman, sdk_dpaa, staging/fsl_qbman; ASK's
-copy is sdk/<line>) target the NXP LSDK kernel, which carries wiring and
+copy is sdk/linux) target the NXP LSDK kernel, which carries wiring and
 APIs that stock mainline lacks. This patch bundles the mainline side of
 building them on a stock kernel.org tree, which each consumer basing on
 mainline (rather than the NXP vendor tag) needs. The SDK side of the same

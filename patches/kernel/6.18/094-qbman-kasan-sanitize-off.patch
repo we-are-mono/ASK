@@ -4,7 +4,7 @@ Date: Sat, 25 Apr 2026 17:55:41 +0200
 Subject: [PATCH] soc: fsl: qbman: skip KASAN instrumentation
 
 The SDK copy's Makefiles (sdk_fman, sdk_dpaa and staging/fsl_qbman in
-sdk/<line>) turn KASAN instrumentation off: those drivers do plain
+sdk/linux) turn KASAN instrumentation off: those drivers do plain
 memset()/memcpy() on iomem (MURAM and QBMan portal regions), and with
 CONFIG_KASAN_GENERIC=y the instrumented calls look up shadow an iomem
 address does not have, and fault. The change that did so opted

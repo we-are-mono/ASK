@@ -80,7 +80,7 @@ include/net/xfrm.h and __xfrm_state_lookup_byhandle is static.
 The SDK driver's side -- the DPOVRD each frame is handed to SEC with,
 inbound and outbound, and a frame SEC was not given counted as a transmit
 drop rather than in `tx toenc` -- is in sdk_dpaa's dpaa_eth_sg.c, in
-ASK's SDK copy (sdk/<line>).
+ASK's SDK copy (sdk/linux).
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---

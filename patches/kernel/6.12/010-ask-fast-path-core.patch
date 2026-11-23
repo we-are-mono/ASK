@@ -5,7 +5,7 @@ Subject: [PATCH] ask: core kernel fields and hooks for the fast path
 
 The core kernel side of the ASK fast-path stack on LS1046A. The SDK
 drivers' side -- the FMan EHASH classifier extensions and the DPAA hooks
-cdx registers -- is in ASK's SDK copy, sdk/<line>.
+cdx registers -- is in ASK's SDK copy, sdk/linux.
 
 Declares the master CONFIG_CPE_FAST_PATH Kconfig in net/Kconfig and
 extends the core kernel with the skb fields (iif_index, ipsec_offload)
