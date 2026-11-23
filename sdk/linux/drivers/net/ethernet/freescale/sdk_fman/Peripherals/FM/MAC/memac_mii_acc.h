@@ -50,9 +50,6 @@
 
 #define MDIO_DATA_BSY               0x80000000
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(push,1)
-#endif /* defined(__MWERKS__) && ... */
 
 /*----------------------------------------------------*/
 /* MII Configuration Control Memory Map Registers     */
@@ -65,9 +62,6 @@ typedef struct t_MemacMiiAccessMemMap
     volatile uint32_t   mdio_addr;      /* 0x03c  */
 } t_MemacMiiAccessMemMap ;
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(pop)
-#endif /* defined(__MWERKS__) && ... */
 
 
 #endif /* __MEMAC_MII_ACC_H */

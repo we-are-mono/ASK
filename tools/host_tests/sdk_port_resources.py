@@ -22,8 +22,7 @@ def function(source, name):
     return source[match.start():end] + "\n"
 
 
-@pytest.mark.parametrize("legacy", [False, True], ids=["ls104x", "legacy"])
-def test_sdk_port_resources(tmp_path, legacy):
+def test_sdk_port_resources(tmp_path):
     kernel = kernel_source()
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
     source = (sdk / "Peripherals/FM/fm.c").read_text()
@@ -54,8 +53,6 @@ def test_sdk_port_resources(tmp_path, legacy):
     for inc in ["inc", "inc/etc", "inc/Peripherals", "inc/flib", "inc/integrations/LS1043",
                 "Peripherals/FM", "Peripherals/FM/inc", "Peripherals/FM/Port"]:
         command.extend(["-I", str(sdk / inc)])
-    if legacy:
-        command.extend(["-DFM_HAS_TOTAL_DMAS", "-DFM_LOW_END_RESTRICTION", "-DTEST_LEGACY"])
     command.extend([str(Path(__file__).with_name("sdk_port_resources.c")), "-o", str(binary)])
     run_process(command, check=True)
     run_process([str(binary)], check=True, timeout=30,

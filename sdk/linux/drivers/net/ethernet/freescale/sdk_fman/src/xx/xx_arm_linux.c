@@ -58,9 +58,6 @@
 
 #include <linux/workqueue.h>
 
-#ifdef BIGPHYSAREA_ENABLE
-#include <linux/bigphysarea.h>
-#endif /* BIGPHYSAREA_ENABLE */
 
 //#include <sysdev/fsl_soc.h>
 #include <asm/pgtable.h>
@@ -83,37 +80,6 @@
 
 #define __ERR_MODULE__      MODULE_UNKNOWN
 
-#ifdef BIGPHYSAREA_ENABLE
-#define MAX_ALLOCATION_SIZE     128 * 1024 /* Maximum size allocated with kmalloc is 128K */
-
-
-/* TODO: large allocations => use big phys area */
-/******************************************************************************
- * routine:     get_nr_pages
- *
- * description:
- *     calculates the number of memory pages for a given size (in bytes)
- *
- * arguments:
- *     size       - the number of bytes
- *
- * return code:
- *     The number of pages
- *
- *****************************************************************************/
-static __inline__ uint32_t get_nr_pages (uint32_t size)
-{
-    return (uint32_t)((size >> PAGE_SHIFT) + (size & PAGE_SHIFT ? 1 : 0));
-}
-
-static bool in_big_phys_area (uint32_t addr)
-{
-    uint32_t base, size;
-
-    bigphysarea_get_details (&base, &size);
-    return ((addr >= base) && (addr < base + size));
-}
-#endif /* BIGPHYSAREA_ENABLE */
 
 void * xx_Malloc(uint32_t n)
 {
@@ -121,11 +87,6 @@ void * xx_Malloc(uint32_t n)
     uint32_t    flags;
 
     flags = XX_DisableAllIntr();
-#ifdef BIGPHYSAREA_ENABLE
-    if (n >= MAX_ALLOCATION_SIZE)
-        a = (void*)bigphysarea_alloc_pages(get_nr_pages(n), 0, GFP_ATOMIC);
-    else
-#endif /* BIGPHYSAREA_ENABLE */
     a = (void *)kmalloc((uint32_t)n, GFP_ATOMIC);
     if (!a)
         XX_Print("No memory for XX_Malloc\n");
@@ -136,11 +97,6 @@ void * xx_Malloc(uint32_t n)
 
 void xx_Free(void *p)
 {
-#ifdef BIGPHYSAREA_ENABLE
-    if (in_big_phys_area ((uint32_t)p))
-        bigphysarea_free_pages(p);
-    else
-#endif /* BIGPHYSAREA_ENABLE */
     kfree(p);
 }
 

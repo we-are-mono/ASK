@@ -152,6 +152,18 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A457 — WireGuard offload never yields a port a hardware qdisc shapes.**
+
+  **Where:** `cdx_wg_can_tx()` (`cdx/cdx_wg.c`) means to keep a port whose HTB tree owns its transmit
+  (`dpa_priv_s.ceetm_en`) on the slow path, but tests it only under `CONFIG_FSL_DPAA_CEETM`: the SDK's own CEETM
+  qdisc, off in every build and gone from the SDK copy. cdx's hardware qdisc sets `ceetm_en` through
+  `dpa_enable_ceetm()` (`cdx/cdx_ceetm_app.c`) under `CONFIG_CPE_FAST_PATH`, as `devman.c` reads it.
+
+  **Why it matters:** since the WireGuard split (_f138f4e6_), offloaded WireGuard frames on a shaped port go out
+  through the port's own Tx queues, not the tree's class queues, so the tree's rate and priorities do not hold for
+  them. Found by code reading while removing dead SDK options; not reproduced on the rig. Fix direction: test
+  `ceetm_en` under `CONFIG_CPE_FAST_PATH`; prove with a WireGuard rate test on a port with an HTB tree.
+
 - [ ] **A456 — a WireGuard receive steer went in 7.6 s and 10.2 s after its tunnel's first sealed frame.**
 
   **Where:** the steer worker (`cdx_wg_steer_work_fn()`, `cdx/cdx_wg.c`), which installs each tuple a seal noted

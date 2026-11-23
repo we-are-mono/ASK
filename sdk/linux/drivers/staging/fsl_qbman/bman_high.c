@@ -129,9 +129,6 @@ struct bman_pool {
 	/* stockpile state - NULL unless BMAN_POOL_FLAG_STOCKPILE is set */
 	struct bm_buffer *sp;
 	unsigned int sp_fill;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	atomic_t in_use;
-#endif
 };
 
 /* (De)Registration of depletion notification callbacks */
@@ -613,9 +610,6 @@ struct bman_pool *bman_new_pool(const struct bman_pool_params *params)
 	pool->sp = NULL;
 	pool->sp_fill = 0;
 	pool->params = *params;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	atomic_set(&pool->in_use, 1);
-#endif
 	if (params->flags & BMAN_POOL_FLAG_DYNAMIC_BPID)
 		pool->params.bpid = bpid;
 	if (params->flags & BMAN_POOL_FLAG_STOCKPILE) {
@@ -838,10 +832,6 @@ int bman_release_by_bpid(u8 bpid, const struct bm_buffer *bufs, u8 num)
 	__maybe_unused unsigned long irqflags;
 	u32 i = num - 1;
 
-#ifdef CONFIG_FSL_DPA_CHECKING
-	if (!num || num > 8)
-		return -EINVAL;
-#endif
 
 	memset(&irqflags, 0, sizeof(irqflags));
 
@@ -879,21 +869,9 @@ int bman_release(struct bman_pool *pool, const struct bm_buffer *bufs, u8 num,
 			u32 flags)
 {
 	int ret;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	if (!num || (num > 8))
-		return -EINVAL;
-	if (pool->params.flags & BMAN_POOL_FLAG_NO_RELEASE)
-		return -EINVAL;
-#endif
 	/* Without stockpile, this API is a pass-through to the h/w operation */
 	if (!(pool->params.flags & BMAN_POOL_FLAG_STOCKPILE))
 		return __bman_release(pool, bufs, num, flags);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	if (!atomic_dec_and_test(&pool->in_use)) {
-		pr_crit("Parallel attempts to enter bman_released() detected.");
-		panic("only one instance of bman_released/acquired allowed");
-	}
-#endif
 	/* Two movements of buffers are possible, and can occur in either order.
 	 * A: moving buffers from the caller to the stockpile.
 	 * B: moving buffers from the stockpile to hardware.
@@ -939,9 +917,6 @@ int bman_release(struct bman_pool *pool, const struct bm_buffer *bufs, u8 num,
 	/* success */
 	ret = 0;
 release_done:
-#ifdef CONFIG_FSL_DPA_CHECKING
-	atomic_inc(&pool->in_use);
-#endif
 	return ret;
 }
 EXPORT_SYMBOL(bman_release);
@@ -979,21 +954,9 @@ int bman_acquire(struct bman_pool *pool, struct bm_buffer *bufs, u8 num,
 			u32 flags)
 {
 	int ret;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	if (!num || (num > 8))
-		return -EINVAL;
-	if (pool->params.flags & BMAN_POOL_FLAG_ONLY_RELEASE)
-		return -EINVAL;
-#endif
 	/* Without stockpile, this API is a pass-through to the h/w operation */
 	if (!(pool->params.flags & BMAN_POOL_FLAG_STOCKPILE))
 		return __bman_acquire(pool, bufs, num);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	if (!atomic_dec_and_test(&pool->in_use)) {
-		pr_crit("Parallel attempts to enter bman_acquire() detected.");
-		panic("only one instance of bman_released/acquired allowed");
-	}
-#endif
 	/* Two movements of buffers are possible, and can occur in either order.
 	 * A: moving buffers from stockpile to the caller.
 	 * B: moving buffers from hardware to the stockpile.
@@ -1042,9 +1005,6 @@ int bman_acquire(struct bman_pool *pool, struct bm_buffer *bufs, u8 num,
 	/* success */
 	ret = num;
 acquire_done:
-#ifdef CONFIG_FSL_DPA_CHECKING
-	atomic_inc(&pool->in_use);
-#endif
 	return ret;
 }
 EXPORT_SYMBOL(bman_acquire);

@@ -94,23 +94,10 @@ typedef  phys_addr_t physAddress_t;
 #define GET_UINT32(arg)             in_be32(&(arg))//*(volatile uint32_t*)(&(arg))
 #define GET_UINT64(arg)             *(volatile uint64_t*)(&(arg))
 
-#ifdef VERBOSE_WRITE
-void    XX_Print(char *str, ...);
-#define WRITE_UINT8(arg, data)  \
-    do { XX_Print("ADDR: 0x%08x, VAL: 0x%02x\r\n",    (uint32_t)&(arg), (data)); *(volatile uint8_t *)(&(arg)) = (data); } while (0)
-#define WRITE_UINT16(arg, data) \
-    do { XX_Print("ADDR: 0x%08x, VAL: 0x%04x\r\n",    (uint32_t)&(arg), (data)); out_be16(&(arg), data); /* *(volatile uint16_t*)(&(arg)) = (data);*/ } while (0)
-#define WRITE_UINT32(arg, data) \
-    do { XX_Print("ADDR: 0x%08x, VAL: 0x%08x\r\n",    (uint32_t)&(arg), (data)); out_be32(&(arg), data); /* *(volatile uint32_t*)(&(arg)) = (data);*/ } while (0)
-#define WRITE_UINT64(arg, data) \
-    do { XX_Print("ADDR: 0x%08x, VAL: 0x%016llx\r\n", (uint32_t)&(arg), (data)); *(volatile uint64_t*)(&(arg)) = (data); } while (0)
-
-#else  /* not VERBOSE_WRITE */
 #define WRITE_UINT8(arg, data)      *(volatile uint8_t *)(&(arg)) = (data)
 #define WRITE_UINT16(arg, data)     out_be16(&(arg), data)//*(volatile uint16_t*)(&(arg)) = (data)
 #define WRITE_UINT32(arg, data)     out_be32(&(arg), data)//*(volatile unsigned int *)(&(arg)) = (data)
 #define WRITE_UINT64(arg, data)     *(volatile uint64_t*)(&(arg)) = (data)
-#endif /* not VERBOSE_WRITE */
 
 
 /*****************************************************************************/

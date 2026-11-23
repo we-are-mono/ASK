@@ -43,13 +43,10 @@
 #include "std_ext.h"
 #include "xx_ext.h"
 #include "memcpy_ext.h"
-#if (DEBUG_ERRORS > 0)
 #include "sprint_ext.h"
 #include "string_ext.h"
-#endif /* DEBUG_ERRORS > 0 */
 
 
-#if (DEBUG_ERRORS > 0)
 
 /* Internally used macros */
 
@@ -222,7 +219,6 @@
 
 
 
-#endif /* DEBUG_ERRORS > 0 */
 
 
 /** @} */ /* end of dump_id group */

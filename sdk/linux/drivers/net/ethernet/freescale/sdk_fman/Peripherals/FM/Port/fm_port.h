@@ -183,9 +183,6 @@ typedef uint32_t fmPcdEngines_t; /**< options as defined below: */
  @Description       Memory Mapped Registers
 *//***************************************************************************/
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(push,1)
-#endif /* defined(__MWERKS__) && ... */
 
 typedef struct
 {
@@ -425,9 +422,6 @@ typedef _Packed struct
 	uint8_t reserved1[0xa0];    /**< 0x60 - 0xff */
 } _PackedType t_FmPortImPram;
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(pop)
-#endif /* defined(__MWERKS__) && ... */
 
 
 /**************************************************************************//**
@@ -795,9 +789,7 @@ typedef struct {
     bool                                setNumOfOpenDmas;
     bool                                setSizeOfFifo;
     bool                                noScatherGather;
-#ifdef FM_HEAVY_TRAFFIC_HANG_ERRATA_FMAN_A005669
     bool                                bcbWorkaround;
-#endif /* FM_HEAVY_TRAFFIC_HANG_ERRATA_FMAN_A005669 */
 } t_FmPortDriverParam;
 
 

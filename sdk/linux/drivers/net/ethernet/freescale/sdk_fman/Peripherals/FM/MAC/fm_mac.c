@@ -239,21 +239,6 @@ t_Error FM_MAC_ConfigException (t_Handle h_FmMac, e_FmMacExceptions ex, bool ena
     RETURN_ERROR(MINOR, E_NOT_SUPPORTED, NO_MSG);
 }
 
-#ifdef FM_TX_ECC_FRMS_ERRATA_10GMAC_A004
-/* ......................................................................... */
-
-t_Error FM_MAC_ConfigSkipFman11Workaround (t_Handle h_FmMac)
-{
-    t_FmMacControllerDriver *p_FmMacControllerDriver = (t_FmMacControllerDriver *)h_FmMac;
-
-    SANITY_CHECK_RETURN_ERROR(p_FmMacControllerDriver, E_INVALID_HANDLE);
-
-    if (p_FmMacControllerDriver->f_FM_MAC_ConfigSkipFman11Workaround)
-        return p_FmMacControllerDriver->f_FM_MAC_ConfigSkipFman11Workaround(h_FmMac);
-
-    RETURN_ERROR(MINOR, E_NOT_SUPPORTED, NO_MSG);
-}
-#endif /* FM_TX_ECC_FRMS_ERRATA_10GMAC_A004 */
 
 
 /*****************************************************************************/
@@ -676,7 +661,6 @@ uint16_t FM_MAC_GetMaxFrameLength(t_Handle h_FmMac)
     return 0;
 }
 
-#if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
 /*****************************************************************************/
 t_Error FM_MAC_DumpRegs(t_Handle h_FmMac)
 {
@@ -688,4 +672,3 @@ t_Error FM_MAC_DumpRegs(t_Handle h_FmMac)
          return p_FmMacControllerDriver->f_FM_MAC_DumpRegs(h_FmMac);
     RETURN_ERROR(MINOR, E_NOT_SUPPORTED, NO_MSG);
 }
-#endif /* (defined(DEBUG_ERRORS) && ... */

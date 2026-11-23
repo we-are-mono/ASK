@@ -720,7 +720,6 @@ t_Error FM_PCD_ForceIntr (t_Handle h_FmPcd, e_FmPcdExceptions exception);
 *//***************************************************************************/
 t_Error FM_PCD_AllowHcUsage(t_Handle h_FmPcd, uint8_t allow);
 
-#if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
 /**************************************************************************//**
  @Function      FM_PCD_DumpRegs
 
@@ -815,7 +814,6 @@ t_Error FM_PCD_PrsDumpRegs(t_Handle h_FmPcd);
                 (i.e. 'guestId'=NCSW_MASTER_ID).
 *//***************************************************************************/
 t_Error     FM_PCD_HcDumpRegs(t_Handle h_FmPcd);
-#endif /* (defined(DEBUG_ERRORS) && ... */
 
 
 
@@ -1984,7 +1982,6 @@ typedef struct t_FmPcdHashTableParams {
 
     t_FmPcdCcNextEngineParams   ccNextEngineParamsForMiss;  /**< Parameters for defining the next engine when a key is not matched */
 
-#if (DPAA_VERSION >= 11)
     bool                        externalHash;               /**< TRUE to use external hash table */
 
     uint32_t                    table_type;                 /**< ip reassembly table type */
@@ -2001,7 +1998,6 @@ typedef struct t_FmPcdHashTableParams {
         uint16_t                dataLiodnOffs;              /**< LIODN offset for external hash access */
         uintptr_t               missMonitorAddr;            /**< User-allocated miss monitor address */
     } externalHashParams;
-#endif /* (DPAA_VERSION >= 11) */
 } t_FmPcdHashTableParams;
 
 /**************************************************************************//**
@@ -2723,9 +2719,7 @@ typedef struct t_FmPcdManipFragCapwapStats {
     uint32_t    totalFrames;            /**< Number of frames that passed through the manipulation node */
     uint32_t    fragmentedFrames;       /**< Number of frames that were fragmented */
     uint32_t    generatedFragments;     /**< Number of fragments that were generated */
-#if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
     uint8_t     sgAllocationFailure;    /**< Number of allocation failure of s/g buffers */
-#endif /* (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0)) */
 } t_FmPcdManipFragCapwapStats;
 
 /**************************************************************************//**

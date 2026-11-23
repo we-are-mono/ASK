@@ -80,9 +80,6 @@ typedef struct {
     t_Error (*f_FM_MAC_ConfigTbiPhyAddr) (t_Handle h_FmMac, uint8_t newVal);
     t_Error (*f_FM_MAC_ConfigException) (t_Handle h_FmMac, e_FmMacExceptions, bool enable);
     t_Error (*f_FM_MAC_ConfigResetOnInit) (t_Handle h_FmMac, bool enable);
-#ifdef FM_TX_ECC_FRMS_ERRATA_10GMAC_A004
-    t_Error (*f_FM_MAC_ConfigSkipFman11Workaround) (t_Handle h_FmMac);
-#endif /* FM_TX_ECC_FRMS_ERRATA_10GMAC_A004 */
 
     t_Error (*f_FM_MAC_SetException) (t_Handle h_FmMac, e_FmMacExceptions ex, bool enable);
 
@@ -128,9 +125,7 @@ typedef struct {
     t_Error (*f_FM_MAC_MII_WritePhyReg)(t_Handle h_FmMac, uint8_t phyAddr, uint8_t reg, uint16_t data);
     t_Error (*f_FM_MAC_MII_ReadPhyReg)(t_Handle h_FmMac,  uint8_t phyAddr, uint8_t reg, uint16_t *p_Data);
 
-#if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
     t_Error (*f_FM_MAC_DumpRegs) (t_Handle h_FmMac);
-#endif /* (defined(DEBUG_ERRORS) && ... */
 
     t_Handle            h_Fm;
     t_FmRevisionInfo    fmRevInfo;

@@ -65,10 +65,10 @@ struct dpa_buffer_layout_s {
 	uint16_t	data_align;
 };
 
+/* An assertion the SDK compiled in only for its debug builds, which nothing
+ * builds: it checks nothing. */
 static inline void DPA_BUG_ON(bool cond)
 {
-	if (IS_ENABLED(CONFIG_FSL_DPAA_ETH_DEBUG))
-		BUG_ON(cond);
 }
 
 #define DPA_TX_PRIV_DATA_SIZE	16
@@ -208,11 +208,7 @@ static inline void DPA_BUG_ON(bool cond)
  * contention between concurrent software senders against the frame queues each
  * one costs, and is not bounded by the core count in either direction.
  */
-#ifdef CONFIG_FMAN_PFC
-#define DPAA_ETH_TX_QUEUES	(NR_CPUS * CONFIG_FMAN_PFC_COS_COUNT)
-#else
 #define DPAA_ETH_TX_QUEUES	16
-#endif
 
 /* Headroom above the direct queues, one slot per leaf class a hardware qdisc
  * can hold on this port, reserved so it can hand sch_htb a real and
@@ -392,9 +388,6 @@ struct dpa_priv_s {
 	uint16_t		 channel;	/* "fsl,qman-channel-id" */
 	struct list_head	 dpa_fq_list;
 
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-	struct dentry		*debugfs_loop_file;
-#endif
 
 	uint32_t		 msg_enable;	/* net_device message level */
 #ifdef CONFIG_FSL_DPAA_1588
@@ -435,15 +428,9 @@ struct dpa_priv_s {
 #ifdef CONFIG_PM
 	u32 wol;
 #endif
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-	int loop_id;
-	int loop_to;
-#endif
-#if defined(CONFIG_FSL_DPAA_CEETM) || defined(CONFIG_CPE_FAST_PATH)
-	bool ceetm_en; /* CEETM QoS enabled */
 #ifdef CONFIG_CPE_FAST_PATH
+	bool ceetm_en; /* CEETM QoS enabled */
 	void *qm_ctx;  /* CEETM context */
-#endif
 #endif
 	void *ifinfo;
 	/* The receive pool's watch (dpaa_eth_pool.c), private ports only:
@@ -461,9 +448,6 @@ struct fm_port_fqs {
 };
 
 
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-extern struct net_device *dpa_loop_netdevs[20];
-#endif
 
 int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *count_ptr, int threshold);
 int dpaa_eth_reseed_bpool(struct dpa_bp *dpa_bp, int count);
@@ -665,16 +649,7 @@ static inline void _dpa_assign_wq(struct dpa_fq *fq)
 	}
 }
 
-#ifdef CONFIG_FMAN_PFC
-/* Use in lieu of skb_get_queue_mapping() */
-#define dpa_get_queue_mapping(skb) \
-	(((skb)->priority < CONFIG_FMAN_PFC_COS_COUNT) ? \
-		((skb)->priority * dpa_num_cpus + smp_processor_id()) : \
-		((CONFIG_FMAN_PFC_COS_COUNT - 1) * \
-			dpa_num_cpus + smp_processor_id()));
-#else
 #define dpa_get_queue_mapping(skb) skb_get_queue_mapping(skb)
-#endif
 
 static inline void _dpa_bp_free_pf(void *addr)
 {

@@ -59,9 +59,6 @@
  @{
 *//***************************************************************************/
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(push,1)
-#endif /* defined(__MWERKS__) && ... */
 
 /**************************************************************************//**
  @Description   enum for defining MAC types
@@ -257,9 +254,6 @@ typedef _Packed struct t_FmIpcReply
     uint8_t     replyBody[FM_IPC_MAX_REPLY_BODY_SIZE];
 } _PackedType t_FmIpcReply;
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(pop)
-#endif /* defined(__MWERKS__) && ... */
 
 
 /***************************************************************************/
@@ -439,9 +433,6 @@ typedef _Packed struct t_FmIpcReply
 #define FM_VSP_SET_PORT_WINDOW      29
 #define FM_GET_FMAN_CTRL_CODE_REV   30
 #define FM_SET_CONG_GRP_PFC_PRIO    31
-#ifdef FM_TX_ECC_FRMS_ERRATA_10GMAC_A004
-#define FM_10G_TX_ECC_WA            100
-#endif /* FM_TX_ECC_FRMS_ERRATA_10GMAC_A004 */
 
 /***************************************************************************/
 /************************ BACK-END-TO-FRONT-END*****************************/

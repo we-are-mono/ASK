@@ -170,11 +170,7 @@ switch (exception){                                         \
                                             FM_EX_QMI_SINGLE_ECC)
 
 #define FM_ECC_ENABLE                       FALSE
-#ifdef FM_PEDANTIC_DMA
-#define FM_AID_OVERRIDE                     TRUE
-#else
 #define FM_AID_OVERRIDE                     FALSE
-#endif /* FM_PEDANTIC_DMA */
 #define FM_DMA_STOP_ON_BUS_ERROR            FALSE
 #define FM_STOP_ON_BUS_ERROR                FALSE
 #define FM_AXI_DBG_NUM_OF_BEATS             1
@@ -273,9 +269,6 @@ switch (exception){                                         \
  @Description       Memory Mapped Registers
 *//***************************************************************************/
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(push,1)
-#endif /* defined(__MWERKS__) && ... */
 
 typedef struct
 {
@@ -317,9 +310,6 @@ typedef struct t_FmTrbRegs
     volatile uint32_t   tsnum4;
 } t_FmTrbRegs;
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(pop)
-#endif /* defined(__MWERKS__) && ... */
 
 /**************************************************************************//**
  @Description       General defines
@@ -396,9 +386,6 @@ typedef struct
     uint32_t                    accumulatedFifoSize;
     uint8_t                     accumulatedNumOfOpenDmas;
     uint8_t                     accumulatedNumOfDeqTnums;
-#ifdef FM_LOW_END_RESTRICTION
-    bool                        lowEndRestriction;
-#endif /* FM_LOW_END_RESTRICTION */
     uint32_t                    exceptions;
     int                         irq;
     int                         errIrq;
@@ -409,10 +396,8 @@ typedef struct
     uint32_t                    extraFifoPoolSize;
     uint8_t                     extraTasksPoolSize;
     uint8_t                     extraOpenDmasPoolSize;
-#if defined(FM_MAX_NUM_OF_10G_MACS) && (FM_MAX_NUM_OF_10G_MACS)
     uint16_t                    portMaxFrameLengths10G[FM_MAX_NUM_OF_10G_MACS];
     uint16_t                    macMaxFrameLengths10G[FM_MAX_NUM_OF_10G_MACS];
-#endif /* defined(FM_MAX_NUM_OF_10G_MACS) && ... */
     uint16_t                    portMaxFrameLengths1G[FM_MAX_NUM_OF_1G_MACS];
     uint16_t                    macMaxFrameLengths1G[FM_MAX_NUM_OF_1G_MACS];
 } t_FmStateStruct;

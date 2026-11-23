@@ -76,9 +76,6 @@ static void init(void)
     f.state.totalNumOfTasks = 128; f.state.totalFifoSize = 128 * 1024;
     f.state.maxNumOfOpenDmas = 32;
     f.state.revInfo.majorRev = 6; f.state.revInfo.minorRev = 1;
-#ifdef TEST_LEGACY
-    f.state.revInfo.majorRev = 3;
-#endif
     f.qmi.fmqm_gc = (32 << 8) | 16;
     f.fpm.fmfp_mxd = 0x87654321;
     writes = locks = 0;
@@ -198,11 +195,7 @@ int main(void)
     /* A representable DMA request can still exhaust the hardware budget. */
     init();
     params = request(e_FM_PORT_TYPE_RX, BASE_1G_RX_PORTID);
-#ifdef TEST_LEGACY
-    f.state.accumulatedNumOfOpenDmas = f.state.maxNumOfOpenDmas;
-#else
     f.state.accumulatedNumOfOpenDmas = DMA_THRESH_MAX_COMMQ + 1;
-#endif
     refused(&params);
     f.state.accumulatedNumOfOpenDmas = 0;
     allocated(&params); released(&params);
@@ -254,16 +247,6 @@ int main(void)
     assert(f.state.accumulatedNumOfDeqTnums == QMI_MAX_NUM_OF_TNUMS - 2);
     assert((f.qmi.fmqm_gc & 0xff) == QMI_MAX_NUM_OF_TNUMS - 1);
     released(&params);
-
-#ifdef FM_LOW_END_RESTRICTION
-    init();
-    params = request(e_FM_PORT_TYPE_OH_HOST_COMMAND, 0x1);
-    f.state.lowEndRestriction = true;
-    refused(&params);
-    f.state.lowEndRestriction = false;
-    allocated(&params); assert(f.state.lowEndRestriction);
-    released(&params); assert(!f.state.lowEndRestriction);
-#endif
 
     /* Exercise the public FIFO API after its initialization parameters are
      * gone, including TX/OH validation and cached values after refusal. */
@@ -320,14 +303,10 @@ int main(void)
     seed_registers = true;
     assert(FmSetNumOfTasks(&f.fm, BASE_1G_RX_PORTID, &tasks, &extra_tasks, true) == E_OK);
     assert(FmSetSizeOfFifo(&f.fm, BASE_1G_RX_PORTID, &fifo, &extra_fifo, true) == E_OK);
-#ifdef FM_HAS_TOTAL_DMAS
-    assert(FmSetNumOfOpenDmas(&f.fm, BASE_1G_RX_PORTID, &dmas, &extra_dmas, true) == E_NOT_SUPPORTED);
-#else
     assert(FmSetNumOfOpenDmas(&f.fm, BASE_1G_RX_PORTID, &dmas, &extra_dmas, true) == E_OK);
     dmas = extra_dmas = 0;
     assert(FmSetNumOfOpenDmas(&f.fm, BASE_1G_RX_PORTID, &dmas, &extra_dmas, true) == E_OK);
     assert(dmas == 3 && extra_dmas == 1);
-#endif
     seed_registers = false;
     assert(!locks && !locked && !irq_disabled && writes);
     assert(!memcmp(&saved.state, &f.state, sizeof(f.state)));

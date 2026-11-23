@@ -546,10 +546,6 @@ static t_KnownFieldsMasks GetKnownProtMask(t_FmPcd *p_FmPcd, e_NetHeaderType hdr
                     if (index == e_FM_PCD_HDR_INDEX_2)
                         return KG_SCH_KN_PTYPE2;
                     if (index == e_FM_PCD_HDR_INDEX_LAST)
-#ifdef FM_KG_NO_IPPID_SUPPORT
-                    if (p_FmPcd->fmRevInfo.majorRev < 6)
-                        return KG_SCH_KN_PTYPE2;
-#endif /* FM_KG_NO_IPPID_SUPPORT */
                         return KG_SCH_KN_IPPID;
                     REPORT_ERROR(MAJOR, E_NOT_SUPPORTED, ("Illegal IPv6 index"));
                     return 0;
@@ -878,7 +874,6 @@ static t_Error UnbindPortToClsPlanGrp(t_FmPcd *p_FmPcd, uint8_t hardwarePortId)
     return KgWriteCpp(p_FmPcd, hardwarePortId, 0);
 }
 
-#if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
 static uint32_t __attribute__((unused)) ReadClsPlanBlockActionReg(uint8_t grpId)
 {
     return (uint32_t)(FM_KG_KGAR_GO |
@@ -892,7 +887,6 @@ static uint32_t __attribute__((unused)) ReadClsPlanBlockActionReg(uint8_t grpId)
        sel = (uint8_t)(0x01 << (7- (entryId % CLS_PLAN_NUM_PER_GRP)));
      */
 }
-#endif /* (defined(DEBUG_ERRORS) && ... */
 
 static void PcdKgErrorException(t_Handle h_FmPcd)
 {
@@ -1067,10 +1061,6 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
 
     if (p_SchemeParams->bypassFqidGeneration)
     {
-#ifdef FM_KG_NO_BYPASS_FQID_GEN
-        if ((p_FmPcd->fmRevInfo.majorRev != 4) && (p_FmPcd->fmRevInfo.majorRev < 6))
-            RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("bypassFqidGeneration."));
-#endif /* FM_KG_NO_BYPASS_FQID_GEN */
         if (p_SchemeParams->baseFqid)
             RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("baseFqid set for a scheme that does not generate an FQID"));
     }
@@ -1101,13 +1091,6 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
 
     if (p_SchemeParams->nextEngine == e_FM_PCD_CC)
     {
-#ifdef FM_KG_NO_BYPASS_PLCR_PROFILE_GEN
-        if ((p_SchemeParams->kgNextEngineParams.cc.plcrNext) && (p_SchemeParams->kgNextEngineParams.cc.bypassPlcrProfileGeneration))
-        {
-            if ((p_FmPcd->fmRevInfo.majorRev != 4) && (p_FmPcd->fmRevInfo.majorRev < 6))
-                RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("bypassPlcrProfileGeneration."));
-        }
-#endif /* FM_KG_NO_BYPASS_PLCR_PROFILE_GEN */
 
         err = FmPcdCcGetGrpParams(p_SchemeParams->kgNextEngineParams.cc.h_CcTree,
                              p_SchemeParams->kgNextEngineParams.cc.grpId,
@@ -2292,9 +2275,6 @@ void KgFreeClsPlanEntries(t_Handle h_FmPcd, uint16_t numOfClsPlanEntries, uint8_
     uint8_t     numOfBlocks;
     uint8_t     i, baseBlock;
 
-#ifdef DISABLE_ASSERTIONS
-UNUSED(guestId);
-#endif /* DISABLE_ASSERTIONS */
 
     /* This routine is issued only on master core of master partition -
        either directly or through IPC, so no need for lock */

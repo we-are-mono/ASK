@@ -77,7 +77,6 @@ do {\
 
 static void hc_swap_frame(struct qm_fd *fd)
 {
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 	/* extract the HC frame address */
 	uint32_t *hcf_va = XX_PhysToVirt(qm_fd_addr(fd));
 	int hcf_l = fd->length20;
@@ -87,7 +86,6 @@ static void hc_swap_frame(struct qm_fd *fd)
 	for(i = 0; i < hcf_l / 4; ++i)
 		hcf_va[i] =
 			___constant_swab32(hcf_va[i]);
-#endif
 }
 
 static enum qman_cb_dqrr_result qm_tx_conf_dqrr_cb(struct qman_portal *portal,
@@ -482,12 +480,6 @@ static t_LnxWrpFmPortDev *ReadFmPortDevTreeNode(struct platform_device
 
 	p_LnxWrpFmPortDev->active = TRUE;
 
-#if defined(CONFIG_FMAN_DISABLE_OH_TO_REUSE_RESOURCES)
-	/* for performance mode no OH port available. */
-	if (p_LnxWrpFmPortDev->settings.param.portType ==
-	    e_FM_PORT_TYPE_OH_OFFLINE_PARSING)
-		p_LnxWrpFmPortDev->active = FALSE;
-#endif
 
 	return p_LnxWrpFmPortDev;
 }
@@ -550,31 +542,6 @@ static t_Error CheckNConfigFmPortAdvArgs (t_LnxWrpFmPortDev *p_LnxWrpFmPortDev)
     const uint32_t          *uint32_prop;
     /*const char              *str_prop;*/
     int                     lenp;
-#ifdef CONFIG_FMAN_PFC
-    uint8_t i, id, num_pools;
-    t_FmBufPoolDepletion poolDepletion;
-
-    if (p_LnxWrpFmPortDev->settings.param.portType == e_FM_PORT_TYPE_RX ||
-            p_LnxWrpFmPortDev->settings.param.portType == e_FM_PORT_TYPE_RX_10G) {
-        memset(&poolDepletion, 0, sizeof(t_FmBufPoolDepletion));
-        poolDepletion.singlePoolModeEnable = true;
-        num_pools = p_LnxWrpFmPortDev->settings.param.specificParams.rxParams.
-                extBufPools.numOfPoolsUsed;
-        for (i = 0; i < num_pools; i++) {
-            id = p_LnxWrpFmPortDev->settings.param.specificParams.rxParams.
-                    extBufPools.extBufPool[i].id;
-            poolDepletion.poolsToConsiderForSingleMode[id] = true;
-        }
-
-        for (i = 0; i < CONFIG_FMAN_PFC_COS_COUNT; i++)
-            poolDepletion.pfcPrioritiesEn[i] = true;
-
-        err = FM_PORT_ConfigPoolDepletion(p_LnxWrpFmPortDev->h_Dev,
-                &poolDepletion);
-        if (err != E_OK)
-            RETURN_ERROR(MAJOR, err, ("FM_PORT_ConfigPoolDepletion() failed"));
-    }
-#endif
 
     fm_node = GetFmAdvArgsDevTreeNode(((t_LnxWrpFmDev *) p_LnxWrpFmPortDev->h_LnxWrpFmDev)->id);
     if (!fm_node) /* no advance parameters for FMan */
@@ -787,7 +754,6 @@ static t_Error InitFmPortDev(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev)
 	if (p_LnxWrpFmPortDev->h_Dev == NULL)
 		RETURN_ERROR(MAJOR, E_INVALID_HANDLE, ("FM-port"));
 
-#ifndef  FM_QMI_NO_DEQ_OPTIONS_SUPPORT
 	if ((p_LnxWrpFmPortDev->settings.param.portType ==
 	     e_FM_PORT_TYPE_TX_10G)
 	    || (p_LnxWrpFmPortDev->settings.param.portType ==
@@ -805,7 +771,6 @@ static t_Error InitFmPortDev(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev)
 		    != E_OK)
 			RETURN_ERROR(MAJOR, errCode, NO_MSG);
 	}
-#endif  /* !FM_QMI_NO_DEQ_OPTIONS_SUPPORT */
 
 /* Call the driver's advanced configuration routines, if requested:
    Compare the function pointer of each entry to the available routines,
@@ -1059,19 +1024,12 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
 		fmPcdParams.ccSupport = p_LnxWrpFmDev->ccActive;
 		fmPcdParams.numOfSchemes = FM_PCD_KG_NUM_OF_SCHEMES;
 
-#ifndef CONFIG_GUEST_PARTITION
 		fmPcdParams.f_Exception = LnxwrpFmPcdDevExceptionsCb;
 		if (fmPcdParams.kgSupport)
 			fmPcdParams.f_ExceptionId =
 				LnxwrpFmPcdDevIndexedExceptionsCb;
 		fmPcdParams.h_App = p_LnxWrpFmDev;
-#endif /* !CONFIG_GUEST_PARTITION */
 
-#ifdef CONFIG_MULTI_PARTITION_SUPPORT
-		fmPcdParams.numOfSchemes = 0;
-		fmPcdParams.numOfClsPlanEntries = 0;
-		fmPcdParams.partitionId = 0;
-#endif /* CONFIG_MULTI_PARTITION_SUPPORT */
 		fmPcdParams.useHostCommand = TRUE;
 
 		p_LnxWrpFmDev->hc_tx_fq =
@@ -1252,9 +1210,6 @@ static int /*__devinit*/ fm_port_probe(struct platform_device *of_dev)
 		return -EIO;
 	}
 
-#ifdef FM_TX_INVALID_ECC_ERRATA_10GMAC_A009
-	FM_DisableRamsEcc(p_LnxWrpFmDev->h_Dev);
-#endif /* FM_TX_INVALID_ECC_ERRATA_10GMAC_A009 */
 
 	DBG(TRACE, ("%s probed", p_LnxWrpFmPortDev->name));
 

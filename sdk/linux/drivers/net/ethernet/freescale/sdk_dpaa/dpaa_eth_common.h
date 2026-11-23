@@ -189,38 +189,6 @@ extern u16 qman_portal_max;
 /* from dpa_ethtool.c */
 extern const struct ethtool_ops dpa_ethtool_ops;
 
-#ifdef CONFIG_FSL_DPAA_HOOKS
-/* Various hooks used for unit-testing and/or fastpath optimizations.
- * Currently only one set of such hooks is supported.
- */
-struct dpaa_eth_hooks_s {
-	/* Invoked on the Tx private path, immediately after receiving the skb
-	 * from the stack.
-	 */
-	dpaa_eth_egress_hook_t	tx;
-
-	/* Invoked on the Rx private path, right before passing the skb
-	 * up the stack. At that point, the packet's protocol id has already
-	 * been set. The skb's data pointer is now at the L3 header, and
-	 * skb->mac_header points to the L2 header. skb->len has been adjusted
-	 * to be the length of L3+payload (i.e., the length of the
-	 * original frame minus the L2 header len).
-	 * For more details on what the skb looks like, see eth_type_trans().
-	 */
-	dpaa_eth_ingress_hook_t	rx_default;
-
-	/* Driver hook for the Rx error private path. */
-	dpaa_eth_confirm_hook_t rx_error;
-	/* Driver hook for the Tx confirmation private path. */
-	dpaa_eth_confirm_hook_t tx_confirm;
-	/* Driver hook for the Tx error private path. */
-	dpaa_eth_confirm_hook_t tx_error;
-};
-
-void fsl_dpaa_eth_set_hooks(struct dpaa_eth_hooks_s *hooks);
-
-extern struct dpaa_eth_hooks_s dpaa_eth_hooks;
-#endif
 
 int dpa_netdev_init(struct net_device *net_dev,
 		    const uint8_t *mac_addr,
@@ -260,11 +228,6 @@ bool dpa_bpid2pool_use(int bpid);
 void dpa_bp_drain(struct dpa_bp *bp);
 void __cold __attribute__((nonnull))
 _dpa_bp_free(struct dpa_bp *dpa_bp);
-#ifdef CONFIG_FMAN_PFC
-u16 dpa_select_queue(struct net_device *net_dev, struct sk_buff *skb,
-		     struct net_device *sb_dev,
-		     select_queue_fallback_t fallback);
-#endif
 struct dpa_fq *dpa_fq_alloc(struct device *dev,
 			    u32 fq_start,
 			    u32 fq_count,
@@ -299,7 +262,7 @@ void count_ern(struct dpa_percpu_priv_s *percpu_priv,
 		      const struct qm_mr_entry *msg);
 int dpa_enable_tx_csum(struct dpa_priv_s *priv,
 	struct sk_buff *skb, struct qm_fd *fd, char *parse_results);
-#if defined(CONFIG_FSL_DPAA_CEETM) || defined(CONFIG_CPE_FAST_PATH)
+#ifdef CONFIG_CPE_FAST_PATH
 void dpa_enable_ceetm(struct net_device *dev);
 void dpa_disable_ceetm(struct net_device *dev);
 #endif

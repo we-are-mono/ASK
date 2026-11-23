@@ -570,33 +570,7 @@ t_Error FM_RTC_GetFreqCompensation(t_Handle h_FmRtc, uint32_t *p_Compensation);
 *//***************************************************************************/
 t_Error FM_RTC_SetFreqCompensation(t_Handle h_FmRtc, uint32_t freqCompensation);
 
-#ifdef CONFIG_PTP_1588_CLOCK_DPAA
-/**************************************************************************//**
-*@Function      FM_RTC_EnableInterrupt
-*
-*@Description   Enable interrupt of FM RTC.
-*
-*@Param[in]     h_FmRtc             - Handle to FM RTC object.
-*@Param[in]     events              - Interrupt events.
-*
-*@Return        E_OK on success; Error code otherwise.
-*//***************************************************************************/
-t_Error FM_RTC_EnableInterrupt(t_Handle h_FmRtc, uint32_t events);
 
-/**************************************************************************//**
-*@Function      FM_RTC_DisableInterrupt
-*
-*@Description   Disable interrupt of FM RTC.
-*
-*@Param[in]     h_FmRtc             - Handle to FM RTC object.
-*@Param[in]     events              - Interrupt events.
-*
-*@Return        E_OK on success; Error code otherwise.
-*//***************************************************************************/
-t_Error FM_RTC_DisableInterrupt(t_Handle h_FmRtc, uint32_t events);
-#endif
-
-#if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
 /**************************************************************************//**
  @Function      FM_RTC_DumpRegs
 
@@ -609,7 +583,6 @@ t_Error FM_RTC_DisableInterrupt(t_Handle h_FmRtc, uint32_t events);
  @Cautions      Allowed only FM_Init().
 *//***************************************************************************/
 t_Error FM_RTC_DumpRegs(t_Handle h_FmRtc);
-#endif /* (defined(DEBUG_ERRORS) && ... */
 
 /** @} */ /* end of fm_rtc_control_grp */
 /** @} */ /* end of fm_rtc_grp */

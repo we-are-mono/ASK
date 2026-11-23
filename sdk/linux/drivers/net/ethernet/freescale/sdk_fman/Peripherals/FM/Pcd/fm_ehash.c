@@ -809,15 +809,9 @@ t_Handle ExternalHashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
 		
 	//determine number of bits set in the hash mask
 	ii = p_Param->hashResMask;
-#ifdef CONFIG_FMAN_ARM
         __asm__ ("clz %0,%1\n"
                         : "=r"(num_of_zeroes)
                         : "r"(ii));
-#else
-        __asm__ ("cntlzw %0,%1\n"
-                        : "=r"(num_of_zeroes)
-                        : "r"(ii));
-#endif
 	h_FmMuram = FmPcdGetMuramHandle(h_FmPcd);
     	if (!h_FmMuram) {
         	REPORT_ERROR(MAJOR, E_INVALID_HANDLE,

@@ -12,9 +12,6 @@
 #define ASSERT_COND assert
 #define RETURN_ERROR(level, err, msg) return (err)
 #define SANITY_CHECK_RETURN_ERROR(cond, err) do { if (!(cond)) return (err); } while (0)
-#ifdef TEST_LEGACY_DEQ
-#undef FM_DEQ_PIPELINE_PARAMS_FOR_OP
-#endif
 
 enum fault { NONE, BUFFER_LAYOUT, VALIDATION, POOLS, FIFO, FM_RESOURCES,
              LOW_LEVEL, DISABLE, VSP };
@@ -125,10 +122,6 @@ int main(void)
                 assert(FM_PORT_Init(port) == E_OK);
                 assert(!port->p_FmPortDriverParam && allocations == 1);
                 uint8_t expected = (types[t] == e_FM_PORT_TYPE_RX || types[t] == e_FM_PORT_TYPE_RX_10G) ? 0 : depth;
-#ifdef TEST_LEGACY_DEQ
-                if ((types[t] == e_FM_PORT_TYPE_OH_OFFLINE_PARSING || types[t] == e_FM_PORT_TYPE_OH_HOST_COMMAND)
-                    && rev != 4 && rev < 6) expected = 2;
-#endif
                 assert(acquired.deqPipelineDepth == expected);
                 port->enabled = true;
                 finish(port, 1); assert(disables == 1);

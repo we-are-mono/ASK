@@ -8,13 +8,6 @@ config FSL_SDK_DPA
 menu "Freescale Datapath QMan/BMan options"
 	depends on FSL_SDK_DPA
 
-config FSL_DPA_CHECKING
-	bool "additional driver checking"
-	default n
-	help
-	  Compiles in additional checks to sanity-check the drivers and any
-	  use of it by other code. Not recommended for performance.
-
 config FSL_DPA_CAN_WAIT
 	bool
 	default y
@@ -56,32 +49,6 @@ config FSL_BMAN_CONFIG
 	  linux image is running as a guest OS under the hypervisor, only one
 	  guest OS ("the control plane") needs this option.
 
-config FSL_BMAN_TEST
-	tristate "BMan self-tests"
-	default n
-	help
-	  This option compiles self-test code for BMan.
-
-config FSL_BMAN_TEST_HIGH
-	bool "BMan high-level self-test"
-	depends on FSL_BMAN_TEST
-	default y
-	help
-	  This requires the presence of cpu-affine portals, and performs
-	  high-level API testing with them (whichever portal(s) are affine to
-	  the cpu(s) the test executes on).
-
-config FSL_BMAN_TEST_THRESH
-	bool "BMan threshold test"
-	depends on FSL_BMAN_TEST
-	default y
-	help
-	  Multi-threaded (SMP) test of BMan pool depletion. A pool is seeded
-	  before multiple threads (one per cpu) create pool objects to track
-	  depletion state changes. The pool is then drained to empty by a
-	  "drainer" thread, and the other threads that they observe exactly
-	  the depletion state changes that are expected.
-
 config FSL_BMAN_DEBUGFS
 	tristate "BMan debugfs interface"
 	depends on DEBUG_FS
@@ -108,30 +75,6 @@ config FSL_QMAN_CONFIG
 	  If this linux image is running natively, you need this option. If this
 	  linux image is running as a guest OS under the hypervisor, only one
 	  guest OS ("the control plane") needs this option.
-
-config FSL_QMAN_TEST
-	tristate "QMan self-tests"
-	default n
-	help
-	  This option compiles self-test code for QMan.
-
-config FSL_QMAN_TEST_STASH_POTATO
-	bool "QMan 'hot potato' data-stashing self-test"
-	depends on FSL_QMAN_TEST
-	default y
-	help
-	  This performs a "hot potato" style test enqueuing/dequeuing a frame
-	  across a series of FQs scheduled to different portals (and cpus), with
-	  DQRR, data and context stashing always on.
-
-config FSL_QMAN_TEST_HIGH
-	bool "QMan high-level self-test"
-	depends on FSL_QMAN_TEST
-	default y
-	help
-	  This requires the presence of cpu-affine portals, and performs
-	  high-level API testing with them (whichever portal(s) are affine to
-	  the cpu(s) the test executes on).
 
 config FSL_QMAN_DEBUGFS
 	tristate "QMan debugfs interface"
@@ -213,23 +156,5 @@ config FSL_QMAN_INIT_TIMEOUT
 	partition in case the control partition fails to boot-up.
 
 endif # FSL_SDK_QMAN
-
-config FSL_USDPAA
-        bool "Freescale USDPAA process driver"
-        depends on FSL_SDK_DPA
-        default y
-	help
-        This driver provides user-space access to kernel-managed
-        resource interfaces for USDPAA applications, on the assumption
-        that each process will open this device once. Specifically, this
-        device exposes functionality that would be awkward if exposed
-        via the portal devices - ie. this device exposes functionality
-        that is inherently process-wide rather than portal-specific.
-        This device is necessary for obtaining access to DMA memory and
-        for allocation of Qman and Bman resources. In short, if you wish
-        to use USDPAA applications, you need this.
-
-        If unsure, say Y.
-
 
 endmenu

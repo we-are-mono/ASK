@@ -325,16 +325,6 @@ int ERROR_DYNAMIC_LEVEL = ERROR_GLOBAL_LEVEL;
 #define PRINT_FORMAT        "[CPU%02d, %s:%d %s]"
 #define PRINT_FMT_PARAMS    raw_smp_processor_id(), __FILE__, __LINE__, __FUNCTION__
 
-#if (!(defined(DEBUG_ERRORS)) || (DEBUG_ERRORS == 0))
-/* No debug/error/event messages at all */
-#define DBG(_level, _vmsg)
-
-#define REPORT_ERROR(_level, _err, _vmsg)
-
-#define RETURN_ERROR(_level, _err, _vmsg) \
-        return ERROR_CODE(_err)
-
-#else /* DEBUG_ERRORS > 0 */
 
 extern const char *dbgLevelStrings[];
 extern const char *moduleStrings[];
@@ -380,7 +370,6 @@ char * ErrTypeStrings (e_ErrorType err);
         return ERROR_CODE(_err); \
     } while (0)
 
-#endif /* (DEBUG_ERRORS > 0) */
 
 
 /**************************************************************************//**
@@ -391,9 +380,6 @@ char * ErrTypeStrings (e_ErrorType err);
  @Param[in]     _cond - The condition being checked, in positive form;
                         Failure of the condition triggers the assert.
 *//***************************************************************************/
-#ifdef DISABLE_ASSERTIONS
-#define ASSERT_COND(_cond)
-#else
 #define ASSERT_COND(_cond) \
     do { \
         if (!(_cond)) { \
@@ -402,15 +388,8 @@ char * ErrTypeStrings (e_ErrorType err);
             XX_Exit(1); \
         } \
     } while (0)
-#endif /* DISABLE_ASSERTIONS */
 
 
-#ifdef DISABLE_INIT_PARAMETERS_CHECK
-
-#define CHECK_INIT_PARAMETERS(handle, f_check)
-#define CHECK_INIT_PARAMETERS_RETURN_VALUE(handle, f_check, retval)
-
-#else
 
 #define CHECK_INIT_PARAMETERS(handle, f_check) \
     do { \
@@ -429,16 +408,7 @@ char * ErrTypeStrings (e_ErrorType err);
         } \
     } while (0)
 
-#endif /* DISABLE_INIT_PARAMETERS_CHECK */
 
-#ifdef DISABLE_SANITY_CHECKS
-
-#define SANITY_CHECK_RETURN_ERROR(_cond, _err)
-#define SANITY_CHECK_RETURN_VALUE(_cond, _err, retval)
-#define SANITY_CHECK_RETURN(_cond, _err)
-#define SANITY_CHECK_EXIT(_cond, _err)
-
-#else /* DISABLE_SANITY_CHECKS */
 
 #define SANITY_CHECK_RETURN_ERROR(_cond, _err) \
     do { \
@@ -471,7 +441,6 @@ char * ErrTypeStrings (e_ErrorType err);
         } \
     } while (0)
 
-#endif /* DISABLE_SANITY_CHECKS */
 
 /** @} */ /* end of Debug/error Utils group */
 

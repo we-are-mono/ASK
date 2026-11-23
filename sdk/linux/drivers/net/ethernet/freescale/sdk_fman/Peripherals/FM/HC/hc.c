@@ -85,9 +85,6 @@ do {                                      \
 } while (0)
 
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(push,1)
-#endif /* defined(__MWERKS__) && ... */
 
 typedef struct t_FmPcdKgPortRegs {
     volatile uint32_t                       spReg;
@@ -109,9 +106,6 @@ typedef struct t_HcFrame {
     } hcSpecificData;
 } t_HcFrame;
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(pop)
-#endif /* defined(__MWERKS__) && ... */
 
 
 typedef enum e_HcBufState {
@@ -239,15 +233,9 @@ static t_Error FillBufPool(t_FmHc *p_FmHc)
 
     for (i = 0; i < HC_CMD_POOL_SIZE; i++)
     {
-#ifdef FM_LOCKUP_ALIGNMENT_ERRATA_FMAN_SW004
-        p_FmHc->p_Frm[i] = (t_HcFrame *)XX_MallocSmart((sizeof(t_HcFrame) + (16 - (sizeof(t_FmHc) % 16))),
-                                                       p_FmHc->dataMemId,
-                                                       16);
-#else
         p_FmHc->p_Frm[i] = (t_HcFrame *)XX_MallocSmart(sizeof(t_HcFrame),
                                                        p_FmHc->dataMemId,
                                                        16);
-#endif /* FM_LOCKUP_ALIGNMENT_ERRATA_FMAN_SW004 */
         if (!p_FmHc->p_Frm[i])
             RETURN_ERROR(MAJOR, E_NO_MEMORY, ("FM HC frames!"));
     }

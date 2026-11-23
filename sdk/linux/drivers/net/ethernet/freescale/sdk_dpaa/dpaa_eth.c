@@ -30,14 +30,8 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifdef CONFIG_FSL_DPAA_ETH_DEBUG
-#define pr_fmt(fmt) \
-	KBUILD_MODNAME ": %s:%hu:%s() " fmt, \
-	KBUILD_BASENAME".c", __LINE__, __func__
-#else
 #define pr_fmt(fmt) \
 	KBUILD_MODNAME ": " fmt
-#endif
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -71,12 +65,6 @@
 #include "mac.h"
 #include "dpaa_eth.h"
 #include "dpaa_eth_common.h"
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-#include "dpaa_debugfs.h"
-#endif /* CONFIG_FSL_DPAA_DBG_LOOP */
-#ifdef CONFIG_FSL_DPAA_CEETM
-#include "dpaa_eth_ceetm.h"
-#endif
 
 /* CREATE_TRACE_POINTS only needs to be defined once. Other dpa files
  * using trace events only need to #include <trace/events/sched.h>
@@ -123,13 +111,7 @@ static uint8_t dpa_priv_common_bpid;
  * ports are not removed. */
 static int __percpu *dpa_priv_common_count;
 
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-struct net_device *dpa_loop_netdevs[20];
-#endif
 
-#ifdef CONFIG_FSL_DPAA_CEETM
-extern struct Qdisc_ops ceetm_qdisc_ops;
-#endif
 
 #ifdef CONFIG_PM
 
@@ -281,12 +263,6 @@ static void _dpa_rx_error(struct net_device *net_dev,
 		if (netif_msg_hw(priv) && net_ratelimit())
 			netdev_dbg(net_dev, "Err FD status = 0x%08x\n",
 					fd->status & FM_FD_STAT_RX_ERRORS);
-#ifdef CONFIG_FSL_DPAA_HOOKS
-	if (dpaa_eth_hooks.rx_error &&
-		dpaa_eth_hooks.rx_error(net_dev, fd, fqid) == DPAA_ETH_STOLEN)
-		/* it's up to the hook to perform resource cleanup */
-		return;
-#endif
 	percpu_priv->stats.rx_errors++;
 
 	if (fd->status & FM_PORT_FRM_ERR_DMA)
@@ -314,12 +290,6 @@ static void _dpa_tx_error(struct net_device		*net_dev,
 	if (netif_msg_hw(priv) && net_ratelimit())
 		netdev_warn(net_dev, "  _dpa_tx_error :FD status = 0x%08x\n",
 				fd->status & FM_FD_STAT_TX_ERRORS);
-#ifdef CONFIG_FSL_DPAA_HOOKS
-	if (dpaa_eth_hooks.tx_error &&
-		dpaa_eth_hooks.tx_error(net_dev, fd, fqid) == DPAA_ETH_STOLEN)
-		/* now the hook must ensure proper cleanup */
-		return;
-#endif
 	percpu_priv->stats.tx_errors++;
 
 	/* If we intended the buffers from this frame to go into the bpools
@@ -432,12 +402,6 @@ static void __hot _dpa_tx_conf(struct net_device	*net_dev,
 	}
 
 	/* hopefully we need not get the timestamp before the hook */
-#ifdef CONFIG_FSL_DPAA_HOOKS
-	if (dpaa_eth_hooks.tx_confirm && dpaa_eth_hooks.tx_confirm(net_dev,
-		fd, fqid) == DPAA_ETH_STOLEN)
-		/* it's the hook that must now perform cleanup */
-		return;
-#endif
 	/* This might not perfectly reflect the reality, if the core dequeuing
 	 * the Tx confirmation is different from the one that did the enqueue,
 	 * but at least it'll show up in the total count.
@@ -904,9 +868,7 @@ static const struct net_device_ops dpa_private_ops = {
 	.ndo_get_stats64 = dpa_get_stats64,
 	.ndo_set_mac_address = dpa_set_mac_address,
 	.ndo_validate_addr = eth_validate_addr,
-#if defined(CONFIG_FMAN_PFC)
-	.ndo_select_queue = dpa_select_queue,
-#elif defined(CONFIG_CPE_FAST_PATH)
+#ifdef CONFIG_CPE_FAST_PATH
 	/* Load-bearing beyond the qdisc: the leaf-class queues live above
 	 * real_num_tx_queues' probe-time value, and once one is in service the
 	 * stack's own hash would otherwise spread ordinary traffic across it. */
@@ -1185,14 +1147,6 @@ static void dpa_priv_bp_seed(struct net_device *net_dev)
 
 static const struct of_device_id dpa_match[];
 
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-static int dpa_new_loop_id(void)
-{
-	static int if_id;
-
-	return if_id++;
-}
-#endif
 
 static int
 dpaa_eth_priv_probe(struct platform_device *_of_dev)
@@ -1262,11 +1216,6 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
 
 	priv->msg_enable = netif_msg_init(debug, -1);
 
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-	priv->loop_id = dpa_new_loop_id();
-	priv->loop_to = -1; /* disabled by default */
-	dpa_loop_netdevs[priv->loop_id] = net_dev;
-#endif
 
 	mac_dev = dpa_mac_probe(_of_dev);
 	if (IS_ERR(mac_dev) || !mac_dev) {
@@ -1362,16 +1311,6 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
 	dpaa_eth_init_ports(mac_dev, dpa_bp, count, &port_fqs,
 			buf_layout, dev);
 
-#ifdef CONFIG_FMAN_PFC
-	for (i = 0; i < CONFIG_FMAN_PFC_COS_COUNT; i++) {
-		err = fm_port_set_pfc_priorities_mapping_to_qman_wq(
-				mac_dev->port_dev[TX], i, i);
-		if (unlikely(err != 0)) {
-			dev_err(dev, "Error maping PFC %u to WQ %u\n", i, i);
-			goto pfc_mapping_failed;
-		}
-	}
-#endif
 
 	priv->percpu_priv = devm_alloc_percpu(dev, *priv->percpu_priv);
 
@@ -1437,9 +1376,6 @@ netdev_init_failed:
 napi_add_failed:
 	dpa_private_napi_del(net_dev);
 alloc_percpu_failed:
-#ifdef CONFIG_FMAN_PFC
-pfc_mapping_failed:
-#endif
 	dpa_fq_free(dev, &priv->dpa_fq_list);
 fq_alloc_failed:
 	dpa_destroy_cgr(&priv->ingress_cgr);
@@ -1543,18 +1479,12 @@ static int __init __cold dpa_load(void)
 		return _errno;
 	}
 
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-	dpa_debugfs_module_init();
-#endif /* CONFIG_FSL_DPAA_DBG_LOOP */
 
 	/* initialise dpaa_eth mirror values */
 	dpa_rx_extra_headroom = fm_get_rx_extra_headroom();
 	dpa_max_frm = fm_get_max_frm();
 	dpa_num_cpus = num_possible_cpus();
 
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-	memset(dpa_loop_netdevs, 0, sizeof(dpa_loop_netdevs));
-#endif
 
 	_errno = platform_driver_register(&dpa_driver);
 	if (unlikely(_errno < 0)) {
@@ -1567,13 +1497,6 @@ static int __init __cold dpa_load(void)
 	pr_debug(KBUILD_MODNAME ": %s:%s() ->\n",
 		KBUILD_BASENAME".c", __func__);
 
-#ifdef CONFIG_FSL_DPAA_CEETM
-	_errno = register_qdisc(&ceetm_qdisc_ops);
-	if (unlikely(_errno))
-		pr_err(KBUILD_MODNAME
-		       ": %s:%hu:%s(): register_qdisc() = %d\n",
-		       KBUILD_BASENAME ".c", __LINE__, __func__, _errno);
-#endif
 
 	return _errno;
 }
@@ -1584,17 +1507,11 @@ static void __exit __cold dpa_unload(void)
 	pr_debug(KBUILD_MODNAME ": -> %s:%s()\n",
 		KBUILD_BASENAME".c", __func__);
 
-#ifdef CONFIG_FSL_DPAA_CEETM
-	unregister_qdisc(&ceetm_qdisc_ops);
-#endif
 
 	platform_driver_unregister(&dpa_driver);
 	dpa_pool_watch_stop();
 	unregister_netdevice_notifier(&dpa_netdev_nb);
 
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-	dpa_debugfs_module_exit();
-#endif /* CONFIG_FSL_DPAA_DBG_LOOP */
 
 	/* Only one channel is used and needs to be relased after all
 	 * interfaces are removed

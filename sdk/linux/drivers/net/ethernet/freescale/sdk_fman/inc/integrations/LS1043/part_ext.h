@@ -43,9 +43,6 @@
 #include "std_ext.h"
 #include "part_integration_ext.h"
 
-#if !(defined(LS1043))
-#error "unable to proceed without chip-definition"
-#endif
 
 
 /**************************************************************************//*

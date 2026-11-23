@@ -175,29 +175,16 @@ enum qm_mr_cmode {		/* matches QCSP_CFG::MM */
 struct qm_eqcr {
 	struct qm_eqcr_entry *ring, *cursor;
 	u8 ci, available, ithresh, vbit;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	u32 busy;
-	enum qm_eqcr_pmode pmode;
-#endif
 };
 
 struct qm_dqrr {
 	const struct qm_dqrr_entry *ring, *cursor;
 	u8 pi, ci, fill, ithresh, vbit;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	enum qm_dqrr_dmode dmode;
-	enum qm_dqrr_pmode pmode;
-	enum qm_dqrr_cmode cmode;
-#endif
 };
 
 struct qm_mr {
 	const struct qm_mr_entry *ring, *cursor;
 	u8 pi, ci, fill, ithresh, vbit;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	enum qm_mr_pmode pmode;
-	enum qm_mr_cmode cmode;
-#endif
 };
 
 struct qm_mc {
@@ -209,16 +196,6 @@ struct qm_mc {
 	 * written until it has: QMan would not see a new valid bit, and the
 	 * old answer would be taken for the new one (qm_mc_settle()). */
 	bool abandoned;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	enum {
-		/* Can be _mc_start()ed */
-		qman_mc_idle,
-		/* Can be _mc_commit()ed or _mc_abort()ed */
-		qman_mc_user,
-		/* Can only be _mc_retry()ed */
-		qman_mc_hw
-	} state;
-#endif
 };
 
 #define QM_PORTAL_ALIGNMENT ____cacheline_aligned
@@ -229,7 +206,7 @@ struct qm_addr {
 };
 
 struct qm_portal {
-	/* In the non-CONFIG_FSL_DPA_CHECKING case, the following stuff up to
+	/* The following stuff, up to
 	 * and including 'mc' fits within a cacheline (yay!). The 'config' part
 	 * is setup-only, so isn't a cause for a concern. In other words, don't
 	 * rearrange this structure on a whim, there be dragons ... */
@@ -289,10 +266,6 @@ static inline int qm_eqcr_init(struct qm_portal *portal,
 	eqcr->available = QM_EQCR_SIZE - 1 -
 			qm_cyc_diff(QM_EQCR_SIZE, eqcr->ci, pi);
 	eqcr->ithresh = qm_in(EQCR_ITR);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	eqcr->busy = 0;
-	eqcr->pmode = pmode;
-#endif
 	cfg = (qm_in(CFG) & 0x00ffffff) |
 		(eq_stash_thresh << 28) | /* QCSP_CFG: EST */
 		(eq_stash_prio << 26)	| /* QCSP_CFG: EP */
@@ -350,9 +323,6 @@ static inline struct qm_eqcr_entry *qm_eqcr_start_no_stash(struct qm_portal
 	if (!eqcr->available)
 		return NULL;
 
-#ifdef CONFIG_FSL_DPA_CHECKING
-	eqcr->busy = 1;
-#endif
 	return eqcr->cursor;
 }
 
@@ -371,9 +341,6 @@ static inline struct qm_eqcr_entry *qm_eqcr_start_stash(struct qm_portal
 		if (!diff)
 			return NULL;
 	}
-#ifdef CONFIG_FSL_DPA_CHECKING
-	eqcr->busy = 1;
-#endif
 	return eqcr->cursor;
 }
 
@@ -381,9 +348,6 @@ static inline void qm_eqcr_abort(struct qm_portal *portal)
 {
 	__maybe_unused register struct qm_eqcr *eqcr = &portal->eqcr;
 	DPA_ASSERT(eqcr->busy);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	eqcr->busy = 0;
-#endif
 }
 
 static inline struct qm_eqcr_entry *qm_eqcr_pend_and_next(
@@ -401,23 +365,12 @@ static inline struct qm_eqcr_entry *qm_eqcr_pend_and_next(
 	return eqcr->cursor;
 }
 
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define EQCR_COMMIT_CHECKS(eqcr) \
 do { \
 	DPA_ASSERT(eqcr->busy); \
 	DPA_ASSERT(eqcr->cursor->orp == (eqcr->cursor->orp & 0xffffff00)); \
 	DPA_ASSERT(eqcr->cursor->fqid == (eqcr->cursor->fqid & 0xffffff00)); \
 } while (0)
-#else
-#define EQCR_COMMIT_CHECKS(eqcr) \
-do { \
-	DPA_ASSERT(eqcr->busy); \
-	DPA_ASSERT(eqcr->cursor->orp == (eqcr->cursor->orp & \
-					cpu_to_be32(0x00ffffff))); \
-	DPA_ASSERT(eqcr->cursor->fqid == (eqcr->cursor->fqid & \
-					cpu_to_be32(0x00ffffff))); \
-} while (0)
-#endif
 
 static inline void qm_eqcr_pci_commit(struct qm_portal *portal, u8 myverb)
 {
@@ -430,9 +383,6 @@ static inline void qm_eqcr_pci_commit(struct qm_portal *portal, u8 myverb)
 	dcbf(eqcr->cursor);
 	hwsync();
 	qm_out(EQCR_PI_CINH, EQCR_PTR2IDX(eqcr->cursor));
-#ifdef CONFIG_FSL_DPA_CHECKING
-	eqcr->busy = 0;
-#endif
 }
 
 static inline void qm_eqcr_pce_prefetch(struct qm_portal *portal)
@@ -454,9 +404,6 @@ static inline void qm_eqcr_pce_commit(struct qm_portal *portal, u8 myverb)
 	dcbf(eqcr->cursor);
 	lwsync();
 	qm_cl_out(EQCR_PI, EQCR_PTR2IDX(eqcr->cursor));
-#ifdef CONFIG_FSL_DPA_CHECKING
-	eqcr->busy = 0;
-#endif
 }
 
 static inline void qm_eqcr_pvb_commit(struct qm_portal *portal, u8 myverb)
@@ -471,9 +418,6 @@ static inline void qm_eqcr_pvb_commit(struct qm_portal *portal, u8 myverb)
 	dcbf(eqcursor);
 	EQCR_INC(eqcr);
 	eqcr->available--;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	eqcr->busy = 0;
-#endif
 }
 
 static inline u8 qm_eqcr_cci_update(struct qm_portal *portal)
@@ -621,9 +565,6 @@ static inline int qm_dqrr_init(struct qm_portal *portal,
 	if (dqrr->fill) {
 		enum qm_dqrr_cmode dcm = (qm_in(CFG) >> 16) & 3;
 
-#ifdef CONFIG_FSL_DPA_CHECKING
-		dqrr->cmode = dcm;
-#endif
 		switch (dcm) {
 		case qm_dqrr_cci:
 			qm_dqrr_cci_consume(portal, dqrr->fill);
@@ -639,11 +580,6 @@ static inline int qm_dqrr_init(struct qm_portal *portal,
 		}
 	}
 
-#ifdef CONFIG_FSL_DPA_CHECKING
-	dqrr->dmode = dmode;
-	dqrr->pmode = pmode;
-	dqrr->cmode = cmode;
-#endif
 	/* Invalidate every ring entry before beginning */
 	for (cfg = 0; cfg < QM_DQRR_SIZE; cfg++)
 		dcbi(qm_cl(dqrr->ring, cfg));
@@ -665,11 +601,6 @@ static inline int qm_dqrr_init(struct qm_portal *portal,
 static inline void qm_dqrr_finish(struct qm_portal *portal)
 {
 	__maybe_unused register struct qm_dqrr *dqrr = &portal->dqrr;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	if ((dqrr->cmode != qm_dqrr_cdc) &&
-			(dqrr->ci != DQRR_PTR2IDX(dqrr->cursor)))
-		pr_crit("Ignoring completed DQRR entries\n");
-#endif
 }
 
 static inline const struct qm_dqrr_entry *qm_dqrr_current(
@@ -914,10 +845,6 @@ static inline int qm_mr_init(struct qm_portal *portal, enum qm_mr_pmode pmode,
 	mr->fill = qm_cyc_diff(QM_MR_SIZE, mr->ci, mr->pi);
 	mr->vbit = (qm_in(MR_PI_CINH) & QM_MR_SIZE) ? QM_MR_VERB_VBIT : 0;
 	mr->ithresh = qm_in(MR_ITR);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	mr->pmode = pmode;
-	mr->cmode = cmode;
-#endif
 	cfg = (qm_in(CFG) & 0xfffff0ff) |
 		((cmode & 1) << 8);		/* QCSP_CFG:MM */
 	qm_out(CFG, cfg);
@@ -1085,9 +1012,6 @@ static inline int qm_mc_init(struct qm_portal *portal)
 
 	mc->vbit = mc->rridx ? QM_MCC_VERB_VBIT : 0;
 	mc->abandoned = false;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	mc->state = qman_mc_idle;
-#endif
 	return 0;
 }
 
@@ -1095,10 +1019,6 @@ static inline void qm_mc_finish(struct qm_portal *portal)
 {
 	__maybe_unused register struct qm_mc *mc = &portal->mc;
 	DPA_ASSERT(mc->state == qman_mc_idle);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	if (mc->state != qman_mc_idle)
-		pr_crit("Losing incomplete MC command\n");
-#endif
 }
 
 /* Whether the portal may take a command: true unless a command was abandoned
@@ -1119,9 +1039,6 @@ static inline bool qm_mc_settle(struct qm_portal *portal)
 	mc->rridx ^= 1;
 	mc->vbit ^= QM_MCC_VERB_VBIT;
 	mc->abandoned = false;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	mc->state = qman_mc_idle;
-#endif
 	return true;
 }
 
@@ -1133,9 +1050,6 @@ static inline struct qm_mc_command *qm_mc_start(struct qm_portal *portal)
 	while (unlikely(!qm_mc_settle(portal)))
 		cpu_relax();
 	DPA_ASSERT(mc->state == qman_mc_idle);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	mc->state = qman_mc_user;
-#endif
 	return mc->cr;
 }
 
@@ -1143,9 +1057,6 @@ static inline void qm_mc_abort(struct qm_portal *portal)
 {
 	__maybe_unused register struct qm_mc *mc = &portal->mc;
 	DPA_ASSERT(mc->state == qman_mc_user);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	mc->state = qman_mc_idle;
-#endif
 }
 
 static inline void qm_mc_commit(struct qm_portal *portal, u8 myverb)
@@ -1157,9 +1068,6 @@ static inline void qm_mc_commit(struct qm_portal *portal, u8 myverb)
 	mc->cr->__dont_write_directly__verb = myverb | mc->vbit;
 	dcbf(mc->cr);
 	dcbit_ro(rr);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	mc->state = qman_mc_hw;
-#endif
 }
 
 static inline struct qm_mc_result *qm_mc_result(struct qm_portal *portal)
@@ -1176,9 +1084,6 @@ static inline struct qm_mc_result *qm_mc_result(struct qm_portal *portal)
 	}
 	mc->rridx ^= 1;
 	mc->vbit ^= QM_MCC_VERB_VBIT;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	mc->state = qman_mc_idle;
-#endif
 	return rr;
 }
 
@@ -1233,21 +1138,13 @@ static inline void qm_isr_set_iperiod(struct qm_portal *portal, u16 iperiod)
 
 static inline u32 __qm_isr_read(struct qm_portal *portal, enum qm_isr_reg n)
 {
-#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
 	return __qm_in(&portal->addr, QM_REG_ISR + (n << 6));
-#else
-	return __qm_in(&portal->addr, QM_REG_ISR + (n << 2));
-#endif
 }
 
 static inline void __qm_isr_write(struct qm_portal *portal, enum qm_isr_reg n,
 					u32 val)
 {
-#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
 	__qm_out(&portal->addr, QM_REG_ISR + (n << 6), val);
-#else
-	__qm_out(&portal->addr, QM_REG_ISR + (n << 2), val);
-#endif
 }
 
 static inline int _qm_mr_consume_and_match_verb(struct qm_portal *p, int v)

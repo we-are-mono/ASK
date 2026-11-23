@@ -48,9 +48,6 @@
 #ifdef CONFIG_FSL_DPAA_1588
 #include "dpaa_1588.h"
 #endif
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-#include "dpaa_debugfs.h"
-#endif /* CONFIG_FSL_DPAA_DBG_LOOP */
 #include "mac.h"
 
 /* Size in bytes of the FQ taildrop threshold */
@@ -79,22 +76,6 @@ static const char fsl_qman_frame_queues[][25] = {
 	[RX] = "fsl,qman-frame-queues-rx",
 	[TX] = "fsl,qman-frame-queues-tx"
 };
-#ifdef CONFIG_FSL_DPAA_HOOKS
-/* A set of callbacks for hooking into the fastpath at different points. */
-struct dpaa_eth_hooks_s dpaa_eth_hooks;
-EXPORT_SYMBOL(dpaa_eth_hooks);
-/* This function should only be called on the probe paths, since it makes no
- * effort to guarantee consistency of the destination hooks structure.
- */
-void fsl_dpaa_eth_set_hooks(struct dpaa_eth_hooks_s *hooks)
-{
-	if (hooks)
-		dpaa_eth_hooks = *hooks;
-	else
-		pr_err("NULL pointer to hooks!\n");
-}
-EXPORT_SYMBOL(fsl_dpaa_eth_set_hooks);
-#endif
 
 int dpa_netdev_init(struct net_device *net_dev,
 		    const uint8_t *mac_addr,
@@ -123,14 +104,6 @@ int dpa_netdev_init(struct net_device *net_dev,
 		return err;
 	}
 
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-	/* create debugfs entry for this net_device */
-	err = dpa_netdev_debugfs_create(net_dev);
-	if (err) {
-		unregister_netdev(net_dev);
-		return err;
-	}
-#endif /* CONFIG_FSL_DPAA_DBG_LOOP */
 
 	return 0;
 }
@@ -487,10 +460,6 @@ void __cold dpa_remove(struct platform_device *of_dev)
 	if (priv->buf_layout)
 		devm_kfree(dev, priv->buf_layout);
 
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-	/* remove debugfs entry for this net_device */
-	dpa_netdev_debugfs_remove(net_dev);
-#endif /* CONFIG_FSL_DPAA_DBG_LOOP */
 
 #ifdef CONFIG_FSL_DPAA_1588
 	if (priv->tsu && priv->tsu->valid)
@@ -675,13 +644,6 @@ dpa_bp_alloc(struct dpa_bp *dpa_bp, struct device *dev)
 	}
 
 	memset(&bp_params, 0, sizeof(struct bman_pool_params));
-#ifdef CONFIG_FMAN_PFC
-	bp_params.flags = BMAN_POOL_FLAG_THRESH;
-	bp_params.thresholds[0] = bp_params.thresholds[2] =
-			CONFIG_FSL_DPAA_ETH_REFILL_THRESHOLD;
-	bp_params.thresholds[1] = bp_params.thresholds[3] =
-			CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT;
-#endif
 
 	/* If the pool is already specified, we only create one per bpid */
 	if (dpa_bpid2pool_use(dpa_bp->bpid))
@@ -814,14 +776,6 @@ bool dpa_bpid2pool_use(int bpid)
 	return false;
 }
 
-#ifdef CONFIG_FMAN_PFC
-u16 dpa_select_queue(struct net_device *net_dev, struct sk_buff *skb,
-		     struct net_device *sb_dev,
-		     select_queue_fallback_t fallback)
-{
-	return dpa_get_queue_mapping(skb);
-}
-#endif
 
 struct dpa_fq *dpa_fq_alloc(struct device *dev,
 			    u32 fq_start,
@@ -847,12 +801,6 @@ struct dpa_fq *dpa_fq_alloc(struct device *dev,
 		list_add_tail(&dpa_fq[i].list, list);
 	}
 
-#ifdef CONFIG_FMAN_PFC
-	if (fq_type == FQ_TYPE_TX)
-		for (i = 0; i < fq_count; i++)
-			dpa_fq[i].wq = i / dpa_num_cpus;
-	else
-#endif
 		for (i = 0; i < fq_count; i++)
 			_dpa_assign_wq(dpa_fq + i);
 
@@ -1781,7 +1729,7 @@ return_error:
 }
 EXPORT_SYMBOL(dpa_enable_tx_csum);
 
-#if defined(CONFIG_FSL_DPAA_CEETM) || defined(CONFIG_CPE_FAST_PATH)
+#ifdef CONFIG_CPE_FAST_PATH
 void dpa_enable_ceetm(struct net_device *dev)
 {
 	struct dpa_priv_s *priv = netdev_priv(dev);

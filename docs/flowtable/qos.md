@@ -209,10 +209,11 @@ directions.
 Three options, in increasing order of how much they change.
 
 **A — hand the tree to the SDK's `tc ceetm` qdisc.**
-`sdk_dpaa/dpaa_eth_ceetm.c` is a complete classful qdisc (`type root|prio|wbfs`)
-that builds the same objects through the same `qman_ceetm_*` API, and
-`CONFIG_FSL_DPAA_CEETM` is currently `not set`. Enabling it gives a standard
-control plane and `tc -s class show` statistics for free.
+NXP's `sdk_dpaa/dpaa_eth_ceetm.c` is a complete classful qdisc (`type
+root|prio|wbfs`) that builds the same objects through the same `qman_ceetm_*`
+API; no ASK build enabled it (`CONFIG_FSL_DPAA_CEETM`), and ASK's SDK copy no
+longer carries it. Enabling it would have given a standard control plane and
+`tc -s class show` statistics for free.
 
 It is the wrong trade, for four reasons that compound.
 
@@ -269,8 +270,8 @@ so a bad qid is out-of-bounds memory rather than an error. The driver must
 therefore own a dense, exclusively-allocated range below
 `real_num_tx_queues` and resize it on every leaf add and delete. Today
 `sdk_dpaa` has none of the machinery that implies: no `ndo_setup_tc`, no
-`NETIF_F_HW_TC`, no `ndo_select_queue` (the one in `dpaa_eth.c:696` is
-`#ifdef CONFIG_FMAN_PFC`, which is off in every build), no
+`NETIF_F_HW_TC`, no `ndo_select_queue` (NXP's one served only PFC, which no
+build enabled and the SDK copy no longer carries), no
 `netif_set_real_num_tx_queues` call, no per-queue stop/wake, no BQL and no XPS
 maps. `real_num_tx_queues` is fixed at probe to `DPAA_ETH_TX_QUEUES`, which is
 literally `NR_CPUS` — 64 under OpenWrt, 16 under meta-ask. A leaf budget that

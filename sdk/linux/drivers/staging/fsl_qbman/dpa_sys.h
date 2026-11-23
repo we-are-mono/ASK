@@ -76,25 +76,9 @@
 /* Misc inline assists */
 /***********************/
 
-#if defined CONFIG_ARM
-#include "dpa_sys_arm.h"
-#elif defined CONFIG_ARM64
 #include "dpa_sys_arm64.h"
-#endif
 
-#ifdef CONFIG_FSL_DPA_CHECKING
-#define DPA_ASSERT(x) \
-	do { \
-		if (!(x)) { \
-			pr_crit("ASSERT: (%s:%d) %s\n", __FILE__, __LINE__, \
-				__stringify_1(x)); \
-			dump_stack(); \
-			panic("assertion failure"); \
-		} \
-	} while (0)
-#else
 #define DPA_ASSERT(x)
-#endif
 
 /* memcpy() stuff - when you know alignments in advance */
 #ifdef CONFIG_TRY_BETTER_MEMCPY
@@ -244,10 +228,4 @@ err:
 		(unsigned long)s - (unsigned long)str);
 	return -EINVAL;
 }
-#ifdef CONFIG_FSL_USDPAA
-/* Hooks from fsl_usdpaa_irq.c to fsl_usdpaa.c */
-int usdpaa_get_portal_config(struct file *filp, void *cinh,
-			     enum usdpaa_portal_type ptype, unsigned int *irq,
-			     void **iir_reg);
-#endif
 #endif /* DPA_SYS_H */

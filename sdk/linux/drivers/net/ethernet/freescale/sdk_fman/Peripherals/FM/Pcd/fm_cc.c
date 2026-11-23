@@ -1048,10 +1048,8 @@ static t_Error CcUpdateParam(
         uint16_t numOfEntries, t_Handle h_Ad, bool validate, uint16_t level,
         t_Handle h_FmTree, bool modify)
 {
-#if (DPAA_VERSION >= 11)
   //  FmPortSetFESupport(h_FmPort);
     return E_OK;
-#endif /* (DPAA_VERSION >= 11) */
 
 }
 
@@ -4775,7 +4773,6 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
 }
 
 
-#if (DPAA_VERSION >= 11)
 void get_indexed_hash_bucket(uint8_t key_size,
 	uint8_t *key_ptr,
 	uint8_t crc_shift,
@@ -4791,7 +4788,6 @@ void get_indexed_hash_bucket(uint8_t key_size,
 	*bucket_index = (uint16_t)crc64 & mask;
 }
 
-#endif /* (DPAA_VERSION >= 11) */
 
 /************************** End of static functions **************************/
 
@@ -5933,7 +5929,6 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
     		case e_FM_PCD_PRS:
 			pr_debug("e_FM_PCD_PRS\n");
 			break;
-#if (DPAA_VERSION >= 11)
 		case e_FM_PCD_FR:
 			{
         			t_FmPcdCcNextFrParams *frParams;       /**< Parameters in case next engine is FR */
@@ -5941,7 +5936,6 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
 				pr_debug("e_FM_PCD_FR: frhandle handle %p\n", frParams->h_FrmReplic);
 			}
 			break;
-#endif /* (DPAA_VERSION >= 11) */
 		case e_FM_PCD_HASH:
 			pr_debug("e_FM_PCD_HASH\n");
 			break;

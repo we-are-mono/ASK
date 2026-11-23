@@ -67,7 +67,6 @@ int Snprint(char * buf, uint32_t size, const char *fmt, ...)
     return i;
 }
 
-#ifndef NCSW_VXWORKS
 int Sscan(const char * buf, const char * fmt, ...)
 {
     va_list args;
@@ -78,4 +77,3 @@ int Sscan(const char * buf, const char * fmt, ...)
     va_end(args);
     return i;
 }
-#endif /* NCSW_VXWORKS */

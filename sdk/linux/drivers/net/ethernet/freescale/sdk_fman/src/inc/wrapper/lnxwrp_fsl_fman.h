@@ -525,24 +525,6 @@ int fm_port_resume(struct fm_port *port);
 
 int fm_port_suspend(struct fm_port *port);
 
-#ifdef CONFIG_FMAN_PFC
-/**************************************************************************//**
-@Function     fm_port_set_pfc_priorities_mapping_to_qman_wq
-
-@Description  Associate a QMan Work Queue with a PFC priority on this
-		FM-port device (Tx port).
-
-@Param[in]    port   - A handle of the FM port device.
-
-@Param[in]    prio   - The PFC priority.
-
-@Param[in]    wq   - The Work Queue associated with the PFC priority.
-
-@Cautions     Allowed only after the port is initialized.
-*//***************************************************************************/
-int fm_port_set_pfc_priorities_mapping_to_qman_wq(struct fm_port *port,
-		uint8_t prio, uint8_t wq);
-#endif
 
 /**************************************************************************//**
 @Function     fm_mac_set_exception
@@ -621,25 +603,6 @@ int fm_mac_set_rx_pause_frames(
 int fm_mac_set_tx_pause_frames(struct fm_mac_dev *fm_mac_dev,
 					     bool en);
 
-#ifdef CONFIG_FSL_SDK_FMAN_RTC_API
-int fm_rtc_enable(struct fm *fm_dev);
-
-int fm_rtc_disable(struct fm *fm_dev);
-
-int fm_rtc_get_cnt(struct fm *fm_dev, uint64_t *ts);
-
-int fm_rtc_set_cnt(struct fm *fm_dev, uint64_t ts);
-
-int fm_rtc_get_drift(struct fm *fm_dev, uint32_t *drift);
-
-int fm_rtc_set_drift(struct fm *fm_dev, uint32_t drift);
-
-int fm_rtc_set_alarm(struct fm *fm_dev, uint32_t id,
-		uint64_t time);
-
-int fm_rtc_set_fiper(struct fm *fm_dev, uint32_t id,
-		uint64_t fiper);
-#else
 static inline int fm_rtc_enable(struct fm *fm_dev) { return 0; }
 
 static inline int fm_rtc_disable(struct fm *fm_dev) { return 0; }
@@ -659,7 +622,6 @@ static inline int fm_rtc_set_alarm(struct fm *fm_dev, uint32_t id,
 
 static inline int fm_rtc_set_fiper(struct fm *fm_dev, uint32_t id,
 				   uint64_t fiper) { return 0; }
-#endif
 
 int fm_mac_set_wol(struct fm_port *port, struct fm_mac_dev *fm_mac_dev,
 			bool en);

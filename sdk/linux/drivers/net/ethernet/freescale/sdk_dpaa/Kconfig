@@ -10,39 +10,6 @@ menuconfig FSL_SDK_DPAA_ETH
 
 if FSL_SDK_DPAA_ETH
 
-config FSL_DPAA_HOOKS
-	bool "DPAA Ethernet driver hooks"
-
-config FSL_DPAA_CEETM
-	bool "DPAA CEETM QoS"
-	depends on NET_SCHED
-	default n
-	help
-	Enable QoS offloading support through the CEETM hardware block.
-
-config FSL_DPAA_CEETM_CCS_THRESHOLD_1G
-	hex "CEETM egress congestion threshold on 1G ports"
-	depends on FSL_DPAA_CEETM
-	range 0x1000 0x10000000
-	default "0x00005000"
-	help
-	  The size in bytes of the CEETM egress Class Congestion State threshold on 1G ports.
-	  The threshold needs to be configured keeping in mind the following factors:
-	       - A threshold too large will buffer frames for a long time in the TX queues,
-	       when a small shaping rate is configured. This will cause buffer pool depletion
-	       or out of memory errors. This in turn will cause frame loss on RX;
-	       - A threshold too small will cause unnecessary frame loss by entering
-	       congestion too often.
-
-config FSL_DPAA_CEETM_CCS_THRESHOLD_10G
-	hex "CEETM egress congestion threshold on 10G ports"
-	depends on FSL_DPAA_CEETM
-	range 0x1000 0x20000000
-	default "0x00032000"
-	help
-	  The size in bytes of the CEETM egress Class Congestion State threshold on 10G ports.
-	  See FSL_DPAA_CEETM_CCS_THRESHOLD_1G for details.
-
 config FSL_DPAA_OFFLINE_PORTS
 	bool "Offline Ports support"
 	depends on FSL_SDK_DPAA_ETH
@@ -154,27 +121,4 @@ config FSL_DPAA_ETH_DEBUGFS
 	help
 	  This option compiles debugfs code for the DPAA Ethernet driver.
 
-config FSL_DPAA_ETH_DEBUG
-	bool "DPAA Ethernet Debug Support"
-	depends on FSL_SDK_DPAA_ETH
-	default n
-	help
-	  This option compiles debug code for the DPAA Ethernet driver.
-
-config FSL_DPAA_DBG_LOOP
-	bool "DPAA Ethernet Debug loopback"
-	depends on FSL_DPAA_ETH_DEBUGFS
-	default n
-	help
-	  This option allows to divert all received traffic on a certain interface A towards a
-	  selected interface B. This option is used to benchmark the HW + Ethernet driver in
-	  isolation from the Linux networking stack. The loops are controlled by debugfs entries,
-	  one for each interface. By default all loops are disabled (target value is -1). I.e. to
-	  change the loop setting for interface 4 and divert all received traffic to interface 5
-	  write Tx interface number in the receive interface debugfs file:
-		# cat /sys/kernel/debug/powerpc/fsl_dpa/eth4_loop
-			4->-1
-		# echo 5 > /sys/kernel/debug/powerpc/fsl_dpa/eth4_loop
-		# cat /sys/kernel/debug/powerpc/fsl_dpa/eth4_loop
-			4->5
 endif # FSL_SDK_DPAA_ETH

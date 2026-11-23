@@ -21,15 +21,6 @@ config FSL_SDK_FMAN_EHASH_SYNC_FAULT
 		quarantine handling can be exercised deterministically.
 		Test images only; never enable in production.
 
-config FSL_SDK_FMAN_RTC_API
-	bool "FMan RTC (1588 timer) APIs"
-	default n
-	help
-		This option enables RTC (1588 timer) initialization and
-		APIs support. The ptp_qoriq driver is not available if
-		it is selected for RTC (1588 timer). Neither of them
-		were not able to be used together.
-
 config FSL_FM_MAX_FRAME_SIZE
 	int "Maximum L2 frame size"
 	range 64 9600
@@ -74,48 +65,6 @@ config FSL_FM_RX_EXTRA_HEADROOM
 		"fsl_fm_rx_extra_headroom=<YourValue>";
 		 * in non-Hypervisor-based scenarios, via u-boot's env, by
 		modifying the "bootargs" env variable.
-
-config FMAN_PFC
-	bool "FMan PFC support (EXPERIMENTAL)"
-	default n
-	help
-		This option enables PFC support on FMan v3 ports.
-		Data Center Bridging defines Classes of Service that are
-		flow-controlled using PFC pause frames.
-
-if FMAN_PFC
-config FMAN_PFC_COS_COUNT
-	int "Number of PFC Classes of Service"
-	depends on FMAN_PFC
-	range 1 4
-	default "3"
-	help
-		The number of Classes of Service controlled by PFC.
-
-config FMAN_PFC_QUANTA_0
-	int "The pause quanta for PFC CoS 0"
-	depends on FMAN_PFC
-	range 0 65535
-	default "65535"
-
-config FMAN_PFC_QUANTA_1
-	int "The pause quanta for PFC CoS 1"
-	depends on FMAN_PFC
-	range 0 65535
-	default "65535"
-
-config FMAN_PFC_QUANTA_2
-	int "The pause quanta for PFC CoS 2"
-	depends on FMAN_PFC
-	range 0 65535
-	default "65535"
-
-config FMAN_PFC_QUANTA_3
-	int "The pause quanta for PFC CoS 3"
-	depends on FMAN_PFC
-	range 0 65535
-	default "65535"
-endif
 
 endif # FSL_SDK_FMAN
 

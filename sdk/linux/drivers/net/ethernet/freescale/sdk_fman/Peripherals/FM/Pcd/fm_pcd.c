@@ -56,11 +56,9 @@
 #include "fm_hc.h"
 #include "fm_muram_ext.h"
 #include "fm_ehash.h"
-#if (DPAA_VERSION >= 11)
 //time stamp infrastructure for use in the case of ext hash tables
 struct ext_hash_ts_info extHashTsInfo;
 EXPORT_SYMBOL(extHashTsInfo);
-#endif
 
 /****************************************/
 /*       static functions               */
@@ -117,9 +115,6 @@ static t_Error IpcMsgHandlerCB(t_Handle  h_FmPcd,
     SANITY_CHECK_RETURN_ERROR(p_FmPcd, E_INVALID_HANDLE);
     SANITY_CHECK_RETURN_ERROR((msgLength >= sizeof(uint32_t)), E_INVALID_VALUE);
 
-#ifdef DISABLE_SANITY_CHECKS
-    UNUSED(msgLength);
-#endif /* DISABLE_SANITY_CHECKS */
 
     ASSERT_COND(p_Msg);
 
@@ -1012,7 +1007,6 @@ t_Error FM_PCD_Init(t_Handle h_FmPcd)
     }
     IOMemSet32(UINT_TO_PTR(p_FmPcd->capwapFrameIdAddr), 0,  2);
 
-#if (DPAA_VERSION >= 11)
     {
        extHashTsInfo.max_ext_ts_timers = MAX_EXT_TS_TIMERS;
        /* allocate memory for external timestamp used in ext hash table */
@@ -1028,7 +1022,6 @@ t_Error FM_PCD_Init(t_Handle h_FmPcd)
                        extHashTsInfo.max_ext_ts_timers, extHashTsInfo.ptr,
                        (void *)p_FmPcd->physicalMuramBase, extHashTsInfo.offset);
    }
-#endif
 
     XX_Free(p_FmPcd->p_FmPcdDriverParam);
     p_FmPcd->p_FmPcdDriverParam = NULL;

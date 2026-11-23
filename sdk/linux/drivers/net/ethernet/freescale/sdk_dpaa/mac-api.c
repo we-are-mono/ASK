@@ -29,14 +29,8 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifdef CONFIG_FSL_DPAA_ETH_DEBUG
-#define pr_fmt(fmt) \
-	KBUILD_MODNAME ": %s:%hu:%s() " fmt, \
-	KBUILD_BASENAME".c", __LINE__, __func__
-#else
 #define pr_fmt(fmt) \
 	KBUILD_MODNAME ": " fmt
-#endif
 
 #include <linux/init.h>
 #include <linux/module.h>

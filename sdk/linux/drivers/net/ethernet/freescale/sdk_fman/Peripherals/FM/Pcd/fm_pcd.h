@@ -119,9 +119,6 @@ switch (exception){                                                 \
 /***********************************************************************/
 /*          Memory map                                                 */
 /***********************************************************************/
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(push,1)
-#endif /* defined(__MWERKS__) && ... */
 
 typedef struct {
 	/* General Configuration and Status Registers */
@@ -156,9 +153,6 @@ typedef struct {
 				    * (for port-ID 1-11, only for supported Port-ID registers) */
 } t_FmPcdPlcrRegs;
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(pop)
-#endif /* defined(__MWERKS__) && ... */
 
 
 /***********************************************************************/

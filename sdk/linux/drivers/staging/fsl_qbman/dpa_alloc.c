@@ -402,37 +402,8 @@ struct alloc_node {
 
 /* #define DPA_ALLOC_DEBUG */
 
-#ifdef DPA_ALLOC_DEBUG
-#define DPRINT pr_info
-static void DUMP(struct dpa_alloc *alloc)
-{
-	int off = 0;
-	char buf[256];
-	struct alloc_node *p;
-	pr_info("Free Nodes\n");
-	list_for_each_entry(p, &alloc->free, list) {
-		if (off < 255)
-			off += snprintf(buf + off, 255-off, "{%d,%d}",
-				p->base, p->base + p->num - 1);
-	}
-	pr_info("%s\n", buf);
-
-	off = 0;
-	pr_info("Used Nodes\n");
-	list_for_each_entry(p, &alloc->used, list) {
-		if (off < 255)
-			off += snprintf(buf + off, 255-off, "{%d,%d}",
-				p->base, p->base + p->num - 1);
-	}
-	pr_info("%s\n", buf);
-
-
-
-}
-#else
 #define DPRINT(x...)
 #define DUMP(a)
-#endif
 
 int dpa_alloc_new(struct dpa_alloc *alloc, u32 *result, u32 count, u32 align,
 		  int partial)

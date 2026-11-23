@@ -89,9 +89,6 @@ typedef enum e_FmPortType {
 /* @} */
 
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(push,1)
-#endif /* defined(__MWERKS__) && ... */
 
 /**************************************************************************//**
  @Description   FM physical Address
@@ -291,9 +288,6 @@ typedef uint32_t fmSpecialOperations_t;                 /**< typedef for definin
 #define FM_CONTEXTB_SET_FQID(contextB,val)  (*((t_FmContextB *)contextB) = ((*((t_FmContextB *)contextB) & ~FM_CONTEXTB_FQID_MASK) | ((val) & FM_CONTEXTB_FQID_MASK)))
 /* @} */
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(pop)
-#endif /* defined(__MWERKS__) && ... */
 
 
 /**************************************************************************//**
@@ -1135,7 +1129,6 @@ typedef struct t_FmCtrlMon {
 } t_FmCtrlMon;
 
 
-#if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
 /**************************************************************************//**
  @Function      FM_DumpRegs
 
@@ -1148,7 +1141,6 @@ typedef struct t_FmCtrlMon {
  @Cautions      Allowed only following FM_Init().
 *//***************************************************************************/
 t_Error FM_DumpRegs(t_Handle h_Fm);
-#endif /* (defined(DEBUG_ERRORS) && ... */
 
 /**************************************************************************//**
  @Function      FM_SetException

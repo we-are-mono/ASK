@@ -12,7 +12,7 @@ import shutil
 import pytest
 
 
-@pytest.mark.parametrize("unit", ["port_pcd", "port_api", "port_free", "port_free_legacy",
+@pytest.mark.parametrize("unit", ["port_pcd", "port_api", "port_free",
                                   "kg_plan", "reassembly", "ehash_create"])
 def test_sdk_port_pcd(tmp_path, unit):
     kernel = kernel_source()
@@ -23,7 +23,7 @@ def test_sdk_port_pcd(tmp_path, unit):
         ehash = (sdk / "Peripherals/FM/Pcd/fm_ehash.c").read_text()
         # The bucket count comes from aarch64's 64-bit count of leading zeros,
         # written as inline assembly; the host has it as a builtin.
-        creation, count = re.subn(r"#ifdef CONFIG_FMAN_ARM\n.*?#endif\n",
+        creation, count = re.subn(r'__asm__ \("clz %0,%1\\n".*?\);\n',
                                   "num_of_zeroes = __builtin_clzll(ii);\n",
                                   function(ehash, "ExternalHashTableSet"), flags=re.S)
         assert count == 1
@@ -36,7 +36,7 @@ def test_sdk_port_pcd(tmp_path, unit):
         production = function((sdk / "Peripherals/FM/Pcd/fm_manip.c").read_text(), "FM_PCD_ManipNodeSet")
         production += function((sdk / "Peripherals/FM/Pcd/fm_ehash.c").read_text(), "ExternalHashTableSet")
         production += function((sdk / "Peripherals/FM/Pcd/fm_cc.c").read_text(), "FM_PCD_HashTableSet")
-    elif unit.startswith("port_free"):
+    elif unit == "port_free":
         source = (sdk / "Peripherals/FM/Port/fm_port.c").read_text()
         production = "\n".join(function(source, name) for name in [
             "FmPortDriverParamFree", "FM_PORT_Init", "FM_PORT_Free",
@@ -64,8 +64,7 @@ def test_sdk_port_pcd(tmp_path, unit):
             "UnbindPortToClsPlanGrp", "FmPcdKgBuildClsPlanGrp", "FmPcdKgDestroyClsPlanGrp", "FmPcdKgSetOrBindToClsPlanGrp",
             "FmPcdKgDeleteOrUnbindPortToClsPlanGrp",
         ])
-    fixture = "port_free" if unit.startswith("port_free") else unit
-    (tmp_path / f"{fixture}_production.inc").write_text(production)
+    (tmp_path / f"{unit}_production.inc").write_text(production)
     shutil.copyfile(Path(__file__).with_name("sdk_types_linux.h"), tmp_path / "types_linux.h")
     binary = tmp_path / unit
     command = [os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
@@ -76,9 +75,7 @@ def test_sdk_port_pcd(tmp_path, unit):
     for inc in ["inc", "inc/etc", "inc/Peripherals", "inc/flib", "inc/integrations/LS1043",
                 "Peripherals/FM/inc", "Peripherals/FM/Port", "Peripherals/FM/Pcd"]:
         command.extend(["-I", str(sdk / inc)])
-    if unit == "port_free_legacy":
-        command.append("-DTEST_LEGACY_DEQ")
-    command.extend([str(Path(__file__).with_name(f"sdk_{fixture}.c")), "-o", str(binary)])
+    command.extend([str(Path(__file__).with_name(f"sdk_{unit}.c")), "-o", str(binary)])
     run_process(command, check=True)
     run_process([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",

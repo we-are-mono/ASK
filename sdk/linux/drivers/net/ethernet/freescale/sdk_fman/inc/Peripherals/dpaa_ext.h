@@ -51,27 +51,16 @@
  @{
 *//***************************************************************************/
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(push,1)
-#endif /* defined(__MWERKS__) && ... */
 
 /**************************************************************************//**
  @Description   Frame descriptor
 *//***************************************************************************/
 typedef _Packed struct t_DpaaFD {
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-    volatile uint8_t liodn;
-    volatile uint8_t bpid;
-    volatile uint8_t elion;
-    volatile uint8_t addrh;
-    volatile uint32_t addrl;
-#else
     volatile uint32_t addrl;
     volatile uint8_t addrh;
     volatile uint8_t elion;
     volatile uint8_t bpid;
     volatile uint8_t liodn;
- #endif
     volatile uint32_t    length;            /**< Frame length */
     volatile uint32_t    status;            /**< FD status */
 } _PackedType t_DpaaFD;
@@ -198,9 +187,6 @@ do {                                                            \
 #define DPAA_SGTE_SET_OFFSET(sgte,val)    (((t_DpaaSGTE *)sgte)->offset = ((((t_DpaaSGTE *)sgte)->offset & ~DPAA_SGTE_OFFSET_MASK) | (((val) << (31-31))& DPAA_SGTE_OFFSET_MASK) )) /**< Macro to set SGTE OFFSET field */
 /* @} */
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(pop)
-#endif /* defined(__MWERKS__) && ... */
 
 #define DPAA_LIODN_DONT_OVERRIDE    (-1)
 

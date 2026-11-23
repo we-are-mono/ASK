@@ -131,7 +131,6 @@
 #define CC_PC_ILLEGAL                       0xff
 #define CC_SIZE_ILLEGAL                     0
 
-#if (DPAA_VERSION >= 11)
 #define FM_PCD_AD_FE_ENTER_ALLOCATE         0x00800000
 #define FM_PCD_AD_FE_ENTER_OPCODE           0x000000F6
 
@@ -142,7 +141,6 @@
 #define FM_PCD_FE_T_HASH_ELIODN_MASK        0x000003c0
 #define FM_PCD_FE_T_HASH_ELIODN_SHIFT       38
 
-#endif /* (DPAA_VERSION >= 11) */
 
 #define FM_PCD_CC_KEYS_MATCH_TABLE_ALIGN    16
 #define FM_PCD_CC_AD_TABLE_ALIGN            16
@@ -199,9 +197,6 @@ typedef uint32_t ccPrivateInfo_t; /**< private info of CC: */
 /***********************************************************************/
 /*          Memory map                                                 */
 /***********************************************************************/
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(push,1)
-#endif /* defined(__MWERKS__) && ... */
 
 typedef struct
 {
@@ -233,9 +228,6 @@ typedef union
     volatile t_AdOfTypeContLookup    adContLookup;
 } t_Ad;
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(pop)
-#endif /* defined(__MWERKS__) && ... */
 
 
 /***********************************************************************/

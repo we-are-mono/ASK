@@ -37,7 +37,6 @@
 
  @Description   General errors and events reporting utilities.
 *//***************************************************************************/
-#if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
 #include "error_ext.h"
 
 
@@ -92,4 +91,3 @@ char * ErrTypeStrings (e_ErrorType err)
     }
     return NULL;
 }
-#endif /* (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0)) */

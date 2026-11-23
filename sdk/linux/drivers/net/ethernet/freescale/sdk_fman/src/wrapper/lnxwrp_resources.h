@@ -40,11 +40,7 @@
 #ifndef LNXWRP_RESOURCES_H_
 #define LNXWRP_RESOURCES_H_
 
-#if !defined(FMAN_RESOURCES_UNIT_TEST)
 #include "lnxwrp_fm.h"
-#else
-#include "lnxwrp_resources_ut.h"
-#endif
 
 #define ROUND(X) ((2*(X)+1)/2)
 #define CEIL(X) ((X)+1)
@@ -84,9 +80,7 @@ int fm_set_active_fman_ports(struct platform_device *of_dev,
 int fm_precalculate_fifosizes(t_LnxWrpFmDev *p_LnxWrpFmDev,
 			   int muram_fifo_size);
 
-#if !defined(FMAN_RESOURCES_UNIT_TEST)
 int fm_config_precalculate_fifosize(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev);
-#endif
 
 /* Compute FMan open DMA based on total number of open DMAs and
  * number of available fman ports.
@@ -106,16 +100,12 @@ int fm_precalculate_open_dma(t_LnxWrpFmDev *p_LnxWrpFmDev,
 			  int default_rx_10g_dmas,
 			  int min_tx_10g_treshold, int min_rx_10g_treshold);
 
-#if !defined(FMAN_RESOURCES_UNIT_TEST)
 int fm_config_precalculate_open_dma(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev);
-#endif
 
 /* Compute FMan tnums based on available tnums and number of ports.
  * Set defaults (minim tresholds) and then distribute leftovers.*/
 int fm_precalculate_tnums(t_LnxWrpFmDev *p_LnxWrpFmDev, int max_fm_tnums);
 
-#if !defined(FMAN_RESOURCES_UNIT_TEST)
 int fm_config_precalculate_tnums(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev);
-#endif
 
 #endif /* LNXWRP_RESOURCES_H_ */

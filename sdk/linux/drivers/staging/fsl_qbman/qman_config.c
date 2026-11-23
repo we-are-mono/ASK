@@ -150,62 +150,35 @@ enum qm_memory {
 union qman_ecir {
 	u32 ecir_raw;
 	struct {
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-		u32 __reserved:2;
-		u32 portal_type:1;
-		u32 portal_num:5;
-		u32 fqid:24;
-#else
 		u32 fqid:24;
 		u32 portal_num:5;
 		u32 portal_type:1;
 		u32 __reserved:2;
-#endif
 	} __packed info;
 };
 
 union qman_ecir2 {
 	u32 ecir2_raw;
 	struct {
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-		u32 portal_type:1;
-		u32 __reserved:21;
-		u32 portal_num:10;
-#else
 		u32 portal_num:10;
 		u32 __reserved:21;
 		u32 portal_type:1;
-#endif
 	} __packed info;
 };
 
 union qman_eadr {
 	u32 eadr_raw;
 	struct {
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-		u32 __reserved1:4;
-		u32 memid:4;
-		u32 __reserved2:12;
-		u32 eadr:12;
-#else
 		u32 eadr:12;
 		u32 __reserved2:12;
 		u32 memid:4;
 		u32 __reserved1:4;
-#endif
 	} __packed info;
 	struct {
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-		u32 __reserved1:3;
-		u32 memid:5;
-		u32 __reserved:8;
-		u32 eadr:16;
-#else
 		u32 eadr:16;
 		u32 __reserved:8;
 		u32 memid:5;
 		u32 __reserved1:3;
-#endif
 	} __packed info_rev3;
 };
 
@@ -548,11 +521,7 @@ static __init int parse_mem_property(struct device_node *node, const char *name,
 
 	if (zero) {
 		/* map as cacheable, non-guarded */
-#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
 		void __iomem *tmpp = ioremap_cache(*addr, *sz);
-#else
-		void __iomem *tmpp = ioremap(*addr, *sz);
-#endif
 
 		if (!tmpp)
 			return -ENOMEM;
@@ -792,11 +761,9 @@ int qman_init_ccsr(struct device_node *node, bool *need_cleanup)
 		return 0;
 	if (node != qm_node)
 		return -EINVAL;
-#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
 	/* TEMP for LS1043 : should be done in uboot */
 	qm_out(QCSP_BARE, 0x5);
 	qm_out(QCSP_BAR, 0x0);
-#endif
 	/* FQD memory */
 	ret = qm_set_memory(qm, qm_memory_fqd, fqd_a, 1, 0, 0, fqd_sz,
 			    need_cleanup);

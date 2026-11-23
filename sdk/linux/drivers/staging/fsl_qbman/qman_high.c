@@ -146,14 +146,12 @@ struct qman_portal {
 	struct net_device *dummy_dev;
 	struct napi_struct napi;
 #endif
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 	/* Keep a shadow copy of the DQRR on LE systems as the SW needs to
 	 * do byte swaps of DQRR read only memory.  First entry must be aligned
 	 * to 2 ** 10 to ensure DQRR index calculations based shadow copy
 	 * address (6 bits for address shift + 4 bits for the DQRR size).
 	 */
 	struct qm_dqrr_entry shadow_dqrr[QM_DQRR_SIZE] __aligned(1024);
-#endif
 };
 
 #ifdef CONFIG_FSL_DPA_PORTAL_SHARE
@@ -322,9 +320,6 @@ static inline void hw_fqd_to_cpu(struct qm_fqd *fqd)
 /* Swap a 40 bit address */
 static inline u64 be40_to_cpu(u64 in)
 {
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-	return in;
-#else
 	u64 out = 0;
 	u8 *pout = (u8 *) &out;
 	u8 *pin = (u8 *) &in;
@@ -334,29 +329,21 @@ static inline u64 be40_to_cpu(u64 in)
 	pout[3] = pin[1];
 	pout[4] = pin[0];
 	return out;
-#endif
 }
 
 /* Swap a 24 bit value */
 static inline u32 cpu_to_be24(u32 in)
 {
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-	return in;
-#else
 	u32 out = 0;
 	u8 *p = (u8 *) &out;
 	p[0] = in >> 16;
 	p[1] = in >> 8;
 	p[2] = in >> 0;
 	return out;
-#endif
 }
 
 static inline u32 be24_to_cpu(u32 in)
 {
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-	return in;
-#else
 	u32 out = 0;
 	u8 *pout = (u8 *) &out;
 	u8 *pin = (u8 *) &in;
@@ -364,14 +351,10 @@ static inline u32 be24_to_cpu(u32 in)
 	pout[1] = pin[1];
 	pout[2] = pin[0];
 	return out;
-#endif
 }
 
 static inline u64 be48_to_cpu(u64 in)
 {
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-	return in;
-#else
 	u64 out = 0;
 	u8 *pout = (u8 *) &out;
 	u8 *pin = (u8 *) &in;
@@ -383,7 +366,6 @@ static inline u64 be48_to_cpu(u64 in)
 	pout[4] = pin[1];
 	pout[5] = pin[0];
 	return out;
-#endif
 }
 static inline void cpu_to_hw_fd(struct qm_fd *fd)
 {
@@ -1226,7 +1208,6 @@ static inline void safe_copy_dqrr(struct qm_dqrr_entry *dst,
 	/* DQRR only has 32 bytes of valid data so only need to
 	 * copy 4 - 64 bit values */
 	*d64 = *s64;
-#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
 	{
 		u64 res, zero = 0;
 		/* Create a dependancy after copying first bytes ensures no wrap
@@ -1247,7 +1228,6 @@ static inline void safe_copy_dqrr(struct qm_dqrr_entry *dst,
 			     : [in1] "r" (res), [in2] "r" (s64)
 			     : "memory");
 	}
-#endif
 	/* Copy the last 3 64 bit parts */
 	d64++; s64++;
 	for (;i<3; i++)
@@ -1290,16 +1270,13 @@ static inline unsigned int __poll_portal_fast(struct qman_portal *p,
 	struct qman_fq *fq;
 	enum qman_cb_dqrr_result res;
 	unsigned int limit = 0;
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 	struct qm_dqrr_entry *shadow;
 	const struct qm_dqrr_entry *orig_dq;
-#endif
 loop:
 	qm_dqrr_pvb_update(&p->p);
 	dq = qm_dqrr_current(&p->p);
 	if (!dq)
 		goto done;
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 	/* If running on an LE system the fields of the
 	   dequeue entry must be swapped.  Because the
 	   QMan HW will ignore writes the DQRR entry is
@@ -1313,7 +1290,6 @@ loop:
 	shadow->contextB = be32_to_cpu(shadow->contextB);
 	shadow->seqnum = be16_to_cpu(shadow->seqnum);
 	hw_fd_to_cpu(&shadow->fd);
-#endif
 	if (dq->stat & QM_DQRR_STAT_UNSCHEDULED) {
 		/* VDQCR: don't trust contextB as the FQ may have been
 		 * configured for h/w consumption and we're draining it
@@ -1362,15 +1338,9 @@ skip:
 	 * check for HELDACTIVE to cover both. */
 	DPA_ASSERT((dq->stat & QM_DQRR_STAT_FQ_HELDACTIVE) ||
 		(res != qman_cb_dqrr_park));
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 	if (res != qman_cb_dqrr_defer)
 		qm_dqrr_cdc_consume_1ptr(&p->p, orig_dq,
 					 (res == qman_cb_dqrr_park));
-#else
-	/* Defer just means "skip it, I'll consume it myself later on" */
-	if (res != qman_cb_dqrr_defer)
-		qm_dqrr_cdc_consume_1ptr(&p->p, dq, (res == qman_cb_dqrr_park));
-#endif
 	/* Move forward */
 	qm_dqrr_next(&p->p);
 	/* Entry processed and consumed, increment our counter. The callback can
@@ -1912,10 +1882,6 @@ int qman_init_fq(struct qman_fq *fq, u32 flags, struct qm_mcc_initfq *opts)
 	if ((fq->state != qman_fq_state_oos) &&
 			(fq->state != qman_fq_state_parked))
 		return -EINVAL;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	if (unlikely(fq_isset(fq, QMAN_FQ_FLAG_NO_MODIFY)))
-		return -EINVAL;
-#endif
 	if (opts && (opts->we_mask & QM_INITFQ_WE_OAC)) {
 		/* And can't be set at the same time as TDTHRESH */
 		if (opts->we_mask & QM_INITFQ_WE_TDTHRESH)
@@ -2022,10 +1988,6 @@ int qman_schedule_fq(struct qman_fq *fq)
 
 	if (fq->state != qman_fq_state_parked)
 		return -EINVAL;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	if (unlikely(fq_isset(fq, QMAN_FQ_FLAG_NO_MODIFY)))
-		return -EINVAL;
-#endif
 	/* Issue a ALTERFQ_SCHED management command */
 	p = get_affine_portal();
 	PORTAL_IRQ_LOCK(p, irqflags);
@@ -2067,10 +2029,6 @@ int qman_retire_fq(struct qman_fq *fq, u32 *flags)
 	if ((fq->state != qman_fq_state_parked) &&
 			(fq->state != qman_fq_state_sched))
 		return -EINVAL;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	if (unlikely(fq_isset(fq, QMAN_FQ_FLAG_NO_MODIFY)))
-		return -EINVAL;
-#endif
 	p = get_affine_portal();
 	PORTAL_IRQ_LOCK(p, irqflags);
 	FQLOCK(fq);
@@ -2154,10 +2112,6 @@ int qman_oos_fq(struct qman_fq *fq)
 
 	if (fq->state != qman_fq_state_retired)
 		return -EINVAL;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	if (unlikely(fq_isset(fq, QMAN_FQ_FLAG_NO_MODIFY)))
-		return -EINVAL;
-#endif
 	p = get_affine_portal();
 	PORTAL_IRQ_LOCK(p, irqflags);
 	FQLOCK(fq);
@@ -2201,10 +2155,6 @@ int qman_fq_flow_control(struct qman_fq *fq, int xon)
 		(fq->state == qman_fq_state_parked))
 		return -EINVAL;
 
-#ifdef CONFIG_FSL_DPA_CHECKING
-	if (unlikely(fq_isset(fq, QMAN_FQ_FLAG_NO_MODIFY)))
-		return -EINVAL;
-#endif
 	/* Issue a ALTER_FQXON or ALTER_FQXOFF management command */
 	p = get_affine_portal();
 	PORTAL_IRQ_LOCK(p, irqflags);

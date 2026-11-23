@@ -30,14 +30,8 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifdef CONFIG_FSL_DPAA_ETH_DEBUG
-#define pr_fmt(fmt) \
-	KBUILD_MODNAME ": %s:%hu:%s() " fmt, \
-	KBUILD_BASENAME".c", __LINE__, __func__
-#else
 #define pr_fmt(fmt) \
 	KBUILD_MODNAME ": " fmt
-#endif
 
 #include <linux/init.h>
 #include <linux/skbuff.h>
@@ -49,9 +43,6 @@
 #include "dpaa_eth_common.h"
 #ifdef CONFIG_FSL_DPAA_1588
 #include "dpaa_1588.h"
-#endif
-#ifdef CONFIG_FSL_DPAA_CEETM
-#include "dpaa_eth_ceetm.h"
 #endif
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 #include <uapi/linux/if_ether.h>
@@ -824,21 +815,6 @@ struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
 }
 EXPORT_SYMBOL(sg_fd_to_skb);
 
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-static inline int dpa_skb_loop(const struct dpa_priv_s *priv,
-		struct sk_buff *skb)
-{
-	if (unlikely(priv->loop_to < 0))
-		return 0; /* loop disabled by default */
-
-	skb_push(skb, ETH_HLEN); /* compensate for eth_type_trans */
-	/* Save the current CPU ID in order to maintain core affinity */
-	skb_set_queue_mapping(skb, raw_smp_processor_id());
-	dpa_tx(skb, dpa_loop_netdevs[priv->loop_to]);
-
-	return 1; /* Frame Tx on the selected interface */
-}
-#endif
 
 void __hot _dpa_rx(struct net_device *net_dev,
 		struct qman_portal *portal,
@@ -878,15 +854,6 @@ void __hot _dpa_rx(struct net_device *net_dev,
 	DPA_BUG_ON((fd->format != qm_fd_contig) && (fd->format != qm_fd_sg));
 
 	if (likely(fd->format == qm_fd_contig)) {
-#ifdef CONFIG_FSL_DPAA_HOOKS
-		/* Execute the Rx processing hook, if it exists. */
-		if (dpaa_eth_hooks.rx_default &&
-			dpaa_eth_hooks.rx_default((void *)fd, net_dev,
-					fqid) == DPAA_ETH_STOLEN) {
-			/* won't count the rx bytes in */
-			return;
-		}
-#endif
 		skb = contig_fd_to_skb(priv, fd, &use_gro, dcl4c_valid);
 	} else {
 		skb = sg_fd_to_skb(priv, fd, &use_gro, count_ptr, dcl4c_valid);
@@ -915,10 +882,6 @@ void __hot _dpa_rx(struct net_device *net_dev,
 	percpu_stats->rx_packets++;
 	percpu_stats->rx_bytes += skb_len;
 
-#ifdef CONFIG_FSL_DPAA_DBG_LOOP
-	if (dpa_skb_loop(priv, skb))
-		return;
-#endif
 
 	skb_record_rx_queue(skb, raw_smp_processor_id());
 
@@ -2278,13 +2241,6 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
 	int queue_mapping = dpa_get_queue_mapping(skb);
 	struct qman_fq *egress_fq, *conf_fq;
 
-#ifdef CONFIG_FSL_DPAA_HOOKS
-	/* If there is a Tx hook, run it. */
-	if (dpaa_eth_hooks.tx &&
-		dpaa_eth_hooks.tx(skb, net_dev) == DPAA_ETH_STOLEN)
-		/* won't update any Tx stats */
-		return NETDEV_TX_OK;
-#endif
 
 #ifdef CONFIG_CPE_FAST_PATH
 	return cpe_fp_tx(skb, net_dev);
@@ -2292,10 +2248,6 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
 
 	priv = netdev_priv(net_dev);
 
-#ifdef CONFIG_FSL_DPAA_CEETM
-	if (priv->ceetm_en)
-		return ceetm_tx(skb, net_dev);
-#endif
 
 	if (unlikely(queue_mapping >= DPAA_ETH_TX_QUEUES))
 		queue_mapping = queue_mapping % DPAA_ETH_TX_QUEUES;

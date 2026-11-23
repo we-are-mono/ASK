@@ -191,10 +191,8 @@ static t_Error CheckInitParameters(t_Memac *p_Memac)
 
     portType = ((ENET_SPEED_FROM_MODE(p_Memac->enetMode) < e_ENET_SPEED_10000) ? e_FM_MAC_1G : e_FM_MAC_10G);
 
-#if (FM_MAX_NUM_OF_10G_MACS > 0)
     if ((portType == e_FM_MAC_10G) && (p_Memac->macId >= FM_MAX_NUM_OF_10G_MACS))
         RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("10G MAC ID must be less than %d", FM_MAX_NUM_OF_10G_MACS));
-#endif /* (FM_MAX_NUM_OF_10G_MACS > 0) */
 
     if ((portType == e_FM_MAC_1G) && (p_Memac->macId >= FM_MAX_NUM_OF_1G_MACS))
         RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("1G MAC ID must be less than %d", FM_MAX_NUM_OF_1G_MACS));
@@ -204,10 +202,8 @@ static t_Error CheckInitParameters(t_Memac *p_Memac)
         RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("Uninitialized f_Exception"));
     if (!p_Memac->f_Event)
         RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("Uninitialized f_Event"));
-#ifdef FM_LEN_CHECK_ERRATA_FMAN_SW002
     if (!p_Memac->p_MemacDriverParam->no_length_check_enable)
        RETURN_ERROR(MINOR, E_NOT_SUPPORTED, ("LengthCheck!"));
-#endif /* FM_LEN_CHECK_ERRATA_FMAN_SW002 */
 
     return E_OK;
 }
@@ -999,7 +995,6 @@ static t_Error MemacInit(t_Handle h_Memac)
                slow_10g_if,
                p_Memac->exceptions);
 
-#ifdef FM_RX_FIFO_CORRUPT_ERRATA_10GMAC_A006320
     {
     	uint32_t tmpReg = 0;
 
@@ -1017,7 +1012,6 @@ static t_Error MemacInit(t_Handle h_Memac)
 			/* DBG(WARNING, ("mEMAC strips CRC from received frames as part of A006320 errata workaround"));*/
         }
     }
-#endif /* FM_RX_FIFO_CORRUPT_ERRATA_10GMAC_A006320 */
 
     MemacInitInternalPhy(h_Memac);
 

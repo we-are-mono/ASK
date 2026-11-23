@@ -1162,7 +1162,6 @@ t_Error FM_PORT_ConfigRxFifoThreshold(t_Handle h_FmPort, uint32_t fifoThreshold)
 *//***************************************************************************/
 t_Error FM_PORT_ConfigRxFifoPriElevationLevel(t_Handle h_FmPort, uint32_t priElevationLevel);
 
-#ifdef FM_HEAVY_TRAFFIC_HANG_ERRATA_FMAN_A005669
 /**************************************************************************//*
  @Function      FM_PORT_ConfigBCBWorkaround
 
@@ -1185,7 +1184,6 @@ t_Error FM_PORT_ConfigRxFifoPriElevationLevel(t_Handle h_FmPort, uint32_t priEle
  @Cautions      Allowed only following FM_PORT_Config() and before FM_PORT_Init().
 *//***************************************************************************/
 t_Error FM_PORT_ConfigBCBWorkaround(t_Handle h_FmPort);
-#endif /* FM_HEAVY_TRAFFIC_HANG_ERRATA_FMAN_A005669 */
 
 /**************************************************************************//*
  @Function      FM_PORT_ConfigInternalBuffOffset
@@ -1282,7 +1280,6 @@ typedef struct t_FmPortCongestionGrps {
                                                              mapping array. */
 } t_FmPortCongestionGrps;
 
-#if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
 /**************************************************************************//**
  @Function      FM_PORT_DumpRegs
 
@@ -1297,7 +1294,6 @@ typedef struct t_FmPortCongestionGrps {
  @Cautions      Allowed only following FM_PORT_Init().
 *//***************************************************************************/
 t_Error FM_PORT_DumpRegs(t_Handle h_FmPort);
-#endif /* (defined(DEBUG_ERRORS) && ... */
 
 /**************************************************************************//**
  @Function      FM_PORT_GetBufferDataOffset

@@ -2525,7 +2525,7 @@ static bool port_tx_queued(const struct eth_iface_info *eth, u64 *frames, u64 *b
 	struct dpa_fq *fq;
 
 	*frames = *bytes = 0;
-#if defined(CONFIG_FSL_DPAA_CEETM) || defined(CONFIG_CPE_FAST_PATH)
+#ifdef CONFIG_CPE_FAST_PATH
 	if (priv->ceetm_en)
 		return false;
 #endif

@@ -257,9 +257,6 @@ typedef enum e_ManipInfo {
 /***********************************************************************/
 /*          Memory map                                                 */
 /***********************************************************************/
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(push,1)
-#endif /* defined(__MWERKS__) && ... */
 
 typedef _Packed struct t_Hmtd {
     volatile uint16_t   cfg;
@@ -272,9 +269,6 @@ typedef _Packed struct t_Hmtd {
     volatile uint32_t   res2;
 } _PackedType t_Hmtd;
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(pop)
-#endif /* defined(__MWERKS__) && ... */
 
 
 /***********************************************************************/

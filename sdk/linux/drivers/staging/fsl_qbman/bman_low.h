@@ -124,27 +124,12 @@ enum bm_rcr_cmode {		/* s/w-only */
 struct bm_rcr {
 	struct bm_rcr_entry *ring, *cursor;
 	u8 ci, available, ithresh, vbit;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	u32 busy;
-	enum bm_rcr_pmode pmode;
-	enum bm_rcr_cmode cmode;
-#endif
 };
 
 struct bm_mc {
 	struct bm_mc_command *cr;
 	struct bm_mc_result *rr;
 	u8 rridx, vbit;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	enum {
-		/* Can only be _mc_start()ed */
-		mc_idle,
-		/* Can only be _mc_commit()ed or _mc_abort()ed */
-		mc_user,
-		/* Can only be _mc_retry()ed */
-		mc_hw
-	} state;
-#endif
 };
 
 struct bm_addr {
@@ -204,11 +189,6 @@ static inline int bm_rcr_init(struct bm_portal *portal, enum bm_rcr_pmode pmode,
 	rcr->available = BM_RCR_SIZE - 1
 		- bm_cyc_diff(BM_RCR_SIZE, rcr->ci, pi);
 	rcr->ithresh = bm_in(RCR_ITR);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	rcr->busy = 0;
-	rcr->pmode = pmode;
-	rcr->cmode = cmode;
-#endif
 	cfg = (bm_in(CFG) & 0xffffffe0) | (pmode & 0x3); /* BCSP_CFG::RPM */
 	bm_out(CFG, cfg);
 	return 0;
@@ -234,9 +214,6 @@ static inline struct bm_rcr_entry *bm_rcr_start(struct bm_portal *portal)
 	DPA_ASSERT(!rcr->busy);
 	if (!rcr->available)
 		return NULL;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	rcr->busy = 1;
-#endif
 	return rcr->cursor;
 }
 
@@ -244,9 +221,6 @@ static inline void bm_rcr_abort(struct bm_portal *portal)
 {
 	__maybe_unused register struct bm_rcr *rcr = &portal->rcr;
 	DPA_ASSERT(rcr->busy);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	rcr->busy = 0;
-#endif
 }
 
 static inline struct bm_rcr_entry *bm_rcr_pend_and_next(
@@ -274,9 +248,6 @@ static inline void bm_rcr_pci_commit(struct bm_portal *portal, u8 myverb)
 	rcr->available--;
 	hwsync();
 	bm_out(RCR_PI_CINH, RCR_PTR2IDX(rcr->cursor));
-#ifdef CONFIG_FSL_DPA_CHECKING
-	rcr->busy = 0;
-#endif
 }
 
 static inline void bm_rcr_pce_prefetch(struct bm_portal *portal)
@@ -297,9 +268,6 @@ static inline void bm_rcr_pce_commit(struct bm_portal *portal, u8 myverb)
 	rcr->available--;
 	lwsync();
 	bm_cl_out(RCR_PI, RCR_PTR2IDX(rcr->cursor));
-#ifdef CONFIG_FSL_DPA_CHECKING
-	rcr->busy = 0;
-#endif
 }
 
 static inline void bm_rcr_pvb_commit(struct bm_portal *portal, u8 myverb)
@@ -314,9 +282,6 @@ static inline void bm_rcr_pvb_commit(struct bm_portal *portal, u8 myverb)
 	dcbf_64(rcursor);
 	RCR_INC(rcr);
 	rcr->available--;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	rcr->busy = 0;
-#endif
 }
 
 static inline u8 bm_rcr_cci_update(struct bm_portal *portal)
@@ -386,9 +351,6 @@ static inline int bm_mc_init(struct bm_portal *portal)
 	mc->rridx = (__raw_readb(&mc->cr->__dont_write_directly__verb) &
 			BM_MCC_VERB_VBIT) ?  0 : 1;
 	mc->vbit = mc->rridx ? BM_MCC_VERB_VBIT : 0;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	mc->state = mc_idle;
-#endif
 	return 0;
 }
 
@@ -396,19 +358,12 @@ static inline void bm_mc_finish(struct bm_portal *portal)
 {
 	__maybe_unused register struct bm_mc *mc = &portal->mc;
 	DPA_ASSERT(mc->state == mc_idle);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	if (mc->state != mc_idle)
-		pr_crit("Losing incomplete MC command\n");
-#endif
 }
 
 static inline struct bm_mc_command *bm_mc_start(struct bm_portal *portal)
 {
 	register struct bm_mc *mc = &portal->mc;
 	DPA_ASSERT(mc->state == mc_idle);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	mc->state = mc_user;
-#endif
 	return mc->cr;
 }
 
@@ -416,9 +371,6 @@ static inline void bm_mc_abort(struct bm_portal *portal)
 {
 	__maybe_unused register struct bm_mc *mc = &portal->mc;
 	DPA_ASSERT(mc->state == mc_user);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	mc->state = mc_idle;
-#endif
 }
 
 static inline void bm_mc_commit(struct bm_portal *portal, u8 myverb)
@@ -430,9 +382,6 @@ static inline void bm_mc_commit(struct bm_portal *portal, u8 myverb)
 	mc->cr->__dont_write_directly__verb = myverb | mc->vbit;
 	dcbf(mc->cr);
 	dcbit_ro(rr);
-#ifdef CONFIG_FSL_DPA_CHECKING
-	mc->state = mc_hw;
-#endif
 }
 
 static inline struct bm_mc_result *bm_mc_result(struct bm_portal *portal)
@@ -449,9 +398,6 @@ static inline struct bm_mc_result *bm_mc_result(struct bm_portal *portal)
 	}
 	mc->rridx ^= 1;
 	mc->vbit ^= BM_MCC_VERB_VBIT;
-#ifdef CONFIG_FSL_DPA_CHECKING
-	mc->state = mc_idle;
-#endif
 	return rr;
 }
 
@@ -486,21 +432,13 @@ static inline void bm_isr_bscn_mask(struct bm_portal *portal, u8 bpid,
 
 static inline u32 __bm_isr_read(struct bm_portal *portal, enum bm_isr_reg n)
 {
-#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
 	return __bm_in(&portal->addr, BM_REG_ISR + (n << 6));
-#else
-	return __bm_in(&portal->addr, BM_REG_ISR + (n << 2));
-#endif
 }
 
 static inline void __bm_isr_write(struct bm_portal *portal, enum bm_isr_reg n,
 					u32 val)
 {
-#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
 	__bm_out(&portal->addr, BM_REG_ISR + (n << 6), val);
-#else
-	__bm_out(&portal->addr, BM_REG_ISR + (n << 2), val);
-#endif
 }
 
 /* Buffer Pool Cleanup */

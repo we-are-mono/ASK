@@ -138,9 +138,6 @@ typedef enum e_FmInterModuleEvent
 } e_FmInterModuleEvent;
 
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(push,1)
-#endif /* defined(__MWERKS__) && ... */
 
 /**************************************************************************//**
  @Description   PCD KG scheme registers
@@ -188,9 +185,6 @@ typedef _Packed struct t_FmPcdCtrlParamsPage {
 
 
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(pop)
-#endif /* defined(__MWERKS__) && ... */
 
 
 /*for UNDER_CONSTRUCTION_FM_RMU_USE_SEC its defined in fm_ext.h*/
@@ -433,7 +427,6 @@ static __inline__ bool TRY_LOCK(t_Handle h_Spinlock, volatile bool *p_Flag)
 
 #define NIA_BMI_AC_ENQ_FRAME_WITHOUT_DMA    0x00000202
 
-#if defined(FM_OP_NO_VSP_NO_RELEASE_ERRATA_FMAN_A006675) || defined(FM_ERROR_VSP_NO_MATCH_SW006)
 #define GET_NIA_BMI_AC_ENQ_FRAME(h_FmPcd)   \
     (uint32_t)((FmPcdIsAdvancedOffloadSupported(h_FmPcd)) ? \
                 (NIA_ENG_FM_CTL | NIA_FM_CTL_AC_PRE_BMI_ENQ_FRAME) : \
@@ -444,18 +437,6 @@ static __inline__ bool TRY_LOCK(t_Handle h_Spinlock, volatile bool *p_Flag)
                 (NIA_ENG_FM_CTL | NIA_FM_CTL_AC_NO_IPACC_PRE_BMI_DISCARD_FRAME))
 #define GET_NO_PCD_NIA_BMI_AC_ENQ_FRAME()   \
         (NIA_ENG_FM_CTL | NIA_FM_CTL_AC_NO_IPACC_PRE_BMI_ENQ_FRAME)
-#else
-#define GET_NIA_BMI_AC_ENQ_FRAME(h_FmPcd)   \
-    (uint32_t)((FmPcdIsAdvancedOffloadSupported(h_FmPcd)) ? \
-                (NIA_ENG_FM_CTL | NIA_FM_CTL_AC_PRE_BMI_ENQ_FRAME) : \
-                (NIA_ENG_BMI | NIA_BMI_AC_ENQ_FRAME))
-#define GET_NIA_BMI_AC_DISCARD_FRAME(h_FmPcd)   \
-    (uint32_t)((FmPcdIsAdvancedOffloadSupported(h_FmPcd)) ? \
-                (NIA_ENG_FM_CTL | NIA_FM_CTL_AC_PRE_BMI_DISCARD_FRAME) : \
-                (NIA_ENG_BMI | NIA_BMI_AC_DISCARD))
-#define GET_NO_PCD_NIA_BMI_AC_ENQ_FRAME()   \
-            (NIA_ENG_BMI | NIA_BMI_AC_ENQ_FRAME)
-#endif /* defined(FM_OP_NO_VSP_NO_RELEASE_ERRATA_FMAN_A006675) || ... */
 
 /**************************************************************************//**
   @Description        CTRL Parameters Page defines
@@ -481,14 +462,9 @@ static __inline__ bool TRY_LOCK(t_Handle h_Spinlock, volatile bool *p_Flag)
 #define FM_PCD_PORT_1G_TX_BASE_INDX     (FM_PCD_PORT_10G_RX_BASE_INDX+FM_MAX_NUM_OF_10G_RX_PORTS)
 #define FM_PCD_PORT_10G_TX_BASE_INDX    (FM_PCD_PORT_1G_TX_BASE_INDX+FM_MAX_NUM_OF_1G_TX_PORTS)
 
-#if (FM_MAX_NUM_OF_OH_PORTS > 0)
 #define CHECK_PORT_ID_OH_PORTS(_relativePortId)                     \
     if ((_relativePortId) >= FM_MAX_NUM_OF_OH_PORTS)                \
         REPORT_ERROR(MAJOR, E_INVALID_VALUE, ("Illegal OH_PORT port id"))
-#else
-#define CHECK_PORT_ID_OH_PORTS(_relativePortId)                     \
-        REPORT_ERROR(MAJOR, E_INVALID_VALUE, ("Illegal OH_PORT port id"))
-#endif
 #if (FM_MAX_NUM_OF_1G_RX_PORTS > 0)
 #define CHECK_PORT_ID_1G_RX_PORTS(_relativePortId)                  \
     if ((_relativePortId) >= FM_MAX_NUM_OF_1G_RX_PORTS)             \
@@ -1101,7 +1077,6 @@ void FmFreePortParams(t_Handle h_Fm,t_FmInterModulePortFreeParams *p_PortParams)
 *//***************************************************************************/
 t_Error FmSetNumOfRiscsPerPort(t_Handle h_Fm, uint8_t hardwarePortId, uint8_t numOfFmanCtrls, t_FmFmanCtrl orFmanCtrl);
 
-#if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
 /**************************************************************************//*
  @Function      FmDumpPortRegs
 
@@ -1115,7 +1090,6 @@ t_Error FmSetNumOfRiscsPerPort(t_Handle h_Fm, uint8_t hardwarePortId, uint8_t nu
  @Cautions      Allowed only FM_Init().
 *//***************************************************************************/
 t_Error FmDumpPortRegs(t_Handle h_Fm,uint8_t hardwarePortId);
-#endif /* (defined(DEBUG_ERRORS) && ... */
 
 void        FmRegisterPcd(t_Handle h_Fm, t_Handle h_FmPcd);
 void        FmUnregisterPcd(t_Handle h_Fm);
@@ -1137,9 +1111,6 @@ t_Error     FmSetPortPreFetchConfiguration(t_Handle h_Fm, uint8_t portNum, bool 
 t_Error     FmGetPortPreFetchConfiguration(t_Handle h_Fm, uint8_t portNum, bool *p_PortConfigured, bool *p_PreFetchConfigured);
 
 
-#ifdef FM_TX_ECC_FRMS_ERRATA_10GMAC_A004
-t_Error     Fm10GTxEccWorkaround(t_Handle h_Fm, uint8_t macId);
-#endif /* FM_TX_ECC_FRMS_ERRATA_10GMAC_A004 */
 
 void        FmMuramClear(t_Handle h_FmMuram);
 t_Error     FmSetNumOfOpenDmas(t_Handle h_Fm,

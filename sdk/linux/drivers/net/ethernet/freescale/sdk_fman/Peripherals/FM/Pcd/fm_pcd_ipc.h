@@ -51,9 +51,6 @@
 *//***************************************************************************/
 
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(push,1)
-#endif /* defined(__MWERKS__) && ... */
 
 /**************************************************************************//**
  @Description   Structure for getting a sw parser address according to a label
@@ -121,9 +118,6 @@ typedef _Packed struct t_FmIpcResourceAllocParams {
     uint16_t    num;
 }_PackedType t_FmIpcResourceAllocParams;
 
-#if defined(__MWERKS__) && !defined(__GNUC__)
-#pragma pack(pop)
-#endif /* defined(__MWERKS__) && ... */
 
 
 

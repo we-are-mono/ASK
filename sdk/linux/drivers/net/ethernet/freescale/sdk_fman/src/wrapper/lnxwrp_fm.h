@@ -55,13 +55,8 @@
 /*#define LNXWRP_FM_NUM_OF_SHARED_PROFILES    16  default value */
 #define LNXWRP_FM_NUM_OF_SHARED_PROFILES    144 /* currently 140 shared profiles are in use */
 
-#if defined(CONFIG_FMAN_DISABLE_OH_TO_REUSE_RESOURCES)
-#define FM_10G_OPENDMA_MIN_TRESHOLD 8 /* 10g minimum treshold if only HC is enabled and no OH port enabled */
-#define FM_OPENDMA_RX_TX_RAPORT 2 /* RX = 2*TX */
-#else
 #define FM_10G_OPENDMA_MIN_TRESHOLD 7 /* 10g minimum treshold if 7 OH ports are enabled */
 #define FM_OPENDMA_RX_TX_RAPORT 1 /* RX = TX */
-#endif
 #define FM_DEFAULT_TX10G_OPENDMA 8 /* default TX 10g open dmas */
 #define FM_DEFAULT_RX10G_OPENDMA 8 /* default RX 10g open dmas */
 

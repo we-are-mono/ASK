@@ -68,7 +68,7 @@ SRCREV_FORMAT = "kernel"
 # What the copy (sdk/linux) holds, and the overlay replaces: OpenWrt's
 # SDK_PATHS list (scripts/mono-sync-ask-kernel.sh) names the same paths. Two
 # kinds of files:
-#   - SDK-only trees (sdk_dpaa, sdk_fman, fsl_qbman, uapi/linux/fmd, the
+#   - SDK-only trees (sdk_dpaa, sdk_fman, fsl_qbman, the
 #     fsl_{bman,qman,usdpaa}.h headers, the *-portals-sdk / dpaa-eth dtsi):
 #     absent on mainline, added fresh.
 #   - Same-named DPAA device tree (fsl-ls1046a.dtsi, fsl-ls1046-post.dtsi,
@@ -84,7 +84,6 @@ NXP_SDK_PATHS = "\
     drivers/net/ethernet/freescale/sdk_dpaa \
     drivers/net/ethernet/freescale/sdk_fman \
     drivers/staging/fsl_qbman \
-    include/uapi/linux/fmd \
     include/linux/fsl_bman.h \
     include/linux/fsl_qman.h \
     include/linux/fsl_usdpaa.h \
