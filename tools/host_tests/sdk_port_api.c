@@ -2,7 +2,7 @@
 #define TEST_PUBLIC_API
 #include "sdk_port_fixture.h"
 
-static bool all_locked, use_fe;
+static bool all_locked;
 static unsigned env_owners, heap_allocs, muram_allocs, muram_calls, muram_fail;
 static unsigned settings_calls, settings_fail, cases;
 static int pcd_token;
@@ -46,7 +46,7 @@ static t_Error bind_port_resources(t_Handle handle)
     t_FmPort *port = handle;
     assert(all_locked && env_owners);
     port->requiredAction |= UPDATE_FMFP_PRC_WITH_ONE_RISC_ONLY;
-    return use_fe ? FmPortSetFESupport(port) : E_OK;
+    return E_OK;
 }
 /* Port destruction must refuse pending PCD ownership before reaching these. */
 static void FmPortDriverParamFree(t_FmPort *port) { assert(!"pending port was freed"); }
@@ -74,7 +74,7 @@ static void init(struct fixture *f, bool oh, bool stats)
     assert(!roots && !plans && !schemes && !statistics);
     memset(f, 0, sizeof(*f));
     failure = cleanup_failure = NONE; muram_calls = muram_fail = settings_calls = settings_fail = 0;
-    reports = 0; use_fe = false;
+    reports = 0;
     f->port.portType = oh ? e_FM_PORT_TYPE_OH_OFFLINE_PARSING : e_FM_PORT_TYPE_RX;
     f->port.port.bmi_regs = &f->bmi; f->port.port.qmi_regs = &f->qmi;
     f->port.p_FmPortBmiRegs = &f->bmi_sdk; f->port.p_FmPortPrsRegs = &f->prs_regs;
@@ -93,7 +93,7 @@ static void clean(struct fixture *f)
     unlocked(f);
     assert(!env_owners && !roots && !plans && !schemes && !statistics);
     assert(!f->port.pcdEngines && !f->port.pcdConfigured && !f->port.pcdNetEnvOwner);
-    assert(!f->port.requiredAction && !f->port.supportFE);
+    assert(!f->port.requiredAction);
     assert(!f->port.pcdBindings.cc && !f->port.pcdBindings.clsPlan && !f->port.pcdBindings.schemes);
     assert(muram_allocs == !!f->port.p_ParamsPage); /* page belongs to port lifetime */
 }
@@ -144,28 +144,6 @@ int main(void)
         assert(!memcmp(&before, &f, sizeof(f)) && !env_owners && !settings_calls);
         finish(&f);
     }
-    /* Reserved replacement API must not inspect handles or change a live
-     * classifier, including already-held locks. */
-    for (unsigned oh = 0; oh < 2; oh++) {
-        for (unsigned detached = 0; detached < 2; detached++) {
-            init(&f, oh, true);
-            assert(FM_PORT_SetPCD(&f.port, &f.params) == E_OK);
-            if (detached) assert(FM_PORT_DetachPCD(&f.port) == E_OK);
-            f.port.lock = all_locked = true;
-            struct fixture before; memcpy(&before, &f, sizeof(f));
-            unsigned r = roots, rb = root_binds, owners = env_owners;
-            unsigned settings = settings_calls;
-            t_Handle trees[] = {f.port.ccTreeId, (void *)1, NULL};
-            for (unsigned i = 0; i < sizeof(trees) / sizeof(trees[0]); i++) {
-                assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree(&f.port, trees[i])) == E_NOT_SUPPORTED);
-                assert(!memcmp(&before, &f, sizeof(f)));
-                assert(roots == r && root_binds == rb && env_owners == owners);
-                assert(settings_calls == settings && all_locked);
-            }
-            f.port.lock = all_locked = false;
-            assert(FM_PORT_DeletePCD(&f.port) == E_OK); finish(&f);
-        }
-    }
     /* A bypass sends a disabled port's frames to its default queue and
      * gives the PCD back unchanged: no host command, refused while the port
      * is enabled, and recoverable from a half done. */
@@ -206,8 +184,6 @@ int main(void)
         assert(FM_PORT_DeletePCD(&f.port) == E_OK); finish(&f);
         assert(GET_ERROR_TYPE(FM_PORT_BypassPCD(&f.port, true)) == E_INVALID_STATE);
     }
-    assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree(NULL, NULL)) == E_NOT_SUPPORTED);
-    assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree((void *)1, (void *)1)) == E_NOT_SUPPORTED);
     /* Reassembly requests cannot change an unconfigured or live port, even
      * when their nested CC pointer is unreadable and the port lock is held. */
     for (unsigned configured = 0; configured < 2; configured++) {
@@ -258,17 +234,14 @@ int main(void)
                 assert(FM_PORT_SetPCD(&f.port, &f.params) != E_OK); clean(&f);
                 retry(&f); finish(&f);
             }
-            for (unsigned fe = 0; fe < 2; fe++) {
-                for (unsigned allocation = 1; allocation <= (fe ? 3 : 1); allocation++) {
-                    init(&f, oh, true); use_fe = fe; muram_fail = allocation;
-                    assert(FM_PORT_SetPCD(&f.port, &f.params) != E_OK); clean(&f);
-                    retry(&f); finish(&f);
-                }
-            }
+            /* The one MURAM allocation the setup makes. */
+            init(&f, oh, true); muram_fail = 1;
+            assert(FM_PORT_SetPCD(&f.port, &f.params) != E_OK); clean(&f);
+            retry(&f); finish(&f);
             for (enum fault cleanup = STATS_DISABLE; cleanup <= CC_UNBIND; cleanup++) {
                 for (unsigned setup_fail = 0; setup_fail < 2; setup_fail++) {
                     for (unsigned next_set = 0; next_set < 2; next_set++) {
-                        init(&f, oh, true); use_fe = true;
+                        init(&f, oh, true);
                         cleanup_failure = cleanup;
                         if (setup_fail) {
                             failure = RISC_ATTACH;
@@ -281,11 +254,8 @@ int main(void)
                         unsigned owners = env_owners, r = roots, p = plans, s = schemes;
                         assert(FM_PORT_DeletePCD(&f.port) != E_OK); unlocked(&f);
                         assert(env_owners == owners && roots == r && plans == p && schemes == s);
-                        assert(FM_PORT_AttachPCD(&f.port) != E_OK); unlocked(&f);
                         assert(GET_ERROR_TYPE(FM_PORT_DetachPCD(&f.port)) == E_INVALID_STATE); unlocked(&f);
                         assert(FM_PORT_Free(&f.port) != E_OK); unlocked(&f);
-                        t_FmPcdPortSchemesParams bind = {.numOfSchemes = 1, .h_Schemes = {(void *)1}};
-                        assert(FM_PORT_PcdKgBindSchemes(&f.port, &bind) != E_OK); unlocked(&f);
                         failure = cleanup_failure = NONE;
                         if (!next_set) { assert(FM_PORT_DeletePCD(&f.port) == E_OK); clean(&f); }
                         retry(&f); finish(&f);
@@ -319,19 +289,6 @@ int main(void)
         assert(FM_PORT_SetPCD(&f.port, &f.params) != E_OK); unlocked(&f);
         assert(f.port.pcdNetEnvOwner && env_owners && reports == 2);
         retry(&f); finish(&f);
-    }
-    /* Dynamic scheme removal/rebinding must agree with later port deletion. */
-    for (unsigned rebind = 0; rebind < 2; rebind++) {
-        init(&f, false, true);
-        assert(FM_PORT_SetPCD(&f.port, &f.params) == E_OK);
-        t_FmPcdPortSchemesParams bind = {.numOfSchemes = 1, .h_Schemes = {(void *)1}};
-        assert(FM_PORT_PcdKgUnbindSchemes(&f.port, &bind) == E_OK);
-        assert(!f.port.pcdBindings.schemes && !schemes);
-        if (rebind) {
-            assert(FM_PORT_PcdKgBindSchemes(&f.port, &bind) == E_OK);
-            assert(f.port.pcdBindings.schemes && schemes == 1);
-        }
-        assert(FM_PORT_DeletePCD(&f.port) == E_OK); finish(&f);
     }
     /* Minimal engine configurations do not acquire nonexistent bindings. */
     e_FmPortPcdSupport modes[] = {e_FM_PORT_PCD_SUPPORT_PRS_ONLY,

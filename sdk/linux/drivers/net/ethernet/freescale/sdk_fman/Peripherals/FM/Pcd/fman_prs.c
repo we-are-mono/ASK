@@ -111,11 +111,6 @@ void fman_prs_disable(struct fman_prs_regs *regs)
 	iowrite32be(tmp, &regs->fmpr_rpimac);
 }
 
-int fman_prs_is_enabled(struct fman_prs_regs *regs)
-{
-	return ioread32be(&regs->fmpr_rpimac) & FM_PCD_PRS_RPIMAC_EN;
-}
-
 void fman_prs_set_stst_port_msk(struct fman_prs_regs *regs, uint32_t pid_msk)
 {
 	iowrite32be(pid_msk, &regs->fmpr_ppsc);

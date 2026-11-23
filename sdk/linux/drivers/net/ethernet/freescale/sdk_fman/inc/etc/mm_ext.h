@@ -118,26 +118,6 @@ t_Error     MM_Init(t_Handle *h_MM, uint64_t base, uint64_t size);
 uint64_t    MM_Get(t_Handle h_MM, uint64_t size, uint64_t alignment, char *name);
 
 /**************************************************************************//**
- @Function      MM_GetForce
-
- @Description   Force memory allocation.
-
-                It means to allocate a block of memory of the given
-                size from the given base address.
-                The routine checks if the required block can be allocated
-                (that is it is free) and then, calls the internal MM_CutFree
-                routine to update all free lists do not include that block.
-
- @Param[in]     h_MM    - Handle to the MM object.
- @Param[in]     base    - Base address of the MM.
- @Param[in]     size    - Size of the MM.
- @Param[in]     name    - Name that specifies an allocated block.
-
- @Return        base address of an allocated block, ILLEGAL_BASE if can't allocate a block.
-*//***************************************************************************/
-uint64_t    MM_GetForce(t_Handle h_MM, uint64_t base, uint64_t size, char *name);
-
-/**************************************************************************//**
  @Function      MM_Put
 
  @Description   Puts a block of memory of the given base address back to the memory.
@@ -157,15 +137,6 @@ uint64_t    MM_GetForce(t_Handle h_MM, uint64_t base, uint64_t size, char *name)
  @Return         The size of bytes released, 0 if failed.
 *//***************************************************************************/
 uint64_t    MM_Put(t_Handle h_MM, uint64_t base);
-
-/**************************************************************************//**
- @Function      MM_Dump
-
- @Description   Prints results of free and busy lists.
-
- @Param[in]     h_MM        - Handle to the MM object.
-*//***************************************************************************/
-void        MM_Dump(t_Handle h_MM);
 
 /**************************************************************************//**
  @Function      MM_Free

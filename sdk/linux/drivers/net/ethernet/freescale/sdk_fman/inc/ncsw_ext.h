@@ -44,7 +44,6 @@
 #include "memcpy_ext.h"
 
 #define WRITE_BLOCK                 IOMemSet32   /* include memcpy_ext.h */
-#define COPY_BLOCK                  Mem2IOCpy32  /* include memcpy_ext.h */
 
 #define PTR_TO_UINT(_ptr)           ((uintptr_t)(_ptr))
 #define UINT_TO_PTR(_val)           ((void*)(uintptr_t)(_val))

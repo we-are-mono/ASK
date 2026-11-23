@@ -688,63 +688,6 @@ uint64_t MM_Get(t_Handle h_MM, uint64_t size, uint64_t alignment, char* name)
 }
 
 /*****************************************************************************/
-uint64_t MM_GetForce(t_Handle h_MM, uint64_t base, uint64_t size, char* name)
-{
-    t_MM        *p_MM = (t_MM *)h_MM;
-    t_FreeBlock *p_FreeB;
-    t_BusyBlock *p_NewBusyB;
-    uint32_t    intFlags;
-    bool        blockIsFree = FALSE;
-
-    ASSERT_COND(p_MM);
-
-    intFlags = XX_LockIntrSpinlock(p_MM->h_Spinlock);
-    p_FreeB = p_MM->freeBlocks[0]; /* The biggest free blocks are in the
-                                      free list with alignment 1 */
-
-    while ( p_FreeB )
-    {
-        if ( base >= p_FreeB->base && (base+size) <= p_FreeB->end )
-        {
-            blockIsFree = TRUE;
-            break;
-        }
-        else
-            p_FreeB = p_FreeB->p_Next;
-    }
-
-    if ( !blockIsFree )
-    {
-        XX_UnlockIntrSpinlock(p_MM->h_Spinlock, intFlags);
-        return (uint64_t)(ILLEGAL_BASE);
-    }
-
-    /* init a new busy block */
-    if ((p_NewBusyB = CreateBusyBlock(base, size, name)) == NULL)
-    {
-        XX_UnlockIntrSpinlock(p_MM->h_Spinlock, intFlags);
-        return (uint64_t)(ILLEGAL_BASE);
-    }
-
-    /* calls Update routine to update a lists of free blocks */
-    if ( CutFree ( p_MM, base, base+size ) != E_OK )
-    {
-        XX_UnlockIntrSpinlock(p_MM->h_Spinlock, intFlags);
-        XX_Free(p_NewBusyB);
-        return (uint64_t)(ILLEGAL_BASE);
-    }
-
-    /* Decreasing the allocated memory size from free memory size */
-    p_MM->freeMemSize -= size;
-
-    /* insert the new busy block into the list of busy blocks */
-    AddBusy ( p_MM, p_NewBusyB );
-    XX_UnlockIntrSpinlock(p_MM->h_Spinlock, intFlags);
-
-    return (base);
-}
-
-/*****************************************************************************/
 uint64_t MM_Put(t_Handle h_MM, uint64_t base)
 {
     t_MM        *p_MM = (t_MM *)h_MM;
@@ -806,32 +749,3 @@ uint64_t MM_GetFreeMemSize(t_Handle h_MM)
     return p_MM->freeMemSize;
 }
 
-/*****************************************************************************/
-void MM_Dump(t_Handle h_MM)
-{
-    t_MM        *p_MM = (t_MM *)h_MM;
-    t_FreeBlock *p_FreeB;
-    t_BusyBlock *p_BusyB;
-    int          i;
-
-    p_BusyB = p_MM->busyBlocks;
-    XX_Print("List of busy blocks:\n");
-    while (p_BusyB)
-    {
-        XX_Print("\t0x%p: (%s: b=0x%llx, e=0x%llx)\n", p_BusyB, p_BusyB->name, p_BusyB->base, p_BusyB->end );
-        p_BusyB = p_BusyB->p_Next;
-    }
-
-    XX_Print("\nLists of free blocks according to alignment:\n");
-    for (i=0; i <= MM_MAX_ALIGNMENT; i++)
-    {
-        XX_Print("%d alignment:\n", (0x1 << i));
-        p_FreeB = p_MM->freeBlocks[i];
-        while (p_FreeB)
-        {
-            XX_Print("\t0x%p: (b=0x%llx, e=0x%llx)\n", p_FreeB, p_FreeB->base, p_FreeB->end);
-            p_FreeB = p_FreeB->p_Next;
-        }
-        XX_Print("\n");
-    }
-}

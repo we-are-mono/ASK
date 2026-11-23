@@ -135,8 +135,6 @@ typedef struct {
     uint16_t            clkFreq;
 } t_FmMacControllerDriver;
 
-uint16_t    FM_MAC_GetMaxFrameLength(t_Handle FmMac);
-
 /* ........................................................................... */
 
 static __inline__ t_EthHashEntry *DequeueAddrFromHashEntry(t_List *p_AddrLst)

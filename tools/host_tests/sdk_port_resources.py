@@ -32,13 +32,10 @@ def test_sdk_port_resources(tmp_path):
         "FmGetSetPortParams", "FmFreePortParams", "FmSetNumOfTasks",
         "FmSetSizeOfFifo", "FmSetNumOfOpenDmas",
     ])
-    port = (sdk / "Peripherals/FM/Port/fm_port.c").read_text()
-    production += function(port, "VerifySizeOfFifo")
-    production += function(port, "FM_PORT_SetSizeOfFifo")
     (tmp_path / "resources_production.inc").write_text(production)
     flib = (sdk / "Peripherals/FM/fman.c").read_text()
     (tmp_path / "resources_flib.inc").write_text("\n".join(function(flib, name) for name in [
-        "fman_get_num_of_tasks", "fman_get_num_extra_tasks", "fman_set_num_of_tasks",
+        "fman_get_num_of_tasks", "fman_set_num_of_tasks",
         "fman_get_size_of_fifo", "fman_get_size_of_extra_fifo", "fman_set_size_of_fifo",
         "fman_get_num_of_dmas", "fman_get_num_extra_dmas", "fman_set_num_of_open_dmas",
         "fman_get_qmi_enq_th", "fman_get_qmi_deq_th", "fman_set_qmi_enq_th", "fman_set_qmi_deq_th",

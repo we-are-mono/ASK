@@ -1048,9 +1048,7 @@ static t_Error CcUpdateParam(
         uint16_t numOfEntries, t_Handle h_Ad, bool validate, uint16_t level,
         t_Handle h_FmTree, bool modify)
 {
-  //  FmPortSetFESupport(h_FmPort);
     return E_OK;
-
 }
 
 static ccPrivateInfo_t IcDefineCode(t_FmPcdCcNodeParams *p_CcNodeParam)
@@ -4929,60 +4927,6 @@ void NextStepAd(t_Handle h_Ad, t_FmPcdCcStatsParams *p_FmPcdCcStatsParams,
     }
 }
 
-t_Handle FmPcdCcTreeGetSavedManipParams(t_Handle h_FmTree)
-{
-    t_FmPcdCcTree *p_FmPcdCcTree = (t_FmPcdCcTree *)h_FmTree;
-
-    ASSERT_COND(p_FmPcdCcTree);
-
-    return p_FmPcdCcTree->h_FmPcdCcSavedManipParams;
-}
-
-void FmPcdCcTreeSetSavedManipParams(t_Handle h_FmTree,
-                                    t_Handle h_SavedManipParams)
-{
-    t_FmPcdCcTree *p_FmPcdCcTree = (t_FmPcdCcTree *)h_FmTree;
-
-    ASSERT_COND(p_FmPcdCcTree);
-
-    p_FmPcdCcTree->h_FmPcdCcSavedManipParams = h_SavedManipParams;
-}
-
-uint8_t FmPcdCcGetParseCode(t_Handle h_CcNode)
-{
-    t_FmPcdCcNode *p_CcNode = (t_FmPcdCcNode *)h_CcNode;
-
-    ASSERT_COND(p_CcNode);
-
-    return p_CcNode->parseCode;
-}
-
-uint8_t FmPcdCcGetOffset(t_Handle h_CcNode)
-{
-    t_FmPcdCcNode *p_CcNode = (t_FmPcdCcNode *)h_CcNode;
-
-    ASSERT_COND(p_CcNode);
-
-    return p_CcNode->offset;
-}
-
-uint16_t FmPcdCcGetNumOfKeys(t_Handle h_CcNode)
-{
-    t_FmPcdCcNode *p_CcNode = (t_FmPcdCcNode *)h_CcNode;
-
-    ASSERT_COND(p_CcNode);
-
-    return p_CcNode->numOfKeys;
-}
-
-t_Error FmPcdCcModifyNextEngineParamTree(
-        t_Handle h_FmPcd, t_Handle h_FmPcdCcTree, uint8_t grpId, uint8_t index,
-        t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams)
-{
-    RETURN_ERROR(MAJOR, E_NOT_SUPPORTED,
-                 ("ASK external-hash roots cannot be modified in place"));
-}
-
 t_Error FmPcdCcRemoveKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
                          uint16_t keyIndex)
 {
@@ -5614,40 +5558,6 @@ t_Error FmPcdUpdateCcShadow(t_FmPcd *p_FmPcd, uint32_t size, uint32_t align)
     return E_OK;
 }
 
-void FmPcdCcGetAdTablesThatPointOnReplicGroup(t_Handle h_Node,
-                                              t_Handle h_ReplicGroup,
-                                              t_List *p_AdTables,
-                                              uint32_t *p_NumOfAdTables)
-{
-    t_FmPcdCcNode *p_CurrentNode = (t_FmPcdCcNode *)h_Node;
-    int i = 0;
-    void * p_AdTable;
-    t_CcNodeInformation ccNodeInfo;
-
-    ASSERT_COND(h_Node);
-    *p_NumOfAdTables = 0;
-
-    /* search in the current node which exact index points on this current replicator group for getting AD */
-    for (i = 0; i < p_CurrentNode->numOfKeys + 1; i++)
-    {
-        if ((p_CurrentNode->keyAndNextEngineParams[i].nextEngineParams.nextEngine
-                == e_FM_PCD_FR)
-                && ((p_CurrentNode->keyAndNextEngineParams[i].nextEngineParams.params.frParams.h_FrmReplic
-                        == (t_Handle)h_ReplicGroup)))
-        {
-            /* save the current ad table in the list */
-            /* this entry uses the input replicator group */
-            p_AdTable =
-                    PTR_MOVE(p_CurrentNode->h_AdTable, i*FM_PCD_CC_AD_ENTRY_SIZE);
-            memset(&ccNodeInfo, 0, sizeof(t_CcNodeInformation));
-            ccNodeInfo.h_CcNode = p_AdTable;
-            EnqueueNodeInfoToRelevantLst(p_AdTables, &ccNodeInfo, NULL);
-            (*p_NumOfAdTables)++;
-        }
-    }
-
-    ASSERT_COND(i != p_CurrentNode->numOfKeys);
-}
 /*********************** End of inter-module routines ************************/
 
 /****************************************/

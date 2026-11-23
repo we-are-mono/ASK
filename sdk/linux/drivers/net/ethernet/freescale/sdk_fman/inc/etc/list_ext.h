@@ -327,18 +327,6 @@ static __inline__ int LIST_IsEmpty(t_List *p_List)
 }
 
 
-/**************************************************************************//**
- @Function      LIST_Append
-
- @Description   Join two lists.
-
- @Param[in]     p_NewList - A pointer to the new list to add.
- @Param[in]     p_Head    - A pointer to the place to add it in the first list.
-
- @Return        none.
-*//***************************************************************************/
-void LIST_Append(t_List *p_NewList, t_List *p_Head);
-
 
 /**************************************************************************//**
  @Function      LIST_NumOfObjs

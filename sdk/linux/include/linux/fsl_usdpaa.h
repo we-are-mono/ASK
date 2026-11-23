@@ -55,11 +55,6 @@ void dpa_alloc_seed(struct dpa_alloc *alloc, u32 fqid, u32 count);
 /* Like 'new' but specifies the desired range, returns -ENOMEM if the entire
  * desired range is not available, or 0 for success. */
 int dpa_alloc_reserve(struct dpa_alloc *alloc, u32 base_id, u32 count);
-/* Pops and returns contiguous ranges from the allocator. Returns -ENOMEM when
- * 'alloc' is empty. */
-int dpa_alloc_pop(struct dpa_alloc *alloc, u32 *result, u32 *count);
-/* Returns 1 if the specified id is alloced, 0 otherwise */
-int dpa_alloc_check(struct dpa_alloc *list, u32 id);
 #endif /* __KERNEL__ */
 
 

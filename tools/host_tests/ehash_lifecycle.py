@@ -31,7 +31,6 @@ def test_ehash_teardown(tmp_path):
         function(ehash, "FreeEnEhashInfo") + function(ehash, "FM_PCD_HashTableDelete")
         + function(cc, "copy_td_to_ccbase") + function(cc, "FM_PCD_CcRootDelete")
         + function(cc, "FM_PCD_CcRootModifyNextEngine")
-        + function(cc, "FmPcdCcModifyNextEngineParamTree")
     )
     # CDX's quarantine over the same table API: its node type through
     # cdx_ehash_delete_entry(), the one delete every CDX path goes through,

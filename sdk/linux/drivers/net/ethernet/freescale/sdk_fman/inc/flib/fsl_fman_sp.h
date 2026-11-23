@@ -128,11 +128,5 @@ void fman_vsp_init(struct fm_pcd_storage_profile_regs   *regs,
 	int port_max_num_of_ext_pools, int bm_max_num_of_pools,
 	int max_num_of_pfc_priorities);
 
-uint32_t fman_vsp_get_statistics(struct fm_pcd_storage_profile_regs *regs,
-					uint16_t index);
-
-void fman_vsp_set_statistics(struct fm_pcd_storage_profile_regs *regs,
-			uint16_t index,	uint32_t value);
-
 
 #endif /* __FSL_FMAN_SP_H */

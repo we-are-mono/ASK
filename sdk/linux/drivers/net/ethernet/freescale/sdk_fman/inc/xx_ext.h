@@ -219,18 +219,6 @@ void    XX_Exit(int status);
 typedef t_Handle t_TaskletHandle;
 
 /**************************************************************************//**
- @Function      XX_InitTasklet
-
- @Description   Create and initialize a tasklet object.
-
- @Param[in]     routine - A routine to be ran as a tasklet.
- @Param[in]     data    - An argument to pass to the tasklet.
-
- @Return        Tasklet handle is returned on success. NULL is returned otherwise.
-*//***************************************************************************/
-t_TaskletHandle XX_InitTasklet (void (*routine)(void *), void *data);
-
-/**************************************************************************//**
  @Function      XX_FreeTasklet
 
  @Description   Free a tasklet object.
@@ -242,19 +230,6 @@ t_TaskletHandle XX_InitTasklet (void (*routine)(void *), void *data);
 void XX_FreeTasklet (t_TaskletHandle h_Tasklet);
 
 /**************************************************************************//**
- @Function      XX_ScheduleTask
-
- @Description   Schedule a tasklet object.
-
- @Param[in]     h_Tasklet - A handle to a tasklet to be scheduled.
- @Param[in]     immediate - Indicate whether to schedule this tasklet on
-                            the immediate queue or on the delayed one.
-
- @Return        0 - on success. Error code - otherwise.
-*//***************************************************************************/
-int XX_ScheduleTask(t_TaskletHandle h_Tasklet, int immediate);
-
-/**************************************************************************//**
  @Function      XX_FlushScheduledTasks
 
  @Description   Flush all tasks there are in the scheduled tasks queue.
@@ -262,39 +237,6 @@ int XX_ScheduleTask(t_TaskletHandle h_Tasklet, int immediate);
  @Return        None.
 *//***************************************************************************/
 void XX_FlushScheduledTasks(void);
-
-/**************************************************************************//**
- @Function      XX_TaskletIsQueued
-
- @Description   Check if task is queued.
-
- @Param[in]     h_Tasklet - A handle to a tasklet to be scheduled.
-
- @Return        1 - task is queued. 0 - otherwise.
-*//***************************************************************************/
-int XX_TaskletIsQueued(t_TaskletHandle h_Tasklet);
-
-/**************************************************************************//**
- @Function      XX_SetTaskletData
-
- @Description   Set data to a scheduled task. Used to change data of already
-                scheduled task.
-
- @Param[in]     h_Tasklet - A handle to a tasklet to be scheduled.
- @Param[in]     data      - Data to be set.
-*//***************************************************************************/
-void XX_SetTaskletData(t_TaskletHandle h_Tasklet, t_Handle data);
-
-/**************************************************************************//**
- @Function      XX_GetTaskletData
-
- @Description   Get the data of scheduled task.
-
- @Param[in]     h_Tasklet - A handle to a tasklet to be scheduled.
-
- @Return        handle to the data of the task.
-*//***************************************************************************/
-t_Handle XX_GetTaskletData(t_TaskletHandle h_Tasklet);
 
 /**************************************************************************//**
  @Function      XX_BottomHalf
@@ -332,28 +274,6 @@ t_Handle XX_InitSpinlock(void);
  @Return        None.
 *//***************************************************************************/
 void XX_FreeSpinlock(t_Handle h_Spinlock);
-
-/**************************************************************************//**
- @Function      XX_LockSpinlock
-
- @Description   Locks a spinlock.
-
- @Param[in]     h_Spinlock - A handle to a spinlock.
-
- @Return        None.
-*//***************************************************************************/
-void XX_LockSpinlock(t_Handle h_Spinlock);
-
-/**************************************************************************//**
- @Function      XX_UnlockSpinlock
-
- @Description   Unlocks a spinlock.
-
- @Param[in]     h_Spinlock - A handle to a spinlock.
-
- @Return        None.
-*//***************************************************************************/
-void XX_UnlockSpinlock(t_Handle h_Spinlock);
 
 /**************************************************************************//**
  @Function      XX_LockIntrSpinlock
@@ -404,15 +324,6 @@ void XX_UnlockIntrSpinlock(t_Handle h_Spinlock, uint32_t intrFlags);
 /*****************************************************************************/
 /*                        Timers Service Routines                            */
 /*****************************************************************************/
-
-/**************************************************************************//**
- @Function      XX_CurrentTime
-
- @Description   Returns current system time.
-
- @Return        Current system time (in milliseconds).
-*//***************************************************************************/
-uint32_t XX_CurrentTime(void);
 
 /**************************************************************************//**
  @Function      XX_CreateTimer
@@ -486,20 +397,6 @@ void XX_StopTimer(t_Handle h_Timer);
  @Return        None.
 *//***************************************************************************/
 void XX_ModTimer(t_Handle h_Timer, uint32_t msecs);
-
-/**************************************************************************//**
- @Function      XX_Sleep
-
- @Description   Non-busy wait until the desired time (in milliseconds) has passed.
-
- @Param[in]     msecs - The requested sleep time (in milliseconds).
-
- @Return        Zero if the requested time has elapsed; Otherwise, the value
-                returned will be the unslept amount) in milliseconds.
-
- @Cautions      This routine enables interrupts during its wait time.
-*//***************************************************************************/
-uint32_t XX_Sleep(uint32_t msecs);
 
 /**************************************************************************//**
  @Function      XX_UDelay

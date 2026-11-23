@@ -191,14 +191,6 @@ void PrsDisable(t_FmPcd *p_FmPcd)
     fman_prs_disable(PrsRegs);
 }
 
-int PrsIsEnabled(t_FmPcd *p_FmPcd)
-{
-    struct fman_prs_regs *PrsRegs = (struct fman_prs_regs *)p_FmPcd->p_FmPcdPrs->p_FmPcdPrsRegs;
-
-    ASSERT_COND(p_FmPcd->guestId == NCSW_MASTER_ID);
-    return fman_prs_is_enabled(PrsRegs);
-}
-
 t_Error PrsIncludePortInStatistics(t_FmPcd *p_FmPcd, uint8_t hardwarePortId, bool include)
 {
     struct fman_prs_regs *PrsRegs;
@@ -405,17 +397,3 @@ t_Error FM_PCD_PrsLoadSw(t_Handle h_FmPcd, t_FmPcdPrsSwParams *p_SwPrs)
     return E_OK;
 }
 
-t_Error FM_PCD_ConfigPrsMaxCycleLimit(t_Handle h_FmPcd,uint16_t value)
-{
-    t_FmPcd *p_FmPcd = (t_FmPcd*)h_FmPcd;
-
-    SANITY_CHECK_RETURN_ERROR(p_FmPcd, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(p_FmPcd->p_FmPcdDriverParam, E_INVALID_HANDLE);
-
-    if(p_FmPcd->guestId != NCSW_MASTER_ID)
-        RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("FM_PCD_ConfigPrsMaxCycleLimit - guest mode!"));
-
-    p_FmPcd->p_FmPcdDriverParam->prsMaxParseCycleLimit = value;
-
-    return E_OK;
-}

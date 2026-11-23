@@ -190,7 +190,6 @@ static void refuses_teardown(t_FmHc *hc)
 {
     unsigned before = frees;
     assert(FmHcFree(hc) != E_OK);
-    assert(FmHcSetFramesDataMemory(hc, 1) != E_OK);
     assert(FmAllowHcUsage(hc, false) != E_OK);
     assert(FmAllowHcUsage(hc, true) != E_OK);
     assert(FmIsHcUsageAllowed(hc));
@@ -378,14 +377,9 @@ static void pool_and_cleanup(void)
     t_FmHc *hc = setup();
     uint32_t seq;
     t_HcFrame *frame = GetBuf(hc, &seq);
-    refuses_teardown(hc); /* Even a CPU borrower prevents pool replacement. */
+    refuses_teardown(hc); /* Even a CPU borrower prevents teardown. */
     PutBuf(hc, frame, seq);
-    assert(FmHcSetFramesDataMemory(hc, 1) == E_OK && frees == HC_CMD_POOL_SIZE);
-    assert(!hc->quiescing);
-    allocation_budget = 1;
-    assert(GET_ERROR_TYPE(FmHcSetFramesDataMemory(hc, 2)) == E_NO_MEMORY);
-    assert(!GetBuf(hc, &seq));
-    dispose(hc); /* Partial replacement allocation is freed exactly once. */
+    dispose(hc);
 
     hc = setup();
     assert(FmHcQuiesce(hc) == E_OK && !GetBuf(hc, &seq));

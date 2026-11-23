@@ -36,7 +36,5 @@
 
 #include "std_ext.h"
 
-uint32_t get_mac_addr_crc(uint64_t _addr);
-
 
 #endif /* __FMAN_CRC32_H */

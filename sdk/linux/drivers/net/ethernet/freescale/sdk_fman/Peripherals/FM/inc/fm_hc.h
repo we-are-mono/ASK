@@ -51,8 +51,6 @@ t_Handle    FmHcConfigAndInit(t_FmHcParams *p_FmHcParams);
  * refuses teardown/reconfiguration: reset the board to recover PCD state. */
 t_Error     FmHcQuiesce(t_Handle h_FmHc);
 t_Error     FmHcFree(t_Handle h_FmHc);
-t_Error     FmHcSetFramesDataMemory(t_Handle h_FmHc,
-                                    uint8_t  memId);
 t_Error     FmHcDumpRegs(t_Handle h_FmHc);
 
 void        FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd);
@@ -62,7 +60,6 @@ t_Error     FmHcPcdKgSetScheme(t_Handle                   h_FmHc,
                                struct fman_kg_scheme_regs *p_SchemeRegs,
                                bool                       updateCounter);
 t_Error     FmHcPcdKgDeleteScheme(t_Handle h_FmHc, t_Handle h_Scheme);
-t_Error     FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragScratchPoolCmdParams *p_FmPcdCcFragScratchPoolCmdParams);
 t_Error     FmHcPcdKgSetClsPlan(t_Handle h_FmHc, t_FmPcdKgInterModuleClsPlanSet *p_Set);
 t_Error     FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t clsPlanGrpId);
 
@@ -85,7 +82,6 @@ t_Error     FmHcPcdKgCcGetSetParams(t_Handle h_FmHc, t_Handle  h_Scheme, uint32_
 t_Error     FmHcPcdPlcrCcGetSetParams(t_Handle h_FmHc,uint16_t absoluteProfileId, uint32_t requiredAction);
 
 t_Error     FmHcPcdSync(t_Handle h_FmHc);
-t_Handle    FmHcGetPort(t_Handle h_FmHc);
 
 t_Error     FmAllowHcUsage(t_Handle h_FmHc, bool allow);
 bool     	FmIsHcUsageAllowed(t_Handle h_FmHc);

@@ -650,7 +650,6 @@ bool        FmPcdIsAdvancedOffloadSupported(t_Handle h_FmPcd);
 bool        FmPcdLockTryLockAll(t_Handle h_FmPcd);
 void        FmPcdLockUnlockAll(t_Handle h_FmPcd);
 t_Error     FmPcdHcSync(t_Handle h_FmPcd);
-t_Handle    FmGetPcd(t_Handle h_Fm);
 /***********************************************************************/
 /*          Common API for FM-PCD KG module                            */
 /***********************************************************************/
@@ -683,8 +682,6 @@ void        FmPcdKgUpdateRequiredAction(t_Handle h_Scheme, uint32_t requiredActi
 bool        FmPcdKgIsDirectPlcr(t_Handle h_FmPcd, uint8_t schemeId);
 bool        FmPcdKgIsDistrOnPlcrProfile(t_Handle h_FmPcd, uint8_t schemeId);
 uint16_t    FmPcdKgGetRelativeProfileId(t_Handle h_FmPcd, uint8_t schemeId);
-t_Handle    FmPcdKgGetSchemeHandle(t_Handle h_FmPcd, uint8_t relativeSchemeId);
-bool        FmPcdKgIsSchemeHasOwners(t_Handle h_Scheme);
 t_Error     FmPcdKgCcGetSetParams(t_Handle h_FmPcd, t_Handle  h_Scheme, uint32_t requiredAction, uint32_t value);
 t_Error     FmPcdKgSetOrBindToClsPlanGrp(t_Handle h_FmPcd, uint8_t hardwarePortId, uint8_t netEnvId, protocolOpt_t *p_OptArray, uint8_t *p_ClsPlanGrpId, bool *p_IsEmptyClsPlanGrp);
 t_Error     FmPcdKgDeleteOrUnbindPortToClsPlanGrp(t_Handle h_FmPcd, uint8_t hardwarePortId, uint8_t clsPlanGrpId);
@@ -700,8 +697,6 @@ t_Error     FmPcdPrsIncludePortInStatistics(t_Handle p_FmPcd, uint8_t hardwarePo
 t_Error     FmPcdPlcrAllocProfiles(t_Handle h_FmPcd, uint8_t hardwarePortId, uint16_t numOfProfiles);
 t_Error     FmPcdPlcrFreeProfiles(t_Handle h_FmPcd, uint8_t hardwarePortId);
 bool        FmPcdPlcrIsProfileValid(t_Handle h_FmPcd, uint16_t absoluteProfileId);
-uint16_t    FmPcdPlcrGetPortProfilesBase(t_Handle h_FmPcd, uint8_t hardwarePortId);
-uint16_t    FmPcdPlcrGetPortNumOfProfiles(t_Handle h_FmPcd, uint8_t hardwarePortId);
 uint32_t    FmPcdPlcrBuildWritePlcrActionRegs(uint16_t absoluteProfileId);
 uint32_t    FmPcdPlcrBuildCounterProfileReg(e_FmPcdPlcrProfileCounters counter);
 uint32_t    FmPcdPlcrBuildWritePlcrActionReg(uint16_t absoluteProfileId);
@@ -714,34 +709,20 @@ t_Error     FmPcdPlcrGetAbsoluteIdByProfileParams(t_Handle                      
                                           uint16_t                      *p_AbsoluteId);
 void        FmPcdPlcrInvalidateProfileSw(t_Handle h_FmPcd, uint16_t absoluteProfileId);
 void        FmPcdPlcrValidateProfileSw(t_Handle h_FmPcd, uint16_t absoluteProfileId);
-bool        FmPcdPlcrHwProfileIsValid(uint32_t profileModeReg);
 uint32_t    FmPcdPlcrGetRequiredAction(t_Handle h_FmPcd, uint16_t absoluteProfileId);
 uint32_t    FmPcdPlcrGetRequiredActionFlag(t_Handle h_FmPcd, uint16_t absoluteProfileId);
 uint32_t    FmPcdPlcrBuildNiaProfileReg(bool green, bool yellow, bool red);
 void        FmPcdPlcrUpdateRequiredAction(t_Handle h_FmPcd, uint16_t absoluteProfileId, uint32_t requiredAction);
 t_Error     FmPcdPlcrCcGetSetParams(t_Handle h_FmPcd, uint16_t profileIndx,uint32_t requiredAction);
 
-/***********************************************************************/
-/*          Common API for FM-PCD CC module                            */
-/***********************************************************************/
-uint8_t     FmPcdCcGetParseCode(t_Handle h_CcNode);
-uint8_t     FmPcdCcGetOffset(t_Handle h_CcNode);
 t_Error     FmPcdCcRemoveKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode, uint16_t keyIndex);
 t_Error     FmPcdCcAddKey(t_Handle h_FmPcd, t_Handle h_CcNode, uint16_t keyIndex, uint8_t keySize, t_FmPcdCcKeyParams *p_FmPCdCcKeyParams);
 t_Error     FmPcdCcModifyKey(t_Handle h_FmPcd, t_Handle h_CcNode, uint16_t keyIndex, uint8_t keySize, uint8_t *p_Key, uint8_t *p_Mask);
 t_Error     FmPcdCcModifyKeyAndNextEngine(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode, uint16_t keyIndex, uint8_t keySize, t_FmPcdCcKeyParams *p_FmPcdCcKeyParams);
 t_Error     FmPcdCcModifyMissNextEngineParamNode(t_Handle h_FmPcd,t_Handle h_FmPcdCcNode, t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams);
-t_Error     FmPcdCcModifyNextEngineParamTree(t_Handle h_FmPcd, t_Handle h_FmPcdCcTree, uint8_t grpId, uint8_t index, t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams);
 uint32_t    FmPcdCcGetNodeAddrOffsetFromNodeInfo(t_Handle h_FmPcd, t_Handle h_Pointer);
-t_Handle    FmPcdCcTreeGetSavedManipParams(t_Handle h_FmTree);
-void        FmPcdCcTreeSetSavedManipParams(t_Handle h_FmTree, t_Handle h_SavedManipParams);
 t_Error     FmPcdCcBindTree(t_Handle h_FmPcd, t_Handle h_PcdParams, t_Handle h_CcTree,  uint32_t  *p_Offset,t_Handle h_FmPort);
 t_Error     FmPcdCcUnbindTree(t_Handle h_FmPcd, t_Handle h_CcTree);
-
-/***********************************************************************/
-/*          Common API for FM-PCD Manip module                            */
-/***********************************************************************/
-t_Error     FmPcdManipUpdate(t_Handle h_FmPcd, t_Handle h_PcdParams, t_Handle h_FmPort, t_Handle h_Manip, t_Handle h_Ad, bool validate, int level, t_Handle h_FmTree, bool modify);
 
 /***********************************************************************/
 /*          Common API for FM-Port module                            */
@@ -753,13 +734,9 @@ typedef enum e_FmPortGprFuncType
 } e_FmPortGprFuncType;
 
 t_Error     FmPortSetGprFunc(t_Handle h_FmPort, e_FmPortGprFuncType gprFunc, void **p_Value);
-t_Error     FmPortSetFESupport(t_Handle h_FmPort);
-t_Error     FmPortDeleteFESupport(t_Handle h_FmPort);
 t_Error     FmGetSetParams(t_Handle h_Fm, t_FmGetSetParams *p_FmGetSetParams);
 t_Error     FmPortGetSetCcParams(t_Handle h_FmPort, t_FmPortGetSetCcParams *p_FmPortGetSetCcParams);
-uint8_t     FmPortGetNetEnvId(t_Handle h_FmPort);
 uint8_t     FmPortGetHardwarePortId(t_Handle h_FmPort);
-uint32_t    FmPortGetPcdEngines(t_Handle h_FmPort);
 void        FmPortPcdKgSwUnbindClsPlanGrp (t_Handle h_FmPort);
 t_Error     FmPcdFrmReplicUpdate(t_Handle h_FmPcd, t_Handle h_FmPort, t_Handle h_FrmReplic);
 
@@ -995,19 +972,6 @@ t_Error FmResetMac(t_Handle h_Fm, e_FmMacType type, uint8_t macId);
 uint16_t FmGetClockFreq(t_Handle h_Fm);
 
 /**************************************************************************//**
- @Function      FmGetMacClockFreq
-
- @Description   Used by MAC driver to get the MAC clock frequency
-
- @Param[in]     h_Fm            A handle to an FM Module.
-
- @Return        clock-freq on success; 0 otherwise.
-
- @Cautions      Allowed only following FM_Init().
-*//***************************************************************************/
-uint16_t FmGetMacClockFreq(t_Handle h_Fm);
-
-/**************************************************************************//**
  @Function      FmGetId
 
  @Description   Used by PCD driver to read rhe FM id
@@ -1076,20 +1040,6 @@ void FmFreePortParams(t_Handle h_Fm,t_FmInterModulePortFreeParams *p_PortParams)
  @Cautions      Allowed only following FM_Init().
 *//***************************************************************************/
 t_Error FmSetNumOfRiscsPerPort(t_Handle h_Fm, uint8_t hardwarePortId, uint8_t numOfFmanCtrls, t_FmFmanCtrl orFmanCtrl);
-
-/**************************************************************************//*
- @Function      FmDumpPortRegs
-
- @Description   Dumps FM port registers which are part of FM common registers
-
- @Param[in]     h_Fm            A handle to an FM Module.
- @Param[in]     hardwarePortId    HW port id.
-
- @Return        E_OK on success; Error code otherwise.
-
- @Cautions      Allowed only FM_Init().
-*//***************************************************************************/
-t_Error FmDumpPortRegs(t_Handle h_Fm,uint8_t hardwarePortId);
 
 void        FmRegisterPcd(t_Handle h_Fm, t_Handle h_FmPcd);
 void        FmUnregisterPcd(t_Handle h_Fm);

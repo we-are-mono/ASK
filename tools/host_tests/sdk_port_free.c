@@ -96,11 +96,10 @@ static t_FmPort *create(e_FmPortType type, uint8_t depth, uint8_t rev)
     memset(&bmi, 0, sizeof(bmi)); port->p_FmPortBmiRegs = &bmi;
     revision = port->fmRevInfo;
     port->fifoBufs.num = 2048; port->h_Spinlock = &fm_token; locks++;
-    if (type == e_FM_PORT_TYPE_RX || type == e_FM_PORT_TYPE_RX_10G) {
-        assert(FM_PORT_ConfigFifoDeqPipelineDepth(port, depth) != E_OK);
-    } else {
-        assert(FM_PORT_ConfigFifoDeqPipelineDepth(port, depth) == E_OK);
-    }
+    /* The depth FM_PORT_Config() leaves a transmit-side port: an Rx port
+     * has none. */
+    if (type != e_FM_PORT_TYPE_RX && type != e_FM_PORT_TYPE_RX_10G)
+        port->p_FmPortDriverParam->dfltCfg.tx_fifo_deq_pipeline_depth = depth;
     return port;
 }
 static void finish(t_FmPort *port, unsigned expected_frees)

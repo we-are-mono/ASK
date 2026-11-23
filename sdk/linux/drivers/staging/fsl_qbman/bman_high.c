@@ -374,45 +374,6 @@ struct bman_portal *bman_create_affine_slave(struct bman_portal *redirect,
 #endif
 }
 
-void bman_destroy_portal(struct bman_portal *bm)
-{
-	const struct bm_portal_config *pcfg;
-	pcfg = bm->config;
-	bm_rcr_cce_update(&bm->p);
-	bm_rcr_cce_update(&bm->p);
-
-	free_irq(pcfg->public_cfg.irq, bm);
-
-	kfree(bm->pools);
-	bm_isr_finish(&bm->p);
-	bm_mc_finish(&bm->p);
-	bm_rcr_finish(&bm->p);
-	bm->config = NULL;
-	if (bm->alloced)
-		kfree(bm);
-}
-
-const struct bm_portal_config *bman_destroy_affine_portal(void)
-{
-	struct bman_portal *bm = get_raw_affine_portal();
-	const struct bm_portal_config *pcfg;
-#ifdef CONFIG_FSL_DPA_PORTAL_SHARE
-	if (bm->sharing_redirect) {
-		bm->sharing_redirect = NULL;
-		put_affine_portal();
-		return NULL;
-	}
-	bm->is_shared = 0;
-#endif
-	pcfg = bm->config;
-	bman_destroy_portal(bm);
-	spin_lock(&affine_mask_lock);
-	cpumask_clear_cpu(pcfg->public_cfg.cpu, &affine_mask);
-	spin_unlock(&affine_mask_lock);
-	put_affine_portal();
-	return pcfg;
-}
-
 /* When release logic waits on available RCR space, we need a global waitqueue
  * in the case of "affine" use (as the waits wake on different cpus which means
  * different portals - so we can't wait on any per-portal waitqueue). */

@@ -41,22 +41,6 @@
 #include "list_ext.h"
 
 
-void LIST_Append(t_List *p_NewList, t_List *p_Head)
-{
-    t_List *p_First = LIST_FIRST(p_NewList);
-
-    if (p_First != p_NewList)
-    {
-        t_List *p_Last  = LIST_LAST(p_NewList);
-        t_List *p_Cur   = LIST_NEXT(p_Head);
-
-        LIST_PREV(p_First) = p_Head;
-        LIST_FIRST(p_Head) = p_First;
-        LIST_NEXT(p_Last)  = p_Cur;
-        LIST_LAST(p_Cur)   = p_Last;
-    }
-}
-
 
 int LIST_NumOfObjs(t_List *p_List)
 {

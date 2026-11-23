@@ -125,20 +125,6 @@ t_Error  FM_MURAM_Free(t_Handle h_FmMuram);
 void  * FM_MURAM_AllocMem(t_Handle h_FmMuram, uint32_t size, uint32_t align);
 
 /**************************************************************************//**
- @Function      FM_MURAM_AllocMemForce
-
- @Description   Allocate some specific memory from FM-MURAM partition (according
-                to base).
-
- @Param[in]     h_FmMuram - FM-MURAM module descriptor.
- @Param[in]     base      - the desired base-address to be allocated.
- @Param[in]     size      - size of the memory to be allocated.
-
- @Return        address of the allocated memory; NULL otherwise.
-*//***************************************************************************/
-void  * FM_MURAM_AllocMemForce(t_Handle h_FmMuram, uint64_t base, uint32_t size);
-
-/**************************************************************************//**
  @Function      FM_MURAM_FreeMem
 
  @Description   Free an allocated memory from FM-MURAM partition.

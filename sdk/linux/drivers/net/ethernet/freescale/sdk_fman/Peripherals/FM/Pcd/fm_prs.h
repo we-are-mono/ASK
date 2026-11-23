@@ -227,7 +227,6 @@ t_Handle PrsConfig(t_FmPcd *p_FmPcd,t_FmPcdParams *p_FmPcdParams);
 t_Error PrsInit(t_FmPcd *p_FmPcd);
 void PrsEnable(t_FmPcd *p_FmPcd);
 void PrsDisable(t_FmPcd *p_FmPcd);
-int PrsIsEnabled(t_FmPcd *p_FmPcd);
 void PrsFree(t_FmPcd *p_FmPcd);
 t_Error PrsIncludePortInStatistics(t_FmPcd *p_FmPcd, uint8_t hardwarePortId,
 				   bool include);

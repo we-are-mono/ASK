@@ -307,41 +307,6 @@ t_Error FM_PCD_Free(t_Handle h_FmPcd);
 *//***************************************************************************/
 
 /**************************************************************************//**
- @Function      FM_PCD_ConfigException
-
- @Description   Calling this routine changes the internal driver data base
-                from its default selection of exceptions enabling.
-                [DEFAULT_numOfSharedPlcrProfiles].
-
- @Param[in]     h_FmPcd         FM PCD module descriptor.
- @Param[in]     exception       The exception to be selected.
- @Param[in]     enable          TRUE to enable interrupt, FALSE to mask it.
-
- @Return        E_OK on success; Error code otherwise.
-
- @Cautions      This routine should NOT be called from guest-partition
-                (i.e. guestId != NCSW_MASTER_ID)
-*//***************************************************************************/
-t_Error FM_PCD_ConfigException(t_Handle h_FmPcd, e_FmPcdExceptions exception, bool enable);
-
-/**************************************************************************//**
- @Function      FM_PCD_ConfigHcFramesDataMemory
-
- @Description   Configures memory-partition-id for FMan-Controller Host-Command
-                frames. Calling this routine changes the internal driver data
-                base from its default configuration [0].
-
- @Param[in]     h_FmPcd         FM PCD module descriptor.
- @Param[in]     memId           Memory partition ID.
-
- @Return        E_OK on success; Error code otherwise.
-
- @Cautions      This routine may be called only if 'useHostCommand' was TRUE
-                when FM_PCD_Config() routine was called.
-*//***************************************************************************/
-t_Error FM_PCD_ConfigHcFramesDataMemory(t_Handle h_FmPcd, uint8_t memId);
-
-/**************************************************************************//**
  @Function      FM_PCD_ConfigPlcrNumOfSharedProfiles
 
  @Description   Calling this routine changes the internal driver data base
@@ -355,41 +320,6 @@ t_Error FM_PCD_ConfigHcFramesDataMemory(t_Handle h_FmPcd, uint8_t memId);
  @Return        E_OK on success; Error code otherwise.
 *//***************************************************************************/
 t_Error FM_PCD_ConfigPlcrNumOfSharedProfiles(t_Handle h_FmPcd, uint16_t numOfSharedPlcrProfiles);
-
-/**************************************************************************//**
- @Function      FM_PCD_ConfigPlcrAutoRefreshMode
-
- @Description   Calling this routine changes the internal driver data base
-                from its default selection of exceptions enablement.
-                By default auto-refresh is [DEFAULT_plcrAutoRefresh].
-
- @Param[in]     h_FmPcd         FM PCD module descriptor.
- @Param[in]     enable          TRUE to enable, FALSE to disable
-
- @Return        E_OK on success; Error code otherwise.
-
- @Cautions      This routine should NOT be called from guest-partition
-                (i.e. guestId != NCSW_MASTER_ID)
-*//***************************************************************************/
-t_Error FM_PCD_ConfigPlcrAutoRefreshMode(t_Handle h_FmPcd, bool enable);
-
-/**************************************************************************//**
- @Function      FM_PCD_ConfigPrsMaxCycleLimit
-
- @Description   Calling this routine changes the internal data structure for
-                the maximum parsing time from its default value
-                [DEFAULT_MAX_PRS_CYC_LIM].
-
- @Param[in]     h_FmPcd         FM PCD module descriptor.
- @Param[in]     value           0 to disable the mechanism, or new
-                                maximum parsing time.
-
- @Return        E_OK on success; Error code otherwise.
-
- @Cautions      This routine should NOT be called from guest-partition
-                (i.e. guestId != NCSW_MASTER_ID)
-*//***************************************************************************/
-t_Error FM_PCD_ConfigPrsMaxCycleLimit(t_Handle h_FmPcd,uint16_t value);
 
 /** @} */ /* end of FM_PCD_advanced_cfg_grp group */
 /** @} */ /* end of FM_PCD_init_grp group */

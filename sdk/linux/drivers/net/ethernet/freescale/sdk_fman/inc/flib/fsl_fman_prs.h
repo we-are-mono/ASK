@@ -96,7 +96,6 @@ void fman_prs_defconfig(struct fman_prs_cfg *cfg);
 int fman_prs_init(struct fman_prs_regs *regs, struct fman_prs_cfg *cfg);
 void fman_prs_enable(struct fman_prs_regs *regs);
 void fman_prs_disable(struct fman_prs_regs *regs);
-int fman_prs_is_enabled(struct fman_prs_regs *regs);
 void fman_prs_set_stst_port_msk(struct fman_prs_regs *regs, uint32_t pid_msk);
 void fman_prs_set_stst(struct fman_prs_regs *regs, bool enable);
 #endif /* __FSL_FMAN_PRS_H */

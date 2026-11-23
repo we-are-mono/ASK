@@ -1391,26 +1391,6 @@ t_Error FmPcdPlcrGetAbsoluteIdByProfileParams(t_Handle                      h_Fm
     return E_OK;
 }
 
-uint16_t FmPcdPlcrGetPortProfilesBase(t_Handle h_FmPcd, uint8_t hardwarePortId)
-{
-    t_FmPcd         *p_FmPcd = (t_FmPcd *)h_FmPcd;
-    uint16_t        swPortIndex = 0;
-
-    HW_PORT_ID_TO_SW_PORT_INDX(swPortIndex, hardwarePortId);
-
-    return p_FmPcd->p_FmPcdPlcr->portsMapping[swPortIndex].profilesBase;
-}
-
-uint16_t FmPcdPlcrGetPortNumOfProfiles(t_Handle h_FmPcd, uint8_t hardwarePortId)
-{
-    t_FmPcd         *p_FmPcd = (t_FmPcd *)h_FmPcd;
-    uint16_t        swPortIndex = 0;
-
-    HW_PORT_ID_TO_SW_PORT_INDX(swPortIndex, hardwarePortId);
-
-    return p_FmPcd->p_FmPcdPlcr->portsMapping[swPortIndex].numOfProfiles;
-
-}
 uint32_t FmPcdPlcrBuildWritePlcrActionReg(uint16_t absoluteProfileId)
 {
     return (uint32_t)(FM_PCD_PLCR_PAR_GO |
@@ -1422,15 +1402,6 @@ uint32_t FmPcdPlcrBuildWritePlcrActionRegs(uint16_t absoluteProfileId)
     return (uint32_t)(FM_PCD_PLCR_PAR_GO |
                       ((uint32_t)absoluteProfileId << FM_PCD_PLCR_PAR_PNUM_SHIFT) |
                       FM_PCD_PLCR_PAR_PWSEL_MASK);
-}
-
-bool    FmPcdPlcrHwProfileIsValid(uint32_t profileModeReg)
-{
-
-    if (profileModeReg & FM_PCD_PLCR_PEMODE_PI)
-        return TRUE;
-    else
-        return FALSE;
 }
 
 uint32_t FmPcdPlcrBuildReadPlcrActionReg(uint16_t absoluteProfileId)
@@ -1493,22 +1464,6 @@ void FmPcdPlcrUpdateRequiredAction(t_Handle h_FmPcd, uint16_t absoluteProfileId,
 /**************************************************/
 /*............Policer API.........................*/
 /**************************************************/
-
-t_Error FM_PCD_ConfigPlcrAutoRefreshMode(t_Handle h_FmPcd, bool enable)
-{
-   t_FmPcd *p_FmPcd = (t_FmPcd*)h_FmPcd;
-
-    SANITY_CHECK_RETURN_ERROR(p_FmPcd, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(p_FmPcd->p_FmPcdDriverParam, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(p_FmPcd->p_FmPcdPlcr, E_INVALID_HANDLE);
-
-    if (!FmIsMaster(p_FmPcd->h_Fm))
-        RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("FM_PCD_ConfigPlcrAutoRefreshMode - guest mode!"));
-
-    p_FmPcd->p_FmPcdDriverParam->plcrAutoRefresh = enable;
-
-    return E_OK;
-}
 
 t_Error FM_PCD_ConfigPlcrNumOfSharedProfiles(t_Handle h_FmPcd, uint16_t numOfSharedPlcrProfiles)
 {

@@ -231,15 +231,8 @@ struct qman_portal *qman_create_affine_portal(
 			bool need_cleanup);
 struct qman_portal *qman_create_affine_slave(struct qman_portal *redirect,
 								int cpu);
-const struct qm_portal_config *qman_destroy_affine_portal(void);
-void qman_destroy_portal(struct qman_portal *qm);
 void qman_enable_irqs(void);
 
-/* Hooks from fsl_usdpaa.c to qman_driver.c */
-struct qm_portal_config *qm_get_unused_portal(void);
-struct qm_portal_config *qm_get_unused_portal_idx(uint32_t idx);
-
-void qm_put_unused_portal(struct qm_portal_config *pcfg);
 void qm_set_liodns(struct qm_portal_config *pcfg);
 
 /* This CGR feature is supported by h/w and required by unit-tests and the

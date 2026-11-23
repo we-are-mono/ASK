@@ -514,38 +514,6 @@ t_Error FmHcFree(t_Handle h_FmHc)
     return E_OK;
 }
 
-/*****************************************************************************/
-t_Error FmHcSetFramesDataMemory(t_Handle h_FmHc,
-                                uint8_t  memId)
-{
-    t_FmHc  *p_FmHc = (t_FmHc*)h_FmHc;
-    int     i;
-    t_Error err;
-
-    SANITY_CHECK_RETURN_ERROR(p_FmHc, E_INVALID_HANDLE);
-
-    err = FmHcQuiesce(p_FmHc);
-    if (err)
-        return err;
-    p_FmHc->dataMemId            = memId;
-
-    for (i=0; i<HC_CMD_POOL_SIZE; i++)
-        if (p_FmHc->p_Frm[i])
-        {
-            XX_FreeSmart(p_FmHc->p_Frm[i]);
-            p_FmHc->p_Frm[i] = NULL;
-        }
-
-    err = FillBufPool(p_FmHc);
-    if (!err)
-    {
-        uint32_t flags = HcLock(p_FmHc);
-        p_FmHc->quiescing = FALSE;
-        HcUnlock(p_FmHc, flags);
-    }
-    return err;
-}
-
 void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
 {
     t_FmHc      *p_FmHc = (t_FmHc*)h_FmHc;
@@ -925,44 +893,6 @@ t_Error FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t  grpId)
     XX_Free(p_ClsPlanSet);
     FmPcdKgDestroyClsPlanGrp(p_FmHc->h_FmPcd, grpId);
 
-    return E_OK;
-}
-
-t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragScratchPoolCmdParams *p_FmPcdCcFragScratchPoolCmdParams)
-{
-    t_FmHc                              *p_FmHc = (t_FmHc*)h_FmHc;
-    t_HcFrame                           *p_HcFrame;
-    t_DpaaFD                            fmFd;
-    t_Error                             err;
-    uint32_t                            seqNum;
-
-    SANITY_CHECK_RETURN_VALUE(h_FmHc, E_INVALID_HANDLE,0);
-
-    p_HcFrame = GetBuf(p_FmHc, &seqNum);
-    if (!p_HcFrame)
-        RETURN_ERROR(MINOR, E_NO_MEMORY, ("HC Frame object"));
-
-    memset(p_HcFrame, 0, sizeof(t_HcFrame));
-
-    p_HcFrame->opcode     = (uint32_t)(HC_HCOR_GBL | HC_HCOR_OPCODE_CC_IP_FRAG_INITIALIZATION);
-    p_HcFrame->actionReg  = (uint32_t)(((fill == TRUE) ? 0 : 1) << HC_HCOR_ACTION_REG_IP_FRAG_SCRATCH_POOL_CMD_SHIFT);
-    p_HcFrame->actionReg |= p_FmPcdCcFragScratchPoolCmdParams->bufferPoolId << HC_HCOR_ACTION_REG_IP_FRAG_SCRATCH_POOL_BPID;
-    if (fill == TRUE)
-    {
-        p_HcFrame->extraReg   = p_FmPcdCcFragScratchPoolCmdParams->numOfBuffers;
-    }
-    p_HcFrame->commandSequence = seqNum;
-
-    BUILD_FD(sizeof(t_HcFrame));
-    if ((err = EnQFrm(p_FmHc, &fmFd, seqNum)) != E_OK)
-    {
-        PutBuf(p_FmHc, p_HcFrame, seqNum);
-        RETURN_ERROR(MINOR, err, NO_MSG);
-    }
-
-    p_FmPcdCcFragScratchPoolCmdParams->numOfBuffers = p_HcFrame->extraReg;
-
-    PutBuf(p_FmHc, p_HcFrame, seqNum);
     return E_OK;
 }
 
@@ -1398,12 +1328,6 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
         return ERROR_CODE(err);
 
     return E_OK;
-}
-
-t_Handle    FmHcGetPort(t_Handle h_FmHc)
-{
-    t_FmHc *p_FmHc = (t_FmHc*)h_FmHc;
-    return p_FmHc->h_HcPortDev;
 }
 
 t_Error FmAllowHcUsage(t_Handle h_FmHc, bool allow)

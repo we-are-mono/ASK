@@ -56,7 +56,7 @@
 /**************************************************************************//**
  @Group         sprint_id Sprint
 
- @Description   Sprint & Sscan module functions,definitions and enums.
+ @Description   Sprint module functions,definitions and enums.
 
  @{
 *//***************************************************************************/
@@ -73,33 +73,6 @@
  @Return        Number of bytes formatted.
 *//***************************************************************************/
 int Sprint(char *buff, const char *str, ...);
-
-/**************************************************************************//**
- @Function      Snprint
-
- @Description   Format a string and place it in a buffer.
-
- @Param[in]     buf  - The buffer to place the result into.
- @Param[in]     size - The size of the buffer, including the trailing null space.
- @Param[in]     fmt  - The format string to use.
- @Param[in]     ...  - Arguments for the format string.
-
- @Return        Number of bytes formatted.
-*//***************************************************************************/
-int Snprint(char * buf, uint32_t size, const char *fmt, ...);
-
-/**************************************************************************//**
- @Function      Sscan
-
- @Description   Unformat a buffer into a list of arguments.
-
- @Param[in]     buf  - input buffer.
- @Param[in]     fmt  - formatting of buffer.
- @Param[out]    ...  - resulting arguments.
-
- @Return        Number of bytes unformatted.
-*//***************************************************************************/
-int Sscan(const char * buf, const char * fmt, ...);
 
 /** @} */ /* end of sprint_id group */
 /** @} */ /* end of etc_id group */

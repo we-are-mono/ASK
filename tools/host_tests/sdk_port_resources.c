@@ -248,35 +248,6 @@ int main(void)
     assert((f.qmi.fmqm_gc & 0xff) == QMI_MAX_NUM_OF_TNUMS - 1);
     released(&params);
 
-    /* Exercise the public FIFO API after its initialization parameters are
-     * gone, including TX/OH validation and cached values after refusal. */
-    e_FmPortType resize_types[] = {e_FM_PORT_TYPE_TX, e_FM_PORT_TYPE_TX_10G,
-                                   e_FM_PORT_TYPE_RX, e_FM_PORT_TYPE_OH_OFFLINE_PARSING};
-    uint8_t resize_ids[] = {BASE_1G_TX_PORTID, BASE_10G_TX_PORTID,
-                            BASE_1G_RX_PORTID, BASE_OH_PORTID};
-    for (unsigned i = 0; i < 4; i++) {
-        init();
-        params = request(resize_types[i], resize_ids[i]);
-        allocated(&params);
-        t_FmPort port = {.h_Fm = &f.fm, .hardwarePortId = params.hardwarePortId,
-            .portType = params.portType, .maxFrameLength = params.maxFrameLength,
-            .deqPipelineDepth = params.deqPipelineDepth, .fmRevInfo = f.state.revInfo,
-            .fifoBufs = {.num = params.sizeOfFifo, .extra = params.extraSizeOfFifo}};
-        t_FmPort before_port;
-        memcpy(&before_port, &port, sizeof(port));
-        memcpy(&saved, &f, sizeof(f));
-        unsigned count = writes;
-        t_FmPortRsrc resize = {.num = 4096};
-        f.state.totalFifoSize = 2048;
-        assert(FM_PORT_SetSizeOfFifo(&port, &resize) != E_OK);
-        assert(!memcmp(&port, &before_port, sizeof(port)) && writes == count);
-        f.state.totalFifoSize = saved.state.totalFifoSize;
-        assert(!memcmp(&saved, &f, sizeof(f)));
-        assert(FM_PORT_SetSizeOfFifo(&port, &resize) == E_OK);
-        assert(port.fifoBufs.num == resize.num && f.state.accumulatedFifoSize == resize.num);
-        released(&params); assert(!f.state.accumulatedFifoSize);
-    }
-
     /* A remote failure must not publish an uncommitted reply into input. */
     init();
     f.fm.guestId = 1; f.fm.h_IpcSessions[0] = &f;

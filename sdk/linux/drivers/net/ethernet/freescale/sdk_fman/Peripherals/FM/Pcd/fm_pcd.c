@@ -430,30 +430,6 @@ t_Error PcdGetClsPlanGrpParams(t_FmPcd *p_FmPcd, t_FmPcdKgInterModuleClsPlanGrpP
 
 }
 
-t_Error PcdGetVectorForOpt(t_FmPcd *p_FmPcd, uint8_t netEnvId, protocolOpt_t opt, uint32_t *p_Vector)
-{
-    uint8_t     j,k;
-
-    *p_Vector = 0;
-
-    ASSERT_COND(p_FmPcd);
-    for (j=0; ((j < FM_PCD_MAX_NUM_OF_DISTINCTION_UNITS) &&
-              (p_FmPcd->netEnvs[netEnvId].units[j].hdrs[0].hdr != HEADER_TYPE_NONE)); j++)
-    {
-        for (k=0; ((k < FM_PCD_MAX_NUM_OF_INTERCHANGEABLE_HDRS) &&
-                  (p_FmPcd->netEnvs[netEnvId].units[j].hdrs[k].hdr != HEADER_TYPE_NONE)); k++)
-        {
-            if (p_FmPcd->netEnvs[netEnvId].units[j].hdrs[k].opt == opt)
-                *p_Vector |= p_FmPcd->netEnvs[netEnvId].unitsVectors[j];
-        }
-    }
-
-    if (!*p_Vector)
-        RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("Requested option was not defined for this Network Environment Characteristics module"));
-    else
-        return E_OK;
-}
-
 t_Error PcdGetUnitsVector(t_FmPcd *p_FmPcd, t_NetEnvParams *p_Params)
 {
     int                     i;
@@ -1128,40 +1104,6 @@ t_Error FM_PCD_Free(t_Handle h_FmPcd)
     XX_Free(p_FmPcd);
 
     return E_OK;
-}
-
-t_Error FM_PCD_ConfigException(t_Handle h_FmPcd, e_FmPcdExceptions exception, bool enable)
-{
-    t_FmPcd         *p_FmPcd = (t_FmPcd*)h_FmPcd;
-    uint32_t        bitMask = 0;
-
-    SANITY_CHECK_RETURN_ERROR(p_FmPcd, E_INVALID_HANDLE);
-
-    if (p_FmPcd->guestId != NCSW_MASTER_ID)
-        RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("FM_PCD_ConfigException - guest mode!"));
-
-    GET_FM_PCD_EXCEPTION_FLAG(bitMask, exception);
-    if (bitMask)
-    {
-        if (enable)
-            p_FmPcd->exceptions |= bitMask;
-        else
-            p_FmPcd->exceptions &= ~bitMask;
-   }
-    else
-        RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("Undefined exception"));
-
-    return E_OK;
-}
-
-t_Error FM_PCD_ConfigHcFramesDataMemory(t_Handle h_FmPcd, uint8_t memId)
-{
-    t_FmPcd         *p_FmPcd = (t_FmPcd*)h_FmPcd;
-
-    SANITY_CHECK_RETURN_ERROR(p_FmPcd, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(p_FmPcd->h_Hc, E_INVALID_HANDLE);
-
-    return FmHcSetFramesDataMemory(p_FmPcd->h_Hc, memId);
 }
 
 t_Error FM_PCD_Enable(t_Handle h_FmPcd)
@@ -2148,8 +2090,3 @@ t_Error FM_PCD_ModifyCounter(t_Handle h_FmPcd, e_FmPcdCounters counter, uint32_t
     return E_OK;
 }
 
-t_Handle FM_PCD_GetHcPort(t_Handle h_FmPcd)
-{
-    t_FmPcd *p_FmPcd = (t_FmPcd*)h_FmPcd;
-    return FmHcGetPort(p_FmPcd->h_Hc);
-}

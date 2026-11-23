@@ -410,55 +410,6 @@ void fman_kg_init(struct fman_kg_regs *regs,
 void fman_kg_enable_scheme_interrupts(struct fman_kg_regs *regs);
 void fman_kg_enable(struct fman_kg_regs *regs);
 void fman_kg_disable(struct fman_kg_regs *regs);
-int fman_kg_write_bind_cls_plans(struct fman_kg_regs *regs,
-					uint8_t hwport_id,
-					uint32_t bind_cls_plans);
-int fman_kg_build_bind_cls_plans(uint8_t grp_base,
-					uint8_t grp_mask,
-					uint32_t *bind_cls_plans);
-int fman_kg_write_bind_schemes(struct fman_kg_regs *regs,
-				uint8_t hwport_id,
-				uint32_t schemes);
-int fman_kg_write_cls_plan(struct fman_kg_regs *regs,
-				uint8_t grp_id,
-				uint8_t entries_mask,
-				uint8_t hwport_id,
-				struct fman_kg_cp_regs *cls_plan_regs);
-int fman_kg_build_cls_plan(struct fman_kg_cls_plan_params *params,
-				struct fman_kg_cp_regs *cls_plan_regs);
-uint32_t fman_kg_get_schemes_total_counter(struct fman_kg_regs *regs);
-int fman_kg_set_scheme_counter(struct fman_kg_regs *regs,
-				uint8_t scheme_id,
-				uint8_t hwport_id,
-				uint32_t counter);
-int fman_kg_get_scheme_counter(struct fman_kg_regs *regs,
-				uint8_t scheme_id,
-				uint8_t hwport_id,
-				uint32_t *counter);
-int fman_kg_delete_scheme(struct fman_kg_regs *regs,
-				uint8_t scheme_id,
-				uint8_t hwport_id);
-int fman_kg_write_scheme(struct fman_kg_regs *regs,
-				uint8_t scheme_id,
-				uint8_t hwport_id,
-				struct fman_kg_scheme_regs *scheme_regs,
-				bool update_counter);
-int fman_kg_build_scheme(struct fman_kg_scheme_params *params,
-				struct fman_kg_scheme_regs *scheme_regs);
-void fman_kg_get_capture(struct fman_kg_regs *regs,
-				struct fman_kg_ex_ecc_attr *ecc_attr,
-				bool clear);
-void fman_kg_get_exception(struct fman_kg_regs *regs,
-				uint32_t *events,
-				uint32_t *scheme_ids,
-				bool clear);
-void fman_kg_set_exception(struct fman_kg_regs *regs,
-				uint32_t exception,
-				bool enable);
-void fman_kg_set_dflt_val(struct fman_kg_regs *regs,
-				uint8_t def_id,
-				uint32_t val);
-void fman_kg_set_data_after_prs(struct fman_kg_regs *regs, uint8_t offset);
 
 
 	

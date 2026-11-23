@@ -156,22 +156,6 @@ void  * FM_MURAM_AllocMem(t_Handle h_FmMuram, uint32_t size, uint32_t align)
 }
 EXPORT_SYMBOL(FM_MURAM_AllocMem);
 
-void  * FM_MURAM_AllocMemForce(t_Handle h_FmMuram, uint64_t base, uint32_t size)
-{
-    t_FmMuram   *p_FmMuram = ( t_FmMuram *)h_FmMuram;
-    uintptr_t   addr;
-
-    SANITY_CHECK_RETURN_VALUE(h_FmMuram, E_INVALID_HANDLE, NULL);
-    SANITY_CHECK_RETURN_VALUE(p_FmMuram->h_Mem, E_INVALID_HANDLE, NULL);
-
-    addr = (uintptr_t)MM_GetForce(p_FmMuram->h_Mem, base, size, "FM MURAM");
-
-    if (addr == ILLEGAL_BASE)
-        return NULL;
-
-    return UINT_TO_PTR(addr);
-}
-
 t_Error FM_MURAM_FreeMem(t_Handle h_FmMuram, void *ptr)
 {
     t_FmMuram   *p_FmMuram = ( t_FmMuram *)h_FmMuram;

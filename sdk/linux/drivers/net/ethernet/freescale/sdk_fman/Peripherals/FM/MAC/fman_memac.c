@@ -249,18 +249,6 @@ void fman_memac_set_exception(struct memac_regs *regs, uint32_t val, bool enable
     iowrite32be(tmp, &regs->imask);
 }
 
-void fman_memac_reset_filter_table(struct memac_regs *regs)
-{
-	uint32_t i;
-	for (i = 0; i < 64; i++)
-		iowrite32be(i & ~HASH_CTRL_MCAST_EN, &regs->hashtable_ctrl);
-}
-
-void fman_memac_set_hash_table_entry(struct memac_regs *regs, uint32_t crc)
-{
-	iowrite32be(crc | HASH_CTRL_MCAST_EN, &regs->hashtable_ctrl);
-}
-
 void fman_memac_set_hash_table(struct memac_regs *regs, uint32_t val)
 {
     iowrite32be(val, &regs->hashtable_ctrl);

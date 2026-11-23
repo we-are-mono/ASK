@@ -65,7 +65,6 @@ static struct qman_portal *shared_portals[NR_CPUS];
 static int num_shared_portals;
 static int shared_portals_idx;
 static LIST_HEAD(unused_pcfgs);
-static DEFINE_SPINLOCK(unused_pcfgs_lock);
 
 /* A SDQCR mask comprising all the available/visible pool channels */
 static u32 pools_sdqcr;
@@ -471,60 +470,12 @@ static struct qm_portal_config *get_pcfg(struct list_head *list)
 	return pcfg;
 }
 
-static struct qm_portal_config *get_pcfg_idx(struct list_head *list, u32 idx)
-{
-	struct qm_portal_config *pcfg;
-	if (list_empty(list))
-		return NULL;
-	list_for_each_entry(pcfg, list, list) {
-		if (pcfg->public_cfg.index == idx) {
-			list_del(&pcfg->list);
-			return pcfg;
-		}
-	}
-	return NULL;
-}
-
 static void portal_set_cpu(struct qm_portal_config *pcfg, int cpu)
 {
 #ifdef CONFIG_FSL_QMAN_CONFIG
 	if (qman_set_sdest(pcfg->public_cfg.channel, cpu))
 #endif
 		pr_warn("Failed to set QMan portal's stash request queue\n");
-}
-
-struct qm_portal_config *qm_get_unused_portal_idx(u32 idx)
-{
-	struct qm_portal_config *ret;
-	spin_lock(&unused_pcfgs_lock);
-	if (idx == QBMAN_ANY_PORTAL_IDX)
-		ret = get_pcfg(&unused_pcfgs);
-	else
-		ret = get_pcfg_idx(&unused_pcfgs, idx);
-	spin_unlock(&unused_pcfgs_lock);
-	/* Bind stashing LIODNs to the CPU we are currently executing on, and
-	 * set the portal to use the stashing request queue corresonding to the
-	 * cpu as well. The user-space driver assumption is that the pthread has
-	 * to already be affine to one cpu only before opening a portal. If that
-	 * check is circumvented, the only risk is a performance degradation -
-	 * stashing will go to whatever cpu they happened to be running on when
-	 * opening the device file, and if that isn't the cpu they subsequently
-	 * bind to and do their polling on, tough. */
-	if (ret)
-		portal_set_cpu(ret, hard_smp_processor_id());
-	return ret;
-}
-
-struct qm_portal_config *qm_get_unused_portal(void)
-{
-	return qm_get_unused_portal_idx(QBMAN_ANY_PORTAL_IDX);
-}
-
-void qm_put_unused_portal(struct qm_portal_config *pcfg)
-{
-	spin_lock(&unused_pcfgs_lock);
-	list_add(&pcfg->list, &unused_pcfgs);
-	spin_unlock(&unused_pcfgs_lock);
 }
 
 static struct qman_portal *init_pcfg(struct qm_portal_config *pcfg,

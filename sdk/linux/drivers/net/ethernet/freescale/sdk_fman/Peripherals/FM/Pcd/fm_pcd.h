@@ -374,7 +374,6 @@ typedef uint8_t t_FmPcdFrmReplicUpdateType;
 /*  PCD internal routines                                              */
 /***********************************************************************/
 
-t_Error     PcdGetVectorForOpt(t_FmPcd *p_FmPcd, uint8_t netEnvId, protocolOpt_t opt, uint32_t *p_Vector);
 t_Error     PcdGetUnitsVector(t_FmPcd *p_FmPcd, t_NetEnvParams *p_Params);
 bool        PcdNetEnvIsUnitWithoutOpts(t_FmPcd *p_FmPcd, uint8_t netEnvId, uint32_t unitVector);
 t_Error     PcdGetClsPlanGrpParams(t_FmPcd *p_FmPcd, t_FmPcdKgInterModuleClsPlanGrpParams *p_GrpParams);
@@ -418,9 +417,6 @@ t_Error     PlcrSetPortProfiles(t_FmPcd    *p_FmPcd,
 t_Error     PlcrClearPortProfiles(t_FmPcd *p_FmPcd, uint8_t hardwarePortId);
 
 t_Error     FmPcdCcGetGrpParams(t_Handle treeId, uint8_t grpId, uint32_t *p_GrpBits, uint8_t *p_GrpBase);
-uint8_t     FmPcdCcGetOffset(t_Handle h_CcNode);
-uint8_t     FmPcdCcGetParseCode(t_Handle h_CcNode);
-uint16_t    FmPcdCcGetNumOfKeys(t_Handle h_CcNode);
 t_Error     ValidateNextEngineParams(t_Handle h_FmPcd, t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams, e_FmPcdCcStatsMode supportedStatsMode);
 
 void        FmPcdManipUpdateOwner(t_Handle h_Manip, bool add);
@@ -436,11 +432,6 @@ void *      FrmReplicGroupGetSourceTableDescriptor(t_Handle h_ReplicGroup);
 void        FrmReplicGroupUpdateOwner(t_Handle h_ReplicGroup, bool add);
 void        FrmReplicGroupUpdateAd(t_Handle h_ReplicGroup, void *p_Ad, t_Handle *h_AdNew);
 
-void        FmPcdCcGetAdTablesThatPointOnReplicGroup(t_Handle   h_Node,
-                                                     t_Handle   h_ReplicGroup,
-                                                     t_List     *p_AdTables,
-                                                     uint32_t   *p_NumOfAdTables);
-
 void EnqueueNodeInfoToRelevantLst(t_List *p_List, t_CcNodeInformation *p_CcInfo, t_Handle h_Spinlock);
 void DequeueNodeInfoFromRelevantLst(t_List *p_List, t_Handle h_Info, t_Handle h_Spinlock);
 t_CcNodeInformation* FindNodeInfoInReleventLst(t_List *p_List, t_Handle h_Info, t_Handle h_Spinlock);
@@ -453,9 +444,6 @@ typedef struct
     uint16_t    tableSize;
     bool        parseAfterHm;
 } t_FmPcdManipHmCcParams;
-
-void FmPcdManipLocalHMGetParams(t_Handle h_Manip, t_FmPcdManipHmCcParams *p_Params, t_Handle *h_ManipIter);
-void FmPcdManipGetInternaltHmTdAndNonHmAd(t_Handle h_Manip, t_Handle *p_InernalHmtd, t_Handle *p_NonHmAd);
 
 typedef struct
 {
@@ -539,7 +527,5 @@ static __inline__ void FmPcdLockUnlock(t_FmPcdLock *p_Lock)
     ASSERT_COND(p_Lock);
     p_Lock->flag = FALSE;
 }
-
-t_Handle FM_PCD_GetHcPort(t_Handle h_FmPcd);
 
 #endif /* __FM_PCD_H */

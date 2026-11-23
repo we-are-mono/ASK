@@ -33,22 +33,6 @@
 
 #include "fsl_fman_sp.h"
 
-uint32_t fman_vsp_get_statistics(struct fm_pcd_storage_profile_regs   *regs,
-                    uint16_t                      index)
-{
-    struct fm_pcd_storage_profile_regs *sp_regs;
-    sp_regs = &regs[index];
-    return ioread32be(&sp_regs->fm_sp_acnt);
-}
-
-void fman_vsp_set_statistics(struct fm_pcd_storage_profile_regs *regs,
-            uint16_t index,	uint32_t value)
-{
-    struct fm_pcd_storage_profile_regs *sp_regs;
-    sp_regs = &regs[index];
-    iowrite32be(value, &sp_regs->fm_sp_acnt);
-}
-
 void fman_vsp_defconfig(struct fm_storage_profile_params *cfg)
 {
     cfg->dma_swap_data =

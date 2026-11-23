@@ -552,45 +552,18 @@ int fman_port_disable(const struct fman_port *port);
 bool fman_port_is_stopped(const struct fman_port *port);
 int fman_port_set_bpools(const struct fman_port *port,
 		const struct fman_port_bpools *bp);
-int fman_port_set_rate_limiter(struct fman_port *port,
-		struct fman_port_rate_limiter *rate_limiter);
-int fman_port_delete_rate_limiter(struct fman_port *port);
-int fman_port_set_err_mask(struct fman_port *port, uint32_t err_mask);
 int fman_port_set_discard_mask(struct fman_port *port, uint32_t discard_mask);
 int fman_port_modify_rx_fd_bits(struct fman_port *port,
 		uint8_t rx_fd_bits,
 		bool add);
 int fman_port_set_perf_cnt_params(struct fman_port *port,
 		struct fman_port_perf_cnt_params *params);
-int fman_port_set_stats_cnt_mode(struct fman_port *port, bool enable);
-int fman_port_set_perf_cnt_mode(struct fman_port *port, bool enable);
-int fman_port_set_queue_cnt_mode(struct fman_port *port, bool enable);
-int fman_port_set_bpool_cnt_mode(struct fman_port *port,
-		uint8_t bpid,
-		bool enable);
 uint32_t fman_port_get_stats_counter(struct fman_port *port,
 		enum fman_port_stats_counters counter);
-void fman_port_set_stats_counter(struct fman_port *port,
-		enum fman_port_stats_counters counter,
-		uint32_t value);
 uint32_t fman_port_get_perf_counter(struct fman_port *port,
 		enum fman_port_perf_counters counter);
-void fman_port_set_perf_counter(struct fman_port *port,
-		enum fman_port_perf_counters counter,
-		uint32_t value);
 uint32_t fman_port_get_qmi_counter(struct fman_port *port,
 		enum fman_port_qmi_counters counter);
-void fman_port_set_qmi_counter(struct fman_port *port,
-		enum fman_port_qmi_counters counter,
-		uint32_t value);
-uint32_t fman_port_get_bpool_counter(struct fman_port *port, uint8_t bpid);
-void fman_port_set_bpool_counter(struct fman_port *port,
-		uint8_t bpid,
-		uint32_t value);
-int fman_port_add_congestion_grps(struct fman_port *port,
-		uint32_t grps_map[FMAN_PORT_CG_MAP_NUM]);
-int fman_port_remove_congestion_grps(struct fman_port  *port,
-		uint32_t grps_map[FMAN_PORT_CG_MAP_NUM]);
 
 
 #endif /* __FSL_FMAN_PORT_H */

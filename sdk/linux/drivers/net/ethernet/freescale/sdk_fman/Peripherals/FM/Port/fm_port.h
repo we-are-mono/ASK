@@ -875,9 +875,6 @@ typedef struct {
     uint8_t                     dfltRelativeId;
     e_FmPortGprFuncType         gprFunc;
     t_FmPcdCtrlParamsPage       *p_ParamsPage;
-    bool						supportFE;
-    uintptr_t                   internalFEBufferPoolManagementIndexAddr;
-    uintptr_t                   internalFEBufferPoolAddr;
     t_FmPortDriverParam         *p_FmPortDriverParam;
 } t_FmPort;
 
@@ -893,12 +890,7 @@ t_Error FmPortImDisable (t_FmPort *p_FmPort);
 t_Error FmPortImRx      (t_FmPort *p_FmPort);
 
 void    FmPortSetMacsecLcv(t_Handle h_FmPort);
-void    FmPortSetMacsecCmd(t_Handle h_FmPort, uint8_t dfltSci);
 
-
-t_Error FM_PORT_SetNumOfOpenDmas(t_Handle h_FmPort, t_FmPortRsrc *p_NumOfOpenDmas);
-t_Error FM_PORT_SetNumOfTasks(t_Handle h_FmPort, t_FmPortRsrc *p_NumOfTasks);
-t_Error FM_PORT_SetSizeOfFifo(t_Handle h_FmPort, t_FmPortRsrc *p_SizeOfFifo);
 
 static __inline__ uint8_t * BdBufferGet (t_PhysToVirt *f_PhysToVirt, t_FmImBd *p_Bd)
 {

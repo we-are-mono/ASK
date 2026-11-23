@@ -476,7 +476,6 @@ int main(void)
     FreeEnEhashInfo(table(&pcd));
     assert(!allocations);
     assert(FM_PCD_CcRootModifyNextEngine((void *)1, 0, 0, (void *)1) == E_NOT_SUPPORTED);
-    assert(FmPcdCcModifyNextEngineParamTree((void *)1, (void *)1, 0, 0, (void *)1) == E_NOT_SUPPORTED);
     check_quarantine();
     check_abandoned();
     assert(!allocations);

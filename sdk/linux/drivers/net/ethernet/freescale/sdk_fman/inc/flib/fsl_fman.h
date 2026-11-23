@@ -696,19 +696,15 @@ uint32_t fman_get_ctrl_intr(struct fman_fpm_regs *fpm_rg,
 uint8_t fman_get_qmi_deq_th(struct fman_qmi_regs *qmi_rg);
 uint8_t fman_get_qmi_enq_th(struct fman_qmi_regs *qmi_rg);
 uint16_t fman_get_size_of_fifo(struct fman_bmi_regs *bmi_rg, uint8_t port_id);
-uint32_t fman_get_total_fifo_size(struct fman_bmi_regs *bmi_rg);
 uint16_t fman_get_size_of_extra_fifo(struct fman_bmi_regs *bmi_rg,
 				uint8_t port_id);
 uint8_t fman_get_num_of_tasks(struct fman_bmi_regs *bmi_rg, uint8_t port_id);
-uint8_t fman_get_num_extra_tasks(struct fman_bmi_regs *bmi_rg,
-				uint8_t port_id);
 uint8_t fman_get_num_of_dmas(struct fman_bmi_regs *bmi_rg, uint8_t port_id);
 uint8_t fman_get_num_extra_dmas(struct fman_bmi_regs *bmi_rg,
 				uint8_t port_id);
 uint32_t fman_get_normal_pending(struct fman_fpm_regs *fpm_rg);
 uint32_t fman_get_controller_event(struct fman_fpm_regs *fpm_rg,
 					uint8_t reg_id);
-uint32_t fman_get_error_pending(struct fman_fpm_regs *fpm_rg);
 void fman_get_revision(struct fman_fpm_regs *fpm_rg, uint8_t *major,
 				uint8_t *minor);
 uint32_t fman_get_counter(struct fman_rg *fman_rg,
@@ -716,7 +712,6 @@ uint32_t fman_get_counter(struct fman_rg *fman_rg,
 uint32_t fman_get_dma_status(struct fman_dma_regs *dma_rg);
 
 
-int fman_set_erratum_10gmac_a004_wa(struct fman_fpm_regs *fpm_rg);
 void fman_set_ctrl_intr(struct fman_fpm_regs *fpm_rg, uint8_t event_reg_id,
 				uint32_t enable_events);
 void fman_set_num_of_riscs_per_port(struct fman_fpm_regs *fpm_rg,
@@ -746,13 +741,9 @@ void fman_set_num_of_open_dmas(struct fman_bmi_regs *bmi_rg,
 				uint8_t num_of_open_dmas,
 				uint8_t num_of_extra_open_dmas,
 				uint8_t total_num_of_dmas);
-void fman_set_ports_bandwidth(struct fman_bmi_regs *bmi_rg, uint8_t *weights);
 int fman_set_exception(struct fman_rg *fman_rg,
 				enum fman_exceptions exception,
 				bool enable);
-void fman_set_dma_emergency(struct fman_dma_regs *dma_rg, bool is_write,
-				bool enable);
-void fman_set_dma_ext_bus_pri(struct fman_dma_regs *dma_rg, uint32_t pri);
 void fman_set_congestion_group_pfc_priority(uint32_t *cpg_rg,
                                             uint32_t congestion_group_id,
                                             uint8_t piority_bit_map,
@@ -760,14 +751,12 @@ void fman_set_congestion_group_pfc_priority(uint32_t *cpg_rg,
 
 
 void fman_defconfig(struct fman_cfg *cfg, bool is_master);
-void fman_regconfig(struct fman_rg *fman_rg, struct fman_cfg *cfg);
 int fman_fpm_init(struct fman_fpm_regs *fpm_rg, struct fman_cfg *cfg);
 int fman_bmi_init(struct fman_bmi_regs *bmi_rg, struct fman_cfg *cfg);
 int fman_qmi_init(struct fman_qmi_regs *qmi_rg, struct fman_cfg *cfg);
 int fman_dma_init(struct fman_dma_regs *dma_rg, struct fman_cfg *cfg);
 void fman_free_resources(struct fman_rg *fman_rg);
 int fman_enable(struct fman_rg *fman_rg, struct fman_cfg *cfg);
-void fman_reset(struct fman_fpm_regs *fpm_rg);
 void fman_resume(struct fman_fpm_regs *fpm_rg);
 
 
@@ -782,11 +771,6 @@ int fman_reset_mac(struct fman_fpm_regs *fpm_rg, uint8_t macId, bool is_10g);
 bool fman_is_port_stalled(struct fman_fpm_regs *fpm_rg, uint8_t port_id);
 bool fman_rams_ecc_is_external_ctl(struct fman_fpm_regs *fpm_rg);
 bool fman_is_qmi_halt_not_busy_state(struct fman_qmi_regs *qmi_rg);
-int fman_modify_counter(struct fman_rg *fman_rg,
-				enum fman_counters reg_name,
-				uint32_t val);
-void fman_force_intr(struct fman_rg *fman_rg,
-				enum fman_exceptions exception);
 void fman_set_vsp_window(struct fman_bmi_regs *bmi_rg,
 			    	     uint8_t port_id,
 				         uint8_t base_storage_profile,

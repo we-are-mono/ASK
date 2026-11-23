@@ -40,7 +40,6 @@ def test_sdk_port_pcd(tmp_path, unit):
         source = (sdk / "Peripherals/FM/Port/fm_port.c").read_text()
         production = "\n".join(function(source, name) for name in [
             "FmPortDriverParamFree", "FM_PORT_Init", "FM_PORT_Free",
-            "FM_PORT_ConfigFifoDeqPipelineDepth",
         ])
     elif unit in ("port_pcd", "port_api"):
         source = (sdk / "Peripherals/FM/Port/fm_port.c").read_text()
@@ -51,12 +50,10 @@ def test_sdk_port_pcd(tmp_path, unit):
             production += function(source, "FmPortGetSetCcParams").replace(
                 "t_Error FmPortGetSetCcParams(", "static t_Error RealGetSetCcParams(")
             production += "\n".join(function(source, name) for name in [
-                "FmPortSetGprFunc", "FmPortSetFESupport", "FmPortDeleteFESupport",
+                "FmPortSetGprFunc",
                 "FM_PORT_Free", "AttachPCD", "DetachPCDEntry", "DetachPCDActions", "DetachPCD",
-                "FM_PORT_AttachPCD", "FM_PORT_DetachPCD", "FM_PORT_BypassPCD",
+                "FM_PORT_DetachPCD", "FM_PORT_BypassPCD",
                 "FM_PORT_ConfigureMuramPage", "DeletePortPcd", "FM_PORT_SetPCD", "FM_PORT_DeletePCD",
-                "FM_PORT_PcdKgBindSchemes", "FM_PORT_PcdKgUnbindSchemes",
-                "FM_PORT_PcdCcModifyTree",
             ])
     else:
         source = (sdk / "Peripherals/FM/Pcd/fm_kg.c").read_text()

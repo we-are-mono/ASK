@@ -22,7 +22,7 @@ def test_sdk_hc_transport(tmp_path):
         qman[qman.index("struct qm_fd {"):qman.index("#define QM_FD_DD_NULL")])
     (tmp_path / "hc_production.inc").write_text("\n".join(function(hc, name) for name in [
         "FillBufPool", "GetBuf", "PutBuf", "EnQFrm", "FmHcQuiesce", "FmHcFree",
-        "FmHcSetFramesDataMemory", "FmHcTxConf", "FmHcPcdSync", "FmHcPcdCcDoDynamicChange",
+        "FmHcTxConf", "FmHcPcdSync", "FmHcPcdCcDoDynamicChange",
         "FmAllowHcUsage", "FmIsHcUsageAllowed",
     ]))
     wait = re.search(r"^#define HC_ENQUEUE_WAIT_NS\b.*$", wrapper, re.M)

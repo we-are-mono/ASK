@@ -2776,30 +2776,6 @@ uint8_t FmPcdKgGetRelativeSchemeId(t_Handle h_FmPcd, uint8_t schemeId)
     return FM_PCD_KG_NUM_OF_SCHEMES;
 }
 
-t_Handle FmPcdKgGetSchemeHandle(t_Handle h_FmPcd, uint8_t relativeSchemeId)
-{
-    t_FmPcd     *p_FmPcd = (t_FmPcd*)h_FmPcd;
-
-    ASSERT_COND(p_FmPcd);
-
-    /* check that schemeId is in range */
-    if (relativeSchemeId >= p_FmPcd->p_FmPcdKg->numOfSchemes)
-    {
-        REPORT_ERROR(MAJOR, E_NOT_IN_RANGE, ("relative-scheme-id %d!", relativeSchemeId));
-        return NULL;
-    }
-
-    if (!FmPcdKgIsSchemeValidSw(&p_FmPcd->p_FmPcdKg->schemes[relativeSchemeId]))
-        return NULL;
-
-    return &p_FmPcd->p_FmPcdKg->schemes[relativeSchemeId];
-}
-
-bool FmPcdKgIsSchemeHasOwners(t_Handle h_Scheme)
-{
-    return (((t_FmPcdKgScheme*)h_Scheme)->owners == 0)?FALSE:TRUE;
-}
-
 t_Error FmPcdKgCcGetSetParams(t_Handle h_FmPcd, t_Handle h_Scheme, uint32_t requiredAction, uint32_t value)
 {
     t_FmPcd             *p_FmPcd = (t_FmPcd*)h_FmPcd;
