@@ -6,7 +6,6 @@ LINUX_VERSION = "6.18.64"
 KERNEL_BRANCH = "linux-6.18.y"
 # v6.18.64, peeled.
 KERNEL_SRCREV = "fd7cfd39c88596fec816639ad83cbf3e9d316372"
-NXP_SDK_BRANCH = "lf-6.18.y"
 
 require linux-ask.inc
 

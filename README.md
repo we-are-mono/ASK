@@ -34,10 +34,11 @@ The components:
   the source of truth. Their sources remain in the `mono-1.0.x` release tags,
   which is what docs citing `cmm/`, `fci/`, `auto_bridge/` or `patches/fmc`
   paths refer to.
-- **Kernel side** — a patch stack per supported kernel line,
-  `patches/kernel/<line>/` (the vendored DPAA/FMAN SDK, ASK's hooks, and board
-  drivers, applied onto stock mainline 6.12 or 6.18 with that line's NXP SDK,
-  pinned in `pins/<line>/`), and the board device tree in `dts/`. See
+- **Kernel side** — per supported kernel line, ASK's copy of NXP's DPAA/FMAN
+  SDK drivers (`sdk/<line>/`, NXP's code with ASK's changes made in place) and
+  a patch series against mainline (`patches/kernel/<line>/`: ASK's hooks, the
+  SDK's build glue, and board drivers), both laid onto stock mainline 6.12 or
+  6.18; and the board device tree in `dts/`. See
   [fan control](docs/fan-control.md) for the EMC2305 kernel interface and testing.
 - **Runtime config** — module load order and init scripts (`config/`). The PCD /
   soft-parser XML in `config/pcd/` is a build-time input, not shipped.
@@ -189,7 +190,7 @@ another line's image.
 ## Versioning and branches
 
 One trunk (`master`) carries every supported kernel line side by side, each with
-its own patch series and SDK pin (`patches/kernel/<line>/`, `pins/<line>/`); one
+its own patch series and SDK copy (`patches/kernel/<line>/`, `sdk/<line>/`); one
 ASK version spans the lines, each release is tagged once (`mono-1.4.0`), and
 its `RELEASED_LINES` names the lines it covers. See
 [docs/versioning.md](docs/versioning.md) for the full model.

@@ -2,7 +2,7 @@
 
 One checkout builds every line it has a kernel recipe for, side by side
 (meta-ask/conf/distro/ask.conf): each has its recipe, its patch series, its
-SDK pin and its own build tree. ASK_LINE names the line a run is about, as
+SDK copy and its own build tree. ASK_LINE names the line a run is about, as
 make's LINE does for the image build.
 """
 

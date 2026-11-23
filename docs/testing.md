@@ -311,8 +311,8 @@ One checkout builds every kernel line it has a recipe for, side by side:
 `LINE` picks one and defaults to the newest; the harness's name for it,
 `ASK_LINE`, sets it too. A line is its recipe
 (`meta-ask/recipes-kernel/linux/linux-ask_<line>.bb`, over the shared
-`linux-ask.inc`), its patch series (`patches/kernel/<line>/`) and its SDK pin
-(`pins/<line>/nxp-sdk-srcrev.inc`). Each builds in a tree of its own,
+`linux-ask.inc`), its patch series (`patches/kernel/<line>/`) and its copy of
+the NXP SDK drivers (`sdk/<line>/`). Each builds in a tree of its own,
 `meta-ask/build/tmp-<line>`, so switching lines rebuilds neither.
 
 `make ask-image` is a thin wrapper around `kas build` against the meta-ask
@@ -799,7 +799,7 @@ A release also refuses an image this checkout did not build, before any case
 runs. Every recipe in `meta-ask` inherits `ask-provenance`, which records the
 checkout files it builds from, each by content: the recipe, its local sources,
 its external source tree and the directories it declares. The kernel declares
-its line's `patches/kernel/<line>/` and `pins/<line>/nxp-sdk-srcrev.inc`, the
+its line's `patches/kernel/<line>/` and `sdk/<line>/`, the
 shared `linux-ask.inc` its recipe requires, and `dts/`; the image declares the
 whole layer. A file
 counts if git would commit it, under the checkout's own ignore rules. The

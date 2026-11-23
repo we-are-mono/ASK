@@ -1,9 +1,10 @@
 """A kernel line's patch series, as a git branch to work on and back.
 
 patches/kernel/<line>/*.patch is the series' one source of truth; this builds
-the git history it is edited in, and writes it back.
+the git history it is edited in, and writes it back. The NXP SDK drivers are
+not patched: their code is the line's copy, sdk/<line>, edited in place.
 
-  prepare        base-<line>: the line's stable commit with the NXP SDK
+  prepare        base-<line>: the line's stable commit with sdk/<line>
                  overlaid, as the recipe's do_overlay_sdk lays it, in one
                  commit; series-<line>: the series applied onto it, strictly
                  (git am, no three-way), in the recipe's SRC_URI order.
@@ -24,6 +25,7 @@ the kas download cache's git mirrors are used when site.conf names one.
 
 import argparse
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,9 +37,7 @@ from ask_orch import kernel_line  # noqa: E402
 ROOT = kernel_line.ROOT
 RECIPES = ROOT / kernel_line.RECIPES
 STABLE_URL = "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
-NXP_URL = "https://github.com/nxp-qoriq/linux.git"
-MIRRORS = {"stable": "git.kernel.org.pub.scm.linux.kernel.git.stable.linux.git",
-           "nxp": "github.com.nxp-qoriq.linux.git"}
+STABLE_MIRROR = "git.kernel.org.pub.scm.linux.kernel.git.stable.linux.git"
 IDENT = ["-c", "user.name=Tomaz Zaman", "-c", "user.email=tomaz@mono.si"]
 
 
@@ -57,14 +57,14 @@ def assignment(text, name):
 
 
 class Line:
-    """What a line's recipe and pin say."""
+    """What a line's recipe says, and where its SDK copy is."""
 
     def __init__(self, line):
         self.line = line
         recipe = (RECIPES / f"linux-ask_{line}.bb").read_text()
         shared = (RECIPES / "linux-ask.inc").read_text()
         self.kernel = assignment(recipe, "KERNEL_SRCREV")
-        self.sdk = assignment((ROOT / "pins" / line / "nxp-sdk-srcrev.inc").read_text(), "NXP_SDK_SRCREV")
+        self.sdk = ROOT / "sdk" / line
         block = re.search(r'^NXP_SDK_PATHS = "\\\n(.*?)^"', shared, re.M | re.S)
         if not block:
             raise SystemExit("NXP_SDK_PATHS not found in linux-ask.inc")
@@ -76,6 +76,10 @@ class Line:
         self.base = f"base-{line}"
         self.series = f"series-{line}"
 
+    def in_sdk(self, path):
+        """Whether a kernel-tree path is one the SDK copy overlays."""
+        return any(path == entry or path.startswith(entry + "/") for entry in self.overlay)
+
 
 def download_dir():
     site = ROOT / "meta-ask" / "site.conf"
@@ -86,11 +90,11 @@ def download_dir():
     return None
 
 
-def source(name):
+def source():
     mirror = download_dir()
-    if mirror and (mirror / MIRRORS[name]).is_dir():
-        return str(mirror / MIRRORS[name])
-    return {"stable": STABLE_URL, "nxp": NXP_URL}[name]
+    if mirror and (mirror / STABLE_MIRROR).is_dir():
+        return str(mirror / STABLE_MIRROR)
+    return STABLE_URL
 
 
 def repository(work):
@@ -106,15 +110,15 @@ def has(repo, rev):
                           capture_output=True).returncode == 0
 
 
-def fetch(repo, name, rev):
-    """A commit by its hash, or a tag by its name (kept as a local tag)."""
+def fetch(repo, rev):
+    """A stable commit by its hash, or a tag by its name (kept as a local tag)."""
     if has(repo, rev):
         return
     spec = rev if re.fullmatch(r"[0-9a-f]{40}", rev) else f"refs/tags/{rev}:refs/tags/{rev}"
-    print(f"fetching {rev} from {source(name)}")
-    git(repo, "fetch", "-q", "--no-tags", source(name), spec, capture=False)
+    print(f"fetching {rev} from {source()}")
+    git(repo, "fetch", "-q", "--no-tags", source(), spec, capture=False)
     if not has(repo, rev):
-        raise SystemExit(f"{rev}: not found in {source(name)}")
+        raise SystemExit(f"{rev}: not found in {source()}")
 
 
 def subject(text):
@@ -143,21 +147,38 @@ def apply_series(repo, line, files_dir):
             raise SystemExit(f"{name} does not apply:\n{result.stdout}{result.stderr}")
 
 
+def overlay(repo, line):
+    """sdk/<line> laid over the checked-out tree, as do_overlay_sdk lays it:
+    a listed directory replaces mainline's wholesale, a listed file overwrites
+    mainline's, and the copy may hold nothing else."""
+    if not line.sdk.is_dir():
+        raise SystemExit(f"{line.sdk}: no SDK copy for the {line.line} line")
+    stray = sorted(str(path.relative_to(line.sdk)) for path in line.sdk.rglob("*")
+                   if (path.is_file() or path.is_symlink())
+                   and not line.in_sdk(str(path.relative_to(line.sdk))))
+    if stray:
+        raise SystemExit(f"{line.sdk} holds files outside NXP_SDK_PATHS: {', '.join(stray)}")
+    for path in line.overlay:
+        src, dst = line.sdk / path, Path(repo) / path
+        if not src.exists():
+            raise SystemExit(f"{path}: in NXP_SDK_PATHS, not in {line.sdk}")
+        git(repo, "rm", "-rq", "--ignore-unmatch", "--", path)
+        if src.is_dir():
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(src, dst, symlinks=True)
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst, follow_symlinks=False)
+
+
 def prepare(args, line):
     repo = repository(args.work)
-    fetch(repo, "stable", line.kernel)
-    fetch(repo, "nxp", line.sdk)
+    fetch(repo, line.kernel)
     git(repo, "checkout", "-q", "-f", "-B", line.base, line.kernel)
     git(repo, "clean", "-qfdx")
-    for path in line.overlay:
-        if subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{line.sdk}:{path}"],
-                          capture_output=True).returncode:
-            raise SystemExit(f"{path}: not in the NXP SDK at {line.sdk}")
-        git(repo, "rm", "-rq", "--ignore-unmatch", "--", path)
-        git(repo, "checkout", line.sdk, "--", path)
+    overlay(repo, line)
     git(repo, "add", "-A")
-    git(repo, *IDENT, "commit", "-qm",
-        f"base: {line.kernel[:12]} + NXP SDK overlay from {line.sdk[:12]}")
+    git(repo, *IDENT, "commit", "-qm", f"base: {line.kernel[:12]} + sdk/{line.line}")
     git(repo, "checkout", "-q", "-B", line.series, line.base)
     apply_series(repo, line, line.dir)
     print(f"{line.series}: {len(line.order)} patches on {line.base} in {repo}")
@@ -207,13 +228,13 @@ def check(args, line):
 
 def stable_review(args, line):
     repo = repository(args.work)
-    fetch(repo, "stable", line.kernel)
-    fetch(repo, "stable", args.to)
+    fetch(repo, line.kernel)
+    fetch(repo, args.to)
     touched = set()
     for path in line.dir.glob("*.patch"):
         touched.update(re.findall(r"^diff --git a/(\S+) b/", path.read_text(), re.M))
     # The overlay replaces these wholesale; upstream changes to them never reach the build.
-    touched = sorted(p for p in touched if not any(p == o or p.startswith(o + "/") for o in line.overlay))
+    touched = sorted(p for p in touched if not line.in_sdk(p))
     log = git(repo, "log", "--no-merges", "--format=%h %s", f"{line.kernel}..{args.to}", "--", *touched)
     commits = log.splitlines()
     print(f"{len(commits)} upstream commits in {line.kernel[:12]}..{args.to} touch the {len(touched)} "

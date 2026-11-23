@@ -226,16 +226,17 @@ def test_every_recipe_in_the_layer_records_its_inputs():
 @pytest.mark.parametrize("line", kernel_line.lines())
 def test_each_kernel_line_records_what_its_recipe_requires(line):
     """bitbake hands the class a recipe's own file, not the files it pulls in
-    by require: what every line shares and the line's SDK pin count only as
-    declared paths, beside the line's series."""
+    by require: what every line shares counts only as a declared path, beside
+    the line's series and its SDK copy."""
     shared = (ROOT / kernel_line.RECIPES / "linux-ask.inc").read_text()
     assert re.search(rf'^ASK_KERNEL_LINE = "{re.escape(line)}"$', kernel_line.recipe(line).read_text(), re.M)
     declared = re.search(r'^ASK_PROVENANCE_PATHS = "(.*?)"$', shared, re.M | re.S)[1]
     paths = declared.replace("\\\n", " ").replace("${ASK_KERNEL_LINE}", line).split()
     required = [path.replace("${ASK_KERNEL_LINE}", line)
                 for path in re.findall(r"^require \$\{ASK_SRCROOT\}/(\S+)$", shared, re.M)]
-    assert required and all((ROOT / path).is_file() for path in required)
-    assert {f"{kernel_line.RECIPES}/linux-ask.inc", f"patches/kernel/{line}", *required} <= set(paths)
+    assert all((ROOT / path).is_file() for path in required)
+    assert {f"{kernel_line.RECIPES}/linux-ask.inc", f"patches/kernel/{line}", f"sdk/{line}",
+            *required} <= set(paths)
 
 
 @pytest.mark.parametrize("line", kernel_line.lines())

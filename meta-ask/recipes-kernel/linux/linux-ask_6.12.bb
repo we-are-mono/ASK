@@ -6,7 +6,6 @@ LINUX_VERSION = "6.12.118"
 KERNEL_BRANCH = "linux-6.12.y"
 # v6.12.118, peeled (the annotated tag object is c246b196...).
 KERNEL_SRCREV = "b869a5313cbfe7102873d3de318ddb68675146d0"
-NXP_SDK_BRANCH = "lf-6.12.y"
 
 require linux-ask.inc
 

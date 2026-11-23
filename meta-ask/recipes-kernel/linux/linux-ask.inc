@@ -1,28 +1,28 @@
 SUMMARY = "Linux kernel for ASK LS1046A test target"
-DESCRIPTION = "Stock mainline ${LINUX_VERSION} kernel with the NXP DPAA/FMan/QBMan \
-SDK overlaid on top and the ASK patch bundle applied. This is the Yocto \
-twin of the OpenWrt-first build (scripts/mono-sync-ask-kernel.sh): the \
-same mainline base + NXP SDK overlay + ASK hooks, producing a bootable \
-Image+initramfs for ASK testing."
+DESCRIPTION = "Stock mainline ${LINUX_VERSION} kernel with ASK's copy of the NXP \
+DPAA/FMan/QBMan SDK drivers (sdk/<line>) overlaid on top and the ASK patch \
+series applied. This is the Yocto twin of the OpenWrt-first build \
+(scripts/mono-sync-ask-kernel.sh): the same mainline base + SDK copy + ASK \
+hooks, producing a bootable Image+initramfs for ASK testing."
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://COPYING;md5=6bc538ed5bd9a7fc9398086aedcd7e46"
 
 # What every kernel line builds alike. Each line's recipe, linux-ask_<line>.bb,
-# sets ASK_KERNEL_LINE and its kernel and SDK pins before requiring this file,
-# and lists its patch series after it; ASK_LINE picks the line a build makes
+# sets ASK_KERNEL_LINE and its kernel pin before requiring this file, and lists
+# its patch series after it; ASK_LINE picks the line a build makes
 # (conf/distro/ask.conf).
 
 inherit kernel ask-provenance
 
 DEPENDS += "bison-native flex-native bc-native"
 
-# This file and the SDK pin arrive by `require`, outside SRC_URI. The series
-# and board directories are recorded whole, so a file that would shadow one in
-# SRC_URI counts too. The record reaches the image through the package every
-# module depends on.
+# This file arrives by `require`, outside SRC_URI. The series, SDK and board
+# directories are recorded whole, so a file that would shadow one in SRC_URI
+# counts too. The record reaches the image through the package every module
+# depends on.
 ASK_PROVENANCE_PATHS = "meta-ask/recipes-kernel/linux/linux-ask.inc \
-                        pins/${ASK_KERNEL_LINE}/nxp-sdk-srcrev.inc \
-                        patches/kernel/${ASK_KERNEL_LINE} dts"
+                        patches/kernel/${ASK_KERNEL_LINE} \
+                        sdk/${ASK_KERNEL_LINE} dts"
 ASK_PROVENANCE_OWNER = "${KERNEL_PACKAGE_NAME}-base"
 
 # The config fragments are one set for every line (files/).
@@ -32,36 +32,25 @@ FILESEXTRAPATHS:prepend := "${ASK_SRCROOT}/patches/kernel/${ASK_KERNEL_LINE}:"
 # ASK repo (dts/mono-gateway-dk.dts); consume it directly rather than keep a
 # drifting copy under files/.
 FILESEXTRAPATHS:prepend := "${ASK_SRCROOT}/dts:"
+# The line's copy of the NXP SDK drivers, sdk/<line> (see do_overlay_sdk).
+FILESEXTRAPATHS:prepend := "${ASK_SRCROOT}/sdk:"
 
 PV = "${LINUX_VERSION}+git${SRCPV}"
 
-# ============================================================================
-# Two-pin split: the kernel base and the NXP SDK overlay are pinned SEPARATELY.
-# The old recipe conflated them in a single SRCREV against the NXP vendor tree
-# (which shipped the SDK drivers in-tree). On stock mainline the SDK is NOT
-# in-tree, so it is fetched separately and overlaid (see do_overlay_sdk below).
-# ============================================================================
-
-# --- Pin 1: mainline kernel base (kernel.org stable) ---
-# A line's KERNEL_SRCREV is the COMMIT its release tag points at, not the
+# The mainline kernel base (kernel.org stable) is the one fetched tree. A
+# line's KERNEL_SRCREV is the COMMIT its release tag points at, not the
 # annotated tag object `git rev-parse v<version>` prints: it is
 # `v<version>^{commit}`. bitbake's SRCREV must be a commit (checkout -B /
 # branch --contains operate on commits), so pin the peeled commit.
 KERNEL_SRC = "git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git;protocol=https"
 
-# --- Pin 2: NXP DPAA/FMan/QBMan SDK overlay ---
-# The SDK SRCREV lives in a canonical, format-neutral pin file per line
-# (pins/<line>/nxp-sdk-srcrev.inc) so every consumer reads ONE source and nobody
-# parses another's format: this recipe `require`s it (bitbake tracks the file's
-# checksum, so a pin bump re-triggers the fetch); OpenWrt's sync and the Armbian
-# build extract the value with a one-line sed. ASK_VERSION stays the single pin
-# — the SDK ref rides inside the pinned ASK tree.
-NXP_SDK_SRC = "git://github.com/nxp-qoriq/linux.git;protocol=https"
-require ${ASK_SRCROOT}/pins/${ASK_KERNEL_LINE}/nxp-sdk-srcrev.inc
-
-# The line's recipe appends its patch series, in order, one patch per entry.
+# The SDK drivers are not fetched: ASK carries NXP's code, with its own changes
+# made in place, at sdk/<line> (sdk/README.md names the NXP commit each copy
+# came from). A local directory in SRC_URI is checksummed file by file, so an
+# SDK edit re-runs the overlay. The line's recipe appends its patch series, in
+# order, one patch per entry.
 SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
-           ${NXP_SDK_SRC};branch=${NXP_SDK_BRANCH};name=nxpsdk;destsuffix=nxp-sdk \
+           file://${ASK_KERNEL_LINE};subdir=sdk \
            file://defconfig \
            file://ask.cfg \
            file://ask-kasan.cfg \
@@ -70,17 +59,15 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
           "
 
 SRCREV_kernel = "${KERNEL_SRCREV}"
-SRCREV_nxpsdk = "${NXP_SDK_SRCREV}"
-# Two SCMs in SRC_URI — bitbake needs to know how to compose SRCPV.
-SRCREV_FORMAT = "kernel_nxpsdk"
+SRCREV_FORMAT = "kernel"
 
 # ============================================================================
-# NXP SDK overlay onto stock mainline.
+# The SDK copy onto stock mainline.
 #
-# This set is OpenWrt's SDK_PATHS list verbatim
-# (scripts/mono-sync-ask-kernel.sh) — kept identical so both builds vendor the
-# exact same tree from the exact same NXP ref; a line's recipe adds what its
-# SDK release needs beyond it. Two kinds of files:
+# What a line's copy (sdk/<line>) holds, and the overlay replaces: OpenWrt's
+# SDK_PATHS list (scripts/mono-sync-ask-kernel.sh) names the same paths. A
+# line's recipe adds what its SDK release needs beyond them. Two kinds of
+# files:
 #   - SDK-only trees (sdk_dpaa, sdk_fman, fsl_qbman, uapi/linux/fmd, the
 #     fsl_{bman,qman,usdpaa}.h headers, the *-portals-sdk / dpaa-eth dtsi):
 #     absent on mainline, added fresh.
@@ -88,8 +75,9 @@ SRCREV_FORMAT = "kernel_nxpsdk"
 #     qoriq-{q,b}man-portals.dtsi, qoriq-fman3-0*.dtsi): mainline ships these
 #     with mainline FMan/DPAA bindings the NXP SDK drivers cannot probe, so the
 #     overlay must OVERWRITE them.
-# ASK-added files (e.g. include/linux/fsl_oh_port.h) arrive with the patch
-# series, NOT from this overlay.
+# A copy holds exactly these paths (tools/host_tests/sdk_tree.py); files ASK
+# adds outside them (e.g. include/linux/fsl_oh_port.h) arrive with the patch
+# series.
 # ============================================================================
 NXP_SDK_PATHS = "\
     drivers/net/ethernet/freescale/sdk_dpaa \
@@ -122,27 +110,38 @@ NXP_SDK_PATHS = "\
 # own shell task. It must run AFTER kernel.bbclass's do_symlink_kernsrc (which
 # moves ${WORKDIR}/git into STAGING_KERNEL_DIR and symlinks it back, so ${S}
 # only resolves to the final kernel-source tree once that has run) and BEFORE
-# do_patch (so the ASK series, which edits the SDK sources, and patch 110, the
-# SDK build-compat glue, apply on top of the vendored tree).
+# do_patch (so the ASK series, whose patch 110 is the build glue the SDK needs
+# in mainline's Kconfig and Makefiles, applies on top of the SDK copy).
 do_overlay_sdk() {
-    # Locate the NXP SDK checkout (the second git fetch, destsuffix=nxp-sdk).
-    # Depending on the OE version the git fetcher lands a destsuffix tree under
-    # WORKDIR or under UNPACKDIR; probe both and fail loudly if neither has it.
-    sdkroot=""
-    for cand in "${WORKDIR}/nxp-sdk" "${UNPACKDIR}/nxp-sdk"; do
-        if [ -d "${cand}/drivers/net/ethernet/freescale/sdk_dpaa" ]; then
-            sdkroot="${cand}"; break
+    # The line's copy, unpacked from SRC_URI (file://<line>;subdir=sdk). Fail
+    # loudly if it is not there, or if it holds a file the overlay would not
+    # copy: such a file would be in the checkout and the kernel record, yet in
+    # no kernel tree.
+    sdkroot="${UNPACKDIR}/sdk/${ASK_KERNEL_LINE}"
+    if [ ! -d "${sdkroot}/drivers/net/ethernet/freescale/sdk_dpaa" ]; then
+        bbfatal "SDK overlay: ${sdkroot} is not the SDK copy (sdk/${ASK_KERNEL_LINE} in ${ASK_SRCROOT})"
+    fi
+    # Kernel-tree paths hold no whitespace, so find's output splits safely.
+    for f in $(cd "${sdkroot}" && find . -type f -o -type l | sed 's|^\./||'); do
+        listed=0
+        for p in ${NXP_SDK_PATHS}; do
+            case "${f}" in
+            "${p}"|"${p}"/*)
+                listed=1
+                break
+                ;;
+            esac
+        done
+        if [ "${listed}" != 1 ]; then
+            bbfatal "SDK overlay: sdk/${ASK_KERNEL_LINE}/${f} is outside NXP_SDK_PATHS"
         fi
     done
-    if [ -z "${sdkroot}" ]; then
-        bbfatal "NXP SDK overlay: nxp-sdk checkout not found under ${WORKDIR}/nxp-sdk or ${UNPACKDIR}/nxp-sdk (SDK fetch ${NXP_SDK_SRC} @ ${NXP_SDK_SRCREV})"
-    fi
-    bbnote "NXP SDK overlay: vendoring from ${sdkroot} into ${S}"
+    bbnote "SDK overlay: copying sdk/${ASK_KERNEL_LINE} into ${S}"
     for p in ${NXP_SDK_PATHS}; do
         src="${sdkroot}/${p}"
         dst="${S}/${p}"
         if [ ! -e "${src}" ]; then
-            bbfatal "NXP SDK overlay: '${p}' missing in ${NXP_SDK_SRC} @ ${NXP_SDK_SRCREV} (ASK-added files come from the patch series, not the overlay)"
+            bbfatal "SDK overlay: '${p}' missing in sdk/${ASK_KERNEL_LINE} (ASK-added files outside NXP_SDK_PATHS come from the patch series)"
         fi
         if [ -d "${src}" ]; then
             # Full replace so no stale mainline file lingers under an
