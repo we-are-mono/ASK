@@ -11,10 +11,11 @@ not patched: their code is the line's copy, sdk/<line>, edited in place.
   regen          series-<line>'s commits written back over their patch files
                  (matched by subject); a file whose change did not change --
                  bar its commit id, blob abbreviations and hunk offsets -- is
-                 left as it is.
+                 left as it is. A commit that changes the SDK copy's files is
+                 refused: that change belongs in sdk/<line>.
   check          the patch files applied onto a fresh base-<line>, strictly,
                  must reproduce series-<line>; the directory and SRC_URI must
-                 name the same patches.
+                 name the same patches, and no patch may touch the SDK copy.
   stable-review  the upstream commits between the line's stable commit and
                  --to that touch a file the series touches: what a stable bump
                  must be read against.
@@ -147,6 +148,17 @@ def apply_series(repo, line, files_dir):
             raise SystemExit(f"{name} does not apply:\n{result.stdout}{result.stderr}")
 
 
+def sdk_patches(line):
+    """The patch files that touch the SDK copy's paths, each with its count."""
+    touching = {}
+    for path in sorted(line.dir.glob("*.patch")):
+        pairs = re.findall(r"^diff --git a/(\S+) b/(\S+)$", path.read_text(), re.M)
+        hits = {name for pair in pairs for name in pair if line.in_sdk(name)}
+        if hits:
+            touching[path.name] = len(hits)
+    return touching
+
+
 def overlay(repo, line):
     """sdk/<line> laid over the checked-out tree, as do_overlay_sdk lays it:
     a listed directory replaces mainline's wholesale, a listed file overwrites
@@ -187,8 +199,16 @@ def prepare(args, line):
 def regen(args, line):
     repo = repository(args.work)
     files = {subject(path.read_text()): path for path in line.dir.glob("*.patch")}
+    commits = git(repo, "rev-list", "--reverse", f"{line.base}..{line.series}").split()
+    for commit in commits:
+        changed = git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", commit).split()
+        if hits := sorted(path for path in changed if line.in_sdk(path)):
+            title = git(repo, "show", "-s", "--format=%s", commit).strip()
+            raise SystemExit(f"commit {commit[:12]} ({title}) changes the SDK copy's files "
+                             f"({', '.join(hits)}): make that change in sdk/{line.line}/, then "
+                             "prepare again; nothing was written")
     written = kept = 0
-    for commit in git(repo, "rev-list", "--reverse", f"{line.base}..{line.series}").split():
+    for commit in commits:
         title = re.sub(r"\s+", " ", git(repo, "show", "-s", "--format=%s", commit)).strip()
         path = files.pop(title, None)
         if path is None:
@@ -212,6 +232,9 @@ def check(args, line):
         missing = sorted(set(names) - set(line.order))
         absent = sorted(set(line.order) - set(names))
         raise SystemExit(f"SRC_URI and {line.dir} differ: not in SRC_URI {missing}, no file {absent}")
+    if touching := sdk_patches(line):
+        raise SystemExit(f"patches changing sdk/{line.line} files (count each), which are edited "
+                         f"in place instead: {touching}")
     repo = repository(args.work)
     with tempfile.TemporaryDirectory(prefix=f"check-{line.line}-") as scratch:
         tree = Path(scratch) / "tree"
