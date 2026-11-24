@@ -1002,24 +1002,29 @@ async def _session_ipv6(ctx, cleanup):
     ctx.server_ppp_if = next(
         i["ifname"] for i in addresses
         if any(a.get("local") == INNER_LOCAL for a in i["addr_info"]))
+    # What is undone of the session's own devices, kept apart so that a redial,
+    # whose devices pppoe-server may number anew, can swap it for its own.
+    session = []
     await dut("ip", "-6", "addr", "del", f"{INNER_REMOTE6}/64", "dev", ctx.ppp_if,
               check=False)
     await dut("ip", "-6", "addr", "add", f"{INNER_REMOTE6}/64", "dev", ctx.ppp_if,
               "nodad")
-    cleanup.append((ctx.target, ["ip", "-6", "addr", "del", f"{INNER_REMOTE6}/64",
+    session.append((ctx.target, ["ip", "-6", "addr", "del", f"{INNER_REMOTE6}/64",
                                  "dev", ctx.ppp_if]))
     await command(ctx.wan, ctx.session, "ip", "-6", "addr", "del",
                   f"{INNER_LOCAL6}/64", "dev", ctx.server_ppp_if, check=False)
     await command(ctx.wan, ctx.session, "ip", "-6", "addr", "add",
                   f"{INNER_LOCAL6}/64", "dev", ctx.server_ppp_if, "nodad")
-    cleanup.append((ctx.wan, ["ip", "-6", "addr", "del", f"{INNER_LOCAL6}/64",
+    session.append((ctx.wan, ["ip", "-6", "addr", "del", f"{INNER_LOCAL6}/64",
                               "dev", ctx.server_ppp_if]))
     # The concentrator has no route to the subscriber's prefix at all. Point to
     # point, so no next hop: the session is the only way there.
     await command(ctx.wan, ctx.session, "ip", "-6", "route", "replace", LAN_PREFIX6,
                   "dev", ctx.server_ppp_if)
-    cleanup.append((ctx.wan, ["ip", "-6", "route", "del", LAN_PREFIX6,
+    session.append((ctx.wan, ["ip", "-6", "route", "del", LAN_PREFIX6,
                               "dev", ctx.server_ppp_if]))
+    cleanup.extend(session)
+    ctx.session_cleanup = session
 
 
 async def _reachable(ctx, client, peer, attempts=25):
@@ -1077,6 +1082,8 @@ async def isp(target_agent, lan, request, dmesg_allowlist):
         ctx.echoes = {}
         stack = TopologyStack()
         cleanup, endpoints = [], []
+        # A redial moves what the fixture removes onto the new session's devices.
+        ctx.cleanup = cleanup
         server = None
         console = Console.target(log_path=str(artifact_dir(request.node.nodeid) / "profile-isp-uart.log"))
         try:
@@ -1834,10 +1841,17 @@ async def test_redial_readmits_every_flow(isp, splat_window):
                                     *nat, check=False)
             if present["rc"]:
                 await command(ctx.target, ctx.session, "iptables", "-t", "nat", "-I", *nat)
+                ctx.cleanup.append((ctx.target, ["iptables", "-t", "nat", "-D", *nat]))
         # The concentrator's own device went too, and with it the only route to the
         # subscriber's IPv6 prefix. Restated here rather than left to the fixture,
-        # so what the profile carried before the drop it carries after it.
-        await _session_ipv6(ctx, [])
+        # so what the profile carried before the drop it carries after it -- on
+        # the new session's devices, which pppoe-server may number anew while the
+        # old session's pppd is still on its way out: the fixture's teardown then
+        # undoes these, not the old devices', which went with their addresses.
+        for entry in ctx.session_cleanup:
+            if entry in ctx.cleanup:
+                ctx.cleanup.remove(entry)
+        await _session_ipv6(ctx, ctx.cleanup)
     finally:
         # Finish the viewer's bounded window before cleanup changes its network.
         observed = await viewer
