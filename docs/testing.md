@@ -307,7 +307,8 @@ make stage-image LINE=6.18    # copy that line's image and device tree into the 
 ```
 
 One checkout builds every kernel line it has a recipe for, side by side:
-6.12 (Linux 6.12 with NXP's lf-6.12 SDK, the line OpenWrt ships) and 6.18.
+6.12 (the line OpenWrt ships) and 6.18, each stock mainline stable with
+ASK's one copy of the NXP SDK drivers (`sdk/linux/`).
 `LINE` picks one and defaults to the newest; the harness's name for it,
 `ASK_LINE`, sets it too. A line is its recipe
 (`meta-ask/recipes-kernel/linux/linux-ask_<line>.bb`, over the shared
