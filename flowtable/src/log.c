@@ -30,7 +30,9 @@ void ft_log(int priority, const char *format, ...)
 	if (fd >= 0) {
 		char *body = strchr(text, '>') + 1;
 		text[len++] = '\n';
-		(void)write(fd, body, len - (size_t)(body - text));
+		if (write(fd, body, len - (size_t)(body - text)) < 0) {
+			/* The last resort refused the line: nowhere is left to say so. */
+		}
 		close(fd);
 	}
 }

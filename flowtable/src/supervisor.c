@@ -95,6 +95,20 @@ static pid_t spawn_worker(const char *conf)
 	_exit(127);
 }
 
+/* Tells the launcher how the start went, and closes the pipe. The int goes in
+ * one write, so it arrives whole or not at all; a launcher still waiting takes
+ * nothing, or less than the whole, as a failed start and stops this
+ * supervisor. */
+static void report_start(int readyfd, int rc)
+{
+	ssize_t n;
+	do n = write(readyfd, &rc, sizeof(rc)); while (n < 0 && errno == EINTR);
+	if (n != (ssize_t)sizeof(rc))
+		ft_log(LOG_WARNING, "cannot tell the launcher the start result: %s",
+		       n < 0 ? strerror(errno) : "short write");
+	close(readyfd);
+}
+
 int ft_supervise(const char *conf, int readyfd)
 {
 	struct ft_ctx ctx = {0};
@@ -162,8 +176,8 @@ int ft_supervise(const char *conf, int readyfd)
 			}
 		}
 		if (readyfd >= 0) {
-			(void)write(readyfd, &rc, sizeof(rc));
-			close(readyfd); readyfd = -1;
+			report_start(readyfd, rc);
+			readyfd = -1;
 		}
 		int wait = 1000;
 		int64_t next = state.stopping ? (killed ? now + 1000 : stop_due) : (state.worker ? now + 1000 : due);
@@ -208,7 +222,7 @@ restore:
 	if (lock >= 0) close(lock);
 	sigprocmask(SIG_SETMASK, &previous, NULL);
 done:
-	if (readyfd >= 0) { (void)write(readyfd, &rc, sizeof(rc)); close(readyfd); }
+	if (readyfd >= 0) report_start(readyfd, rc);
 	return rc;
 }
 

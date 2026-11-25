@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A459 — ask-flowtable did not build where the compiler predefines `_FORTIFY_SOURCE` (Ubuntu).** Six ignored
+  write()/fgets() results now checked; host test builds it fortified (_:/^flowtable: check what write/_).
+
 - [x] **A458 — attaching an HTB tree stranded what the port's plain queues held, for the tree's life.** Now sent
   once the entries are rebuilt; a failed attach no longer latches the port dead (_:/^cdx: send what a tree's switch_).
 

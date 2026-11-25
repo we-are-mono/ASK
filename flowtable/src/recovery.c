@@ -100,7 +100,8 @@ int ft_recovery(struct ft_ctx *ctx, const char *verb)
 	struct recovery r;
 	char boot[40] = {0};
 	FILE *f = fopen(BOOT_ID, "r");
-	if (f) { (void)fgets(boot, sizeof(boot), f); fclose(f); }
+	/* A failed read leaves the buffer indeterminate; empty is no boot ID. */
+	if (f) { if (!fgets(boot, sizeof(boot), f)) boot[0] = 0; fclose(f); }
 	boot[strcspn(boot, "\r\n")] = 0;
 	if (!boot_id_valid(boot) || read_record(&r)) {
 		snprintf(ctx->err, sizeof(ctx->err), "cannot read recovery state; watchdog recovery must stay disabled");

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <syslog.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -21,7 +22,8 @@ void ft_failure_reason(char *reason, size_t n)
 	 * meanwhile. Read without RTNL, which a failed probe may not get. */
 	char degraded[96] = "";
 	FILE *f = fopen(FT_CDX_MODULE "/parameters/flowtable_degraded_reason", "r");
-	if (f) { (void)fgets(degraded, sizeof(degraded), f); fclose(f); }
+	/* A failed read leaves the buffer indeterminate, not empty. */
+	if (f) { if (!fgets(degraded, sizeof(degraded), f)) degraded[0] = 0; fclose(f); }
 	degraded[strcspn(degraded, "\r\n")] = 0;
 	snprintf(reason, n, "datapath health check failed or timed out%s%s",
 		 degraded[0] ? "; classifier bypassed: " : "", degraded);
@@ -69,7 +71,13 @@ static void report(int fd, struct ft_ctx *ctx, int rc)
 	struct ft_probe_step step = {.rc = rc};
 	if (!rc) ctx->err[0] = 0;
 	memcpy(step.err, ctx->err, sizeof(step.err));
-	(void)write(fd, &step, sizeof(step));
+	ssize_t n;
+	do n = write(fd, &step, sizeof(step)); while (n < 0 && errno == EINTR);
+	/* The parent takes a step that did not arrive as a failed probe; what
+	 * is left here is to say why. */
+	if (n != (ssize_t)sizeof(step))
+		ft_log(LOG_WARNING, "health probe cannot report a step: %s",
+		       n < 0 ? strerror(errno) : "short write");
 }
 
 static long now_ms(void)

@@ -33,10 +33,11 @@ static int is_phys_up(const char *ifn)
 	f = fopen(path, "r");
 	if (!f)
 		return 0;
-	state[0] = '\0';
 	if (fgets(state, sizeof(state), f)) {
 		char *nl = strpbrk(state, "\r\n");
 		if (nl) *nl = '\0';
+	} else {
+		state[0] = '\0';	/* a failed read leaves it indeterminate */
 	}
 	fclose(f);
 	return !strcmp(state, "up");
