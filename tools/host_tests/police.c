@@ -28,6 +28,7 @@
 
 #define U32_MAX UINT32_MAX
 #define ETH_HLEN 14
+#define VLAN_HLEN 4
 #define AF_INET 2
 #define AF_INET6 10
 #define IPPROTO_TCP 6
@@ -274,17 +275,35 @@ static void assert_port_boot(struct dpa_iface_info *i)
            s->params.paramsOnYellow.action == e_FM_PCD_ENQ_FRAME);
 }
 
-/* A tc police action's meter: bytes from the IP header on, yellow dropped. */
-static void assert_meter(struct profile *s, u32 cir, u32 pir, u32 cbs, u32 pbs)
+/* A tc police action's meter, counting from `from`, yellow dropped. */
+static void assert_tc_meter(struct profile *s, e_FmPcdPlcrFrameLengthSelect from,
+                            u32 cir, u32 pir, u32 cbs, u32 pbs)
 {
     assert(RATE(s).rateMode == e_FM_PCD_PLCR_BYTE_MODE);
     assert(RATE(s).committedInfoRate == cir && RATE(s).peakOrExcessInfoRate == pir);
     assert(RATE(s).committedBurstSize == cbs && RATE(s).peakOrExcessBurstSize == pbs);
-    assert(RATE(s).byteModeParams.frameLengthSelection == e_FM_PCD_PLCR_L3_FRM_LEN);
+    assert(RATE(s).byteModeParams.frameLengthSelection == from);
     assert(s->params.nextEngineOnYellow == e_FM_PCD_DONE &&
            s->params.paramsOnYellow.action == e_FM_PCD_DROP_FRAME);
     assert(s->params.nextEngineOnRed == e_FM_PCD_DONE &&
            s->params.paramsOnRed.action == e_FM_PCD_DROP_FRAME);
+}
+
+/* A per-flow profile meets only frames the classifier matched on their
+ * addresses and ports, IP headers found: it counts from there, as Linux
+ * charges the rate, and its length bucket leaves the Ethernet header out. */
+static void assert_meter(struct profile *s, u32 cir, u32 pir, u32 cbs, u32 pbs)
+{
+    assert_tc_meter(s, e_FM_PCD_PLCR_L3_FRM_LEN, cir, pir, cbs, pbs);
+}
+
+/* The port's profile also meets PPPoE session frames, which the soft parser
+ * sends it from the PPPoE header with no IP header found: it counts from the
+ * Ethernet header, which every frame has, with any VLAN tag still in it, so
+ * its length bucket is the mtu and a tag (A460). */
+static void assert_port_meter(struct profile *s, u32 cir, u32 pir, u32 cbs, u32 pbs)
+{
+    assert_tc_meter(s, e_FM_PCD_PLCR_L2_FRM_LEN, cir, pir, cbs, pbs);
 }
 
 /* A per-flow profile no filter holds: NXP's meter, wide open, so a flow still
@@ -427,10 +446,12 @@ static void verbs(void)
      * green is that: the committed bucket is the rate's, and the peak bucket
      * is `mtu` deep and refilled faster than any port, so it turns away only
      * a longer frame. Yellow and red are both dropped. */
-    /* The profile counts from the IP header, as Linux charges the rate;
-     * Linux's length check adds the Ethernet header back. */
+    /* The port's profile counts from the Ethernet header, as Linux's length
+     * check does, but with a VLAN tag Linux has moved out of the frame still
+     * in it: a tag deeper than the mtu, so a full-size tagged frame under
+     * `mtu 1514` passes as it does in Linux. */
     assert(offer(base()) == 0 && !ack.msg);
-    assert_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert_port_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 + 4);
 
     /* A peak rate is Linux's second bucket, `mtu` deep at that rate: its
      * long-term rate stays the committed one. */
@@ -438,13 +459,19 @@ static void verbs(void)
     a.police.peakrate_bytes_ps = 125000000; /* 1 Gbit/s */
     a.police.mtu = 9216;
     assert(offer(a) == 0);
-    assert_meter(p4, 500000, 1000000, 64000, 9216 - 14);
+    assert_port_meter(p4, 500000, 1000000, 64000, 9216 + 4);
+    a.police.mtu = 1514;
+    assert(offer(a) == 0 && RATE(p4).peakOrExcessBurstSize == 1518);
     a.police.mtu = U32_MAX;                 /* no length worth checking */
-    assert(offer(a) == 0 && RATE(p4).peakOrExcessBurstSize == U32_MAX - 14);
-    /* An mtu no frame fits keeps a bucket nothing fits, never an empty
-     * one, which the profile would read as "use the default". */
+    assert(offer(a) == 0 && RATE(p4).peakOrExcessBurstSize == U32_MAX);
+    a.police.mtu = U32_MAX - 2;             /* saturates, never wraps */
+    assert(offer(a) == 0 && RATE(p4).peakOrExcessBurstSize == U32_MAX);
+    /* An mtu no frame fits keeps a bucket nothing fits, and none is ever
+     * empty, which the profile would read as "use the default". */
     a.police.mtu = 10;
-    assert(offer(a) == 0 && RATE(p4).peakOrExcessBurstSize == 1);
+    assert(offer(a) == 0 && RATE(p4).peakOrExcessBurstSize == 14);
+    a.police.mtu = 0;
+    assert(offer(a) == 0 && RATE(p4).peakOrExcessBurstSize == 4);
 
     tried = plcr_attempts;
     a = base(); a.police.peakrate_bytes_ps = 1000;
@@ -547,8 +574,8 @@ static void verbs(void)
     assert(cdx_police_reaches(&dev, MALL_COOKIE + 1) == 0);
     assert(cdx_police_reaches(&dev, 999) == 0 && cdx_police_reaches(&other, MALL_COOKIE) == 0);
     assert(offer_on(&other, MALL_COOKIE + 1, base()) == 0);
-    assert_meter(p3, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
-    assert_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert_port_meter(p3, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 + 4);
+    assert_port_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 + 4);
     assert(mall_cmd(&other, MALL_COOKIE + 1, TC_CLSMATCHALL_DESTROY, NULL) == 0);
     assert_port_boot(&eth3);
 
@@ -789,7 +816,7 @@ static void matchall_deferred(void)
     /* The retry lands, and the port runs what tc asked for. */
     p4->green += 10;
     assert(run_queued_work() == 1);
-    assert_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert_port_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 + 4);
     assert(!work_count);
 
     /* The rewrite zeroed the counters, and the filter's baseline went with
@@ -805,13 +832,13 @@ static void matchall_deferred(void)
     a = base(); a.police.rate_bytes_ps = 125000000;      /* 1 Gbit/s */
     plcr_late = 1;
     assert(offer(a) == 0 && ack.msg && work_count == 1);
-    assert_meter(p4, 1000000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert_port_meter(p4, 1000000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 + 4);
     p4->green = 5;
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
     assert(s.pkts == 5);
     landed = p4->landed;
     assert(run_queued_work() == 1 && p4->landed == landed + 1 && !work_count);
-    assert_meter(p4, 1000000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert_port_meter(p4, 1000000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 + 4);
     p4->green = 3;
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
     assert(s.pkts == 3);
@@ -828,7 +855,7 @@ static void matchall_destroy_deferred(void)
     struct flow_stats s;
 
     assert(offer(base()) == 0);
-    assert_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert_port_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 + 4);
 
     /* tc forgets the filter whatever the driver says, so the port has to go
      * back to its boot rate regardless: left at the filter's, it would run a
@@ -836,7 +863,7 @@ static void matchall_destroy_deferred(void)
     plcr_lost = 1;
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0);
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == -ENOENT);
-    assert_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert_port_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 + 4);
     assert(run_queued_work() == 1);
     assert_port_boot(&eth4);
     assert(!work_count);
@@ -849,9 +876,9 @@ static void matchall_destroy_deferred(void)
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0);
     a = base(); a.police.rate_bytes_ps = 12500000;       /* 100 Mbit/s */
     assert(offer_on(&dev, MALL_COOKIE + 1, a) == 0 && !ack.msg);
-    assert_meter(p4, 100000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert_port_meter(p4, 100000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 + 4);
     run_queued_work();
-    assert_meter(p4, 100000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert_port_meter(p4, 100000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 + 4);
     assert(!work_count);
     assert(mall_cmd(&dev, MALL_COOKIE + 1, TC_CLSMATCHALL_DESTROY, NULL) == 0);
     assert_port_boot(&eth4);
@@ -870,7 +897,7 @@ static void matchall_refused_destroy(void)
      * the driver. That delete is no reason to take the port's limiter from
      * the filter that holds it. */
     assert(mall_cmd(&dev, MALL_COOKIE + 1, TC_CLSMATCHALL_DESTROY, NULL) == 0);
-    assert_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert_port_meter(p4, 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 + 4);
     assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0);
     assert_port_boot(&eth4);
 }
@@ -1013,7 +1040,7 @@ static void channel_shut(void)
      * nothing is due. */
     plcr_shut = false;
     assert(run_queued_work() == 1);
-    assert_meter(port_of(&eth4), 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
+    assert_port_meter(port_of(&eth4), 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 + 4);
     assert_meter(meter(1), 500000, CDX_POLICE_UNBOUNDED_KBITS, 64000, 2040 - 14);
     assert(!work_count);
     tried = plcr_attempts;

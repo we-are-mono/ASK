@@ -1628,8 +1628,9 @@ an `mtu` stays in software.
 What a frame costs follows Linux too. Linux charges a police rate the IP
 datagram (`qdisc_pkt_len()` at tc ingress, after `skb_vlan_untag()` has moved
 a tag out of the frame) and checks the length with the 14-byte Ethernet
-header added back. A tc profile counts `e_FM_PCD_PLCR_L3_FRM_LEN`, which the
-rig measured on untagged frames as exactly that datagram: from the IP header
+header added back. A per-flow tc profile counts `e_FM_PCD_PLCR_L3_FRM_LEN`
+(the port's does not, below), which the rig measured on untagged frames as
+exactly that datagram: from the IP header
 to the end of the frame without the FCS (`L2_FRM_LEN` adds the Ethernet header,
 `FULL_FRM_LEN` the FCS as well); the parser places the IP header after any
 tags. So the peak bucket is `mtu` less 14 deep, and a frame of exactly `mtu`
@@ -1645,9 +1646,33 @@ bytes per frame less charged, and frames that much longer pass. With a peak
 rate, the one PBS is both the length check and the peak bucket's depth, so
 that bucket is 14 bytes shallower than Linux's.
 
-A matchall meters the port's data path, not every frame. IPv4 and PPPoE
-session traffic reach its profile (measured: 2000 of 2000 of each metered),
-but a frame with no IP inside -- ARP, PPPoE discovery and LCP, LLDP -- misses
+**That holds for the per-flow profiles, not the port's.** L3 needs the parse
+to have found an IP header, and a frame a profile measures without one is
+flagged with a frame-length error (`FM_FD_ERR_PLCR_FRAME_LEN`), which the
+port's receive discard mask drops. A per-flow profile meets only the frames of
+a flow the classifier matched on its addresses and ports, so it always has
+one. The port's profile, a matchall's, does not: the soft parser sends a PPPoE
+session frame to it straight from the PPPoE header ("police the packet
+first") and ends the parse there. Counting L3, a matchall on a PPPoE WAN
+dropped every frame of the session while tc showed it metered, green and
+undropped (A460). The port's profile therefore counts `L2_FRM_LEN`, from the
+Ethernet header, which every frame has: 14 bytes a frame more than Linux
+charges the rate, 18 with a VLAN tag still in the frame, so a matchall runs
+under its rate rather than ever over it -- 0.9% at full-size frames, but 13%
+fewer 92-byte datagrams than Linux admits untagged and 16% tagged, A323's
+deficit back for the matchall on every WAN. The per-flow profiles keep
+charging the IP datagram.
+Its length check is a tag deeper than the `mtu`: exact for a tagged frame,
+whose tag Linux has moved out before measuring, and 4 bytes lenient for an
+untagged one. As deep as the `mtu` alone, an `mtu 1514` on a tagged WAN
+turned away every full-size frame Linux passes.
+
+A matchall meters the port's data path, not every frame. The soft parser
+hands its profile UDP, ESP and TCP without SYN, FIN or RST over IP, and every
+PPPoE session frame but LCP (`cdx_police_reaches()`; IPv4 and PPPoE session
+traffic measured, 2000 of 2000 of each metered), but another IP protocol --
+ICMP among them -- or a frame with no IP inside -- ARP, PPPoE discovery and
+LCP, LLDP -- misses
 the Ethernet table, whose miss action is the shared punt profile
 (`CDX_EXPT_ETH_RATELIMIT`, `dpa_cfg.c`), and never meets the port's (0 of
 2000 metered). NXP's CDX routes it the same way. That traffic is bounded by the

@@ -152,6 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
+- [x] **A460 — a matchall police on a PPPoE WAN dropped every frame of the session.** Its L3 count had no IP header
+  (the soft parser ends PPPoE there); the port's profile counts from Ethernet, flower stays L3 (_:/^cdx: count a port's police/_).
+
 - [x] **A459 — ask-flowtable did not build where the compiler predefines `_FORTIFY_SOURCE` (Ubuntu).** Six ignored
   write()/fgets() results now checked; host test builds it fortified (_:/^flowtable: check what write/_).
 

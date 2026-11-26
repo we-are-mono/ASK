@@ -37,6 +37,7 @@
  */
 
 #include <linux/bitmap.h>
+#include <linux/if_vlan.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/rtnetlink.h>
@@ -116,9 +117,11 @@ static int cdx_police_check(const struct flow_action_entry *act,
 
 /* The action's rates in the profile's own units. Byte mode is Kbit/s, packet
  * mode is packets per second; the two are never mixed, which cdx_police_check()
- * has already established. */
+ * has already established. `port` is a port's profile, a matchall's, rather
+ * than a per-flow one: the two count a frame from different headers
+ * (cdx_plcr_lengths()). */
 static int cdx_police_rates(const struct flow_action_entry *act,
-			    struct netlink_ext_ack *extack, bool *byte_mode,
+			    struct netlink_ext_ack *extack, bool port, bool *byte_mode,
 			    u32 *cir, u32 *pir, u32 *cbs, u32 *pbs)
 {
 	*byte_mode = act->police.rate_bytes_ps != 0;
@@ -132,21 +135,32 @@ static int cdx_police_rates(const struct flow_action_entry *act,
 		 * for tc (cdx_port_police_set()), so its green is that same
 		 * rule: the committed bucket is the rate's, and the peak bucket
 		 * at the peak rate does the length check as well, so it is as
-		 * deep as the longest frame `mtu` lets through (below) -- 14
-		 * bytes shallower than Linux's. With no peak rate it does the
+		 * deep as the longest frame `mtu` lets through, counted as the
+		 * profile counts it (below). With no peak rate it does the
 		 * length check alone, refilled far faster than any port can
 		 * drain it, so only a frame longer than it misses. */
 		*pir = act->police.peakrate_bytes_ps ?
 			cdx_police_bytes_to_kbits(act->police.peakrate_bytes_ps) :
 			CDX_POLICE_UNBOUNDED_KBITS;
-		/* A tc profile counts the frame from its IP header on
-		 * (cdx_plcr_lengths()), what Linux charges the rate, while
-		 * Linux's length check adds the 14-byte Ethernet header back:
-		 * tc ingress has already moved a VLAN tag out of the frame. A
-		 * second tag (QinQ) or a PPPoE session header stays in Linux's
-		 * count and not in the profile's, which is that much more
-		 * lenient. An mtu no frame fits keeps a bucket nothing fits. */
-		*pbs = act->police.mtu > ETH_HLEN ? act->police.mtu - ETH_HLEN : 1;
+		/* Linux's length check adds the Ethernet header back to the
+		 * datagram (tc ingress has already moved a VLAN tag out of the
+		 * frame). A per-flow profile counts from the IP header, so its
+		 * bucket is 14 bytes shallower; a second tag (QinQ) or a PPPoE
+		 * session header stays in Linux's count and not in the
+		 * profile's, which is that much more lenient. The port's
+		 * counts from the Ethernet header as Linux's check does, but
+		 * with a VLAN tag still in the frame, which Linux has moved
+		 * out: its bucket is a tag deeper than the mtu, exact for a
+		 * tagged frame and 4 bytes lenient for an untagged one. As deep
+		 * as the mtu alone, an `mtu 1514` on a tagged WAN turned away
+		 * every full-size frame Linux passes. An mtu no frame fits
+		 * keeps a bucket nothing fits, and none is ever empty, which
+		 * the profile would read as "use the default". */
+		if (port)
+			*pbs = act->police.mtu > U32_MAX - VLAN_HLEN ? U32_MAX :
+			       act->police.mtu + VLAN_HLEN;
+		else
+			*pbs = act->police.mtu > ETH_HLEN ? act->police.mtu - ETH_HLEN : 1;
 	} else {
 		*cir = (u32)act->police.rate_pkt_ps;
 		*pir = *cir;
@@ -266,7 +280,7 @@ static int cdx_police_replace(struct net_device *dev,
 	if (rc)
 		return rc;
 
-	rc = cdx_police_rates(act, extack, &byte_mode, &cir, &pir, &cbs, &pbs);
+	rc = cdx_police_rates(act, extack, true, &byte_mode, &cir, &pir, &cbs, &pbs);
 	if (rc)
 		return rc;
 
@@ -757,7 +771,7 @@ static int cdx_police_flower_replace(struct net_device *dev,
 	rc = cdx_police_check(act, extack);
 	if (rc)
 		return rc;
-	rc = cdx_police_rates(act, extack, &byte_mode, &cir, &pir, &cbs, &pbs);
+	rc = cdx_police_rates(act, extack, false, &byte_mode, &cir, &pir, &cbs, &pbs);
 	if (rc)
 		return rc;
 	/* The per-flow profiles are programmed in byte mode; a packet-rate
@@ -971,8 +985,9 @@ static int cdx_police_block_cb(enum tc_setup_type type, void *type_data,
  * would not match in software -- one direction, one port. A port-less
  * direction is not counted: ESP, GRE and IP in IP are keyed in the
  * three-tuple tables, where no case has proved the profile is met. The
- * matchall is the port's rate limiter, which the soft parser hands every
- * unicast TCP, UDP and ESP frame the port receives and no other: a GRE or
+ * matchall is the port's rate limiter, which the soft parser hands the
+ * unicast TCP frames without SYN, FIN or RST, the UDP and ESP frames and the
+ * PPPoE session frames but LCP the port receives, and no other: a GRE or
  * IP-in-IP transit direction (A386) passes it unmetered, where the software
  * filter would meter it (cdx_tc_filter_mirrored() says the same of a
  * multicast stream). A bridged pair carries whatever its stations send, and

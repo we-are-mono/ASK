@@ -48,6 +48,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import signal
 import socket
 import struct
@@ -57,6 +58,7 @@ import time
 import pytest
 
 from _flowtable_pppoe import CLONED_WAN_MAC, DPORT6, _concentrator_if, _session_pids, DUT_LOG
+from _flowtable_qos import policed
 from _gated_tcp import GatedTcp
 from _topology import LAN_IPV6, TARGET_LAN_IF, TARGET_WAN_IF, lan_run
 import _flowtable_rig as ft
@@ -1220,6 +1222,107 @@ async def test_mtu_retires(pppoe_rig):
     finally:
         await command(r.target, r.session, "ip", "link", "set", r.ppp_if,
                       "mtu", str(SESSION_MTU), check=False)
+
+
+@pytest.mark.parametrize("mtu", [None, 1514], ids=["default-mtu", "mtu-1514"])
+async def test_ingress_policer_keeps_the_session(pppoe_rig, mtu):
+    """A matchall police on the WAN port meters the session and keeps it.
+
+    A policer far above what the case sends passes everything it meters: the
+    session's frames reach the port's profile and come out green, so the path
+    across the session and an offloaded flow both carry on. LCP and discovery
+    carry no IP and take the punt policer instead (A325).
+
+    The soft parser ends a session frame's parse at its PPPoE header, so it
+    has no IP header to count from. A profile measuring from one flagged
+    every such frame with a frame-length error, which the port discards: the
+    filter cut the whole session while reporting nothing dropped (A460).
+
+    With an explicit `mtu 1514`, a datagram filling the session crosses too:
+    Linux measures it with the tag moved out (1514 bytes), the profile with
+    the tag still in the frame (1518), so its length check is a tag deeper.
+    """
+    r = pppoe_rig
+    await _wait_reachable(r)
+    tc = _console_tc(r)
+    length = ["mtu", str(mtu)] if mtu else []
+
+    await tc("qdisc", "del", "dev", TARGET_WAN_IF, "clsact", check=False)
+    await tc("qdisc", "add", "dev", TARGET_WAN_IF, "clsact")
+    try:
+        await tc("filter", "add", "dev", TARGET_WAN_IF, "ingress", "protocol", "all",
+                 "pref", "100", "matchall", "skip_sw", "action", "police",
+                 "rate", "500mbit", "burst", "256k", *length, "conform-exceed", "drop")
+        # A filter tc has not yet asked the hardware about shows no hardware
+        # line at all; it has metered nothing.
+        before = max(_metered(await tc("-s", "filter", "show", "dev", TARGET_WAN_IF,
+                                       "ingress")), 0)
+        await _wait_reachable(r, attempts=5)
+        flows, delta = await _established(r)
+        assert all(d == 64 for d in delta.values()), delta
+        # The largest datagram the session takes, both ways: the download
+        # arrives as a full-size tagged session frame.
+        start = {f["cookie"]: int(f["packets"]) for f in (await r.state())["flows"]}
+        await r.exchange(count=16, payload_size=SESSION_MTU - 28)
+        full = {f["cookie"]: int(f["packets"]) - start[f["cookie"]]
+                for f in (await r.state())["flows"] if f["cookie"] in start}
+        assert sorted(full.values()) == [16, 16], full
+        after = await tc("-s", "filter", "show", "dev", TARGET_WAN_IF, "ingress")
+        assert _metered(after) > before, after["stdout"]
+        assert "dropped 0," in after["stdout"], after["stdout"]
+        r.record("pppoe-policed", {"flows": flows, "delta": delta, "full": full,
+                                   "tc": after["stdout"]})
+    finally:
+        await tc("qdisc", "del", "dev", TARGET_WAN_IF, "clsact", check=False)
+
+
+async def test_flower_policer_keeps_its_flow(pppoe_rig):
+    """A flower police naming the session's download meters it and carries it.
+
+    The filter's profile is bound to the download when the flowtable admits
+    it, and the download's frames arrive through the session, whose parse the
+    soft parser ends at the PPPoE header (A460). The classifier reaches a
+    per-flow profile through a second parse past that header, so it has an
+    IP header to count from and charges the datagram, as Linux does. Far
+    above what the case sends, the profile passes every frame.
+    """
+    r = pppoe_rig
+    await _wait_reachable(r)
+    tc = _console_tc(r)
+
+    await tc("qdisc", "del", "dev", TARGET_WAN_IF, "clsact", check=False)
+    await tc("qdisc", "add", "dev", TARGET_WAN_IF, "clsact")
+    try:
+        await tc("filter", "add", "dev", TARGET_WAN_IF, "ingress", "protocol", "ip",
+                 "pref", "1", "flower", "skip_sw", "ip_proto", r.proto,
+                 "dst_ip", r.lan_ip, "dst_port", str(SPORT),
+                 "action", "police", "rate", "500mbit", "burst", "256k",
+                 "conform-exceed", "drop")
+        flows, delta = await _established(r)
+        reverse = _direction(flows, INNER_LOCAL, r.lan_ip)
+        after = await tc("-s", "filter", "show", "dev", TARGET_WAN_IF, "ingress")
+        assert all(d == 64 for d in delta.values()), delta
+        # The download names the filter's profile.
+        assert policed(await r.state(), reverse), reverse
+        assert _metered(after) >= 64, after["stdout"]
+        assert "dropped 0," in after["stdout"], after["stdout"]
+        r.record("pppoe-flower-policed", {"flows": flows, "delta": delta, "tc": after["stdout"]})
+    finally:
+        await tc("qdisc", "del", "dev", TARGET_WAN_IF, "clsact", check=False)
+
+
+def _console_tc(r):
+    """`tc` is not in the agent's argv allowlist, so filters are installed on
+    the console the fixture holds."""
+    async def tc(*argv, check=True):
+        return await console_command(r.console, "tc", *argv, check=check, timeout=30)
+    return tc
+
+
+def _metered(shown):
+    """The frames a hardware police action counted, all colours."""
+    found = re.search(r"Sent hardware \d+ bytes (\d+) pkt", shown["stdout"])
+    return int(found.group(1)) if found else -1
 
 
 @pytest.mark.rfc("2516", section="5")

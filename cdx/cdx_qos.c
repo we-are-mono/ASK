@@ -522,11 +522,25 @@ int cdxdrv_release_shared_policers(struct cdx_fman_info *finfo)
  * the IP header after any tags), where L2 counts the
  * Ethernet header too and FULL the FCS as well. A red frame's rollback was
  * measured to make no difference either way; L2, the nearer, is taken.
- * NXP's profiles meter the whole frame as the wire carried it. */
-static void cdx_plcr_lengths(t_FmPcdPlcrProfileParams *params, bool tc_meter)
+ * NXP's profiles meter the whole frame as the wire carried it.
+ *
+ * L3 needs the parse to have found an IP header: a frame it is asked of
+ * without one is flagged FM_FD_ERR_PLCR_FRAME_LEN, which the port's receive
+ * discard mask drops. The port's profile meets frames without one: the soft
+ * parser sends every PPPoE session frame but LCP to it from the PPPoE header
+ * and ends the parse there, and an L3 count dropped all of them, IPCP and
+ * CHAP with the data (A460). So the port's (`port`) counts from the Ethernet
+ * header, which every frame has: 14 bytes a frame more than Linux charges,
+ * 18 with a VLAN tag, on the side that runs under the rate rather than over
+ * it. A per-flow profile meets only frames of a flow the classifier matched
+ * on its addresses and ports, which a PPPoE download reaches through a second
+ * parse past the session header: flowtable_pppoe.py's
+ * test_flower_policer_keeps_its_flow meters one at L3 and passes it whole. */
+static void cdx_plcr_lengths(t_FmPcdPlcrProfileParams *params, bool tc_meter, bool port)
 {
 	params->nonPassthroughAlgParams.byteModeParams.frameLengthSelection =
-		tc_meter ? e_FM_PCD_PLCR_L3_FRM_LEN : e_FM_PCD_PLCR_FULL_FRM_LEN;
+		!tc_meter ? e_FM_PCD_PLCR_FULL_FRM_LEN :
+		port ? e_FM_PCD_PLCR_L2_FRM_LEN : e_FM_PCD_PLCR_L3_FRM_LEN;
 	params->nonPassthroughAlgParams.byteModeParams.rollBackFrameSelection =
 		tc_meter ? e_FM_PCD_PLCR_ROLLBACK_L2_FRM_LEN : e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN;
 }
@@ -569,7 +583,7 @@ static void port_plcr_params(const struct port_ff_rate_lim_info *info,
 	params->color.override = e_FM_PCD_PLCR_RED;
 	params->nonPassthroughAlgParams.rateMode = info->rate_mode;
 	if (info->rate_mode == e_FM_PCD_PLCR_BYTE_MODE)
-		cdx_plcr_lengths(params, info->tc_meter);
+		cdx_plcr_lengths(params, info->tc_meter, true);
 	params->nonPassthroughAlgParams.committedInfoRate = info->cir_value;
 	params->nonPassthroughAlgParams.committedBurstSize = info->cbs;
 	params->nonPassthroughAlgParams.peakOrExcessInfoRate = info->pir_value;
@@ -901,7 +915,7 @@ static int cdx_ingress_plcr_write(struct cdx_fman_info *finfo, uint32_t queue_no
 	{
 		/*set algorithm mode as bytes/sec */
 		Params.nonPassthroughAlgParams.rateMode = e_FM_PCD_PLCR_BYTE_MODE;
-		cdx_plcr_lengths(&Params, info->tc_meter);
+		cdx_plcr_lengths(&Params, info->tc_meter, false);
 	}
 	Params.nonPassthroughAlgParams.committedInfoRate = info->cir_value;
 	Params.nonPassthroughAlgParams.committedBurstSize = info->cbs;
